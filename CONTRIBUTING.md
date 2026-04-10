@@ -1,26 +1,36 @@
 # Contributing
 
-Thanks for contributing to `fancy-openclaw-linear-connector`.
+Thanks for your interest in contributing to fancy-openclaw-linear-connector!
 
-## Contribution flow
+## Local Setup
 
-1. Open or reference an issue before starting significant work.
-2. Create one branch per ticket.
-3. Keep changes focused and small where possible.
-4. Update docs when behavior or setup changes.
-5. Open a pull request with context, testing notes, and any rollout concerns.
+```bash
+git clone https://github.com/fancymatt/fancy-openclaw-linear-connector.git
+cd fancy-openclaw-linear-connector
+npm install
+npm run build
+```
 
-## Development expectations
+## Branch Naming
 
-- Treat Linear as the system of record.
-- Prefer config over code forks.
-- Keep the connector operationally reliable and conservative in its actions.
-- Avoid introducing fancymatt-specific workflow policy into the shared service.
+Use Linear's auto-generated branch names (e.g., `ai-205-bootstrap-repo`). This keeps branches linked to their tickets automatically.
 
-## Pull requests
+## Pull Request Process
 
-Please include:
-- what changed
-- why it changed
-- how it was tested
-- any open questions or follow-up work
+1. Create a branch from `main` using the Linear branch name
+2. Make your changes with clear, atomic commits
+3. Ensure `npm run build` and `npm run lint` pass
+4. Open a PR referencing the Linear ticket ID (e.g., `AI-205`)
+5. Fill out the PR template — the Linear ticket link is required
+
+## Code Style
+
+- **TypeScript strict mode** — no implicit `any`, strict null checks enabled
+- **ESLint** — run `npm run lint` before committing
+- Keep modules focused and small
+- Prefer explicit types over inference for public APIs
+- Write comments that explain *why*, not *what*
+
+## Code of Conduct
+
+This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md). Be kind.

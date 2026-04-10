@@ -1,0 +1,20 @@
+# connector.example.yaml — copy to connector.yaml and fill in values
+
+server:
+  port: 3000
+
+linear:
+  # HMAC secret from the Linear webhook configuration page
+  # Set as LINEAR_WEBHOOK_SECRET env var instead of hardcoding here
+  webhookSecret: ""
+
+openclaw:
+  # Base URL of your OpenClaw gateway
+  gatewayUrl: "http://localhost:8080"
+
+# Routing rules: map Linear team keys to OpenClaw agent IDs
+routing:
+  - teamKey: "ENG"
+    agentId: "charles"
+  - teamKey: "DESIGN"
+    agentId: "laren"

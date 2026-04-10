@@ -1,51 +1,70 @@
 # fancy-openclaw-linear-connector
 
-Standalone connector service that bridges Linear assignment events into OpenClaw agents.
+A standalone connector service that bridges [Linear](https://linear.app) webhooks to [OpenClaw](https://openclaw.com) agent sessions. This is **not** an OpenClaw plugin or skill — it's an independent service that receives Linear webhook events and routes them to the appropriate OpenClaw agents.
 
-## Status
+> **Status:** v0.1 in development
 
-Early v0.1 bootstrap. This repository is being set up as shared infrastructure for FancyMatt and ILL deployments.
+## Design Principles
 
-## What this is
+1. **Linear is the system of record** — the connector never maintains authoritative state
+2. **Don't duplicate what Linear tracks** — priority, status, queue position all live in Linear
+3. **Agents respond immediately, even when queued** — acknowledgment is instant, execution is ordered
+4. **Reliability through derivability** — any agent can reconstruct its queue from Linear alone
+5. **Deterministic behavior** — same events + same state = same decisions
+6. **Recoverability** — restart should be boring, no operator cleanup required
+7. **Config, not code forks** — different deployments are different configs of the same binary
+8. **Conservative action model** — when uncertain, avoid destructive actions
 
-This project is a standalone connector service.
+## Project Structure
 
-It is not an OpenClaw plugin.
-It is not an agent skill.
+```
+src/
+  index.ts              Service entrypoint
+  config/index.ts       Configuration loader
+  webhook/index.ts      Linear webhook handler
+  routing/index.ts      Event routing engine
+  queue/index.ts        Agent queue manager
+  delivery/index.ts     OpenClaw session adapter
+  persistence/index.ts  Event store
+config/
+  connector.example.yaml  Example configuration
+docs/
+  architecture.md       System architecture
+  deployment.md         Deployment guide
+  configuration.md      Configuration reference
+```
 
-Its job is to:
-- receive Linear webhook events
-- normalize and route assignment events
-- hand work off to OpenClaw agents
-- maintain operational queue and recovery behavior without becoming a second task system
+## Getting Started
 
-Linear remains the system of record for task state, ownership, and priority.
+### Prerequisites
 
-## Relationship to skills
+- Node.js >= 20
+- A Linear workspace with webhook access
+- An OpenClaw installation
 
-A companion Linear workflow skill may be used alongside this connector to help agents behave consistently, but that skill is optional and separate from this service.
+### Setup
 
-## Local setup
+```bash
+git clone https://github.com/fancymatt/fancy-openclaw-linear-connector.git
+cd fancy-openclaw-linear-connector
+npm install
+cp config/connector.example.yaml config/connector.yaml
+# Edit config/connector.yaml with your settings
+```
 
-Detailed setup docs will land as the implementation progresses.
+### Development
 
-For now, expect this project to be a Node/TypeScript service with local configuration via environment variables and config files.
+```bash
+npm run dev      # Start in development mode
+npm run build    # Compile TypeScript
+npm run lint     # Run linter
+npm test         # Run tests
+```
 
-## Initial repo layout
+## Related
 
-- `src/` — service code
-- `docs/` — design notes and operator documentation
-- `.github/` — templates and repo hygiene
+- [fancy-openclaw-linear-skill](https://github.com/fancymatt/fancy-openclaw-linear-skill) — Companion OpenClaw skill that agents use to interact with Linear
 
-## Intended scope
+## License
 
-This repo is for the connector service only:
-- webhook ingestion
-- event normalization
-- routing
-- queue management
-- delivery to OpenClaw
-- restart recovery
-- operator visibility
-
-It does not define agent workflow policy internally.
+[MIT](LICENSE) © 2026 Matt Henry
