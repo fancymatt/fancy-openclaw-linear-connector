@@ -1,0 +1,33 @@
+{
+  "name": "fancy-openclaw-linear-connector",
+  "version": "0.1.0",
+  "description": "Standalone connector service bridging Linear assignment events into OpenClaw agents",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "lint": "eslint src/",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "linear",
+    "openclaw",
+    "webhook",
+    "connector"
+  ],
+  "author": "FancyMatt",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "eslint": "^9.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
