@@ -10,3 +10,4 @@ config/connector.yaml
 coverage/
 .DS_Store
 *.log
+data/
