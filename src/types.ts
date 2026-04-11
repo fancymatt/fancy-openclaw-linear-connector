@@ -2,14 +2,7 @@
  * Core type definitions for the connector service.
  */
 
-/** Normalized Linear event after ingestion and parsing. */
-export interface LinearEvent {
-  id: string;
-  type: string;
-  action: string;
-  createdAt: string;
-  data: Record<string, unknown>;
-}
+import type { LinearEvent } from "./webhook/schema";
 
 /** Routing decision mapping an event to an OpenClaw agent. */
 export interface RouteResult {
@@ -24,5 +17,49 @@ export interface ConnectorConfig {
   port: number;
   linearWebhookSecret: string;
   openclawGatewayUrl: string;
-  logLevel: 'debug' | 'info' | 'warn' | 'error';
+  logLevel: "debug" | "info" | "warn" | "error";
+}
+
+/** Payload sent into OpenClaw as the delivery contract boundary. */
+export interface OpenClawAssignmentPayload {
+  version: 1;
+  source: "linear";
+  agentId: string;
+  sessionKey: string;
+  priority: number;
+  eventType: string;
+  action: string;
+  issue?: {
+    id?: string;
+    identifier?: string;
+    title?: string;
+    url?: string;
+    teamKey?: string;
+    stateName?: string;
+    assigneeName?: string;
+    priority?: number;
+  };
+  summary: string;
+  rawEvent: LinearEvent;
+}
+
+export interface OpenClawDeliveryRequest {
+  destination: {
+    agentId: string;
+    sessionKey: string;
+  };
+  payload: OpenClawAssignmentPayload;
+}
+
+export interface OpenClawDeliveryResult {
+  ok: boolean;
+  destination: {
+    agentId: string;
+    sessionKey: string;
+  };
+  transport: "mock" | "http";
+  requestBody: string;
+  statusCode?: number;
+  responseBody?: string;
+  error?: string;
 }

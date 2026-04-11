@@ -13,11 +13,12 @@ function tmpDbPath(): string {
 }
 
 function makeRouteResult(agentId: string, issueId: string): RouteResult {
+  const timestamp = "2026-04-10T18:00:00.000Z";
   const event: LinearIssueCreatedEvent = {
     type: "Issue",
     action: "create",
     actor: { id: "actor-1", name: "Test" },
-    createdAt: new Date().toISOString(),
+    createdAt: timestamp,
     data: {
       id: issueId,
       identifier: `ENG-${issueId}`,
@@ -31,8 +32,8 @@ function makeRouteResult(agentId: string, issueId: string): RouteResult {
       assigneeName: "Agent",
       labelIds: [],
       url: `https://linear.app/org/issue/ENG-${issueId}`,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      createdAt: timestamp,
+      updatedAt: timestamp,
     },
     raw: {},
   };
