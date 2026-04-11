@@ -1,7 +1,9 @@
+import crypto from "crypto";
 import { Router, Request, Response } from "express";
 import { verifyLinearSignature } from "./signature";
 import { normalizeLinearEvent } from "./normalize";
 import { LinearEvent } from "./schema";
+import { EventStore } from "../store/event-store";
 
 export { LinearEvent } from "./schema";
 export { verifyLinearSignature } from "./signature";
@@ -17,7 +19,7 @@ export { normalizeLinearEvent } from "./normalize";
  * Environment variables consumed:
  *   LINEAR_WEBHOOK_SECRET  — HMAC secret from the Linear webhook dashboard
  */
-export function createWebhookRouter(): Router {
+export function createWebhookRouter(eventStore?: EventStore): Router {
   const router = Router();
 
   /**
@@ -89,9 +91,22 @@ export function createWebhookRouter(): Router {
         return;
       }
 
-      // ── 7. Acknowledge immediately ────────────────────────────────────────
+      // ── 7. Deduplication ──────────────────────────────────────────────────
+      const deliveryId =
+        (req.headers["x-linear-delivery"] as string | undefined) ??
+        crypto.createHash("sha256").update(rawBody).digest("hex");
+
+      if (eventStore?.isDuplicate(deliveryId)) {
+        res.status(200).json({ ok: true, duplicate: true });
+        return;
+      }
+
+      // ── 8. Acknowledge immediately ────────────────────────────────────────
       // Linear expects a 200 within a few seconds. We ack first, process async.
       res.status(200).json({ ok: true });
+
+      // Record event for dedup & restart recovery
+      eventStore?.recordEvent(deliveryId, payload as object);
 
       // Emit for downstream consumers (routing, queue, etc.)
       // In a full implementation this would publish to an event bus.
