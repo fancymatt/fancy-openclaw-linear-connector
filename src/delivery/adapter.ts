@@ -5,6 +5,9 @@ import type {
   RouteResult,
 } from "../types";
 import type { LinearIssueCreatedEvent, LinearIssueUpdatedEvent } from "../webhook/schema";
+import { createLogger, componentLogger } from "../logger";
+
+const log = componentLogger(createLogger(), "delivery");
 
 export interface OpenClawDeliveryAdapter {
   deliver(request: OpenClawDeliveryRequest): Promise<OpenClawDeliveryResult>;
@@ -26,6 +29,9 @@ export class HttpOpenClawDeliveryAdapter implements OpenClawDeliveryAdapter {
 
   async deliver(request: OpenClawDeliveryRequest): Promise<OpenClawDeliveryResult> {
     const requestBody = JSON.stringify(request.payload);
+    const { agentId, sessionKey } = request.destination;
+
+    log.info({ agentId, sessionKey }, "attempting delivery");
 
     try {
       const response = await this.fetchImpl(`${this.gatewayUrl}/deliveries/openclaw`, {
@@ -40,6 +46,12 @@ export class HttpOpenClawDeliveryAdapter implements OpenClawDeliveryAdapter {
 
       const responseBody = await response.text();
 
+      if (response.ok) {
+        log.info({ agentId, statusCode: response.status }, "delivery succeeded");
+      } else {
+        log.error({ agentId, statusCode: response.status, responseBody }, "delivery failed");
+      }
+
       return {
         ok: response.ok,
         destination: request.destination,
@@ -50,6 +62,7 @@ export class HttpOpenClawDeliveryAdapter implements OpenClawDeliveryAdapter {
         error: response.ok ? undefined : `Delivery failed with status ${response.status}`,
       };
     } catch (error) {
+      log.error({ agentId, error: error instanceof Error ? error.message : String(error) }, "delivery error");
       return {
         ok: false,
         destination: request.destination,
