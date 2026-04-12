@@ -39,6 +39,7 @@ export function extractAgentTarget(event: LinearEvent): string | null {
   }
 
   const data = "data" in event ? (event.data as Record<string, unknown> | undefined) : null;
+  log.info(`extractAgentTarget: type=${event.type} actor=${event.actor?.id} hasData=${!!data} dataKeys=${data ? Object.keys(data).slice(0,5).join(',') : 'none'}`);
 
   // 1. Check delegate first — OAuth app actors are set as delegates, not assignees
   let target: string | null = null;
@@ -59,6 +60,7 @@ export function extractAgentTarget(event: LinearEvent): string | null {
 
   // 3. Check mentioned users
   const mentionedUsers = data?.mentionedUsers as Array<{ id?: string }> | null | undefined;
+  log.info(`Mention check: mentionedUsers=${JSON.stringify(mentionedUsers)} agentMapKeys=${Object.keys(agentMap).join(',')}`);
   if (mentionedUsers) {
     for (const user of mentionedUsers) {
       if (user.id && agentMap[user.id]) {

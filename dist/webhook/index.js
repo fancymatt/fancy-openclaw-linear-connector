@@ -70,6 +70,7 @@ function createWebhookRouter(eventStore) {
         // ── 6. Normalize event ────────────────────────────────────────────────
         let event;
         try {
+            log.info(`Raw payload type=${payload.type} dataKeys=${payload.data ? Object.keys(payload.data).slice(0, 10).join(',') : 'none'}`);
             event = (0, normalize_1.normalizeLinearEvent)(payload);
         }
         catch (err) {
