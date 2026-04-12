@@ -14,6 +14,12 @@ export class EventStore {
 
   constructor(dbPath?: string) {
     const resolvedPath = dbPath ?? path.join(process.cwd(), "data", "events.db");
+    // Ensure directory exists
+    const dir = path.dirname(resolvedPath);
+    const fs = require("fs");
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
     this.db = new Database(resolvedPath);
     this.db.pragma("journal_mode = WAL");
     this.migrate();

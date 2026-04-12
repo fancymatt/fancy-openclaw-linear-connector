@@ -4,6 +4,12 @@ import { verifyLinearSignature } from "./signature";
 import { normalizeLinearEvent } from "./normalize";
 import { LinearEvent } from "./schema";
 import { EventStore } from "../store/event-store";
+import { routeEvent } from "../router";
+import { createSessionAndEmitThought } from "../agent-session";
+import { getOpenclawAgentName } from "../agents";
+import { createLogger, componentLogger } from "../logger";
+
+const log = componentLogger(createLogger(), "webhook");
 
 export { LinearEvent } from "./schema";
 export { verifyLinearSignature } from "./signature";
@@ -22,17 +28,6 @@ export { normalizeLinearEvent } from "./normalize";
 export function createWebhookRouter(eventStore?: EventStore): Router {
   const router = Router();
 
-  /**
-   * POST /webhooks/linear
-   *
-   * Receives and validates Linear webhook events.
-   *
-   * Responses:
-   *   200 OK             — event accepted and queued
-   *   400 Bad Request    — missing signature header or malformed payload
-   *   401 Unauthorized   — signature validation failed
-   *   500 Internal Error — unexpected server error
-   */
   router.post(
     "/linear",
     (req: Request, res: Response): void => {
@@ -49,9 +44,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
 
       // ── 2. Secret configured ──────────────────────────────────────────────
       if (!secret) {
-        console.error(
-          "[webhook] LINEAR_WEBHOOK_SECRET is not set — rejecting all requests"
-        );
+        log.error("LINEAR_WEBHOOK_SECRET is not set — rejecting all requests");
         res.status(500).json({ error: "Server misconfiguration" });
         return;
       }
@@ -102,19 +95,38 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
       }
 
       // ── 8. Acknowledge immediately ────────────────────────────────────────
-      // Linear expects a 200 within a few seconds. We ack first, process async.
       res.status(200).json({ ok: true });
 
       // Record event for dedup & restart recovery
       eventStore?.recordEvent(deliveryId, payload as object);
 
-      // Emit for downstream consumers (routing, queue, etc.)
-      // In a full implementation this would publish to an event bus.
-      // For now we log at info level so the event is observable.
-      console.info(
-        `[webhook] received event type=${event.type} action=${"action" in event ? event.action : "?"}`
-      );
-    }
+      // ── 9. Route to agent ─────────────────────────────────────────────────
+      const route = routeEvent(event);
+      if (!route) {
+        log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
+        return;
+      }
+
+      const agentName = route.agentId;
+      log.info(`Routed event to ${agentName} [${route.sessionKey}]`);
+
+      // ── 10. Create agent session + emit thought ───────────────────────────
+      const data = event.data as Record<string, unknown> | null;
+      const issueId = data?.id as string | undefined;
+
+      if (issueId && event.type === "Issue") {
+        createSessionAndEmitThought(issueId, agentName, {
+          identifier: data?.identifier as string | undefined,
+          title: data?.title as string | undefined,
+          description: data?.description as string | undefined,
+        }).catch((err) => {
+          log.error(`Failed to create agent session: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      }
+
+      // TODO: deliver to OpenClaw gateway via HttpOpenClawDeliveryAdapter
+      log.info(`Event processing complete for ${agentName}`);
+    },
   );
 
   return router;

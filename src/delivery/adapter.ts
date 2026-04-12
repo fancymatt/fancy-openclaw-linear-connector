@@ -31,7 +31,7 @@ export class HttpOpenClawDeliveryAdapter implements OpenClawDeliveryAdapter {
     const requestBody = JSON.stringify(request.payload);
     const { agentId, sessionKey } = request.destination;
 
-    log.info({ agentId, sessionKey }, "attempting delivery");
+    log.info(`Attempting delivery to ${agentId} [${sessionKey}]`);
 
     try {
       const response = await this.fetchImpl(`${this.gatewayUrl}/deliveries/openclaw`, {
@@ -47,9 +47,9 @@ export class HttpOpenClawDeliveryAdapter implements OpenClawDeliveryAdapter {
       const responseBody = await response.text();
 
       if (response.ok) {
-        log.info({ agentId, statusCode: response.status }, "delivery succeeded");
+        log.info(`Delivery succeeded for ${agentId}: ${response.status}`);
       } else {
-        log.error({ agentId, statusCode: response.status, responseBody }, "delivery failed");
+        log.error(`Delivery failed for ${agentId}: ${response.status} ${responseBody}`);
       }
 
       return {
@@ -62,7 +62,7 @@ export class HttpOpenClawDeliveryAdapter implements OpenClawDeliveryAdapter {
         error: response.ok ? undefined : `Delivery failed with status ${response.status}`,
       };
     } catch (error) {
-      log.error({ agentId, error: error instanceof Error ? error.message : String(error) }, "delivery error");
+      log.error(`Delivery error for ${agentId}: ${error instanceof Error ? error.message : String(error)}`);
       return {
         ok: false,
         destination: request.destination,

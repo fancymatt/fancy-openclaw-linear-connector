@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { EventStore } from "../store/event-store";
 export { LinearEvent } from "./schema";
 export { verifyLinearSignature } from "./signature";
 export { normalizeLinearEvent } from "./normalize";
@@ -12,5 +13,5 @@ export { normalizeLinearEvent } from "./normalize";
  * Environment variables consumed:
  *   LINEAR_WEBHOOK_SECRET  — HMAC secret from the Linear webhook dashboard
  */
-export declare function createWebhookRouter(): Router;
+export declare function createWebhookRouter(eventStore?: EventStore): Router;
 //# sourceMappingURL=index.d.ts.map
