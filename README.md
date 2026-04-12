@@ -30,6 +30,10 @@ Each agent gets its **own** OAuth application in Linear.
 2. **Name and icon** — this is how the agent appears in Linear (mention menu, delegate dropdown, comments). Choose carefully.
 3. **Redirect URI**: `https://your-host/oauth/callback` (e.g. `https://ai.fcy.sh/oauth/callback`)
 4. Under **Webhooks**, enable: **Issues**, **Comments**, **Agent Session Events**
+   - This is an **application-level webhook** (not agent-specific)
+   - Agent Session Events enable the Linear UI "Agent working" widget when you @mention agents
+   - Issues + Comments enable routing to OpenClaw agents
+⚠️ **Important:** Use application-level webhooks, not agent-specific webhooks. Agent-specific webhooks cause duplicate notifications. Only one application webhook is needed per workspace.
 5. Note the **Client ID** and **Client Secret**
 
 ### Step 2: Authorize as an App (NOT as a personal user)
@@ -116,11 +120,15 @@ On startup, the connector will:
 
 ### Step 7: Create the Linear Webhook
 
-If this is the first agent, create a workspace webhook in Linear:
+⚠️ **Only create this ONCE per workspace**, not per agent.** This is an application-level webhook that handles all agents.
 
-1. Linear → Settings → API → Webhooks → Create new
+If you already have a workspace webhook for Linear events, **update the existing one** instead of creating a new one. Enable the same event types for all agents.
+
+1. Linear → Settings → API → Webhooks → Create new (or edit existing)
 2. URL: `https://your-host/linear-webhook/`
 3. Event types: **Issues**, **Comments**, **Agent Session Events**
+   - Use **exact** event type names: `Issue`, `Comment`, `AgentSessionEvent`
+   - Avoid redundant types like `Issue.completed` or `Issue.canceled` (covered by `Issue.updated`)
 4. Use the signing secret from your OAuth app settings
 
 ### Step 8: Test End-to-End
