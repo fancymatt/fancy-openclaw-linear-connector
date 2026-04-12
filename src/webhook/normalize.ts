@@ -39,6 +39,9 @@ function extractIssueData(data: Record<string, unknown>): LinearIssueData {
     teamKey: String(team.key ?? data.teamKey ?? ""),
     assigneeId: assignee ? String(assignee.id) : undefined,
     assigneeName: assignee ? String(assignee.name) : undefined,
+    delegate: data.delegate as { id?: string; name?: string } | null | undefined,
+    assignee: data.assignee as { id?: string; name?: string } | null | undefined,
+    mentionedUsers: data.mentionedUsers as Array<{ id?: string; name?: string }> | undefined,
     labelIds: Array.isArray(data.labelIds)
       ? (data.labelIds as unknown[]).map(String)
       : [],

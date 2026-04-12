@@ -30,7 +30,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
 
   router.post(
     "/linear",
-    (req: Request, res: Response): void => {
+    async (req: Request, res: Response): Promise<void> => {
       const secret = process.env.LINEAR_WEBHOOK_SECRET;
 
       // ── 1. Signature header presence ──────────────────────────────────────
@@ -124,8 +124,25 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
         });
       }
 
-      // TODO: deliver to OpenClaw gateway via HttpOpenClawDeliveryAdapter
-      log.info(`Event processing complete for ${agentName}`);
+      // Deliver to OpenClaw agent
+      try {
+        const { exec } = require("child_process");
+        const { promisify } = require("util");
+        const execAsync = promisify(exec);
+        const openclawCmd = "/home/fancymatt/.nvm/versions/node/v22.22.1/bin/openclaw";
+        const identifier = (data?.identifier as string | undefined) ?? "";
+        const title = (data?.title as string | undefined) ?? "";
+        const message = `[NEW TASK] ${identifier}: ${title}. Fetch the issue details and take appropriate action.`;
+        const sessionId = route.sessionKey;
+
+        const { stdout, stderr } = await execAsync(
+          `${openclawCmd} agent --agent ${JSON.stringify(agentName)} --session-id ${JSON.stringify(sessionId)} --message ${JSON.stringify(message)}`,
+          { timeout: 30_000 }
+        );
+        log.info(`OpenClaw delivery to ${agentName}: ${(stdout || stderr || "completed").trim().slice(0, 200)}`);
+      } catch (err) {
+        log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
+      }
     },
   );
 
