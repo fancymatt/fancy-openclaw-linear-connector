@@ -91,6 +91,7 @@ function createWebhookRouter(eventStore) {
         // Record event for dedup & restart recovery
         eventStore?.recordEvent(deliveryId, payload);
         // ── 9. Route to agent ─────────────────────────────────────────────────
+        log.info(`Normalized event: type=${event.type} hasData=${"data" in event} dataKeys=${event.data ? Object.keys(event.data).join(',') : 'none'}`);
         const route = (0, router_1.routeEvent)(event);
         if (!route) {
             log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);

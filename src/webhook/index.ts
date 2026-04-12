@@ -102,6 +102,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
       eventStore?.recordEvent(deliveryId, payload as object);
 
       // ── 9. Route to agent ─────────────────────────────────────────────────
+      log.info(`Normalized event: type=${event.type} hasData=${"data" in event} dataKeys=${event.data ? Object.keys(event.data as object).join(',') : 'none'}`);
       const route = routeEvent(event);
       if (!route) {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
