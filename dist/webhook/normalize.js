@@ -50,6 +50,7 @@ function extractCommentData(data) {
         body: String(data.body ?? ""),
         issueId: String(issue.id ?? data.issueId ?? ""),
         issueIdentifier: String(issue.identifier ?? data.issueIdentifier ?? ""),
+        mentionedUsers: data.mentionedUsers,
         url: String(data.url ?? ""),
         createdAt: String(data.createdAt ?? ""),
         updatedAt: String(data.updatedAt ?? ""),
@@ -119,6 +120,7 @@ function normalizeLinearEvent(payload) {
         action,
         actor,
         createdAt,
+        data: p.data,
         raw: payload,
     };
 }

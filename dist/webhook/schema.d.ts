@@ -51,6 +51,11 @@ export interface LinearCommentData {
     body: string;
     issueId: string;
     issueIdentifier: string;
+    /** Users mentioned in the comment */
+    mentionedUsers?: Array<{
+        id?: string;
+        name?: string;
+    }>;
     url: string;
     createdAt: string;
     updatedAt: string;

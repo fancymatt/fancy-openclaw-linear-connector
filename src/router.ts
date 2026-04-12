@@ -103,7 +103,12 @@ export function routeEvent(event: LinearEvent): RouteResult | null {
 
   const agent = getAgent(agentName);
   const openclawName = getOpenclawAgentName(agentName);
-  const identifier = (event.data as Record<string, unknown>)?.identifier as string | undefined;
+  const d = event.data as Record<string, unknown> | undefined;
+  const sessionData = d?.agentSession as Record<string, unknown> | undefined;
+  const identifier =
+    (d?.identifier as string | undefined) ??
+    (d?.issueIdentifier as string | undefined) ??
+    (sessionData?.issue as Record<string, unknown>)?.identifier as string | undefined;
 
   return {
     agentId: openclawName,

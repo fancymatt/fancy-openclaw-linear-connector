@@ -61,6 +61,7 @@ function extractCommentData(
     body: String(data.body ?? ""),
     issueId: String(issue.id ?? data.issueId ?? ""),
     issueIdentifier: String(issue.identifier ?? data.issueIdentifier ?? ""),
+    mentionedUsers: data.mentionedUsers as Array<{ id?: string; name?: string }> | undefined,
     url: String(data.url ?? ""),
     createdAt: String(data.createdAt ?? ""),
     updatedAt: String(data.updatedAt ?? ""),
@@ -139,6 +140,7 @@ export function normalizeLinearEvent(payload: unknown): LinearEvent {
     action,
     actor,
     createdAt,
+    data: p.data as Record<string, unknown> | undefined,
     raw: payload,
   };
 }
