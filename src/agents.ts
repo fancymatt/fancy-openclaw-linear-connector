@@ -5,6 +5,7 @@
  */
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { createLogger, componentLogger } from "./logger";
 
@@ -17,10 +18,10 @@ export interface AgentConfig {
   clientSecret: string;
   accessToken: string;
   refreshToken: string;
-  /** OpenClaw agent name if different from Linear agent name */
   openclawAgent?: string;
-  /** Host where this agent runs: "ishikawa" or "local" (Nakazawa) */
   host?: "ishikawa" | "local";
+  /** Path to write LINEAR_API_KEY when tokens refresh */
+  secretsPath?: string;
 }
 
 interface AgentsFile {
@@ -89,7 +90,26 @@ export function updateTokens(
     a.name === agentName ? { ...a, accessToken, refreshToken } : a,
   );
   save(_agents);
+  syncWorkspaceSecrets(agentName, accessToken);
   log.info(`Tokens updated for ${agentName}: ${accessToken.slice(0, 20)}...`);
+}
+
+/** Sync access token to the agent's workspace secrets file */
+function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
+  const agent = _agents.find((a) => a.name === agentName);
+  if (!agent) return;
+
+  const secretsPath = agent.secretsPath ??
+    path.join(os.homedir(), `.openclaw/workspace-${agent.openclawAgent ?? agent.name}/.secrets/linear.env`);
+
+  try {
+    fs.mkdirSync(path.dirname(secretsPath), { recursive: true });
+    fs.writeFileSync(secretsPath, `LINEAR_API_KEY=${accessToken}\n`, "utf8");
+    fs.chmodSync(secretsPath, 0o600);
+    log.info(`Synced token to ${secretsPath}`);
+  } catch (err) {
+    log.error(`Failed to sync token to ${secretsPath}: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /** Add or update an agent from OAuth callback */
