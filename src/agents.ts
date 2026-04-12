@@ -120,9 +120,11 @@ export function upsertAgent(config: AgentConfig): { isNew: boolean } {
       a.linearUserId === config.linearUserId ? { ...a, ...config } : a,
     );
     save(_agents);
+    syncWorkspaceSecrets(config.name, config.accessToken);
     return { isNew: false };
   }
   _agents.push(config);
   save(_agents);
+  syncWorkspaceSecrets(config.name, config.accessToken);
   return { isNew: true };
 }
