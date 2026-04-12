@@ -8,7 +8,7 @@
  * while allowing agent-to-agent delegation.
  */
 
-import { buildAgentMap, getAccessToken, getAgent, getOpenclawAgentName } from "./agents";
+import { buildAgentMap, getAccessToken, getAgent, getOpenclawAgentName, getAgents } from "./agents";
 import type { LinearEvent } from "./webhook/schema";
 import type { RouteResult } from "./types";
 import { createLogger, componentLogger } from "./logger";
@@ -69,7 +69,18 @@ export function extractAgentTarget(event: LinearEvent): string | null {
     }
   }
 
-  // 4. Self-trigger filtering: skip if the actor IS the target agent
+  // 4. Body-based mention detection for Comment events
+  //    Linear webhooks don't include mentionedUsers, so we parse the body for @name mentions
+  if (!target && event.type === "Comment" && data?.body && typeof data.body === "string") {
+    const nameMap = buildNameMap();
+    const bodyMention = detectMentionInBody(data.body, nameMap);
+    if (bodyMention) {
+      target = nameMap[bodyMention];
+      log.info(`Routed via body mention: @${bodyMention} → ${target}`);
+    }
+  }
+
+  // 5. Self-trigger filtering: skip if the actor IS the target agent
   //    But allow agent-to-agent delegation (Emi delegates to Aki)
   if (isActorOurAgent) {
     if (!target || agentMap[actorId!] === target) {
@@ -89,6 +100,35 @@ function extractId(field: unknown): string | null {
   if (typeof field === "string") return field;
   if (typeof field === "object" && field !== null && "id" in field) {
     return (field as { id?: string }).id ?? null;
+  }
+  return null;
+}
+
+/** Build a lowercase-name → agentName map for body mention detection */
+function buildNameMap(): Record<string, string> {
+  const agents = getAgents();
+  const map: Record<string, string> = {};
+  for (const agent of agents) {
+    const name = agent.name.toLowerCase();
+    map[name] = agent.name;
+    const openclawName = agent.openclawAgent?.toLowerCase();
+    if (openclawName && openclawName !== name) {
+      map[openclawName] = agent.name;
+    }
+  }
+  return map;
+}
+
+/** Detect an @mention in a comment body and return the matched agent key from nameMap */
+function detectMentionInBody(body: string, nameMap: Record<string, string>): string | null {
+  // Match @word or @[Multi Word] patterns
+  const mentionPattern = /@\[([^\]]+)\]|@(\w+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = mentionPattern.exec(body)) !== null) {
+    const name = (match[1] || match[2]).toLowerCase();
+    if (nameMap[name]) {
+      return name;
+    }
   }
   return null;
 }

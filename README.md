@@ -167,7 +167,7 @@ src/
 ### Known Limitations
 
 - **AgentSessionEvent webhooks have no data** — Linear doesn't include issue info in these payloads. Filtered out to avoid noise.
-- **Comment webhooks don't include mentionedUsers** — mention routing requires API enrichment (planned).
+- **Comment webhooks don't include mentionedUsers** — mention routing is done by parsing the comment body for `@name` patterns and matching against agent names (case-insensitive).
 - **OAuth tokens refresh every ~20h** — the connector syncs refreshed tokens to agent workspace secrets automatically.
 
 ## Configuration Reference
