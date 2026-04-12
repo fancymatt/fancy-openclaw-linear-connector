@@ -92,10 +92,32 @@ function createWebhookRouter(eventStore) {
         eventStore?.recordEvent(deliveryId, payload);
         // ── 9. Route to agent ─────────────────────────────────────────────────
         log.info(`Normalized event: type=${event.type} hasData=${"data" in event} dataKeys=${event.data ? Object.keys(event.data).join(',') : 'none'}`);
-        // Skip AgentSessionEvent — no actionable data, just noise
+        // AgentSessionEvent — create session for Linear UI widget
         if (event.type === "AgentSessionEvent") {
-            log.info(`Skipping AgentSessionEvent — no issue data to act on`);
-            return;
+            // Create a Linear agent session to show "Agent working" widget
+            // This is separate from OpenClaw agent routing
+            const data = event.data ?? {};
+            const sessionData = data.agentSession ?? {};
+            const issueData = sessionData.issue ?? {};
+            const issueId = issueData.id;
+            if (!issueId) {
+                log.warn("AgentSessionEvent has no issue data - skipping session creation");
+                return;
+            }
+            // Extract agent name from event data (for session creation)
+            const agentName = sessionData.user?.name || "unknown";
+            let agentSessionId = null;
+            try {
+                const sessionResult = await (0, agent_session_1.createSessionAndEmitThought)(issueId, agentName, {
+                    identifier: issueData.identifier,
+                    title: issueData.title,
+                    description: issueData.description,
+                });
+                agentSessionId = sessionResult.sessionId;
+            }
+            catch (err) {
+                log.error(`Failed to create agent session: ${err instanceof Error ? err.message : String(err)}`);
+            }
         }
         const route = (0, router_1.routeEvent)(event);
         if (!route) {
