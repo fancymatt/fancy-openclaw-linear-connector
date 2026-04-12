@@ -5,7 +5,7 @@ import { normalizeLinearEvent } from "./normalize";
 import { LinearEvent } from "./schema";
 import { EventStore } from "../store/event-store";
 import { routeEvent } from "../router";
-import { createSessionAndEmitThought } from "../agent-session";
+import { createSessionAndEmitThought, emitResponse } from "../agent-session";
 import { getOpenclawAgentName } from "../agents";
 import { createLogger, componentLogger } from "../logger";
 
@@ -122,15 +122,19 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
       // ── 10. Create agent session + emit thought ───────────────────────────
       const data = event.data as Record<string, unknown> | null;
       const issueId = data?.id as string | undefined;
+      let agentSessionId: string | null = null;
 
       if (issueId && event.type === "Issue") {
-        createSessionAndEmitThought(issueId, agentName, {
-          identifier: data?.identifier as string | undefined,
-          title: data?.title as string | undefined,
-          description: data?.description as string | undefined,
-        }).catch((err) => {
+        try {
+          const sessionResult = await createSessionAndEmitThought(issueId, agentName, {
+            identifier: data?.identifier as string | undefined,
+            title: data?.title as string | undefined,
+            description: data?.description as string | undefined,
+          });
+          agentSessionId = sessionResult.sessionId;
+        } catch (err) {
           log.error(`Failed to create agent session: ${err instanceof Error ? err.message : String(err)}`);
-        });
+        }
       }
 
       // Deliver to OpenClaw agent
@@ -154,6 +158,16 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
           { timeout: 60_000 }
         );
         log.info(`OpenClaw delivery to ${agentName}: ${(stdout || stderr || "completed").trim().slice(0, 200)}`);
+
+        // ── 11. Close agent session ─────────────────────────────────────────
+        if (agentSessionId) {
+          try {
+            await emitResponse(agentSessionId, agentName, "Task delegated to agent. Session closed.");
+            log.info(`Closed agent session ${agentSessionId}`);
+          } catch (err) {
+            log.error(`Failed to close agent session: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
       } catch (err) {
         log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
       }
