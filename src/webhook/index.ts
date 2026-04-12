@@ -132,9 +132,13 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
         const execAsync = promisify(exec);
         const nodeBin = "/home/fancymatt/.nvm/versions/node/v22.22.1/bin/node";
         const openclawScript = "/home/fancymatt/.nvm/versions/node/v22.22.1/bin/openclaw";
-        const identifier = (data?.identifier as string | undefined) ?? "";
-        const title = (data?.title as string | undefined) ?? "";
-        const message = `[NEW TASK] ${identifier}: ${title}. Fetch the issue details and take appropriate action.`;
+        // Extract issue identifier from various event shapes
+        const data = (route.event.data ?? {}) as Record<string, unknown>;
+        const sessionData = data.agentSession as Record<string, unknown> | undefined;
+        const issueData = (data.issue ?? sessionData?.issue ?? data) as Record<string, unknown>;
+        const identifier = String(issueData?.identifier ?? route.sessionKey.replace("linear-", ""));
+        const title = String(issueData?.title ?? "");
+        const message = `[NEW TASK] You were mentioned or assigned on ${identifier}: ${title}. Fetch the issue details and take appropriate action.`;
         const sessionId = route.sessionKey;
 
         const { stdout, stderr } = await execAsync(
