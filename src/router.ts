@@ -149,11 +149,17 @@ export function routeEvent(event: LinearEvent): RouteResult | null {
     (d?.identifier as string | undefined) ??
     (d?.issueIdentifier as string | undefined) ??
     (sessionData?.issue as Record<string, unknown> | undefined)?.identifier as string | undefined;
-  log.info(`routeEvent: type=${event.type} identifier=${identifier ?? 'none'}`);
+  
+  // Use Linear agent session UUID as OpenClaw session-id for ticket-scoped sessions
+  // This allows OpenClaw to correlate agent sessions with Linear agent sessions
+  const linearAgentSessionId = sessionData?.id as string | undefined;
+  const sessionKey = linearAgentSessionId ? `linear-session-${linearAgentSessionId}` : (identifier ? `linear-${identifier}` : `linear-${event.type}-${Date.now()}`);
+  
+  log.info(`routeEvent: type=${event.type} identifier=${identifier ?? 'none'} linearAgentSessionId=${linearAgentSessionId ?? 'none'}`);
 
   return {
     agentId: openclawName,
-    sessionKey: identifier ? `linear-${identifier}` : `linear-${event.type}-${Date.now()}`,
+    sessionKey,
     priority: 0,
     event,
   };
