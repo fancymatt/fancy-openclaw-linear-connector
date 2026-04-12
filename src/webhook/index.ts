@@ -153,11 +153,16 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
         const message = `[NEW TASK] You were mentioned or assigned on ${identifier}: ${title}.\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments.\n\nRun these commands:\n  linear issue ${identifier}\n  linear comments ${identifier}\n\nReview both the description AND comments for your task brief before taking action.`;
         const sessionId = route.sessionKey;
 
-        const { stdout, stderr } = await execAsync(
-          `${nodeBin} ${openclawScript} agent --agent ${JSON.stringify(agentName)} --session-id ${JSON.stringify(sessionId)} --message ${JSON.stringify(message)}`,
-          { timeout: 60_000 }
-        );
-        log.info(`OpenClaw delivery to ${agentName}: ${(stdout || stderr || "completed").trim().slice(0, 200)}`);
+        // Fire-and-forget delivery — don't block the webhook handler
+        const deliveryCmd = `${nodeBin} ${openclawScript} agent --agent ${JSON.stringify(agentName)} --session-id ${JSON.stringify(sessionId)} --message ${JSON.stringify(message)}`;
+        const child = require("child_process").spawn(nodeBin, [
+          openclawScript, "agent",
+          "--agent", agentName,
+          "--session-id", sessionId,
+          "--message", message,
+        ], { detached: true, stdio: "ignore" });
+        child.unref();
+        log.info(`Delivery spawned for ${agentName} [${sessionId}]`);
 
         // ── 11. Close agent session ─────────────────────────────────────────
         if (agentSessionId) {
