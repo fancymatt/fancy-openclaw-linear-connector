@@ -130,6 +130,146 @@ If this is the first agent, create a workspace webhook in Linear:
 3. You should see: `Routed via delegate → agent-name`, `Session created`, `Delivery spawned`
 4. The agent should comment on the issue within a minute or two
 
+### Step 9: Configure Exec Permissions (Security)
+
+Agents spawned by the connector need exec permissions to run the `linear` CLI and other tools. OpenClaw's exec approval system defaults to "deny" and requires manual approval for every command — this blocks automated work.
+
+**Standard pattern for connector agents:** Allowlist mode with specific safe commands.
+
+#### A. Identify the Agent Index
+Find the agent's index in the OpenClaw config (`~/.openclaw/config/agents.yaml`). For example, `mckell` might be index 17. You'll need this for the config commands.
+
+```bash
+openclaw config list | grep -A 2 'mckell'
+```
+
+#### B. Set Security Mode to Allowlist
+
+```bash
+# Replace 17 with the actual agent index
+openclaw config set agents.list[17].tools.exec.security allowlist
+openclaw config set agents.list[17].tools.exec.ask on-miss
+openclaw config set agents.list[17].tools.exec.askFallback deny
+```
+
+**Why this mode:**
+- **Safe operations without approval** — allowlisted commands run immediately (linear CLI, basic tools)
+- **Destructive ops require approval** — `rm`, `sudo`, system commands not in allowlist trigger prompts
+- **Configurable per agent** — each agent gets their own allowlist based on needs
+
+#### C. Add Allowlist Patterns
+
+Edit `~/.openclaw/exec-approvals.json` to add the agent's allowlist entry:
+
+```json
+{
+  "version": 1,
+  "socket": {
+    "path": "/home/fancymatt/.openclaw/exec-approvals.sock",
+    "token": "0UjXI66lhKNKPXfneUojoJolNMiznj1-"
+  },
+  "defaults": {
+    "security": "deny",
+    "ask": "on-miss",
+    "askFallback": "deny",
+    "autoAllowSkills": true
+  },
+  "agents": {
+    "your-agent-name": {
+      "security": "allowlist",
+      "ask": "on-miss",
+      "askFallback": "deny",
+      "allowlist": [
+        {
+          "pattern": "/home/fancymatt/.nvm/**",
+          "id": "<generate-unique-uuid>"
+        },
+        {
+          "pattern": "/usr/bin/python3",
+          "id": "<generate-unique-uuid>"
+        },
+        {
+          "pattern": "/usr/bin/grep",
+          "id": "<generate-unique-uuid>"
+        },
+        {
+          "pattern": "/usr/bin/mkdir",
+          "id": "<generate-unique-uuid>"
+        },
+        {
+          "pattern": "/usr/bin/ls",
+          "id": "<generate-unique-uuid>"
+        },
+        {
+          "pattern": "/usr/bin/cat",
+          "id": "<generate-unique-uuid>"
+        },
+        {
+          "pattern": "/usr/bin/echo",
+          "id": "<generate-unique-uuid>"
+        },
+        {
+          "pattern": "/home/fancymatt/.openclaw/workspace-your-agent/**",
+          "id": "<generate-unique-uuid>"
+        },
+        {
+          "pattern": "/home/fancymatt/.openclaw/shared/skills/**",
+          "id": "<generate-unique-uuid>"
+        }
+      ]
+    }
+  }
+}
+```
+
+**Explanation of patterns:**
+
+| Pattern | Purpose | Risk Level |
+|---------|----------|-----------|
+| `/home/fancymatt/.nvm/**` | npm, node, and npm-linked CLIs (including `linear` command) | Low |
+| `/usr/bin/python3` | Python scripting | Low |
+| `/usr/bin/grep`, `/usr/bin/ls`, `/usr/bin/cat`, `/usr/bin/echo` | Basic file operations | Low |
+| `/usr/bin/mkdir` | Directory creation | Low |
+| `/home/fancymatt/.openclaw/workspace-your-agent/**` | Agent's own workspace | Low |
+| `/home/fancymatt/.openclaw/shared/skills/**` | Shared skills access | Low |
+
+**What's NOT in the allowlist (intentionally blocked):**
+- `/usr/bin/rm`, `/usr/bin/rmdir` — destructive file operations
+- `/usr/bin/sudo`, `/usr/bin/doas` — privilege escalation
+- System management commands that could disrupt the host
+
+#### D. Generate UUIDs
+
+Generate a fresh UUID for each allowlist pattern using the OpenClaw CLI:
+
+```bash
+openclaw uuid
+```
+
+Or use `uuidgen` if installed:
+
+```bash
+apt install uuid-runtime  # Ubuntu/Debian
+uuidgen
+```
+
+**Important:** Each pattern entry must have a unique `id`. Reusing IDs causes the system to treat them as the same rule.
+
+#### E. Verify Configuration
+
+Check that the agent's exec permissions are correctly set:
+
+```bash
+openclaw config get agents.list[<agent-index>].tools.exec
+```
+
+Expected output:
+```yaml
+security: allowlist
+ask: on-miss
+askFallback: deny
+```
+
 ## Common Mistakes (Learned the Hard Way)
 
 ### ❌ Authorizing without `actor=app`
@@ -241,6 +381,16 @@ Check that the `linear` CLI is installed (`npm link` in the skill repo) and that
 
 ### Multiple agent sessions on one issue
 Each webhook creates a new session. The connector deduplicates within a 30-second window. Sessions auto-close when the agent process exits.
+
+### ❌ Agent exec permissions not configured
+After onboarding, the agent receives Linear tasks but gets stuck on every `exec` command waiting for manual approval. The connector's fire-and-forget delivery can't wait for approvals.
+
+**Symptoms:**
+- Agent doesn't comment on Linear issue within expected time
+- Connector logs show "Delivery spawned" but no agent activity
+- Agent workspace shows exec approval timeout or denial
+
+**Fix:** Follow Step 9 to set up allowlist permissions. Connector-spawned agents need `security: allowlist` mode with the `linear` CLI and basic tools pre-approved.
 
 ## License
 
