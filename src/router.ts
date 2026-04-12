@@ -108,7 +108,8 @@ export function routeEvent(event: LinearEvent): RouteResult | null {
   const identifier =
     (d?.identifier as string | undefined) ??
     (d?.issueIdentifier as string | undefined) ??
-    (sessionData?.issue as Record<string, unknown>)?.identifier as string | undefined;
+    (sessionData?.issue as Record<string, unknown> | undefined)?.identifier as string | undefined;
+  log.info(`routeEvent: type=${event.type} d=${JSON.stringify(d).slice(0, 200)} identifier=${identifier}`);
 
   return {
     agentId: openclawName,
