@@ -109,7 +109,7 @@ export function routeEvent(event: LinearEvent): RouteResult | null {
     (d?.identifier as string | undefined) ??
     (d?.issueIdentifier as string | undefined) ??
     (sessionData?.issue as Record<string, unknown> | undefined)?.identifier as string | undefined;
-  log.info(`routeEvent: type=${event.type} d=${JSON.stringify(d).slice(0, 200)} identifier=${identifier}`);
+  log.info(`routeEvent: type=${event.type} hasData=${!!d} keys=${d ? Object.keys(d).join(',') : 'none'} identifier=${identifier ?? 'none'}`);
 
   return {
     agentId: openclawName,
