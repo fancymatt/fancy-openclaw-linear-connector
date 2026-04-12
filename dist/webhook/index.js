@@ -29,38 +29,39 @@ Object.defineProperty(exports, "normalizeLinearEvent", { enumerable: true, get: 
  */
 function createWebhookRouter(eventStore) {
     const router = (0, express_1.Router)();
-    router.post("/linear", (req, res) => {
+    router.post("/linear", async (req, res) => {
         const secret = process.env.LINEAR_WEBHOOK_SECRET;
-        // ── 1. Signature header presence ──────────────────────────────────────
-        const signature = req.headers["x-linear-signature"];
-        if (!signature || typeof signature !== "string") {
-            res.status(400).json({
-                error: "Missing x-linear-signature header",
-            });
-            return;
-        }
-        // ── 2. Secret configured ──────────────────────────────────────────────
-        if (!secret) {
-            log.error("LINEAR_WEBHOOK_SECRET is not set — rejecting all requests");
-            res.status(500).json({ error: "Server misconfiguration" });
-            return;
-        }
-        // ── 3. Raw body available ─────────────────────────────────────────────
+        // ── 1. Debug: log relevant headers ──────────────────────────────────
+        log.info(`Webhook received. Headers: ${JSON.stringify(Object.keys(req.headers).filter(h => h.startsWith('x-') || h.startsWith('linear')))} `);
+        // ── 2. Get raw body ────────────────────────────────────────────────────
         const rawBody = req.rawBody;
-        if (!rawBody) {
-            res.status(400).json({ error: "Empty or unreadable request body" });
-            return;
+        // ── 3. Signature validation (skip if no secret configured) ────────────
+        if (secret) {
+            const signature = req.headers["x-linear-signature"] ?? req.headers["linear-signature"];
+            if (!signature || typeof signature !== "string") {
+                res.status(400).json({
+                    error: "Missing signature header",
+                });
+                return;
+            }
+            if (!rawBody) {
+                res.status(400).json({ error: "Empty or unreadable request body" });
+                return;
+            }
+            const signatureValid = (0, signature_1.verifyLinearSignature)(rawBody, signature, secret);
+            if (!signatureValid) {
+                res.status(401).json({ error: "Invalid signature" });
+                return;
+            }
         }
-        // ── 4. HMAC signature validation ──────────────────────────────────────
-        const signatureValid = (0, signature_1.verifyLinearSignature)(rawBody, signature, secret);
-        if (!signatureValid) {
-            res.status(401).json({ error: "Invalid signature" });
-            return;
+        else {
+            log.warn("No LINEAR_WEBHOOK_SECRET set — skipping signature validation");
         }
-        // ── 5. Parse JSON payload ─────────────────────────────────────────────
+        // ── 4. Parse JSON payload ─────────────────────────────────────────────
         let payload;
         try {
-            payload = JSON.parse(rawBody.toString("utf8"));
+            const body = rawBody ?? Buffer.from(JSON.stringify(req.body));
+            payload = JSON.parse(body.toString("utf8"));
         }
         catch {
             res.status(400).json({ error: "Malformed JSON payload" });
@@ -80,7 +81,7 @@ function createWebhookRouter(eventStore) {
         }
         // ── 7. Deduplication ──────────────────────────────────────────────────
         const deliveryId = req.headers["x-linear-delivery"] ??
-            crypto_1.default.createHash("sha256").update(rawBody).digest("hex");
+            crypto_1.default.createHash("sha256").update(rawBody ?? Buffer.from(JSON.stringify(payload))).digest("hex");
         if (eventStore?.isDuplicate(deliveryId)) {
             res.status(200).json({ ok: true, duplicate: true });
             return;
@@ -109,8 +110,23 @@ function createWebhookRouter(eventStore) {
                 log.error(`Failed to create agent session: ${err instanceof Error ? err.message : String(err)}`);
             });
         }
-        // TODO: deliver to OpenClaw gateway via HttpOpenClawDeliveryAdapter
-        log.info(`Event processing complete for ${agentName}`);
+        // Deliver to OpenClaw agent
+        try {
+            const { exec } = require("child_process");
+            const { promisify } = require("util");
+            const execAsync = promisify(exec);
+            const nodeBin = "/home/fancymatt/.nvm/versions/node/v22.22.1/bin/node";
+            const openclawScript = "/home/fancymatt/.nvm/versions/node/v22.22.1/bin/openclaw";
+            const identifier = data?.identifier ?? "";
+            const title = data?.title ?? "";
+            const message = `[NEW TASK] ${identifier}: ${title}. Fetch the issue details and take appropriate action.`;
+            const sessionId = route.sessionKey;
+            const { stdout, stderr } = await execAsync(`${nodeBin} ${openclawScript} agent --agent ${JSON.stringify(agentName)} --session-id ${JSON.stringify(sessionId)} --message ${JSON.stringify(message)}`, { timeout: 60000 });
+            log.info(`OpenClaw delivery to ${agentName}: ${(stdout || stderr || "completed").trim().slice(0, 200)}`);
+        }
+        catch (err) {
+            log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
+        }
     });
     return router;
 }

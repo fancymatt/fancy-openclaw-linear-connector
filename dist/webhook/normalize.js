@@ -32,6 +32,9 @@ function extractIssueData(data) {
         teamKey: String(team.key ?? data.teamKey ?? ""),
         assigneeId: assignee ? String(assignee.id) : undefined,
         assigneeName: assignee ? String(assignee.name) : undefined,
+        delegate: data.delegate,
+        assignee: data.assignee,
+        mentionedUsers: data.mentionedUsers,
         labelIds: Array.isArray(data.labelIds)
             ? data.labelIds.map(String)
             : [],

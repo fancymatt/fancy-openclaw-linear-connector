@@ -96,7 +96,7 @@ describe("POST /webhooks/linear", () => {
     expect(res.status).toBe(400);
   });
 
-  it("returns 500 when LINEAR_WEBHOOK_SECRET is not set", async () => {
+  it("skips signature validation when LINEAR_WEBHOOK_SECRET is not set", async () => {
     delete process.env.LINEAR_WEBHOOK_SECRET;
     const res = await request(app)
       .post("/webhooks/linear")
@@ -104,6 +104,7 @@ describe("POST /webhooks/linear", () => {
       .set("x-linear-signature", sign(validIssueBody))
       .send(validIssueBody);
 
-    expect(res.status).toBe(500);
+    // When no secret is configured, signature validation is skipped
+    expect(res.status).toBe(200);
   });
 });
