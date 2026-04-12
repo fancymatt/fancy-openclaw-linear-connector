@@ -32,6 +32,12 @@ export interface LinearIssueData {
   teamKey: string;
   assigneeId?: string;
   assigneeName?: string;
+  /** Delegate user (OAuth app actors appear here, not in assignee) */
+  delegate?: { id?: string; name?: string } | null;
+  /** Assignee object with id (for OAuth routing) */
+  assignee?: { id?: string; name?: string } | null;
+  /** Users mentioned in the issue/comment */
+  mentionedUsers?: Array<{ id?: string; name?: string }>;
   labelIds: string[];
   url: string;
   createdAt: string; // ISO 8601
@@ -89,6 +95,8 @@ export interface LinearUnknownEvent {
   action: string;
   actor: LinearActor;
   createdAt: string;
+  /** Event data — may contain issue/comment/agent session payload */
+  data?: Record<string, unknown>;
   /** Raw payload — we keep it so unsupported events aren't silently dropped */
   raw: unknown;
 }
