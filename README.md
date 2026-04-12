@@ -10,132 +10,150 @@ A standalone connector service that bridges Linear webhooks to OpenClaw agent se
 Linear webhook → nginx reverse proxy → connector (port 3100)
                                            ├── Verify HMAC signature
                                            ├── Normalize event
-                                           ├── Route to agent (by assignee/mention)
+                                           ├── Route to agent (by delegate/mention)
                                            ├── Create Linear agent session (Working indicator)
-                                           ├── Deliver to OpenClaw agent
-                                           └── Close agent session (complete)
+                                           ├── Deliver to OpenClaw agent (fire-and-forget)
+                                           └── Close agent session when agent process exits
 ```
 
 **Companion skill:** [fancy-openclaw-linear-skill](https://github.com/fancymatt/fancy-openclaw-linear-skill) — the `linear` CLI that agents use to interact with Linear.
 
-## Getting Started
+## Adding a New Agent (Playbook)
 
-### Prerequisites
-
-- Node.js >= 20
-- A Linear workspace with admin access
-- An OpenClaw installation running on the same host
-- nginx or similar reverse proxy (for HTTPS + Linear webhook delivery)
+This is the step-by-step process for onboarding a new agent into the connector. Follow it exactly.
 
 ### Step 1: Create a Linear OAuth Application
 
-1. Go to Linear → Settings → API → OAuth Applications → Create new
-2. Set redirect URL to `https://your-host/oauth/callback`
-3. Note the **Client ID** and **Client Secret**
-4. Under Webhooks, create a signing secret and note it
+Each agent gets its **own** OAuth application in Linear.
 
-### Step 2: Configure the Connector
+1. Go to [Linear → Settings → API → Applications → Create new](https://linear.app/settings/api/applications/new)
+2. **Name and icon** — this is how the agent appears in Linear (mention menu, delegate dropdown, comments). Choose carefully.
+3. **Redirect URI**: `https://your-host/oauth/callback` (e.g. `https://ai.fcy.sh/oauth/callback`)
+4. Under **Webhooks**, enable: **Issues**, **Comments**, **Agent Session Events**
+5. Note the **Client ID** and **Client Secret**
+
+### Step 2: Authorize as an App (NOT as a personal user)
+
+⚠️ **This is the most common mistake.** You must use `actor=app` in the OAuth URL. Without it, the app authorizes under your personal Linear account, the agent won't appear in the delegate/mention menus, and the self-trigger filter will block legitimate events.
+
+Build this URL and visit it in a browser (you need workspace admin permissions):
+
+```
+https://linear.app/oauth/authorize?client_id=CLIENT_ID&redirect_uri=REDIRECT_URI&response_type=code&scope=read,write,app:assignable,app:mentionable&actor=app&state=AGENT_NAME
+```
+
+Key parameters:
+- **`actor=app`** — installs the app as its own user (not your personal account)
+- **`app:assignable`** — allows the app to appear as a delegate on issues
+- **`app:mentionable`** — allows the app to be @mentioned in comments
+- **`scope=read,write`** — API access
+
+The page will show an **"Install App"** consent screen (not a personal auth screen). After approving, Linear redirects to your callback URL with a `code` parameter.
+
+### Step 3: Exchange the Code for Tokens
 
 ```bash
-git clone https://github.com/fancymatt/fancy-openclaw-linear-connector.git
-cd fancy-openclaw-linear-connector
-npm install
-npm run build
+curl -s -X POST https://api.linear.app/oauth/token \
+  -d "client_id=CLIENT_ID" \
+  -d "client_secret=CLIENT_SECRET" \
+  -d "code=CODE_FROM_REDIRECT" \
+  -d "redirect_uri=REDIRECT_URI" \
+  -d "grant_type=authorization_code"
 ```
 
-Create `.env` from the example:
+Response:
+```json
+{
+  "access_token": "lin_oauth_...",
+  "refresh_token": "lin_refresh_...",
+  "scope": "app:assignable app:mentionable read write"
+}
+```
+
+⚠️ **Verify the scopes include `app:assignable` and `app:mentionable`.** If they don't, the OAuth URL was wrong (missing `actor=app` or the scope params).
+
+### Step 4: Get the Agent's Linear User ID
 
 ```bash
-cp .env.example .env
+curl -s https://api.linear.app/graphql \
+  -H "Authorization: Bearer ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{ viewer { id name } }"}'
 ```
 
-Set these values:
+⚠️ **The response must show the agent's name** (e.g. `{"name": "Charles (CTO)"}`). If it shows your personal name (e.g. "Matt Henry"), you authorized as a personal user, not as an app. Go back to Step 2.
 
-```env
-PORT=3100
-LINEAR_WEBHOOK_SECRET=whs_your_signing_secret
-NODE_ENV=production
-```
+### Step 5: Add to agents.json
 
-Create `agents.json` with your agent credentials:
+Add an entry to the connector's `agents.json`:
 
 ```json
 {
-  "agents": [
-    {
-      "name": "mckell",
-      "linearUserId": "linear-user-uuid",
-      "clientId": "linear-oauth-client-id",
-      "clientSecret": "linear-oauth-client-secret",
-      "accessToken": "will-be-refreshed",
-      "refreshToken": "will-be-refreshed",
-      "openclawAgent": "mckell",
-      "secretsPath": "/home/you/.openclaw/workspace-mckell/.secrets/linear.env"
-    }
-  ]
+  "name": "agent-name",
+  "linearUserId": "UUID_FROM_STEP_4",
+  "clientId": "CLIENT_ID",
+  "clientSecret": "CLIENT_SECRET",
+  "accessToken": "ACCESS_TOKEN",
+  "refreshToken": "REFRESH_TOKEN",
+  "openclawAgent": "openclaw-agent-name",
+  "secretsPath": "/home/you/.openclaw/workspace-agentname/.secrets/linear.env",
+  "host": "local"
 }
 ```
 
-To get the `linearUserId`, complete the OAuth flow once (see Step 5).
+**`secretsPath` must point to `linear.env`** (not `linear-oauth.env`). The `linear` CLI reads from `.secrets/linear.env` — this is where the connector syncs refreshed tokens.
 
-### Step 3: Set Up the Reverse Proxy
-
-Point nginx at port 3100:
-
-```nginx
-location /linear-webhook/ {
-    proxy_pass http://127.0.0.1:3100/webhooks/linear;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-}
-```
-
-### Step 4: Run as a Systemd Service
-
-Create `/etc/systemd/system/fancy-openclaw-linear-connector.service`:
-
-```ini
-[Unit]
-Description=Fancy OpenClaw Linear Connector
-After=network.target
-
-[Service]
-Type=simple
-User=fancymatt
-WorkingDirectory=/path/to/fancy-openclaw-linear-connector
-ExecStart=/path/to/node /path/to/fancy-openclaw-linear-connector/dist/index.js
-Restart=on-failure
-RestartSec=5
-Environment=NODE_ENV=production
-
-[Install]
-WantedBy=multi-user.target
-```
+### Step 6: Restart the Connector
 
 ```bash
-sudo systemctl enable fancy-openclaw-linear-connector
-sudo systemctl start fancy-openclaw-linear-connector
+sudo systemctl restart fancy-openclaw-linear-connector
 ```
 
-### Step 5: OAuth Callback — Authorize Your Agent
+On startup, the connector will:
+- Refresh all agent tokens
+- Sync refreshed tokens to each agent's `secretsPath`
+- Start receiving webhooks
 
-Visit `https://your-host/oauth/authorize?agent=mckell` in a browser. This redirects to Linear's OAuth consent screen. After authorization, the connector stores the tokens in `agents.json` and syncs them to the agent's workspace secrets.
+### Step 7: Create the Linear Webhook
 
-### Step 6: Create the Linear Workspace Webhook
+If this is the first agent, create a workspace webhook in Linear:
 
-1. In Linear, go to Settings → API → Webhooks → Create new
-2. Set the URL to `https://your-host/linear-webhook/`
-3. Select event types: **Issues**, **Comments**, **Agent Session Events**
-4. Paste the signing secret from Step 1
-5. Save
+1. Linear → Settings → API → Webhooks → Create new
+2. URL: `https://your-host/linear-webhook/`
+3. Event types: **Issues**, **Comments**, **Agent Session Events**
+4. Use the signing secret from your OAuth app settings
 
-### Step 7: Test End-to-End
+### Step 8: Test End-to-End
 
-1. Assign a Linear issue to the agent's Linear user
+1. Delegate a Linear issue to the agent (should appear in the delegate dropdown)
 2. Check connector logs: `journalctl -u fancy-openclaw-linear-connector -f`
-3. The agent should receive a `[NEW TASK]` message in OpenClaw
+3. You should see: `Routed via delegate → agent-name`, `Session created`, `Delivery spawned`
+4. The agent should comment on the issue within a minute or two
+
+## Common Mistakes (Learned the Hard Way)
+
+### ❌ Authorizing without `actor=app`
+The app installs under your personal account. The agent won't appear in delegate/mention menus. The self-trigger filter will block events because your user ID matches the agent's user ID.
+
+**Fix:** Always include `actor=app` in the OAuth URL. Verify with `{ viewer { id name } }` — it should show the agent's name.
+
+### ❌ `secretsPath` pointing to the wrong file
+If the `linear` CLI reads `.secrets/linear.env` but the connector writes to `.secrets/linear-oauth.env`, token refreshes won't reach the CLI. After ~20h, the agent's token expires and all API calls fail.
+
+**Fix:** Set `secretsPath` to `.secrets/linear.env`.
+
+### ❌ Reusing a disabled personal API key alongside OAuth tokens
+If `.secrets/linear.env` contains an old `lin_api_...` personal token AND a new OAuth token, the CLI may pick up the wrong one (it matches `linear.*api.*key` patterns). Personal tokens get disabled when OAuth apps take over.
+
+**Fix:** Overwrite `linear.env` with only `LINEAR_API_KEY=<oauth_token>`. Remove any `LINEAR_AGENTNAME_API_KEY` entries.
+
+### ❌ Session closing before agent finishes
+Closing the Linear agent session immediately after spawning the delivery process kills the "Working" indicator before the agent has responded. The agent may also see the session as "complete" and skip work.
+
+**Fix:** The connector listens for the spawned process `exit` event and closes the session after.
+
+### ❌ Same session ID for repeated delegations
+The session key is `linear-<ISSUE-ID>`. Re-delegating the same issue reuses the session, which may have stale state ("already done"). Use a fresh issue for testing.
 
 ## Project Structure
 
@@ -144,14 +162,15 @@ src/
   index.ts              Service entrypoint (Express server)
   agents.ts             Agent config, token management, workspace sync
   agent-session.ts      Linear agent session CRUD (create, thought, response/close)
-  router.ts             Event routing (assignee + mention matching)
+  router.ts             Event routing (delegate + assignee + body mention matching)
   webhook/
     index.ts            Webhook handler (receive, verify, normalize, route, deliver)
     normalize.ts        Raw payload → typed event normalizer
     schema.ts           TypeScript event type definitions
     signature.ts        HMAC signature verification
-    endpoint.test.ts    Integration tests
   token-refresh.ts      OAuth token refresh cron (every 20h)
+  queue/
+    agent-queue.ts      Per-agent task queue (prevents concurrent sessions)
 ```
 
 ## How It Works
@@ -159,16 +178,27 @@ src/
 1. **Webhook received** — Linear sends event to the reverse proxy
 2. **Signature verified** — HMAC-SHA256 against the signing secret
 3. **Event normalized** — raw payload converted to typed event (Issue, Comment, etc.)
-4. **Agent routed** — matched by assignee ID or mentioned user ID
+4. **Agent routed** — matched by delegate ID, assignee ID, or `@mention` in comment body
 5. **Agent session created** — "Working" indicator appears in Linear UI
-6. **Task delivered** — `openclaw agent --agent <name> --message "[NEW TASK] ..."` spawns an agent session
-7. **Session closed** — response activity emitted, Linear auto-transitions session to `complete`
+6. **Task delivered** — `openclaw agent --agent <name> --message "[NEW TASK] ..."` spawned as detached process
+7. **Session closed** — when the spawned process exits, response activity emitted, Linear auto-transitions to `complete`
+
+### Routing Logic
+
+Events are routed to agents in this priority order:
+
+1. **Delegate** (OAuth app actor) — the agent was delegated the issue in Linear
+2. **Assignee** — the issue was assigned to the agent's Linear user
+3. **Body mention** — for Comment events, `@agentname` parsed from the comment body (case-insensitive)
+
+Self-triggered events (agent acting on its own behalf) are filtered out to prevent loops.
 
 ### Known Limitations
 
-- **AgentSessionEvent webhooks have no data** — Linear doesn't include issue info in these payloads. Filtered out to avoid noise.
-- **Comment webhooks don't include mentionedUsers** — mention routing is done by parsing the comment body for `@name` patterns and matching against agent names (case-insensitive).
-- **OAuth tokens refresh every ~20h** — the connector syncs refreshed tokens to agent workspace secrets automatically.
+- **AgentSessionEvent webhooks have no data** — Linear doesn't include issue info. Filtered out to avoid noise.
+- **Comment webhooks don't include mentionedUsers** — mention routing parses `@name` patterns from comment body.
+- **OAuth tokens refresh every ~20h** — the connector auto-syncs refreshed tokens to agent workspace secrets.
+- **Session deduplication** — 30-second window prevents duplicate sessions from rapid webhooks.
 
 ## Configuration Reference
 
@@ -183,38 +213,34 @@ src/
 
 ### agents.json
 
-Each agent entry:
-
 | Field | Required | Description |
 |-------|----------|-------------|
 | `name` | Yes | Internal agent name (used for routing) |
-| `linearUserId` | Yes | Linear user UUID for this agent |
+| `linearUserId` | Yes | Linear user UUID (obtained via `actor=app` OAuth) |
 | `clientId` | Yes | Linear OAuth app client ID |
 | `clientSecret` | Yes | Linear OAuth app client secret |
 | `accessToken` | Yes* | OAuth access token (auto-refreshed) |
 | `refreshToken` | Yes* | OAuth refresh token (auto-refreshed) |
 | `openclawAgent` | No | OpenClaw agent name if different from `name` |
-| `secretsPath` | No | Path to write `LINEAR_API_KEY` on token refresh |
+| `secretsPath` | No | Path to write `LINEAR_API_KEY` on token refresh (**must be `linear.env`**) |
 | `host` | No | `"ishikawa"` or `"local"` (future use) |
-
-*Initial tokens are obtained via the OAuth callback flow.
 
 ## Troubleshooting
 
-### Signature verification fails
-Linear uses different header names depending on webhook type. The connector checks both `linear-signature` and `Linear-Signature`. Check that `LINEAR_WEBHOOK_SECRET` matches the value in Linear's webhook settings.
+### "No agent target for event"
+The router didn't match any agent. Check that `agents.json` has the correct `linearUserId` and the issue is delegated/assigned to that user.
 
-### Token 401 errors
-OAuth tokens refresh every 20h. The connector syncs new tokens to `agents.json` and the agent's `secretsPath`. If an agent's session has a cached token, it needs to re-read from the secrets file. The `fancy-openclaw-linear-skill` CLI does this automatically on each invocation.
+### "Skipping self-triggered event"
+The event actor matches the target agent. This prevents loops. If this fires for legitimate delegations, the `linearUserId` is wrong (likely set to your personal user ID instead of the app's user ID).
 
-### Agent not receiving tasks
-- Check `agents.json` has the correct `linearUserId`
-- Verify the issue is assigned to that Linear user
-- Check connector logs for "No agent target"
-- Ensure `openclaw` is in PATH for the service user
+### Token 401 / "Account disabled"
+The agent's personal API key was disabled when the OAuth app took over. Ensure `.secrets/linear.env` contains only `LINEAR_API_KEY=<oauth_token>` — no `lin_api_...` keys.
+
+### Agent receives task but doesn't respond in Linear
+Check that the `linear` CLI is installed (`npm link` in the skill repo) and that `.secrets/linear.env` has a valid token. The agent's session reads the CLI output to fetch issue details.
 
 ### Multiple agent sessions on one issue
-Each webhook delivery creates a new session. The connector deduplicates within a 30-second window. If you see multiple sessions, it's likely from rapid successive webhooks. Sessions are auto-closed after delivery.
+Each webhook creates a new session. The connector deduplicates within a 30-second window. Sessions auto-close when the agent process exits.
 
 ## License
 
