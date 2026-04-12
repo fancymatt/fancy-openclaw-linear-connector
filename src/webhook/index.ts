@@ -139,7 +139,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
         const issueData = (data.issue ?? sessionData?.issue ?? data) as Record<string, unknown>;
         const identifier = String(issueData?.identifier ?? route.sessionKey.replace("linear-", ""));
         const title = String(issueData?.title ?? "");
-        const message = `[NEW TASK] You were mentioned or assigned on ${identifier}: ${title}. Fetch the issue details and take appropriate action.`;
+        const message = `[NEW TASK] You were mentioned or assigned on ${identifier}: ${title}.\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments. Do not skip reading comments.\n\nStep 1: Run \'linear issue ${identifier}\' to get the issue details.\nStep 2: Run \'linear comments ${identifier}\' to read the full comment thread.\nStep 3: Review both the description AND comments for your task brief before taking action.`;
         const sessionId = route.sessionKey;
 
         const { stdout, stderr } = await execAsync(
