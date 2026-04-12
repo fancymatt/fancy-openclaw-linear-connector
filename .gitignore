@@ -12,3 +12,4 @@ coverage/
 *.log
 data/
 agents.json
+# node_modules
