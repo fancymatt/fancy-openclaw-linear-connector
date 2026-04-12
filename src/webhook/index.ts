@@ -160,25 +160,19 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
           "--agent", agentName,
           "--session-id", sessionId,
           "--message", message,
-        ], { detached: true, stdio: "ignore" });
+        ], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
         child.unref();
         log.info(`Delivery spawned for ${agentName} [${sessionId}]`);
 
-        // Note: agent session closing is deferred — the agent process runs asynchronously.
-        // Linear sessions without a response activity stay in "working" state until cleaned up.
-        // If agentSessionId is available, we close after a delay to give the agent time to work.
+        // Close session when the agent process finishes
         if (agentSessionId) {
           const sid = agentSessionId;
           const aname = agentName;
-          // Close session after 5 minutes (agent should be done by then)
-          setTimeout(async () => {
-            try {
-              await emitResponse(sid, aname, "Task delegated to agent. Session closed.");
-              log.info(`Closed agent session ${sid} (delayed)`);
-            } catch (err) {
-              log.error(`Failed to close agent session: ${err instanceof Error ? err.message : String(err)}`);
-            }
-          }, 300_000);
+          child.on("exit", () => {
+            emitResponse(sid, aname, "Task delegated to agent. Session closed.")
+              .then(() => log.info(`Closed agent session ${sid} (after delivery)`))
+              .catch((err: unknown) => log.error(`Failed to close agent session: ${err instanceof Error ? err.message : String(err)}`));
+          });
         }
       } catch (err) {
         log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
