@@ -146,7 +146,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
         const issueData = (data.issue ?? sessionData?.issue ?? data) as Record<string, unknown>;
         const identifier = String(issueData?.identifier ?? route.sessionKey.replace("linear-", ""));
         const title = String(issueData?.title ?? "");
-        const message = `[NEW TASK] You were mentioned or assigned on ${identifier}: ${title}.\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments. Do not skip reading comments.\n\nIf you have the fancy-openclaw-linear-skill CLI available:\n  node ~/.openclaw/shared/skills/fancy-openclaw-linear-skill/dist/index.js issue ${identifier}\n  node ~/.openclaw/shared/skills/fancy-openclaw-linear-skill/dist/index.js comments ${identifier}\n\nOtherwise, use the Linear GraphQL API directly (Authorization header without Bearer prefix for API keys, with Bearer for OAuth tokens).`;
+        const message = `[NEW TASK] You were mentioned or assigned on ${identifier}: ${title}.\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments.\n\nRun these commands:\n  linear issue ${identifier}\n  linear comments ${identifier}\n\nReview both the description AND comments for your task brief before taking action.`;
         const sessionId = route.sessionKey;
 
         const { stdout, stderr } = await execAsync(
