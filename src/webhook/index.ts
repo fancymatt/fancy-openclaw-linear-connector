@@ -103,6 +103,13 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
 
       // ── 9. Route to agent ─────────────────────────────────────────────────
       log.info(`Normalized event: type=${event.type} hasData=${"data" in event} dataKeys=${event.data ? Object.keys(event.data as object).join(',') : 'none'}`);
+
+      // Skip AgentSessionEvent — no actionable data, just noise
+      if (event.type === "AgentSessionEvent") {
+        log.info(`Skipping AgentSessionEvent — no issue data to act on`);
+        return;
+      }
+
       const route = routeEvent(event);
       if (!route) {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
@@ -139,7 +146,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
         const issueData = (data.issue ?? sessionData?.issue ?? data) as Record<string, unknown>;
         const identifier = String(issueData?.identifier ?? route.sessionKey.replace("linear-", ""));
         const title = String(issueData?.title ?? "");
-        const message = `[NEW TASK] You were mentioned or assigned on ${identifier}: ${title}.\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments. Do not skip reading comments.\n\nStep 1: Run \'linear issue ${identifier}\' to get the issue details.\nStep 2: Run \'linear comments ${identifier}\' to read the full comment thread.\nStep 3: Review both the description AND comments for your task brief before taking action.`;
+        const message = `[NEW TASK] You were mentioned or assigned on ${identifier}: ${title}.\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments. Do not skip reading comments.\n\nIf you have the fancy-openclaw-linear-skill CLI available:\n  node ~/.openclaw/shared/skills/fancy-openclaw-linear-skill/dist/index.js issue ${identifier}\n  node ~/.openclaw/shared/skills/fancy-openclaw-linear-skill/dist/index.js comments ${identifier}\n\nOtherwise, use the Linear GraphQL API directly (Authorization header without Bearer prefix for API keys, with Bearer for OAuth tokens).`;
         const sessionId = route.sessionKey;
 
         const { stdout, stderr } = await execAsync(

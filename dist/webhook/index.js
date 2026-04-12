@@ -92,6 +92,11 @@ function createWebhookRouter(eventStore) {
         eventStore?.recordEvent(deliveryId, payload);
         // ── 9. Route to agent ─────────────────────────────────────────────────
         log.info(`Normalized event: type=${event.type} hasData=${"data" in event} dataKeys=${event.data ? Object.keys(event.data).join(',') : 'none'}`);
+        // Skip AgentSessionEvent — no actionable data, just noise
+        if (event.type === "AgentSessionEvent") {
+            log.info(`Skipping AgentSessionEvent — no issue data to act on`);
+            return;
+        }
         const route = (0, router_1.routeEvent)(event);
         if (!route) {
             log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
@@ -124,7 +129,7 @@ function createWebhookRouter(eventStore) {
             const issueData = (data.issue ?? sessionData?.issue ?? data);
             const identifier = String(issueData?.identifier ?? route.sessionKey.replace("linear-", ""));
             const title = String(issueData?.title ?? "");
-            const message = `[NEW TASK] You were mentioned or assigned on ${identifier}: ${title}.\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments. Do not skip reading comments.\n\nStep 1: Run \'linear issue ${identifier}\' to get the issue details.\nStep 2: Run \'linear comments ${identifier}\' to read the full comment thread.\nStep 3: Review both the description AND comments for your task brief before taking action.`;
+            const message = `[NEW TASK] You were mentioned or assigned on ${identifier}: ${title}.\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments. Do not skip reading comments.\n\nIf you have the fancy-openclaw-linear-skill CLI available:\n  node ~/.openclaw/shared/skills/fancy-openclaw-linear-skill/dist/index.js issue ${identifier}\n  node ~/.openclaw/shared/skills/fancy-openclaw-linear-skill/dist/index.js comments ${identifier}\n\nOtherwise, use the Linear GraphQL API directly (Authorization header without Bearer prefix for API keys, with Bearer for OAuth tokens).`;
             const sessionId = route.sessionKey;
             const { stdout, stderr } = await execAsync(`${nodeBin} ${openclawScript} agent --agent ${JSON.stringify(agentName)} --session-id ${JSON.stringify(sessionId)} --message ${JSON.stringify(message)}`, { timeout: 60000 });
             log.info(`OpenClaw delivery to ${agentName}: ${(stdout || stderr || "completed").trim().slice(0, 200)}`);
