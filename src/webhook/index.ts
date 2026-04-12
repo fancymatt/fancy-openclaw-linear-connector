@@ -76,7 +76,6 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
       // ── 6. Normalize event ────────────────────────────────────────────────
       let event: LinearEvent;
       try {
-        log.info(`Raw payload type=${(payload as any).type} dataKeys=${(payload as any).data ? Object.keys((payload as any).data).slice(0,10).join(',') : 'none'}`);
         event = normalizeLinearEvent(payload);
       } catch (err) {
         res.status(400).json({
