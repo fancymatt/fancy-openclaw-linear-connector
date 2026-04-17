@@ -182,14 +182,14 @@ function createWebhookRouter(eventStore) {
             }
             const message = `[NEW TASK] ${reasonText}\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments.\n\nRun these commands:\n  linear issue ${identifier}\n  linear comments ${identifier}\n\nReview both the description AND comments for your task brief before taking action.`;
             const sessionId = route.sessionKey;
-            // Fire-and-forget delivery — send message to agent's Telegram session
-            // Use message send instead of agent to avoid creating isolated sessions
-            const deliveryCmd = `${nodeBin} ${openclawScript} message send --channel telegram --target -1003712293789 --message ${JSON.stringify(message)}`;
+            // Fire-and-forget delivery — use agent command with --deliver flag
+            // This sends message to agent's configured channel instead of hardcoded Telegram ID
+            const deliveryCmd = `${nodeBin} ${openclawScript} agent --agent ${JSON.stringify(agentName)} --message ${JSON.stringify(message)} --deliver`;
             const child = require("child_process").spawn(nodeBin, [
-                openclawScript, "message", "send",
-                "--channel", "telegram",
-                "--target", "-1003712293789",
+                openclawScript, "agent",
+                "--agent", agentName,
                 "--message", message,
+                "--deliver",
             ], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
             child.unref();
             log.info(`Delivery spawned for ${agentName} [${sessionId}]`);
