@@ -10,6 +10,7 @@ export interface RouteResult {
   sessionKey: string;
   priority: number;
   event: LinearEvent;
+  routingReason?: "delegate" | "assignee" | "mention" | "body-mention";
 }
 
 /** Connector service configuration. */

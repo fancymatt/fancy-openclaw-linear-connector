@@ -25,6 +25,12 @@ async function refreshAgent(agent: {
 }): Promise<void> {
   log.info(`Refreshing token for ${agent.name}...`);
 
+  // Skip refresh if no refresh token available (newly added agent)
+  if (!agent.refreshToken || agent.refreshToken === "") {
+    log.warn(`Skipping token refresh for ${agent.name}: no refresh token available yet`);
+    return;
+  }
+
   try {
     const params = new URLSearchParams({
       client_id: agent.clientId,

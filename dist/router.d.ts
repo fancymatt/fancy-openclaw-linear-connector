@@ -14,7 +14,10 @@ import type { RouteResult } from "./types";
  * Checks delegate first (OAuth app actors), then assignee, then mentioned users.
  * Returns null if no agent target found or if it's a self-triggered event.
  */
-export declare function extractAgentTarget(event: LinearEvent): string | null;
+export declare function extractAgentTarget(event: LinearEvent): {
+    name: string;
+    reason: "delegate" | "assignee" | "mention" | "body-mention";
+} | null;
 /**
  * Route a Linear event to an OpenClaw agent.
  * Returns a RouteResult if routing succeeded, null if no agent found.

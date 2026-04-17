@@ -35,9 +35,12 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
 
       // ── 1. Debug: log relevant headers ──────────────────────────────────
       log.info(`Webhook received. Headers: ${JSON.stringify(Object.keys(req.headers).filter(h => h.startsWith('x-') || h.startsWith('linear')))} `);
+      log.info(`linear-event header: ${req.headers["linear-event"] || "(missing)"}`);
+      log.info(`linear-timestamp header: ${req.headers["linear-timestamp"] || "(missing)"}`);
 
       // ── 2. Get raw body ────────────────────────────────────────────────────
       const rawBody: Buffer | undefined = (req as Request & { rawBody?: Buffer }).rawBody;
+      log.info(`Raw body length: ${rawBody?.length || 0} bytes`);
 
       // ── 3. Signature validation (skip if no secret configured) ────────────
       if (secret) {
@@ -55,6 +58,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
         }
 
         const signatureValid = verifyLinearSignature(rawBody, signature as string, secret);
+      log.info(`Signature validation result: ${signatureValid ? "valid" : "invalid"}`);
         if (!signatureValid) {
           res.status(401).json({ error: "Invalid signature" });
           return;
@@ -68,6 +72,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
       try {
         const body = rawBody ?? Buffer.from(JSON.stringify(req.body));
         payload = JSON.parse(body.toString("utf8"));
+      log.info("JSON parsed successfully");
       } catch {
         res.status(400).json({ error: "Malformed JSON payload" });
         return;
@@ -77,6 +82,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
       let event: LinearEvent;
       try {
         event = normalizeLinearEvent(payload);
+      log.info(`Event normalized: type=${event.type}`);
       } catch (err) {
         res.status(400).json({
           error: "Invalid payload structure",
@@ -91,6 +97,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
         crypto.createHash("sha256").update(rawBody ?? Buffer.from(JSON.stringify(payload))).digest("hex");
 
       if (eventStore?.isDuplicate(deliveryId)) {
+      log.info(`Checking duplicate for delivery: ${deliveryId}`);
         res.status(200).json({ ok: true, duplicate: true });
         return;
       }
@@ -171,30 +178,41 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
         const issueData = (data.issue ?? sessionData?.issue ?? data) as Record<string, unknown>;
         const identifier = String(issueData?.identifier ?? route.sessionKey.replace("linear-", ""));
         const title = String(issueData?.title ?? "");
-        const message = `[NEW TASK] You were mentioned or assigned on ${identifier}: ${title}.\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments.\n\nRun these commands:\n  linear issue ${identifier}\n  linear comments ${identifier}\n\nReview both the description AND comments for your task brief before taking action.`;
+
+        // Build routing-reason-specific message
+        const reason = route.routingReason ?? "assignee";
+        let reasonText: string;
+        switch (reason) {
+          case "delegate":
+            reasonText = `You were delegated ${identifier}: ${title}.\n\nThe assignee field may show someone else (the workflow owner), but YOU are the delegate — this task is yours to action.`;
+            break;
+          case "assignee":
+            reasonText = `You were assigned to ${identifier}: ${title}.`;
+            break;
+          case "mention":
+          case "body-mention":
+            reasonText = `You were mentioned on ${identifier}: ${title}.`;
+            break;
+          default:
+            reasonText = `You were mentioned or assigned on ${identifier}: ${title}.`;
+        }
+        const message = `[NEW TASK] ${reasonText}\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments.\n\nRun these commands:\n  linear issue ${identifier}\n  linear comments ${identifier}\n\nReview both the description AND comments for your task brief before taking action.`;
         const sessionId = route.sessionKey;
 
-        // Fire-and-forget delivery — don't block the webhook handler
-        const deliveryCmd = `${nodeBin} ${openclawScript} agent --agent ${JSON.stringify(agentName)} --session-id ${JSON.stringify(sessionId)} --message ${JSON.stringify(message)}`;
+        // Fire-and-forget delivery — send message to agent's Telegram session
+        // Use message send instead of agent to avoid creating isolated sessions
+        const deliveryCmd = `${nodeBin} ${openclawScript} message send --channel telegram --target -1003712293789 --message ${JSON.stringify(message)}`;
         const child = require("child_process").spawn(nodeBin, [
-          openclawScript, "agent",
-          "--agent", agentName,
-          "--session-id", sessionId,
+          openclawScript, "message", "send",
+          "--channel", "telegram",
+          "--target", "-1003712293789",
           "--message", message,
         ], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
         child.unref();
         log.info(`Delivery spawned for ${agentName} [${sessionId}]`);
-
-        // Close session when the agent process finishes
-        if (agentSessionId) {
-          const sid = agentSessionId;
-          const aname = agentName;
-          child.on("exit", () => {
-            emitResponse(sid, aname, "Task delegated to agent. Session closed.")
-              .then(() => log.info(`Closed agent session ${sid} (after delivery)`))
-              .catch((err: unknown) => log.error(`Failed to close agent session: ${err instanceof Error ? err.message : String(err)}`));
-          });
-        }
+        // Note: Linear agent session stays open until agent responds via comment.
+        // We don't close it here because we're just delivering a message,
+        // not starting an agent process that will run and exit.
       } catch (err) {
         log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
       }

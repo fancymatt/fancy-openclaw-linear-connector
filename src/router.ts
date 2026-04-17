@@ -20,7 +20,7 @@ const log = componentLogger(createLogger(), "router");
  * Checks delegate first (OAuth app actors), then assignee, then mentioned users.
  * Returns null if no agent target found or if it's a self-triggered event.
  */
-export function extractAgentTarget(event: LinearEvent): string | null {
+export function extractAgentTarget(event: LinearEvent): { name: string; reason: "delegate" | "assignee" | "mention" | "body-mention" } | null {
   const agentMap = buildAgentMap();
   if (Object.keys(agentMap).length === 0) {
     log.warn("No agents configured — skipping event");
@@ -35,16 +35,18 @@ export function extractAgentTarget(event: LinearEvent): string | null {
   if (event.type === "AgentSessionEvent") {
     // TODO: extract agent from session data if needed
     const agents = Object.values(agentMap);
-    return agents.length > 0 ? agents[0] : null;
+    return agents.length > 0 ? { name: agents[0], reason: "delegate" } : null;
   }
 
   const data = "data" in event ? (event.data as Record<string, unknown> | undefined) : null;
 
   // 1. Check delegate first — OAuth app actors are set as delegates, not assignees
   let target: string | null = null;
+  let reason: "delegate" | "assignee" | "mention" | "body-mention" = "delegate";
   const delegateId = extractId(data?.delegate);
   if (delegateId && agentMap[delegateId]) {
     target = agentMap[delegateId];
+    reason = "delegate";
     log.info(`Routed via delegate: ${delegateId} → ${target}`);
   }
 
@@ -53,16 +55,18 @@ export function extractAgentTarget(event: LinearEvent): string | null {
     const assigneeId = extractId(data?.assignee);
     if (assigneeId && agentMap[assigneeId]) {
       target = agentMap[assigneeId];
+      reason = "assignee";
       log.info(`Routed via assignee: ${assigneeId} → ${target}`);
     }
   }
 
   // 3. Check mentioned users
   const mentionedUsers = data?.mentionedUsers as Array<{ id?: string }> | null | undefined;
-  if (mentionedUsers) {
+  if (!target && mentionedUsers) {
     for (const user of mentionedUsers) {
       if (user.id && agentMap[user.id]) {
         target = agentMap[user.id];
+        reason = "mention";
         log.info(`Routed via mention: ${user.id} → ${target}`);
         break;
       }
@@ -70,28 +74,27 @@ export function extractAgentTarget(event: LinearEvent): string | null {
   }
 
   // 4. Body-based mention detection for Comment events
-  //    Linear webhooks don't include mentionedUsers, so we parse the body for @name mentions
   if (!target && event.type === "Comment" && data?.body && typeof data.body === "string") {
     const nameMap = buildNameMap();
     const bodyMention = detectMentionInBody(data.body, nameMap);
     if (bodyMention) {
       target = nameMap[bodyMention];
+      reason = "body-mention";
       log.info(`Routed via body mention: @${bodyMention} → ${target}`);
     }
   }
 
   // 5. Self-trigger filtering: skip if the actor IS the target agent
-  //    But allow agent-to-agent delegation (Emi delegates to Aki)
+  //    But allow agent-to-agent delegation
   if (isActorOurAgent) {
     if (!target || agentMap[actorId!] === target) {
       log.info(`Skipping self-triggered event from ${actorId}`);
       return null;
     }
-    // Actor is our agent but target is a different agent — allow through
     log.info(`Agent-to-agent delegation: ${agentMap[actorId!]} → ${target}`);
   }
 
-  return target;
+  return target ? { name: target, reason } : null;
 }
 
 /** Extract an ID from a field that may be a string, an object with .id, or null */
@@ -138,11 +141,11 @@ function detectMentionInBody(body: string, nameMap: Record<string, string>): str
  * Returns a RouteResult if routing succeeded, null if no agent found.
  */
 export function routeEvent(event: LinearEvent): RouteResult | null {
-  const agentName = extractAgentTarget(event);
-  if (!agentName) return null;
+  const result = extractAgentTarget(event);
+  if (!result) return null;
 
-  const agent = getAgent(agentName);
-  const openclawName = getOpenclawAgentName(agentName);
+  const agent = getAgent(result.name);
+  const openclawName = getOpenclawAgentName(result.name);
   const d = event.data as Record<string, unknown> | undefined;
   const sessionData = d?.agentSession as Record<string, unknown> | undefined;
   const identifier =
@@ -150,17 +153,16 @@ export function routeEvent(event: LinearEvent): RouteResult | null {
     (d?.issueIdentifier as string | undefined) ??
     (sessionData?.issue as Record<string, unknown> | undefined)?.identifier as string | undefined;
   
-  // Use Linear agent session UUID as OpenClaw session-id for ticket-scoped sessions
-  // This allows OpenClaw to correlate agent sessions with Linear agent sessions
   const linearAgentSessionId = sessionData?.id as string | undefined;
   const sessionKey = linearAgentSessionId ? `linear-session-${linearAgentSessionId}` : (identifier ? `linear-${identifier}` : `linear-${event.type}-${Date.now()}`);
   
-  log.info(`routeEvent: type=${event.type} identifier=${identifier ?? 'none'} linearAgentSessionId=${linearAgentSessionId ?? 'none'}`);
+  log.info(`routeEvent: type=${event.type} identifier=${identifier ?? 'none'} reason=${result.reason}`);
 
   return {
     agentId: openclawName,
     sessionKey,
     priority: 0,
     event,
+    routingReason: result.reason,
   };
 }

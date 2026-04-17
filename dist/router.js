@@ -32,14 +32,16 @@ function extractAgentTarget(event) {
     if (event.type === "AgentSessionEvent") {
         // TODO: extract agent from session data if needed
         const agents = Object.values(agentMap);
-        return agents.length > 0 ? agents[0] : null;
+        return agents.length > 0 ? { name: agents[0], reason: "delegate" } : null;
     }
     const data = "data" in event ? event.data : null;
     // 1. Check delegate first — OAuth app actors are set as delegates, not assignees
     let target = null;
+    let reason = "delegate";
     const delegateId = extractId(data?.delegate);
     if (delegateId && agentMap[delegateId]) {
         target = agentMap[delegateId];
+        reason = "delegate";
         log.info(`Routed via delegate: ${delegateId} → ${target}`);
     }
     // 2. Fall back to assignee (for human-user API key tokens)
@@ -47,41 +49,42 @@ function extractAgentTarget(event) {
         const assigneeId = extractId(data?.assignee);
         if (assigneeId && agentMap[assigneeId]) {
             target = agentMap[assigneeId];
+            reason = "assignee";
             log.info(`Routed via assignee: ${assigneeId} → ${target}`);
         }
     }
     // 3. Check mentioned users
     const mentionedUsers = data?.mentionedUsers;
-    if (mentionedUsers) {
+    if (!target && mentionedUsers) {
         for (const user of mentionedUsers) {
             if (user.id && agentMap[user.id]) {
                 target = agentMap[user.id];
+                reason = "mention";
                 log.info(`Routed via mention: ${user.id} → ${target}`);
                 break;
             }
         }
     }
     // 4. Body-based mention detection for Comment events
-    //    Linear webhooks don't include mentionedUsers, so we parse the body for @name mentions
     if (!target && event.type === "Comment" && data?.body && typeof data.body === "string") {
         const nameMap = buildNameMap();
         const bodyMention = detectMentionInBody(data.body, nameMap);
         if (bodyMention) {
             target = nameMap[bodyMention];
+            reason = "body-mention";
             log.info(`Routed via body mention: @${bodyMention} → ${target}`);
         }
     }
     // 5. Self-trigger filtering: skip if the actor IS the target agent
-    //    But allow agent-to-agent delegation (Emi delegates to Aki)
+    //    But allow agent-to-agent delegation
     if (isActorOurAgent) {
         if (!target || agentMap[actorId] === target) {
             log.info(`Skipping self-triggered event from ${actorId}`);
             return null;
         }
-        // Actor is our agent but target is a different agent — allow through
         log.info(`Agent-to-agent delegation: ${agentMap[actorId]} → ${target}`);
     }
-    return target;
+    return target ? { name: target, reason } : null;
 }
 /** Extract an ID from a field that may be a string, an object with .id, or null */
 function extractId(field) {
@@ -126,26 +129,25 @@ function detectMentionInBody(body, nameMap) {
  * Returns a RouteResult if routing succeeded, null if no agent found.
  */
 function routeEvent(event) {
-    const agentName = extractAgentTarget(event);
-    if (!agentName)
+    const result = extractAgentTarget(event);
+    if (!result)
         return null;
-    const agent = (0, agents_1.getAgent)(agentName);
-    const openclawName = (0, agents_1.getOpenclawAgentName)(agentName);
+    const agent = (0, agents_1.getAgent)(result.name);
+    const openclawName = (0, agents_1.getOpenclawAgentName)(result.name);
     const d = event.data;
     const sessionData = d?.agentSession;
     const identifier = d?.identifier ??
         d?.issueIdentifier ??
         sessionData?.issue?.identifier;
-    // Use Linear agent session UUID as OpenClaw session-id for ticket-scoped sessions
-    // This allows OpenClaw to correlate agent sessions with Linear agent sessions
     const linearAgentSessionId = sessionData?.id;
     const sessionKey = linearAgentSessionId ? `linear-session-${linearAgentSessionId}` : (identifier ? `linear-${identifier}` : `linear-${event.type}-${Date.now()}`);
-    log.info(`routeEvent: type=${event.type} identifier=${identifier ?? 'none'} linearAgentSessionId=${linearAgentSessionId ?? 'none'}`);
+    log.info(`routeEvent: type=${event.type} identifier=${identifier ?? 'none'} reason=${result.reason}`);
     return {
         agentId: openclawName,
         sessionKey,
         priority: 0,
         event,
+        routingReason: result.reason,
     };
 }
 //# sourceMappingURL=router.js.map

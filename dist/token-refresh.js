@@ -12,6 +12,11 @@ const log = (0, logger_1.componentLogger)((0, logger_1.createLogger)(), "token-r
 const REFRESH_INTERVAL_MS = 20 * 60 * 60 * 1000; // 20 hours
 async function refreshAgent(agent) {
     log.info(`Refreshing token for ${agent.name}...`);
+    // Skip refresh if no refresh token available (newly added agent)
+    if (!agent.refreshToken || agent.refreshToken === "") {
+        log.warn(`Skipping token refresh for ${agent.name}: no refresh token available yet`);
+        return;
+    }
     try {
         const params = new URLSearchParams({
             client_id: agent.clientId,
