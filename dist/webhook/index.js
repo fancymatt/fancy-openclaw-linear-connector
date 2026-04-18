@@ -9,6 +9,10 @@ const crypto_1 = __importDefault(require("crypto"));
 const express_1 = require("express");
 const signature_1 = require("./signature");
 const normalize_1 = require("./normalize");
+const nudge_store_1 = require("../store/nudge-store");
+/** 15-minute suppression window for bulk-delegation noise reduction (AI-348). */
+const NUDGE_SUPPRESSION_MS = 15 * 60 * 1000;
+const nudgeStore = new nudge_store_1.NudgeStore();
 const router_1 = require("../router");
 const agent_session_1 = require("../agent-session");
 const logger_1 = require("../logger");
@@ -163,24 +167,28 @@ function createWebhookRouter(eventStore) {
             const issueData = (data.issue ?? sessionData?.issue ?? data);
             const identifier = String(issueData?.identifier ?? route.sessionKey.replace("linear-", ""));
             const title = String(issueData?.title ?? "");
-            // Build routing-reason-specific message
+            // Build routing-reason-specific message.
+            // Mentions: full [NEW TASK] push — someone is talking to you directly.
+            // Delegate/assignee: lightweight nudge with 15-min suppression (AI-348).
+            // Bulk delegations collapse into one nudge; agent pulls queue at own cadence.
             const reason = route.routingReason ?? "assignee";
-            let reasonText;
-            switch (reason) {
-                case "delegate":
-                    reasonText = `You were delegated ${identifier}: ${title}.\n\nThe assignee field may show someone else (the workflow owner), but YOU are the delegate — this task is yours to action.`;
-                    break;
-                case "assignee":
-                    reasonText = `You were assigned to ${identifier}: ${title}.`;
-                    break;
-                case "mention":
-                case "body-mention":
-                    reasonText = `You were mentioned on ${identifier}: ${title}.`;
-                    break;
-                default:
-                    reasonText = `You were mentioned or assigned on ${identifier}: ${title}.`;
+            let message;
+            if (reason === "mention" || reason === "body-mention") {
+                // Mentions always fire the full push.
+                message = `[NEW TASK] You were mentioned on ${identifier}: ${title}.\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments. Even if you believe you already handled this ticket, re-fetch it — there may be new comments, follow-up questions, or updated context since your last visit.\n\nRun these commands:\n  linear issue ${identifier}\n  linear comments ${identifier}\n\nReview both the description AND comments for your task brief before taking action.\n\nWhen your work is complete, DELEGATE the ticket forward using \`linear handoff <ID> <agent> \"<comment>\"\` — do not just post a comment saying you will delegate. A ticket with no delegate is an incomplete action.`;
             }
-            const message = `[NEW TASK] ${reasonText}\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments.\n\nRun these commands:\n  linear issue ${identifier}\n  linear comments ${identifier}\n\nReview both the description AND comments for your task brief before taking action.`;
+            else {
+                // Delegate/assignee: lightweight nudge with suppression.
+                if (nudgeStore.isSuppressed(agentName, NUDGE_SUPPRESSION_MS)) {
+                    log.info(`Nudge suppressed for ${agentName} — within 15-min window. ${identifier} silently queued.`);
+                    return;
+                }
+                nudgeStore.recordNudge(agentName);
+                const actionText = reason === "delegate"
+                    ? `You were delegated ${identifier}`
+                    : `You were assigned ${identifier}`;
+                message = `[NEW TASK] ${actionText}. Run \`linear my-next\` to see your highest-priority pending task.`;
+            }
             const sessionId = route.sessionKey;
             // Fire-and-forget delivery — use agent command with --deliver flag
             // This sends message to agent's configured channel instead of hardcoded Telegram ID
