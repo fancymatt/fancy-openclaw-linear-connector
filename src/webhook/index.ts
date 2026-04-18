@@ -192,8 +192,8 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
         let message: string;
 
         if (reason === "mention" || reason === "body-mention") {
-          // Mentions always fire the full push.
-          message = `[NEW TASK] You were mentioned on ${identifier}: ${title}.\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments. Even if you believe you already handled this ticket, re-fetch it — there may be new comments, follow-up questions, or updated context since your last visit.\n\nRun these commands:\n  linear issue ${identifier}\n  linear comments ${identifier}\n\nReview both the description AND comments for your task brief before taking action.\n\nWhen your work is complete, DELEGATE the ticket forward using \`linear handoff <ID> <agent> \"<comment>\"\` — do not just post a comment saying you will delegate. A ticket with no delegate is an incomplete action.`;
+          // Mentions always fire the short, accurate message without delegation boilerplate.
+          message = `[NEW TASK] You were mentioned on ${identifier}: ${title}.\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments.\n\nRun these commands:\n  linear issue ${identifier}\n  linear comments ${identifier}\n\nReview both the description AND comments for your task brief before taking action.`;
         } else {
           // Delegate/assignee: lightweight nudge with suppression.
           if (nudgeStore.isSuppressed(agentName, NUDGE_SUPPRESSION_MS)) {
