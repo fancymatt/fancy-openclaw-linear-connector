@@ -9,12 +9,13 @@ const webhook_1 = require("./webhook");
 const token_refresh_1 = require("./token-refresh");
 const agents_1 = require("./agents");
 const logger_1 = require("./logger");
+const oauth_callback_1 = require("./oauth-callback");
 const log = (0, logger_1.componentLogger)((0, logger_1.createLogger)(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 function createApp() {
     const app = (0, express_1.default)();
     // Raw body capture for webhook signature validation.
-    app.use("/webhooks", express_1.default.raw({ type: "application/json", limit: "1mb" }), (req, _res, next) => {
+    app.use("/", express_1.default.raw({ type: "application/json", limit: "1mb" }), (req, _res, next) => {
         if (Buffer.isBuffer(req.body)) {
             req.rawBody = req.body;
         }
@@ -30,10 +31,12 @@ function createApp() {
             agentNames: agents.map((a) => a.name),
         });
     });
+    // OAuth callback — handles Linear app authorization flow
+    app.get("/callback", oauth_callback_1.handleOAuthCallback);
     // Webhook routes — pass the event store from the dedup module
     const { EventStore } = require("./store/event-store");
     const eventStore = new EventStore();
-    app.use("/webhooks", (0, webhook_1.createWebhookRouter)(eventStore));
+    app.use("/", (0, webhook_1.createWebhookRouter)(eventStore));
     return app;
 }
 // Only start listening when this file is the entry point, not when imported by tests

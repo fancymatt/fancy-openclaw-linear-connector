@@ -3,6 +3,7 @@ import { createWebhookRouter } from "./webhook";
 import { startTokenRefresh } from "./token-refresh";
 import { getAgents } from "./agents";
 import { createLogger, componentLogger } from "./logger";
+import { handleOAuthCallback } from "./oauth-callback";
 
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -32,6 +33,9 @@ export function createApp() {
       agentNames: agents.map((a) => a.name),
     });
   });
+
+  // OAuth callback — handles Linear app authorization flow
+  app.get("/callback", handleOAuthCallback);
 
   // Webhook routes — pass the event store from the dedup module
   const { EventStore } = require("./store/event-store");

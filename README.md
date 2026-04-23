@@ -73,68 +73,45 @@ Repeat this phase for each agent you want to connect.
 6. **Create OAuth app in Linear:**
    - Settings → API → Applications → Create new
    - Name: your agent's display name (e.g. `Charles (CTO)`)
-   - Redirect URI: `https://your-host/oauth/callback`
+   - Redirect URI: `https://your-host/linear-webhook/callback`
    - Scopes: `read, write, app:assignable, app:mentionable`
    - Note the **Client ID** and **Client Secret**
 
-7. **Authorize as an app (NOT as your personal user):**
+7. **Register the app credentials:**
+   Copy `oauth-apps.json.example` to `oauth-apps.json` and add the app:
+   ```json
+   {
+     "apps": {
+       "agent-name": {
+         "clientId": "CLIENT_ID",
+         "clientSecret": "CLIENT_SECRET"
+       }
+     }
+   }
+   ```
+   The connector uses this file to exchange OAuth codes for tokens.
+
+   ⚠️ **Add `oauth-apps.json` to `.gitignore`** — it contains client secrets.
+
+8. **Authorize as an app (NOT as your personal user):**
    Visit this URL in your browser (requires workspace admin):
    ```text
-   https://linear.app/oauth/authorize?client_id=CLIENT_ID&redirect_uri=REDIRECT_URI&response_type=code&scope=read,write,app:assignable,app:mentionable&actor=app&state=AGENT_NAME
+   https://linear.app/oauth/authorize?client_id=CLIENT_ID&redirect_uri=https://your-host/linear-webhook/callback&response_type=code&scope=read,write,app:assignable,app:mentionable&actor=app&state=AGENT_NAME
    ```
 
    ⚠️ **Must include `actor=app`** — this installs the app as its own user. Without it, the agent won't appear in delegate/mention menus and the self-trigger filter will break.
 
-   After approving, Linear redirects to your callback URL with a `code` parameter.
+   After approving, Linear redirects to your callback URL. The connector automatically:
+   - Exchanges the code for access + refresh tokens
+   - Fetches the agent's Linear user ID
+   - Writes the entry to `agents.json`
+   - Shows a success page with the agent details
 
-8. **Exchange the code for tokens:**
-   ```bash
-   curl -s -X POST https://api.linear.app/oauth/token \
-     -d "client_id=YOUR_CLIENT_ID" \
-     -d "client_secret=YOUR_CLIENT_SECRET" \
-     -d "code=CODE_FROM_REDIRECT" \
-     -d "redirect_uri=https://your-host/oauth/callback" \
-     -d "grant_type=authorization_code"
-   ```
-
-   ⚠️ **Verify the response includes scopes `app:assignable` and `app:mentionable`.** If not, the OAuth URL was wrong (missing `actor=app` or scope params).
-
-9. **Get the agent's Linear User ID:**
-   ```bash
-   curl -s https://api.linear.app/graphql \
-     -H "Authorization: Bearer ACCESS_TOKEN" \
-     -H "Content-Type: application/json" \
-     -d '{"query":"{ viewer { id name } }"}'
-   ```
-
-   ⚠️ **Must show the agent's name** (e.g. `Charles (CTO)`). If it shows your personal name, you authorized as a user — redo step 7 with `actor=app`.
+9. **Verify the success page shows the agent's name** (e.g. `Charles (CTO)`). If it shows your personal name, you authorized as a user — redo step 8 with `actor=app`.
 
 ### Phase 4: Connect Everything
 
-10. **Add agent to `agents.json`:**
-    ```json
-    {
-      "name": "agent-name",
-      "linearUserId": "UUID_FROM_STEP_9",
-      "clientId": "CLIENT_ID",
-      "clientSecret": "CLIENT_SECRET",
-      "accessToken": "ACCESS_TOKEN",
-      "refreshToken": "REFRESH_TOKEN",
-      "secretsPath": "/path/to/workspace/.secrets/linear.env",
-      "openclawAgent": "openclaw-agent-name",
-      "host": "local"
-    }
-    ```
-
-    **`secretsPath` must point to `linear.env`** — the `linear` CLI reads from `.secrets/linear.env`.
-
-11. **Create the secrets file:**
-    ```bash
-    mkdir -p /path/to/workspace/.secrets
-    echo 'LINEAR_API_KEY=ACCESS_TOKEN' > /path/to/workspace/.secrets/linear.env
-    ```
-
-12. **Restart the connector:**
+10. **Restart the connector:**
     ```bash
     sudo systemctl restart fancy-openclaw-linear-connector
     # Or just: npm run dev

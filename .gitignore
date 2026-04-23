@@ -12,4 +12,5 @@ coverage/
 *.log
 data/
 agents.json
+oauth-apps.json
 # node_modules
