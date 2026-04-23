@@ -1,5 +1,5 @@
 import { Request, Response } from "express";
-import { upsertAgent, AgentConfig } from "./agents";
+import { getAgent, upsertAgent, AgentConfig } from "./agents";
 import { createLogger, componentLogger } from "./logger";
 
 const log = componentLogger(createLogger(), "oauth-callback");
@@ -11,11 +11,9 @@ const log = componentLogger(createLogger(), "oauth-callback");
  *   code  — authorization code from Linear
  *   state — agent name (set when building the authorize URL)
  *
- * Requires the agent's OAuth app credentials to be registered in a
- * staging file (`oauth-apps.json`) so the connector can exchange the code.
- *
- * oauth-apps.json format:
- *   { "apps": { "<agent-name>": { "clientId": "...", "clientSecret": "..." } } }
+ * The agent must already exist in agents.json with at least `name`,
+ * `clientId`, and `clientSecret` populated (a "partial" entry).
+ * The callback fills in `linearUserId`, `accessToken`, and `refreshToken`.
  */
 export async function handleOAuthCallback(req: Request, res: Response): Promise<void> {
   const { code, state, error, error_description } = req.query as Record<string, string>;
@@ -33,14 +31,20 @@ export async function handleOAuthCallback(req: Request, res: Response): Promise<
 
   const agentName = state;
 
-  // Load app credentials from oauth-apps.json
-  const apps = loadOAuthApps();
-  const appConfig = apps[agentName];
-  if (!appConfig) {
+  // Look up the agent's OAuth credentials from agents.json
+  const existing = getAgent(agentName);
+  if (!existing) {
     res.status(400).send(
-      `No OAuth app registered for agent "${agentName}". ` +
-      `Add it to oauth-apps.json first. ` +
-      `Registered agents: ${Object.keys(apps).join(", ") || "(none)"}`
+      `No agent "${agentName}" found in agents.json. ` +
+      `Add a partial entry with name, clientId, and clientSecret first.`
+    );
+    return;
+  }
+
+  if (!existing.clientId || !existing.clientSecret) {
+    res.status(400).send(
+      `Agent "${agentName}" is missing clientId or clientSecret in agents.json. ` +
+      `Add them before authorizing.`
     );
     return;
   }
@@ -52,8 +56,8 @@ export async function handleOAuthCallback(req: Request, res: Response): Promise<
   let tokenResponse: { access_token: string; refresh_token: string; scope?: string };
   try {
     const params = new URLSearchParams({
-      client_id: appConfig.clientId,
-      client_secret: appConfig.clientSecret,
+      client_id: existing.clientId,
+      client_secret: existing.clientSecret,
       code,
       redirect_uri: redirectUri,
       grant_type: "authorization_code",
@@ -118,16 +122,14 @@ export async function handleOAuthCallback(req: Request, res: Response): Promise<
 
   log.info(`Agent "${agentName}" → Linear user "${linearUserName}" (${linearUserId})`);
 
-  // Step 3: Add to agents.json
+  // Step 3: Update agents.json with full credentials
   const agentConfig: AgentConfig = {
-    name: agentName,
+    ...existing,
     linearUserId,
-    clientId: appConfig.clientId,
-    clientSecret: appConfig.clientSecret,
     accessToken: access_token,
     refreshToken: refresh_token,
-    openclawAgent: agentName,
-    host: "local",
+    openclawAgent: existing.openclawAgent ?? agentName,
+    host: existing.host ?? "local",
   };
 
   const { isNew } = upsertAgent(agentConfig);
@@ -149,33 +151,10 @@ export async function handleOAuthCallback(req: Request, res: Response): Promise<
       <h1 class="success">✅ Agent "${agentName}" ${isNew ? "registered" : "updated"}</h1>
       <p>Linear user: <strong>${linearUserName}</strong> (${linearUserId})</p>
       ${!scope?.includes("app:assignable") ? '<p class="warning">⚠️ Missing app:assignable scope. Did you use actor=app in the authorize URL?</p>' : ""}
-      <h3>Agent entry written to agents.json:</h3>
+      <h3>Agent entry in agents.json:</h3>
       <pre>${JSON.stringify(agentConfig, null, 2)}</pre>
       <p>Restart the connector to load the new agent and start token refresh.</p>
     </body>
     </html>
   `);
-}
-
-// --- oauth-apps.json loader ---
-
-interface OAuthAppsFile {
-  apps: Record<string, { clientId: string; clientSecret: string }>;
-}
-
-function loadOAuthApps(): Record<string, { clientId: string; clientSecret: string }> {
-  const fs = require("fs") as typeof import("fs");
-  const path = require("path") as typeof import("path");
-
-  const appsPath = path.resolve(process.cwd(), "oauth-apps.json");
-  if (!fs.existsSync(appsPath)) return {};
-
-  try {
-    const raw = fs.readFileSync(appsPath, "utf8");
-    const data = JSON.parse(raw) as OAuthAppsFile;
-    return data.apps ?? {};
-  } catch {
-    log.error(`Failed to load oauth-apps.json`);
-    return {};
-  }
 }

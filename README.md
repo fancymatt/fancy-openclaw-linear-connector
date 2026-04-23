@@ -77,21 +77,21 @@ Repeat this phase for each agent you want to connect.
    - Scopes: `read, write, app:assignable, app:mentionable`
    - Note the **Client ID** and **Client Secret**
 
-7. **Register the app credentials:**
-   Copy `oauth-apps.json.example` to `oauth-apps.json` and add the app:
+7. **Add a partial entry to `agents.json`:**
+   Create (or edit) `agents.json` in the connector directory with just the agent name and OAuth credentials:
    ```json
    {
-     "apps": {
-       "agent-name": {
+     "agents": [
+       {
+         "name": "agent-name",
          "clientId": "CLIENT_ID",
-         "clientSecret": "CLIENT_SECRET"
+         "clientSecret": "CLIENT_SECRET",
+         "openclawAgent": "openclaw-agent-name"
        }
-     }
+     ]
    }
    ```
-   The connector uses this file to exchange OAuth codes for tokens.
-
-   ⚠️ **Add `oauth-apps.json` to `.gitignore`** — it contains client secrets.
+   The callback will fill in `linearUserId`, `accessToken`, and `refreshToken` automatically.
 
 8. **Authorize as an app (NOT as your personal user):**
    Visit this URL in your browser (requires workspace admin):
@@ -101,10 +101,10 @@ Repeat this phase for each agent you want to connect.
 
    ⚠️ **Must include `actor=app`** — this installs the app as its own user. Without it, the agent won't appear in delegate/mention menus and the self-trigger filter will break.
 
-   After approving, Linear redirects to your callback URL. The connector automatically:
+   After approving, Linear redirects to `/callback`. The connector automatically:
    - Exchanges the code for access + refresh tokens
    - Fetches the agent's Linear user ID
-   - Writes the entry to `agents.json`
+   - Updates the entry in `agents.json` with full credentials
    - Shows a success page with the agent details
 
 9. **Verify the success page shows the agent's name** (e.g. `Charles (CTO)`). If it shows your personal name, you authorized as a user — redo step 8 with `actor=app`.
