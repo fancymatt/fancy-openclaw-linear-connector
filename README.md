@@ -51,10 +51,11 @@ A standalone connector service that bridges Linear webhooks to OpenClaw agent se
 
 4. **Create a Linear webhook:**
    - Linear → Settings → API → Webhooks → Create new
-   - URL: `https://your-host/linear-webhook/`
-   - Events: `Issue`, `Comment`, `AgentSessionEvent`
+   - URL: `https://your-host/linear-webhook/linear`
+   - Events: **Issue**, **Comment**
    - Note the **signing secret** — you'll need it below
    - ⚠️ **Only create this once per workspace** — one webhook handles all agents
+   - ⚠️ Don't enable per-agent webhooks. The workspace webhook covers all routing.
 
 5. **Configure the webhook secret:**
    Set the `LINEAR_WEBHOOK_SECRET` environment variable to the signing secret from step 4. If using systemd, add it to your service file or `.env`.
@@ -261,7 +262,7 @@ Each agent gets its **own** OAuth application in Linear.
    - Agent Session Events enable the Linear UI "Agent working" widget when you @mention agents
    - Issues + Comments enable routing to OpenClaw agents
 
-⚠️ **Important:** Use application-level webhooks, not agent-specific webhooks. Agent-specific webhooks cause duplicate notifications. Only one application webhook is needed per workspace.
+⚠️ **Important:** Application-level webhooks are configured per OAuth app in the Linear API settings. Do not confuse these with workspace-level webhooks (Settings → API → Webhooks), which are separate and don't support Agent Session Events. Only one application webhook is needed per workspace.
 
 5. Note the **Client ID** and **Client Secret**
 
@@ -350,14 +351,14 @@ On startup, the connector will:
 
 ### Step 7: Create the Linear Webhook
 
-⚠️ **Only create this ONCE per workspace**, not per agent. This is an application-level webhook that handles all agents.
+⚠️ **Only create this ONCE per workspace**, not per agent. This is a workspace-level webhook that handles all agents.
 
 If you already have a workspace webhook for Linear events, **update the existing one** instead of creating a new one. Enable the same event types for all agents.
 
 1. Linear → Settings → API → Webhooks → Create new (or edit existing)
-2. URL: `https://your-host/linear-webhook/`
-3. Event types: **Issues**, **Comments**, **Agent Session Events**
-   - Use **exact** event type names: `Issue`, `Comment`, `AgentSessionEvent`
+2. URL: `https://your-host/linear-webhook/linear`
+3. Event types: **Issues**, **Comments**
+   - `AgentSessionEvent` is not available on workspace webhooks — it comes from the per-app webhook configured in Step 1
    - Avoid redundant types like `Issue.completed` or `Issue.canceled` (covered by `Issue.updated`)
 4. Use the signing secret from your OAuth app settings
 
