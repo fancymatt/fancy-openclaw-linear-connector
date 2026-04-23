@@ -19,6 +19,7 @@ A standalone connector service that bridges Linear webhooks to OpenClaw agent se
    git clone https://github.com/fancymatt/fancy-openclaw-linear-connector.git
    cd fancy-openclaw-linear-connector
    npm install
+   npm run build
    ```
 
 2. **Set up reverse proxy:**
@@ -40,6 +41,7 @@ A standalone connector service that bridges Linear webhooks to OpenClaw agent se
 3. **Start the connector:**
    ```bash
    npm start
+   # Dev mode with hot reload: npm run dev
    # Or: systemd service (see Deployment Scenarios below)
    ```
 
@@ -132,7 +134,7 @@ Repeat this phase for each agent you want to connect.
 12. **Restart the connector:**
     ```bash
     sudo systemctl restart fancy-openclaw-linear-connector
-    # Or just: npm start
+    # Or just: npm run dev
     ```
     On startup, the connector refreshes all agent tokens and syncs them to each agent's `secretsPath`.
 
@@ -161,7 +163,7 @@ Use this if you already have OpenClaw Gateway and agents running on the same mac
 3. Update `secretsPath` to match your workspace structure
 4. Create/reuse Linear webhook pointing to your domain
 5. Set `LINEAR_WEBHOOK_SECRET` environment variable
-6. Start connector with `npm start` or systemd
+6. Start connector with `npm run dev` or systemd
 
 **When to use this:**
 - Adding agents to existing OpenClaw setup
