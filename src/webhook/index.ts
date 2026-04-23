@@ -209,12 +209,13 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
         const sessionId = route.sessionKey;
 
         // Fire-and-forget delivery — use agent command with --deliver flag
-        // This sends message to agent's configured channel instead of hardcoded Telegram ID
-        const deliveryCmd = `${nodeBin} ${openclawScript} agent --agent ${JSON.stringify(agentName)} --message ${JSON.stringify(message)} --deliver`;
+        // --channel telegram: required when multiple channels (slack, telegram) are configured;
+        // without an explicit channel OpenClaw fails-closed with "Channel is required" error.
         const child = require("child_process").spawn(nodeBin, [
           openclawScript, "agent",
           "--agent", agentName,
           "--message", message,
+          "--channel", "telegram",
           "--deliver",
         ], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
         child.unref();
