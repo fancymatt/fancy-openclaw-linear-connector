@@ -4,74 +4,141 @@ A standalone connector service that bridges Linear webhooks to OpenClaw agent se
 
 > **Status:** v0.2 in development — Fully functional, 15 agents onboarded, symlink-escape bug documented
 
-## Quick Start (5 Minutes)
+## Quick Start
 
 **Prerequisites:**
 - OpenClaw Gateway running on your machine
 - Node.js 18+ (`npm install` to run connector)
 - Linear workspace with admin permissions
+- A domain name pointing to your machine (for webhook delivery)
 
-**Steps:**
-1. **Clone connector:**
+### Phase 1: Clone & Run the Connector
+
+1. **Clone and install:**
    ```bash
    git clone https://github.com/fancymatt/fancy-openclaw-linear-connector.git
    cd fancy-openclaw-linear-connector
    npm install
    ```
-2. **Create OAuth app in Linear:**
-   - Settings → API → Applications → Create new
-   - Name: `Your Agent Name`
-   - Redirect URI: `https://your-host.com/oauth/callback`
-   - Scopes: `read, write, app:assignable, app:mentionable`
-   - **Important:** Must check `actor=app` in authorization URL
-   - Get Client ID and Client Secret
-3. **Get tokens:**
-   ```bash
-   # Replace with your OAuth code from browser redirect
-   curl -s -X POST https://api.linear.app/oauth/token \
-     -d "client_id=YOUR_CLIENT_ID" \
-     -d "client_secret=YOUR_CLIENT_SECRET" \
-     -d "code=CODE_FROM_REDIRECT" \
-     -d "redirect_uri=https://your-host.com/oauth/callback" \
-     -d "grant_type=authorization_code"
-   ```
-4. **Get Linear User ID:**
-   ```bash
-   curl -s https://api.linear.app/graphql \
-     -H "Authorization: Bearer ACCESS_TOKEN" \
-     -H "Content-Type: application/json" \
-     -d '{"query":"{ viewer { id name email } }"}'
-   ```
-5. **Add agent to agents.json:**
-   ```json
-   {
-     "name": "agent-name",
-     "linearUserId": "UUID",
-     "clientId": "CLIENT_ID",
-     "clientSecret": "CLIENT_SECRET",
-     "accessToken": "ACCESS_TOKEN",
-     "refreshToken": "REFRESH_TOKEN",
-     "secretsPath": "/path/to/workspace/.secrets/linear.env",
-     "openclawAgent": "openclaw-agent-name"
+
+2. **Set up reverse proxy:**
+   The connector listens on port 3100. Set up nginx (or similar) to proxy `https://your-host/linear-webhook/` → `http://localhost:3100/webhook`.
+
+   Example nginx config:
+   ```nginx
+   location /linear-webhook/ {
+       proxy_pass http://localhost:3100/webhook;
+       proxy_set_header Host $host;
+       proxy_set_header X-Real-IP $remote_addr;
    }
    ```
-6. **Create Linear webhook:**
-   - Settings → API → Webhooks → Create
-   - URL: `https://your-host.com/linear-webhook`
-   - Events: `Issue`, `Comment`, `AgentSessionEvent`
-   - Secret: Use OAuth app's signing secret
-   - **Note:** One webhook per workspace handles all agents
-7. **Create secrets file:**
-   ```bash
-   mkdir -p /path/to/workspace/.secrets
-   echo 'LINEAR_API_KEY=ACCESS_TOKEN' > /path/to/workspace/.secrets/linear.env
-   ```
-8. **Start connector:**
+
+   Verify it's reachable before proceeding — `curl -v https://your-host/linear-webhook/` should connect (even if it returns a 4xx, that means the proxy is working).
+
+3. **Start the connector:**
    ```bash
    npm start
    # Or: systemd service (see Deployment Scenarios below)
    ```
-9. **Test:** Delegate an issue to your agent in Linear and check connector logs
+
+### Phase 2: Set Up the Webhook
+
+4. **Create a Linear webhook:**
+   - Linear → Settings → API → Webhooks → Create new
+   - URL: `https://your-host/linear-webhook/`
+   - Events: `Issue`, `Comment`, `AgentSessionEvent`
+   - Note the **signing secret** — you'll need it below
+   - ⚠️ **Only create this once per workspace** — one webhook handles all agents
+
+5. **Configure the webhook secret:**
+   Set the `LINEAR_WEBHOOK_SECRET` environment variable to the signing secret from step 4. If using systemd, add it to your service file or `.env`.
+
+   ```bash
+   export LINEAR_WEBHOOK_SECRET=your-signing-secret
+   ```
+
+   Restart the connector if it's already running so it picks up the secret.
+
+### Phase 3: Create OAuth App (Per Agent)
+
+Repeat this phase for each agent you want to connect.
+
+6. **Create OAuth app in Linear:**
+   - Settings → API → Applications → Create new
+   - Name: your agent's display name (e.g. `Charles (CTO)`)
+   - Redirect URI: `https://your-host/oauth/callback`
+   - Scopes: `read, write, app:assignable, app:mentionable`
+   - Note the **Client ID** and **Client Secret**
+
+7. **Authorize as an app (NOT as your personal user):**
+   Visit this URL in your browser (requires workspace admin):
+   ```text
+   https://linear.app/oauth/authorize?client_id=CLIENT_ID&redirect_uri=REDIRECT_URI&response_type=code&scope=read,write,app:assignable,app:mentionable&actor=app&state=AGENT_NAME
+   ```
+
+   ⚠️ **Must include `actor=app`** — this installs the app as its own user. Without it, the agent won't appear in delegate/mention menus and the self-trigger filter will break.
+
+   After approving, Linear redirects to your callback URL with a `code` parameter.
+
+8. **Exchange the code for tokens:**
+   ```bash
+   curl -s -X POST https://api.linear.app/oauth/token \
+     -d "client_id=YOUR_CLIENT_ID" \
+     -d "client_secret=YOUR_CLIENT_SECRET" \
+     -d "code=CODE_FROM_REDIRECT" \
+     -d "redirect_uri=https://your-host/oauth/callback" \
+     -d "grant_type=authorization_code"
+   ```
+
+   ⚠️ **Verify the response includes scopes `app:assignable` and `app:mentionable`.** If not, the OAuth URL was wrong (missing `actor=app` or scope params).
+
+9. **Get the agent's Linear User ID:**
+   ```bash
+   curl -s https://api.linear.app/graphql \
+     -H "Authorization: Bearer ACCESS_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"query":"{ viewer { id name } }"}'
+   ```
+
+   ⚠️ **Must show the agent's name** (e.g. `Charles (CTO)`). If it shows your personal name, you authorized as a user — redo step 7 with `actor=app`.
+
+### Phase 4: Connect Everything
+
+10. **Add agent to `agents.json`:**
+    ```json
+    {
+      "name": "agent-name",
+      "linearUserId": "UUID_FROM_STEP_9",
+      "clientId": "CLIENT_ID",
+      "clientSecret": "CLIENT_SECRET",
+      "accessToken": "ACCESS_TOKEN",
+      "refreshToken": "REFRESH_TOKEN",
+      "secretsPath": "/path/to/workspace/.secrets/linear.env",
+      "openclawAgent": "openclaw-agent-name",
+      "host": "local"
+    }
+    ```
+
+    **`secretsPath` must point to `linear.env`** — the `linear` CLI reads from `.secrets/linear.env`.
+
+11. **Create the secrets file:**
+    ```bash
+    mkdir -p /path/to/workspace/.secrets
+    echo 'LINEAR_API_KEY=ACCESS_TOKEN' > /path/to/workspace/.secrets/linear.env
+    ```
+
+12. **Restart the connector:**
+    ```bash
+    sudo systemctl restart fancy-openclaw-linear-connector
+    # Or just: npm start
+    ```
+    On startup, the connector refreshes all agent tokens and syncs them to each agent's `secretsPath`.
+
+13. **Test:** Delegate a Linear issue to the agent. Check connector logs:
+    ```bash
+    journalctl -u fancy-openclaw-linear-connector -f
+    ```
+    You should see: `Routed via delegate → agent-name`, `Session created`, `Delivery spawned`. The agent should comment on the issue within a minute or two.
 
 ---
 
