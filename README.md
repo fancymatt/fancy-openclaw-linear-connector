@@ -30,7 +30,7 @@ A standalone connector service that bridges Linear webhooks to OpenClaw agent se
    Example nginx config:
    ```nginx
    location /linear-webhook/ {
-       proxy_pass http://localhost:3100/webhooks;
+       proxy_pass http://localhost:3100/;
        proxy_set_header Host $host;
        proxy_set_header X-Real-IP $remote_addr;
    }

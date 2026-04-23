@@ -12,7 +12,7 @@ export function createApp() {
 
   // Raw body capture for webhook signature validation.
   app.use(
-    "/webhooks",
+    "/",
     express.raw({ type: "application/json", limit: "1mb" }),
     (req: Request, _res: Response, next: NextFunction) => {
       if (Buffer.isBuffer(req.body)) {
@@ -36,7 +36,7 @@ export function createApp() {
   // Webhook routes — pass the event store from the dedup module
   const { EventStore } = require("./store/event-store");
   const eventStore = new EventStore();
-  app.use("/webhooks", createWebhookRouter(eventStore));
+  app.use("/", createWebhookRouter(eventStore));
 
   return app;
 }
