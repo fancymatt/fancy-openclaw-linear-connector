@@ -22,7 +22,9 @@ A standalone connector service that bridges Linear webhooks to OpenClaw agent se
    ```
 
 2. **Set up reverse proxy:**
-   The connector listens on port 3100. Set up nginx (or similar) to proxy `https://your-host/linear-webhook/` → `http://localhost:3100/webhook`.
+   The connector listens on port 3100 by default. To use a different port, set `PORT` before starting: `export PORT=3200`.
+
+   Set up nginx (or similar) to proxy `https://your-host/linear-webhook/` → `http://localhost:3100/webhook` (or your chosen port).
 
    Example nginx config:
    ```nginx
