@@ -53,18 +53,23 @@ A standalone connector service that bridges Linear webhooks to OpenClaw agent se
    - Linear → Settings → API → Webhooks → Create new
    - URL: `https://your-host/linear-webhook/linear`
    - Events: **Issue**, **Comment**
-   - Note the **signing secret** — you'll need it below
+   - Copy the **signing secret** that Linear generates — you'll need it next
    - ⚠️ **Only create this once per workspace** — one webhook handles all agents
    - ⚠️ Don't enable per-agent webhooks. The workspace webhook covers all routing.
 
-5. **Configure the webhook secret:**
-   Set the `LINEAR_WEBHOOK_SECRET` environment variable to the signing secret from step 4. If using systemd, add it to your service file or `.env`.
+5. **Configure the webhook signing secret in the connector:**
+   The connector verifies that incoming webhook requests are actually from Linear using the signing secret. Set it as an environment variable in the connector's environment (the machine running the connector service, not OpenClaw).
 
    ```bash
-   export LINEAR_WEBHOOK_SECRET=your-signing-secret
+   export LINEAR_WEBHOOK_SECRET=the-signing-secret-from-step-4
    ```
 
-   Restart the connector if it's already running so it picks up the secret.
+   Or create a `.env` file in the connector directory:
+   ```
+   LINEAR_WEBHOOK_SECRET=the-signing-secret-from-step-4
+   ```
+
+   Restart the connector so it picks up the secret.
 
 ### Phase 3: Create OAuth App (Per Agent)
 
