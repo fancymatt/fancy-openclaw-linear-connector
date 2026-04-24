@@ -43,6 +43,8 @@ function createApp() {
 if (require.main === module) {
     const agents = (0, agents_1.getAgents)();
     log.info(`Starting connector with ${agents.length} agent(s): ${agents.map((a) => a.name).join(", ")}`);
+    // Watch agents.json for external changes — no restart needed to add agents
+    (0, agents_1.watchAgentsFile)();
     // Start token refresh for all configured agents
     if (agents.length > 0) {
         (0, token_refresh_1.startTokenRefresh)();

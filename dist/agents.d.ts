@@ -15,6 +15,8 @@ export interface AgentConfig {
     /** Path to write LINEAR_API_KEY when tokens refresh */
     secretsPath?: string;
 }
+/** Start watching agents.json for external changes (e.g. manual edits). */
+export declare function watchAgentsFile(): void;
 export declare function getAgents(): AgentConfig[];
 /** Build linearUserId → agentName map for routing */
 export declare function buildAgentMap(): Record<string, string>;

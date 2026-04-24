@@ -52,8 +52,38 @@ function save(agents: AgentConfig[]): void {
   fs.writeFileSync(getAgentsPath(), JSON.stringify(data, null, 2) + "\n", "utf8");
 }
 
-// In-memory cache, kept in sync with disk
+// In-memory cache, kept in sync with disk via file watcher
 let _agents: AgentConfig[] = load();
+
+/** Start watching agents.json for external changes (e.g. manual edits). */
+export function watchAgentsFile(): void {
+  const filePath = getAgentsPath();
+  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  try {
+    const watcher = fs.watch(filePath, (eventType) => {
+      if (eventType === "change") {
+        // Debounce — editors often write in multiple steps
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          const reloaded = load();
+          const added = reloaded.filter((r) => !_agents.some((a) => a.name === r.name));
+          const removed = _agents.filter((a) => !reloaded.some((r) => r.name === a.name));
+          _agents = reloaded;
+          log.info(`agents.json reloaded: ${_agents.length} agent(s)` +
+            (added.length ? ` — added: ${added.map((a) => a.name).join(", ")}` : "") +
+            (removed.length ? ` — removed: ${removed.map((a) => a.name).join(", ")}` : ""));
+        }, 250);
+      }
+    });
+    watcher.on("error", () => {
+      // File doesn't exist yet or was deleted — that's fine, will retry on next access
+      log.warn(`Could not watch ${filePath} for changes`);
+    });
+  } catch {
+    // fs.watch not supported in this environment — non-fatal
+  }
+}
 
 export function getAgents(): AgentConfig[] {
   return _agents;

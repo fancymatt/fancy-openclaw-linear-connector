@@ -8,6 +8,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.watchAgentsFile = watchAgentsFile;
 exports.getAgents = getAgents;
 exports.buildAgentMap = buildAgentMap;
 exports.getAccessToken = getAccessToken;
@@ -42,8 +43,38 @@ function save(agents) {
     const data = { agents };
     node_fs_1.default.writeFileSync(getAgentsPath(), JSON.stringify(data, null, 2) + "\n", "utf8");
 }
-// In-memory cache, kept in sync with disk
+// In-memory cache, kept in sync with disk via file watcher
 let _agents = load();
+/** Start watching agents.json for external changes (e.g. manual edits). */
+function watchAgentsFile() {
+    const filePath = getAgentsPath();
+    let debounceTimer = null;
+    try {
+        const watcher = node_fs_1.default.watch(filePath, (eventType) => {
+            if (eventType === "change") {
+                // Debounce — editors often write in multiple steps
+                if (debounceTimer)
+                    clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(() => {
+                    const reloaded = load();
+                    const added = reloaded.filter((r) => !_agents.some((a) => a.name === r.name));
+                    const removed = _agents.filter((a) => !reloaded.some((r) => r.name === a.name));
+                    _agents = reloaded;
+                    log.info(`agents.json reloaded: ${_agents.length} agent(s)` +
+                        (added.length ? ` — added: ${added.map((a) => a.name).join(", ")}` : "") +
+                        (removed.length ? ` — removed: ${removed.map((a) => a.name).join(", ")}` : ""));
+                }, 250);
+            }
+        });
+        watcher.on("error", () => {
+            // File doesn't exist yet or was deleted — that's fine, will retry on next access
+            log.warn(`Could not watch ${filePath} for changes`);
+        });
+    }
+    catch {
+        // fs.watch not supported in this environment — non-fatal
+    }
+}
 function getAgents() {
     return _agents;
 }

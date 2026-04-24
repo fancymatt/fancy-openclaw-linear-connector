@@ -1,7 +1,7 @@
 import express, { Request, Response, NextFunction } from "express";
 import { createWebhookRouter } from "./webhook";
 import { startTokenRefresh } from "./token-refresh";
-import { getAgents } from "./agents";
+import { getAgents, watchAgentsFile } from "./agents";
 import { createLogger, componentLogger } from "./logger";
 import { handleOAuthCallback } from "./oauth-callback";
 
@@ -49,6 +49,9 @@ export function createApp() {
 if (require.main === module) {
   const agents = getAgents();
   log.info(`Starting connector with ${agents.length} agent(s): ${agents.map((a) => a.name).join(", ")}`);
+
+  // Watch agents.json for external changes — no restart needed to add agents
+  watchAgentsFile();
 
   // Start token refresh for all configured agents
   if (agents.length > 0) {
