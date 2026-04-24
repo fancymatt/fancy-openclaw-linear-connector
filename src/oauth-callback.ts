@@ -153,7 +153,7 @@ export async function handleOAuthCallback(req: Request, res: Response): Promise<
       ${!scope?.includes("app:assignable") ? '<p class="warning">⚠️ Missing app:assignable scope. Did you use actor=app in the authorize URL?</p>' : ""}
       <h3>Agent entry in agents.json:</h3>
       <pre>${JSON.stringify(agentConfig, null, 2)}</pre>
-      <p>Restart the connector to load the new agent and start token refresh.</p>
+      <p>The connector will pick up the new agent automatically. No restart needed.</p>
     </body>
     </html>
   `);
