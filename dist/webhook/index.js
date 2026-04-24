@@ -33,6 +33,9 @@ Object.defineProperty(exports, "normalizeLinearEvent", { enumerable: true, get: 
  */
 function createWebhookRouter(eventStore) {
     const router = (0, express_1.Router)();
+    router.get("/", (_req, res) => {
+        res.json({ status: "ok", service: "fancy-openclaw-linear-connector" });
+    });
     router.post("/", async (req, res) => {
         const secret = process.env.LINEAR_WEBHOOK_SECRET;
         // ── 1. Debug: log relevant headers ──────────────────────────────────
@@ -179,11 +182,11 @@ function createWebhookRouter(eventStore) {
             }
             else {
                 // Delegate/assignee: lightweight nudge with suppression.
-                if (nudgeStore.isSuppressed(agentName, NUDGE_SUPPRESSION_MS)) {
+                if (nudgeStore.isSuppressed(agentName, identifier, NUDGE_SUPPRESSION_MS)) {
                     log.info(`Nudge suppressed for ${agentName} — within 15-min window. ${identifier} silently queued.`);
                     return;
                 }
-                nudgeStore.recordNudge(agentName);
+                nudgeStore.recordNudge(agentName, identifier);
                 const actionText = reason === "delegate"
                     ? `You were delegated ${identifier}`
                     : `You were assigned ${identifier}`;
@@ -204,7 +207,7 @@ function createWebhookRouter(eventStore) {
                         "Authorization": `Bearer ${hooksToken}`,
                         "Content-Type": "application/json",
                     },
-                    body: JSON.stringify({ agent: agentName, message }),
+                    body: JSON.stringify({ agentId: agentName, message, thinking: process.env.OPENCLAW_HOOKS_THINKING || undefined, model: process.env.OPENCLAW_HOOKS_MODEL || undefined }),
                 });
                 if (!response.ok) {
                     throw new Error(`hooks responded with ${response.status}`);

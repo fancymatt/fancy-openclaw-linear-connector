@@ -220,7 +220,8 @@ Linear webhook → nginx reverse proxy → connector (port 3100)
                                            ├── Normalize event
                                            ├── Route to agent (by delegate/mention)
                                            ├── Create Linear agent session (Working indicator)
-                                           ├── Deliver to OpenClaw agent (fire-and-forget)
+                                           ├── Nudge suppression (per-agent + per-ticket, 15-min window)
+                                           ├── Deliver to OpenClaw (isolated hook or main session)
                                            └── Close agent session when agent process exits
 ```
 
@@ -565,6 +566,7 @@ Self-triggered events (agent acting on its own behalf) are filtered out to preve
 - **Comment webhooks don't include mentionedUsers** — mention routing parses `@name` patterns from comment body.
 - **OAuth tokens refresh every ~20h** — the connector auto-syncs refreshed tokens to agent workspace secrets.
 - **Session deduplication** — 30-second window prevents duplicate sessions from rapid webhooks.
+- **Nudge suppression** — per-ticket 15-minute window prevents spam from duplicate webhooks on the same interaction. Different tickets always deliver.
 
 ## Configuration Reference
 
@@ -576,6 +578,33 @@ Self-triggered events (agent acting on its own behalf) are filtered out to preve
 | `LINEAR_WEBHOOK_SECRET` | Yes | — | Linear webhook signing secret |
 | `NODE_ENV` | No | `development` | Set to `production` for systemd |
 | `AGENTS_FILE` | No | `agents.json` | Path to agent config file |
+| `OPENCLAW_HOOKS_URL` | No | — | OpenClaw `/hooks/agent` URL for isolated delivery |
+| `OPENCLAW_HOOKS_TOKEN` | No | — | Bearer token for the hooks endpoint |
+| `OPENCLAW_HOOKS_THINKING` | No | — | Thinking level for isolated sessions (e.g. `high`) |
+| `OPENCLAW_HOOKS_MODEL` | No | — | Model override for isolated sessions (e.g. `zai/glm-5-turbo`) |
+
+### Delivery Modes
+
+The connector supports two delivery modes, controlled by whether `OPENCLAW_HOOKS_URL` is set:
+
+**Main session mode** (default, no hooks config):
+- Messages are delivered to the agent's existing chat session via `openclaw message`
+- Agent picks up the task on its next heartbeat or wake cycle
+- Good for low-volume setups or when you want tasks in the agent's main thread
+
+**Isolated session mode** (set `OPENCLAW_HOOKS_URL` + `OPENCLAW_HOOKS_TOKEN`):
+- Each webhook creates a fresh, ephemeral agent turn via the `/hooks/agent` endpoint
+- Tasks don't pollute the agent's main session history
+- Supports `model` and `thinking` overrides per-delivery
+- Recommended for multi-agent setups with frequent delegations
+
+Example `.env` for isolated mode:
+```bash
+OPENCLAW_HOOKS_URL=http://127.0.0.1:18789/hooks/agent
+OPENCLAW_HOOKS_TOKEN=your-hooks-token-from-openclaw-json
+OPENCLAW_HOOKS_THINKING=high
+OPENCLAW_HOOKS_MODEL=zai/glm-5-turbo
+```
 
 ### agents.json
 

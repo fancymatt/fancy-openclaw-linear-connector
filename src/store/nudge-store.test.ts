@@ -1,5 +1,6 @@
 /**
- * Tests for NudgeStore — 15-min suppression window for bulk-delegation noise.
+ * Tests for NudgeStore — per-ticket 15-min suppression window.
+ * Suppresses rapid-fire events on the same ticket, but different tickets always deliver.
  */
 
 import fs from "node:fs";
@@ -17,30 +18,35 @@ describe("NudgeStore", () => {
   it("is not suppressed when no nudge recorded", () => {
     const { dbPath, cleanup } = makeTempDb();
     const store = new NudgeStore(dbPath);
-    expect(store.isSuppressed("charles", 15 * 60 * 1000)).toBe(false);
+    expect(store.isSuppressed("charles", "AI-100", 15 * 60 * 1000)).toBe(false);
     store.close();
     cleanup();
   });
 
-  it("is suppressed immediately after recordNudge", () => {
+  it("is suppressed for same agent + same ticket after recordNudge", () => {
     const { dbPath, cleanup } = makeTempDb();
     const store = new NudgeStore(dbPath);
-    store.recordNudge("charles");
-    expect(store.isSuppressed("charles", 15 * 60 * 1000)).toBe(true);
+    store.recordNudge("charles", "AI-100");
+    expect(store.isSuppressed("charles", "AI-100", 15 * 60 * 1000)).toBe(true);
+    store.close();
+    cleanup();
+  });
+
+  it("is NOT suppressed for same agent + different ticket", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new NudgeStore(dbPath);
+    store.recordNudge("charles", "AI-100");
+    expect(store.isSuppressed("charles", "AI-200", 15 * 60 * 1000)).toBe(false);
     store.close();
     cleanup();
   });
 
   it("is not suppressed after resetSuppression clears the record", () => {
-    // Tests the expiry path indirectly: once reset, the agent has no
-    // nudge record, so any window returns false — same effective result
-    // as expiry. Direct time-based expiry tests are fragile because
-    // SQLite datetime('now') has second-level precision.
     const { dbPath, cleanup } = makeTempDb();
     const store = new NudgeStore(dbPath);
-    store.recordNudge("charles");
+    store.recordNudge("charles", "AI-100");
     store.resetSuppression("charles");
-    expect(store.isSuppressed("charles", 15 * 60 * 1000)).toBe(false);
+    expect(store.isSuppressed("charles", "AI-100", 15 * 60 * 1000)).toBe(false);
     store.close();
     cleanup();
   });
@@ -48,8 +54,8 @@ describe("NudgeStore", () => {
   it("does not suppress a different agent", () => {
     const { dbPath, cleanup } = makeTempDb();
     const store = new NudgeStore(dbPath);
-    store.recordNudge("charles");
-    expect(store.isSuppressed("astrid", 15 * 60 * 1000)).toBe(false);
+    store.recordNudge("charles", "AI-100");
+    expect(store.isSuppressed("astrid", "AI-100", 15 * 60 * 1000)).toBe(false);
     store.close();
     cleanup();
   });
@@ -57,10 +63,10 @@ describe("NudgeStore", () => {
   it("resets suppression after resetSuppression()", () => {
     const { dbPath, cleanup } = makeTempDb();
     const store = new NudgeStore(dbPath);
-    store.recordNudge("charles");
-    expect(store.isSuppressed("charles", 15 * 60 * 1000)).toBe(true);
+    store.recordNudge("charles", "AI-100");
+    expect(store.isSuppressed("charles", "AI-100", 15 * 60 * 1000)).toBe(true);
     store.resetSuppression("charles");
-    expect(store.isSuppressed("charles", 15 * 60 * 1000)).toBe(false);
+    expect(store.isSuppressed("charles", "AI-100", 15 * 60 * 1000)).toBe(false);
     store.close();
     cleanup();
   });
@@ -68,11 +74,11 @@ describe("NudgeStore", () => {
   it("increments nudge count on repeated recordNudge calls", () => {
     const { dbPath, cleanup } = makeTempDb();
     const store = new NudgeStore(dbPath);
-    store.recordNudge("charles");
-    store.recordNudge("charles");
-    store.recordNudge("charles");
+    store.recordNudge("charles", "AI-100");
+    store.recordNudge("charles", "AI-100");
+    store.recordNudge("charles", "AI-100");
     // Just confirm it stays suppressed and doesn't throw
-    expect(store.isSuppressed("charles", 15 * 60 * 1000)).toBe(true);
+    expect(store.isSuppressed("charles", "AI-100", 15 * 60 * 1000)).toBe(true);
     store.close();
     cleanup();
   });

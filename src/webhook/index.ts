@@ -33,6 +33,10 @@ export { normalizeLinearEvent } from "./normalize";
 export function createWebhookRouter(eventStore?: EventStore): Router {
   const router = Router();
 
+  router.get("/", (_req: Request, res: Response) => {
+    res.json({ status: "ok", service: "fancy-openclaw-linear-connector" });
+  });
+
   router.post(
     "/",
     async (req: Request, res: Response): Promise<void> => {
@@ -196,11 +200,11 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
           message = `[NEW TASK] You were mentioned on ${identifier}: ${title}.\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments.\n\nRun these commands:\n  linear issue ${identifier}\n  linear comments ${identifier}\n\nReview both the description AND comments for your task brief before taking action.`;
         } else {
           // Delegate/assignee: lightweight nudge with suppression.
-          if (nudgeStore.isSuppressed(agentName, NUDGE_SUPPRESSION_MS)) {
+          if (nudgeStore.isSuppressed(agentName, identifier, NUDGE_SUPPRESSION_MS)) {
             log.info(`Nudge suppressed for ${agentName} — within 15-min window. ${identifier} silently queued.`);
             return;
           }
-          nudgeStore.recordNudge(agentName);
+          nudgeStore.recordNudge(agentName, identifier);
           const actionText = reason === "delegate"
             ? `You were delegated ${identifier}`
             : `You were assigned ${identifier}`;
@@ -223,7 +227,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
               "Authorization": `Bearer ${hooksToken}`,
               "Content-Type": "application/json",
             },
-            body: JSON.stringify({ agentId: agentName, message }),
+            body: JSON.stringify({ agentId: agentName, message, thinking: process.env.OPENCLAW_HOOKS_THINKING || undefined, model: process.env.OPENCLAW_HOOKS_MODEL || undefined }),
           });
           if (!response.ok) {
             throw new Error(`hooks responded with ${response.status}`);
