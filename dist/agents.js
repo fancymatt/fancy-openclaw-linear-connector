@@ -121,9 +121,12 @@ function syncWorkspaceSecrets(agentName, accessToken) {
 }
 /** Add or update an agent from OAuth callback */
 function upsertAgent(config) {
-    const existing = _agents.find((a) => a.linearUserId === config.linearUserId);
+    // Match by name first (for partial entries that don't have linearUserId yet)
+    // then fall back to linearUserId for token refresh updates
+    const existing = _agents.find((a) => a.name === config.name) ??
+        _agents.find((a) => a.linearUserId === config.linearUserId);
     if (existing) {
-        _agents = _agents.map((a) => a.linearUserId === config.linearUserId ? { ...a, ...config } : a);
+        _agents = _agents.map((a) => a.name === config.name ? { ...a, ...config } : a);
         save(_agents);
         syncWorkspaceSecrets(config.name, config.accessToken);
         return { isNew: false };
