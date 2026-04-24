@@ -223,7 +223,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
               "Authorization": `Bearer ${hooksToken}`,
               "Content-Type": "application/json",
             },
-            body: JSON.stringify({ agent: agentName, message }),
+            body: JSON.stringify({ agentId: agentName, message }),
           });
           if (!response.ok) {
             throw new Error(`hooks responded with ${response.status}`);
