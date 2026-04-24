@@ -95,7 +95,13 @@ Repeat this phase for each agent you want to connect.
      ]
    }
    ```
-   The callback will fill in `linearUserId`, `accessToken`, and `refreshToken` automatically. Only add `openclawAgent` if the OpenClaw agent name differs from the `name` field.
+   The callback will fill in `linearUserId`, `accessToken`, and `refreshToken` automatically.
+
+   **Naming rules:**
+   - `name` must match the `state` parameter in the authorize URL (step 8) — this is case-sensitive
+   - By default, the connector uses `name` as the OpenClaw agent name when delivering messages
+   - If your OpenClaw agent name differs from `name`, add `"openclawAgent": "the-openclaw-name"` to the entry
+  
 
 8. **Authorize as an app (NOT as your personal user):**
    Visit this URL in your browser (requires workspace admin):
