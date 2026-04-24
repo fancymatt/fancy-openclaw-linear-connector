@@ -593,10 +593,13 @@ The connector supports two delivery modes, controlled by whether `OPENCLAW_HOOKS
 - Good for low-volume setups or when you want tasks in the agent's main thread
 
 **Isolated session mode** (set `OPENCLAW_HOOKS_URL` + `OPENCLAW_HOOKS_TOKEN`):
-- Each webhook creates a fresh, ephemeral agent turn via the `/hooks/agent` endpoint
+- Each webhook creates or resumes a **task-scoped agent session** keyed to the Linear ticket (e.g. `linear-AI-395`)
+- On first mention, a new session is created. On subsequent mentions/comments on the same ticket, the existing session is reused — the agent already has the ticket context loaded
 - Tasks don't pollute the agent's main session history
 - Supports `model` and `thinking` overrides per-delivery
 - Recommended for multi-agent setups with frequent delegations
+
+> **Task-scoped sessions:** OpenClaw creates sessions with keys matching `linear-{IDENTIFIER}` (e.g. `linear-AI-395`). If a session for that ticket already exists, subsequent webhook events on the same ticket resume it. This gives agents persistent per-ticket context without manual session management.
 
 Example `.env` for isolated mode:
 ```bash

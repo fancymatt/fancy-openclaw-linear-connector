@@ -227,7 +227,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
               "Authorization": `Bearer ${hooksToken}`,
               "Content-Type": "application/json",
             },
-            body: JSON.stringify({ agentId: agentName, message, thinking: process.env.OPENCLAW_HOOKS_THINKING || undefined, model: process.env.OPENCLAW_HOOKS_MODEL || undefined }),
+            body: JSON.stringify({ agentId: agentName, sessionKey: sessionId, message, thinking: process.env.OPENCLAW_HOOKS_THINKING || undefined, model: process.env.OPENCLAW_HOOKS_MODEL || undefined }),
           });
           if (!response.ok) {
             throw new Error(`hooks responded with ${response.status}`);
