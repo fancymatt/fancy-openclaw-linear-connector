@@ -197,7 +197,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
 
         if (reason === "mention" || reason === "body-mention") {
           // Mentions always fire the short, accurate message without delegation boilerplate.
-          message = `[NEW TASK] You were mentioned on ${identifier}: ${title}.\n\nIMPORTANT: Fetch the FULL issue details INCLUDING comment history. The task brief may be in the description OR in the comments.\n\nRun these commands:\n  linear issue ${identifier}\n  linear comments ${identifier}\n\nReview both the description AND comments for your task brief before taking action.`;
+          message = `[NEW TASK] You were mentioned on ${identifier}: ${title}.\n\nRun \`linear observeIssue ${identifier}\` to read the full context.`;
         } else {
           // Delegate/assignee: lightweight nudge with suppression.
           if (nudgeStore.isSuppressed(agentName, identifier, NUDGE_SUPPRESSION_MS)) {
@@ -208,7 +208,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
           const actionText = reason === "delegate"
             ? `You were delegated ${identifier}`
             : `You were assigned ${identifier}`;
-          message = `[NEW TASK] ${actionText}. Run \`linear my-next\` to see your highest-priority pending task.`;
+          message = `[NEW TASK] ${actionText}. Run \`linear considerWork ${identifier}\` to pick it up.`;
         }
         const sessionId = route.sessionKey;
 
