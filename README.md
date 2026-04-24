@@ -90,13 +90,12 @@ Repeat this phase for each agent you want to connect.
        {
          "name": "agent-name",
          "clientId": "CLIENT_ID",
-         "clientSecret": "CLIENT_SECRET",
-         "openclawAgent": "openclaw-agent-name"
+         "clientSecret": "CLIENT_SECRET"
        }
      ]
    }
    ```
-   The callback will fill in `linearUserId`, `accessToken`, and `refreshToken` automatically.
+   The callback will fill in `linearUserId`, `accessToken`, and `refreshToken` automatically. Only add `openclawAgent` if the OpenClaw agent name differs from the `name` field.
 
 8. **Authorize as an app (NOT as your personal user):**
    Visit this URL in your browser (requires workspace admin):
