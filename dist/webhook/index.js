@@ -199,38 +199,98 @@ function createWebhookRouter(eventStore) {
             // Enable isolated mode by setting OPENCLAW_HOOKS_URL + OPENCLAW_HOOKS_TOKEN in .env.
             const hooksUrl = process.env.OPENCLAW_HOOKS_URL;
             const hooksToken = process.env.OPENCLAW_HOOKS_TOKEN;
+            const DELIVERY_TIMEOUT_MS = 30000;
+            const RETRY_DELAY_MS = 5000;
+            const MAX_RETRIES = 1;
             if (hooksUrl && hooksToken) {
-                // Isolated session mode
-                const response = await fetch(hooksUrl, {
-                    method: "POST",
-                    headers: {
-                        "Authorization": `Bearer ${hooksToken}`,
-                        "Content-Type": "application/json",
-                    },
-                    body: JSON.stringify({ agentId: agentName, message, thinking: process.env.OPENCLAW_HOOKS_THINKING || undefined, model: process.env.OPENCLAW_HOOKS_MODEL || undefined }),
-                });
-                if (!response.ok) {
-                    throw new Error(`hooks responded with ${response.status}`);
+                // Isolated session mode — fetch with timeout + single retry
+                let delivered = false;
+                for (let attempt = 0; attempt <= MAX_RETRIES && !delivered; attempt++) {
+                    if (attempt > 0) {
+                        log.info(`Retrying isolated delivery for ${agentName} [${sessionId}] (attempt ${attempt + 1}/${MAX_RETRIES + 1}) after ${RETRY_DELAY_MS}ms`);
+                        await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+                    }
+                    try {
+                        const controller = new AbortController();
+                        const timer = setTimeout(() => controller.abort(), DELIVERY_TIMEOUT_MS);
+                        const response = await fetch(hooksUrl, {
+                            method: "POST",
+                            headers: {
+                                "Authorization": `Bearer ${hooksToken}`,
+                                "Content-Type": "application/json",
+                            },
+                            body: JSON.stringify({ agentId: agentName, sessionKey: sessionId, message, thinking: process.env.OPENCLAW_HOOKS_THINKING || undefined, model: process.env.OPENCLAW_HOOKS_MODEL || undefined }),
+                            signal: controller.signal,
+                        });
+                        clearTimeout(timer);
+                        if (!response.ok) {
+                            throw new Error(`hooks responded with ${response.status}`);
+                        }
+                        const json = await response.json();
+                        log.info(`Isolated delivery dispatched for ${agentName} [${sessionId}]: runId=${json.runId ?? "ok"}`);
+                        delivered = true;
+                    }
+                    catch (err) {
+                        log.error(`Isolated delivery attempt ${attempt + 1} failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
+                    }
                 }
-                const json = await response.json();
-                log.info(`Isolated delivery dispatched for ${agentName} [${sessionId}]: runId=${json.runId ?? "ok"}`);
+                if (!delivered) {
+                    log.error(`All delivery attempts exhausted for ${agentName} [${sessionId}]`);
+                }
             }
             else {
                 // Default mode: route to agent's main session via CLI
                 // --channel telegram: required when multiple channels are configured;
                 // without an explicit channel OpenClaw fails-closed with "Channel is required" error.
-                const child = require("child_process").spawn(nodeBin, [
-                    openclawScript, "agent",
-                    "--agent", agentName,
-                    "--message", message,
-                    "--channel", "telegram",
-                    "--deliver",
-                ], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
-                child.unref();
-                log.info(`Delivery spawned for ${agentName} [${sessionId}]`);
-                // Note: Linear agent session stays open until agent responds via comment.
-                // We don't close it here because we're just delivering a message,
-                // not starting an agent process that will run and exit.
+                const spawn = require("child_process").spawn;
+                let delivered = false;
+                for (let attempt = 0; attempt <= MAX_RETRIES && !delivered; attempt++) {
+                    if (attempt > 0) {
+                        log.info(`Retrying CLI delivery for ${agentName} [${sessionId}] (attempt ${attempt + 1}/${MAX_RETRIES + 1}) after ${RETRY_DELAY_MS}ms`);
+                        await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+                    }
+                    try {
+                        delivered = await new Promise((resolve) => {
+                            const child = spawn(nodeBin, [
+                                openclawScript, "agent",
+                                "--agent", agentName,
+                                "--message", message,
+                                "--channel", "telegram",
+                                "--deliver",
+                            ], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+                            child.unref();
+                            const timer = setTimeout(() => {
+                                log.warn(`CLI delivery timed out after ${DELIVERY_TIMEOUT_MS}ms for ${agentName} — killing child`);
+                                child.kill("SIGKILL");
+                                resolve(false);
+                            }, DELIVERY_TIMEOUT_MS);
+                            child.on("exit", (code) => {
+                                clearTimeout(timer);
+                                if (code === 0) {
+                                    resolve(true);
+                                }
+                                else {
+                                    log.error(`CLI delivery exited with code ${code} for ${agentName}`);
+                                    resolve(false);
+                                }
+                            });
+                            child.on("error", (err) => {
+                                clearTimeout(timer);
+                                log.error(`CLI delivery spawn error for ${agentName}: ${err.message}`);
+                                resolve(false);
+                            });
+                        });
+                    }
+                    catch (err) {
+                        log.error(`CLI delivery attempt ${attempt + 1} threw for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
+                    }
+                }
+                if (delivered) {
+                    log.info(`Delivery spawned for ${agentName} [${sessionId}]`);
+                }
+                else {
+                    log.error(`All CLI delivery attempts exhausted for ${agentName} [${sessionId}]`);
+                }
             }
         }
         catch (err) {
