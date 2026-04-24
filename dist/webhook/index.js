@@ -190,21 +190,45 @@ function createWebhookRouter(eventStore) {
                 message = `[NEW TASK] ${actionText}. Run \`linear my-next\` to see your highest-priority pending task.`;
             }
             const sessionId = route.sessionKey;
-            // Fire-and-forget delivery — use agent command with --deliver flag
-            // --channel telegram: required when multiple channels (slack, telegram) are configured;
-            // without an explicit channel OpenClaw fails-closed with "Channel is required" error.
-            const child = require("child_process").spawn(nodeBin, [
-                openclawScript, "agent",
-                "--agent", agentName,
-                "--message", message,
-                "--channel", "telegram",
-                "--deliver",
-            ], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
-            child.unref();
-            log.info(`Delivery spawned for ${agentName} [${sessionId}]`);
-            // Note: Linear agent session stays open until agent responds via comment.
-            // We don't close it here because we're just delivering a message,
-            // not starting an agent process that will run and exit.
+            // Fire-and-forget delivery.
+            // Isolated mode (opt-in): POST to /hooks/agent — creates a fresh ephemeral agent turn.
+            // Default mode: spawn openclaw agent CLI — routes to the agent's main session.
+            // Enable isolated mode by setting OPENCLAW_HOOKS_URL + OPENCLAW_HOOKS_TOKEN in .env.
+            const hooksUrl = process.env.OPENCLAW_HOOKS_URL;
+            const hooksToken = process.env.OPENCLAW_HOOKS_TOKEN;
+            if (hooksUrl && hooksToken) {
+                // Isolated session mode
+                const response = await fetch(hooksUrl, {
+                    method: "POST",
+                    headers: {
+                        "Authorization": `Bearer ${hooksToken}`,
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify({ agent: agentName, message }),
+                });
+                if (!response.ok) {
+                    throw new Error(`hooks responded with ${response.status}`);
+                }
+                const json = await response.json();
+                log.info(`Isolated delivery dispatched for ${agentName} [${sessionId}]: runId=${json.runId ?? "ok"}`);
+            }
+            else {
+                // Default mode: route to agent's main session via CLI
+                // --channel telegram: required when multiple channels are configured;
+                // without an explicit channel OpenClaw fails-closed with "Channel is required" error.
+                const child = require("child_process").spawn(nodeBin, [
+                    openclawScript, "agent",
+                    "--agent", agentName,
+                    "--message", message,
+                    "--channel", "telegram",
+                    "--deliver",
+                ], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+                child.unref();
+                log.info(`Delivery spawned for ${agentName} [${sessionId}]`);
+                // Note: Linear agent session stays open until agent responds via comment.
+                // We don't close it here because we're just delivering a message,
+                // not starting an agent process that will run and exit.
+            }
         }
         catch (err) {
             log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
