@@ -119,20 +119,15 @@ Repeat this phase for each agent you want to connect.
 
 9. **Verify the success page shows the agent's name** (e.g. `Charles (CTO)`). If it shows your personal name, you authorized as a user — redo step 8 with `actor=app`.
 
-### Phase 4: Connect Everything
+### Phase 4: Test
 
-10. **Restart the connector:**
-    ```bash
-    sudo systemctl restart fancy-openclaw-linear-connector
-    # Or just: npm run dev
-    ```
-    On startup, the connector refreshes all agent tokens and syncs them to each agent's `secretsPath`.
-
-13. **Test:** Delegate a Linear issue to the agent. Check connector logs:
+10. **Test:** Delegate a Linear issue to the agent. Check connector logs:
     ```bash
     journalctl -u fancy-openclaw-linear-connector -f
     ```
     You should see: `Routed via delegate → agent-name`, `Session created`, `Delivery spawned`. The agent should comment on the issue within a minute or two.
+
+    If you're not running as a systemd service, check the terminal output from `node dist/index.js` or `npm run dev` instead of `journalctl`.
 
 ---
 
