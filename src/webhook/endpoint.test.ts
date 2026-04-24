@@ -25,13 +25,13 @@ const validIssueBody = JSON.stringify({
     priorityLabel: "No priority",
     team: { id: "t1", key: "ENG" },
     labelIds: [],
-    url: "https://linear.app/test/issue/ENG-1",
+    url: "https://.app/test/issue/ENG-1",
     createdAt: "2026-04-10T12:00:00.000Z",
     updatedAt: "2026-04-10T12:00:00.000Z",
   },
 });
 
-describe("POST /linear", () => {
+describe("POST /", () => {
   let app: ReturnType<typeof createApp>;
 
   beforeEach(() => {
@@ -45,7 +45,7 @@ describe("POST /linear", () => {
 
   it("returns 200 for a valid signed request", async () => {
     const res = await request(app)
-      .post("/linear")
+      .post("/")
       .set("Content-Type", "application/json")
       .set("x-linear-signature", sign(validIssueBody))
       .send(validIssueBody);
@@ -56,7 +56,7 @@ describe("POST /linear", () => {
 
   it("returns 401 for an invalid signature", async () => {
     const res = await request(app)
-      .post("/linear")
+      .post("/")
       .set("Content-Type", "application/json")
       .set("x-linear-signature", "deadbeef".repeat(8))
       .send(validIssueBody);
@@ -66,7 +66,7 @@ describe("POST /linear", () => {
 
   it("returns 400 when signature header is missing", async () => {
     const res = await request(app)
-      .post("/linear")
+      .post("/")
       .set("Content-Type", "application/json")
       .send(validIssueBody);
 
@@ -77,7 +77,7 @@ describe("POST /linear", () => {
   it("returns 400 for malformed JSON", async () => {
     const badBody = "not-json{{{";
     const res = await request(app)
-      .post("/linear")
+      .post("/")
       .set("Content-Type", "application/json")
       .set("x-linear-signature", sign(badBody))
       .send(badBody);
@@ -88,7 +88,7 @@ describe("POST /linear", () => {
   it("returns 400 for a payload missing required fields", async () => {
     const badPayload = JSON.stringify({ foo: "bar" });
     const res = await request(app)
-      .post("/linear")
+      .post("/")
       .set("Content-Type", "application/json")
       .set("x-linear-signature", sign(badPayload))
       .send(badPayload);
@@ -99,7 +99,7 @@ describe("POST /linear", () => {
   it("skips signature validation when LINEAR_WEBHOOK_SECRET is not set", async () => {
     delete process.env.LINEAR_WEBHOOK_SECRET;
     const res = await request(app)
-      .post("/linear")
+      .post("/")
       .set("Content-Type", "application/json")
       .set("x-linear-signature", sign(validIssueBody))
       .send(validIssueBody);

@@ -51,7 +51,7 @@ A standalone connector service that bridges Linear webhooks to OpenClaw agent se
 
 4. **Create a Linear webhook:**
    - Linear → Settings → API → Webhooks → Create new
-   - URL: `https://your-host/linear-webhook/linear`
+   - URL: `https://your-host/linear-webhook/`
    - Events: **Issue**, **Comment**
    - Copy the **signing secret** that Linear generates — you'll need it next
    - ⚠️ **Only create this once per workspace** — one webhook handles all agents
@@ -171,7 +171,7 @@ Use this for a fresh OpenClaw + connector installation on a different server.
 1. Install OpenClaw on new machine
 2. Clone connector repo: `git clone https://github.com/fancymatt/fancy-openclaw-linear-connector.git`
 3. Copy `agents.json.example` to `agents.json` and configure all agents
-4. Set up nginx reverse proxy for `/linear-webhook` → `http://localhost:3100/webhook`
+4. Set up nginx reverse proxy for `/linear-webhook` → `http://localhost:3100/`
 5. Update Linear webhook URL to point to your new domain
 6. Update OAuth apps' `redirect_uri` to new domain (or keep `ai.fcy.sh` if using same domain)
 7. Create agent workspaces and `.secrets/linear.env` files
@@ -338,7 +338,7 @@ On startup, the connector will:
 If you already have a workspace webhook for Linear events, **update the existing one** instead of creating a new one. Enable the same event types for all agents.
 
 1. Linear → Settings → API → Webhooks → Create new (or edit existing)
-2. URL: `https://your-host/linear-webhook/linear`
+2. URL: `https://your-host/linear-webhook/`
 3. Event types: **Issues**, **Comments**
    - `AgentSessionEvent` is not available on workspace webhooks — it comes from the per-app webhook configured in Step 1
    - Avoid redundant types like `Issue.completed` or `Issue.canceled` (covered by `Issue.updated`)

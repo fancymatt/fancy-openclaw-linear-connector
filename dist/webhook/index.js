@@ -33,7 +33,7 @@ Object.defineProperty(exports, "normalizeLinearEvent", { enumerable: true, get: 
  */
 function createWebhookRouter(eventStore) {
     const router = (0, express_1.Router)();
-    router.post("/linear", async (req, res) => {
+    router.post("/", async (req, res) => {
         const secret = process.env.LINEAR_WEBHOOK_SECRET;
         // ── 1. Debug: log relevant headers ──────────────────────────────────
         log.info(`Webhook received. Headers: ${JSON.stringify(Object.keys(req.headers).filter(h => h.startsWith('x-') || h.startsWith('linear')))} `);

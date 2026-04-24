@@ -34,7 +34,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
   const router = Router();
 
   router.post(
-    "/linear",
+    "/",
     async (req: Request, res: Response): Promise<void> => {
       const secret = process.env.LINEAR_WEBHOOK_SECRET;
 
