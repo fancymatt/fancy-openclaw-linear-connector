@@ -4,7 +4,31 @@ A standalone connector service that bridges Linear webhooks to OpenClaw agent se
 
 > **Status:** v0.2 in development — Fully functional, 15 agents onboarded, symlink-escape bug documented
 
-## Quick Start
+## Quick Start (Onboard Wizard)
+
+The fastest way to add a new agent. The wizard walks you through the entire process interactively.
+
+**Prerequisites:** Connector is already cloned, installed, and running (see [Phase 1](#phase-1-clone--run-the-connector) below).
+
+```bash
+npm run onboard
+```
+
+The wizard will:
+1. Collect the agent name, display name, and OpenClaw agent name
+2. Show step-by-step instructions for creating the OAuth app in Linear
+3. Collect the Client ID and Client Secret
+4. Write the partial config to `agents.json`
+5. Open the authorize URL in your browser
+6. Verify the agent is fully configured after you approve
+
+That's it. The connector picks up the new agent automatically — no restart needed.
+
+---
+
+## Quick Start (Manual)
+
+For reference or when the wizard isn't available. The wizard above automates most of this.
 
 **Prerequisites:**
 - OpenClaw Gateway running on your machine
