@@ -25,7 +25,8 @@ Object.defineProperty(exports, "normalizeLinearEvent", { enumerable: true, get: 
  * route — signature validation requires the exact bytes as received.
  *
  * Environment variables consumed:
- *   LINEAR_WEBHOOK_SECRET  — HMAC secret from the Linear webhook dashboard
+ *   LINEAR_WEBHOOK_SECRETS — comma-separated list of HMAC secrets (new, supports private teams)
+ *   LINEAR_WEBHOOK_SECRET  — single HMAC secret (legacy, backward compatible)
  */
 function createWebhookRouter(eventStore) {
     const router = (0, express_1.Router)();
@@ -33,7 +34,7 @@ function createWebhookRouter(eventStore) {
         res.json({ status: "ok", service: "fancy-openclaw-linear-connector" });
     });
     router.post("/", async (req, res) => {
-        const secret = process.env.LINEAR_WEBHOOK_SECRET;
+        const secrets = (0, signature_1.parseWebhookSecrets)();
         // ── 1. Debug: log relevant headers ──────────────────────────────────
         log.info(`Webhook received. Headers: ${JSON.stringify(Object.keys(req.headers).filter(h => h.startsWith('x-') || h.startsWith('linear')))} `);
         log.info(`linear-event header: ${req.headers["linear-event"] || "(missing)"}`);
@@ -42,7 +43,7 @@ function createWebhookRouter(eventStore) {
         const rawBody = req.rawBody;
         log.info(`Raw body length: ${rawBody?.length || 0} bytes`);
         // ── 3. Signature validation (skip if no secret configured) ────────────
-        if (secret) {
+        if (secrets.length > 0) {
             const signature = req.headers["x-linear-signature"] ?? req.headers["linear-signature"];
             if (!signature || typeof signature !== "string") {
                 res.status(400).json({
@@ -54,7 +55,7 @@ function createWebhookRouter(eventStore) {
                 res.status(400).json({ error: "Empty or unreadable request body" });
                 return;
             }
-            const signatureValid = (0, signature_1.verifyLinearSignature)(rawBody, signature, secret);
+            const signatureValid = (0, signature_1.verifyLinearSignatureMulti)(rawBody, signature, secrets);
             log.info(`Signature validation result: ${signatureValid ? "valid" : "invalid"}`);
             if (!signatureValid) {
                 res.status(401).json({ error: "Invalid signature" });
@@ -62,7 +63,7 @@ function createWebhookRouter(eventStore) {
             }
         }
         else {
-            log.warn("No LINEAR_WEBHOOK_SECRET set — skipping signature validation");
+            log.warn("No LINEAR_WEBHOOK_SECRETS or LINEAR_WEBHOOK_SECRET set — skipping signature validation");
         }
         // ── 4. Parse JSON payload ─────────────────────────────────────────────
         let payload;

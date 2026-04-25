@@ -11,7 +11,8 @@ export { normalizeLinearEvent } from "./normalize";
  * route — signature validation requires the exact bytes as received.
  *
  * Environment variables consumed:
- *   LINEAR_WEBHOOK_SECRET  — HMAC secret from the Linear webhook dashboard
+ *   LINEAR_WEBHOOK_SECRETS — comma-separated list of HMAC secrets (new, supports private teams)
+ *   LINEAR_WEBHOOK_SECRET  — single HMAC secret (legacy, backward compatible)
  */
 export declare function createWebhookRouter(eventStore?: EventStore): Router;
 //# sourceMappingURL=index.d.ts.map
