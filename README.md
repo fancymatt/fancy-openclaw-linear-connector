@@ -78,8 +78,9 @@ For reference or when the wizard isn't available. The wizard above automates mos
    - URL: `https://your-host/linear-webhook/`
    - Events: **Issue**, **Comment**
    - Copy the **signing secret** that Linear generates — you'll need it next
-   - ⚠️ **Only create this once per workspace** — one webhook handles all agents
+   - ⚠️ **Only create this once per workspace** — one workspace webhook handles all agents and all public teams
    - ⚠️ Don't enable per-agent webhooks. The workspace webhook covers all routing.
+   - ⚠️ **Private teams need their own team-level webhook** — see [Private Team Webhooks](#private-team-webhooks) below
 
 5. **Configure the webhook signing secret in the connector:**
    The connector verifies that incoming webhook requests are actually from Linear using the signing secret. Set it as an environment variable in the connector's environment (the machine running the connector service, not OpenClaw).
@@ -366,7 +367,7 @@ On startup, the connector will:
 
 ### Step 7: Create the Linear Webhook
 
-⚠️ **Only create this ONCE per workspace**, not per agent. This is a workspace-level webhook that handles all agents.
+⚠️ **Only create this ONCE per workspace**, not per agent. This is a workspace-level webhook that handles all agents and all public teams. Private teams require separate team-level webhooks — see [Private Team Webhooks](#private-team-webhooks).
 
 If you already have a workspace webhook for Linear events, **update the existing one** instead of creating a new one. Enable the same event types for all agents.
 
@@ -616,15 +617,6 @@ Self-triggered events (agent acting on its own behalf) are filtered out to preve
 | `OPENCLAW_HOOKS_THINKING` | No | — | Thinking level for isolated sessions (e.g. `high`) |
 | `OPENCLAW_HOOKS_MODEL` | No | — | Model override for isolated sessions (e.g. `zai/glm-5-turbo`) |
 
-### Delivery Modes
-
-The connector supports two delivery modes, controlled by whether `OPENCLAW_HOOKS_URL` is set:
-
-**Main session mode** (default, no hooks config):
-- Messages are delivered to the agent's existing chat session via `openclaw message`
-- Agent picks up the task on its next heartbeat or wake cycle
-- Good for low-volume setups or when you want tasks in the agent's main thread
-
 ¹ At least one of `LINEAR_WEBHOOK_SECRET` or `LINEAR_WEBHOOK_SECRETS` must be set for signature validation. If both are set, `LINEAR_WEBHOOK_SECRETS` takes precedence and `LINEAR_WEBHOOK_SECRET` is included as the first entry.
 
 ### Private Team Webhooks
@@ -667,7 +659,7 @@ The connector supports two delivery modes, controlled by whether `OPENCLAW_HOOKS
 - Agent picks up the task on its next heartbeat or wake cycle
 - Good for low-volume setups or when you want tasks in the agent's main thread
 
-**Isolated session mode** (set `OPENCLAW_HOOKS_URL` + `OPENCLAW_HOOKS_TOKEN`) (set `OPENCLAW_HOOKS_URL` + `OPENCLAW_HOOKS_TOKEN`):
+**Isolated session mode** (set `OPENCLAW_HOOKS_URL` + `OPENCLAW_HOOKS_TOKEN`):
 - Each webhook creates or resumes a **task-scoped agent session** keyed to the Linear ticket (e.g. `linear-AI-395`)
 - On first mention, a new session is created. On subsequent mentions/comments on the same ticket, the existing session is reused — the agent already has the ticket context loaded
 - Tasks don't pollute the agent's main session history
