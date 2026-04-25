@@ -9,10 +9,6 @@ const crypto_1 = __importDefault(require("crypto"));
 const express_1 = require("express");
 const signature_1 = require("./signature");
 const normalize_1 = require("./normalize");
-const nudge_store_1 = require("../store/nudge-store");
-/** 15-minute suppression window for bulk-delegation noise reduction (AI-348). */
-const NUDGE_SUPPRESSION_MS = 15 * 60 * 1000;
-const nudgeStore = new nudge_store_1.NudgeStore();
 const router_1 = require("../router");
 const agent_session_1 = require("../agent-session");
 const logger_1 = require("../logger");
@@ -193,12 +189,6 @@ function createWebhookRouter(eventStore) {
                 ].join("\n");
             }
             else {
-                // Delegate/assignee: full decision tree with suppression.
-                if (nudgeStore.isSuppressed(agentName, identifier, NUDGE_SUPPRESSION_MS)) {
-                    log.info(`Nudge suppressed for ${agentName} \u2014 within 15-min window. ${identifier} silently queued.`);
-                    return;
-                }
-                nudgeStore.recordNudge(agentName, identifier);
                 const actionText = reason === "delegate"
                     ? `You were delegated ${identifier}`
                     : `You were assigned ${identifier}`;

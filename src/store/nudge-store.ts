@@ -47,7 +47,7 @@ export class NudgeStore {
 
     if (!row) return false;
 
-    const lastNudge = new Date(row.last_nudge_at).getTime();
+    const lastNudge = new Date(row.last_nudge_at + "Z").getTime();  // Force UTC — SQLite datetime('now') is UTC but JS parses space-separated strings as local
     return Date.now() - lastNudge < windowMs;
   }
 

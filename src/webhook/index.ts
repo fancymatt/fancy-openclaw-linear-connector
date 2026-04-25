@@ -4,11 +4,6 @@ import { verifyLinearSignature } from "./signature";
 import { normalizeLinearEvent } from "./normalize";
 import { LinearEvent } from "./schema";
 import { EventStore } from "../store/event-store";
-import { NudgeStore } from "../store/nudge-store";
-
-/** 15-minute suppression window for bulk-delegation noise reduction (AI-348). */
-const NUDGE_SUPPRESSION_MS = 15 * 60 * 1000;
-const nudgeStore = new NudgeStore();
 import { routeEvent } from "../router";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session";
 import { getOpenclawAgentName } from "../agents";
@@ -211,12 +206,6 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
             "- If this isn\u2019t relevant to you, no action is needed.",
           ].join("\n");
         } else {
-          // Delegate/assignee: full decision tree with suppression.
-          if (nudgeStore.isSuppressed(agentName, identifier, NUDGE_SUPPRESSION_MS)) {
-            log.info(`Nudge suppressed for ${agentName} \u2014 within 15-min window. ${identifier} silently queued.`);
-            return;
-          }
-          nudgeStore.recordNudge(agentName, identifier);
           const actionText = reason === "delegate"
             ? `You were delegated ${identifier}`
             : `You were assigned ${identifier}`;
