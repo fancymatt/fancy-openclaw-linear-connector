@@ -13,7 +13,7 @@ describe("isolated session delivery — payload field name", () => {
       json: async () => ({ runId: "test-run-id" }),
     });
 
-    // Simulate the delivery code path from webhook/index.ts
+    // Simulate the delivery code path
     const agentName = "charles";
     const message = "[NEW TASK] You were delegated AI-393.";
     const hooksUrl = "http://localhost:18789/hooks/agent";
@@ -36,13 +36,13 @@ describe("isolated session delivery — payload field name", () => {
     expect(payload).toHaveProperty("message");
   });
 
-  it("source code uses agentId not agent in hooks fetch body", () => {
-    // Snapshot test: read the actual source and confirm the field name.
+  it("delivery module uses agentId not agent in hooks fetch body", () => {
+    // Snapshot test: read the actual delivery source and confirm the field name.
     // This catches regressions if the field is accidentally reverted.
     const fs = require("fs");
     const path = require("path");
     const src = fs.readFileSync(
-      path.join(__dirname, "index.ts"),
+      path.join(__dirname, "..", "delivery", "deliver.ts"),
       "utf8"
     );
 

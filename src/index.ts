@@ -7,6 +7,7 @@ import { handleOAuthCallback } from "./oauth-callback";
 
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const DEPLOYMENT_NAME = process.env.DEPLOYMENT_NAME ?? "fancymatt";
 
 export function createApp() {
   const app = express();
@@ -29,6 +30,7 @@ export function createApp() {
     res.json({
       status: "ok",
       service: "fancy-openclaw-linear-connector",
+      deployment: DEPLOYMENT_NAME,
       agents: agents.length,
       agentNames: agents.map((a) => a.name),
     });
@@ -50,7 +52,7 @@ export function createApp() {
 // Only start listening when this file is the entry point, not when imported by tests
 if (require.main === module) {
   const agents = getAgents();
-  log.info(`Starting connector with ${agents.length} agent(s): ${agents.map((a) => a.name).join(", ")}`);
+  log.info(`Starting connector [${DEPLOYMENT_NAME}] with ${agents.length} agent(s): ${agents.map((a) => a.name).join(", ")}`);
 
   // Watch agents.json for external changes — no restart needed to add agents
   watchAgentsFile();
@@ -62,7 +64,7 @@ if (require.main === module) {
 
   const app = createApp();
   const server = app.listen(PORT, () => {
-    log.info(`fancy-openclaw-linear-connector listening on port ${PORT} (pid=${process.pid})`);
+    log.info(`fancy-openclaw-linear-connector [${DEPLOYMENT_NAME}] listening on port ${PORT} (pid=${process.pid})`);
   });
 
   // Graceful shutdown — drain in-flight connections before exit

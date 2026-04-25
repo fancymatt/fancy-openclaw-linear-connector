@@ -12,6 +12,7 @@ const logger_1 = require("./logger");
 const oauth_callback_1 = require("./oauth-callback");
 const log = (0, logger_1.componentLogger)((0, logger_1.createLogger)(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const DEPLOYMENT_NAME = process.env.DEPLOYMENT_NAME ?? "fancymatt";
 function createApp() {
     const app = (0, express_1.default)();
     // Raw body capture for webhook signature validation.
@@ -27,6 +28,7 @@ function createApp() {
         res.json({
             status: "ok",
             service: "fancy-openclaw-linear-connector",
+            deployment: DEPLOYMENT_NAME,
             agents: agents.length,
             agentNames: agents.map((a) => a.name),
         });
@@ -35,14 +37,16 @@ function createApp() {
     app.get("/callback", oauth_callback_1.handleOAuthCallback);
     // Webhook routes — pass the event store from the dedup module
     const { EventStore } = require("./store/event-store");
+    const { NudgeStore } = require("./store/nudge-store");
     const eventStore = new EventStore();
-    app.use("/", (0, webhook_1.createWebhookRouter)(eventStore));
+    const nudgeStore = new NudgeStore();
+    app.use("/", (0, webhook_1.createWebhookRouter)(eventStore, nudgeStore));
     return app;
 }
 // Only start listening when this file is the entry point, not when imported by tests
 if (require.main === module) {
     const agents = (0, agents_1.getAgents)();
-    log.info(`Starting connector with ${agents.length} agent(s): ${agents.map((a) => a.name).join(", ")}`);
+    log.info(`Starting connector [${DEPLOYMENT_NAME}] with ${agents.length} agent(s): ${agents.map((a) => a.name).join(", ")}`);
     // Watch agents.json for external changes — no restart needed to add agents
     (0, agents_1.watchAgentsFile)();
     // Start token refresh for all configured agents
@@ -51,7 +55,7 @@ if (require.main === module) {
     }
     const app = createApp();
     const server = app.listen(PORT, () => {
-        log.info(`fancy-openclaw-linear-connector listening on port ${PORT} (pid=${process.pid})`);
+        log.info(`fancy-openclaw-linear-connector [${DEPLOYMENT_NAME}] listening on port ${PORT} (pid=${process.pid})`);
     });
     // Graceful shutdown — drain in-flight connections before exit
     function shutdown(signal) {
