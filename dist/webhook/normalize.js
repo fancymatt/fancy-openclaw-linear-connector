@@ -50,6 +50,7 @@ function extractCommentData(data) {
         body: String(data.body ?? ""),
         issueId: String(issue.id ?? data.issueId ?? ""),
         issueIdentifier: String(issue.identifier ?? data.issueIdentifier ?? ""),
+        issueTitle: String(issue.title ?? ""),
         mentionedUsers: data.mentionedUsers,
         url: String(data.url ?? ""),
         createdAt: String(data.createdAt ?? ""),

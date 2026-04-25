@@ -185,8 +185,8 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
         const data = (route.event.data ?? {}) as Record<string, unknown>;
         const sessionData = data.agentSession as Record<string, unknown> | undefined;
         const issueData = (data.issue ?? sessionData?.issue ?? data) as Record<string, unknown>;
-        const identifier = String(issueData?.identifier ?? route.sessionKey.replace("linear-", ""));
-        const title = String(issueData?.title ?? "");
+        const identifier = String(issueData?.identifier ?? (data as Record<string, unknown>).issueIdentifier ?? route.sessionKey.replace("linear-", ""));
+        const title = String(issueData?.title ?? (data as Record<string, unknown>).issueTitle ?? "");
 
         // Build routing-reason-specific message (AI-411).
         // Mentions: full [NEW TASK] push with commenter name and response options.

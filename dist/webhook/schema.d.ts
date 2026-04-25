@@ -51,6 +51,7 @@ export interface LinearCommentData {
     body: string;
     issueId: string;
     issueIdentifier: string;
+    issueTitle: string;
     /** Users mentioned in the comment */
     mentionedUsers?: Array<{
         id?: string;

@@ -168,8 +168,8 @@ function createWebhookRouter(eventStore) {
             const data = (route.event.data ?? {});
             const sessionData = data.agentSession;
             const issueData = (data.issue ?? sessionData?.issue ?? data);
-            const identifier = String(issueData?.identifier ?? route.sessionKey.replace("linear-", ""));
-            const title = String(issueData?.title ?? "");
+            const identifier = String(issueData?.identifier ?? data.issueIdentifier ?? route.sessionKey.replace("linear-", ""));
+            const title = String(issueData?.title ?? data.issueTitle ?? "");
             // Build routing-reason-specific message (AI-411).
             // Mentions: full [NEW TASK] push with commenter name and response options.
             // Delegate/assignee: full decision-tree nudge with 15-min suppression (AI-348).
