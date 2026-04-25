@@ -59,7 +59,24 @@ if (require.main === module) {
   }
 
   const app = createApp();
-  app.listen(PORT, () => {
-    log.info(`fancy-openclaw-linear-connector listening on port ${PORT}`);
+  const server = app.listen(PORT, () => {
+    log.info(`fancy-openclaw-linear-connector listening on port ${PORT} (pid=${process.pid})`);
   });
+
+  // Graceful shutdown — drain in-flight connections before exit
+  function shutdown(signal: string) {
+    log.info(`Received ${signal}, shutting down gracefully...`);
+    server.close(() => {
+      log.info("Server closed. Exiting.");
+      process.exit(0);
+    });
+    // Force exit after 8s if drain stalls (systemd SendSIGKILL fires at 10s)
+    setTimeout(() => {
+      log.warn("Graceful shutdown timed out, forcing exit.");
+      process.exit(1);
+    }, 8000).unref();
+  }
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
