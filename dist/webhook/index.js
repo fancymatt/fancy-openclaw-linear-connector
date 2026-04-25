@@ -170,27 +170,56 @@ function createWebhookRouter(eventStore) {
             const issueData = (data.issue ?? sessionData?.issue ?? data);
             const identifier = String(issueData?.identifier ?? route.sessionKey.replace("linear-", ""));
             const title = String(issueData?.title ?? "");
-            // Build routing-reason-specific message.
-            // Mentions: full [NEW TASK] push — someone is talking to you directly.
-            // Delegate/assignee: lightweight nudge with 15-min suppression (AI-348).
-            // Bulk delegations collapse into one nudge; agent pulls queue at own cadence.
+            // Build routing-reason-specific message (AI-411).
+            // Mentions: full [NEW TASK] push with commenter name and response options.
+            // Delegate/assignee: full decision-tree nudge with 15-min suppression (AI-348).
             const reason = route.routingReason ?? "assignee";
+            const actor = route.event.actor;
+            const actorName = actor?.name ?? "Someone";
             let message;
             if (reason === "mention" || reason === "body-mention") {
-                // Mentions always fire the short, accurate message without delegation boilerplate.
-                message = `[NEW TASK] You were mentioned on ${identifier}: ${title}.\n\nRun \`linear observeIssue ${identifier}\` to read the full context.`;
+                // Mentions: title, commenter name, response options (no `linear comment` per Matt).
+                message = [
+                    `You were mentioned on ${identifier}: ${title}`,
+                    "",
+                    `${actorName} mentioned you in a comment. Your input or awareness is requested \u2014 you are NOT expected to take ownership unless you choose to.`,
+                    "",
+                    `Run \`linear observe-issue ${identifier}\` to read the full context.`,
+                    "",
+                    "To respond:",
+                    "- To add your input, run \`linear handoff-work ${identifier} [delegate] --comment \"[your response]\"\`",
+                    "- If you want to take ownership, run \`linear consider-work ${identifier}\`",
+                    "- If this isn\u2019t relevant to you, no action is needed.",
+                ].join("\n");
             }
             else {
-                // Delegate/assignee: lightweight nudge with suppression.
+                // Delegate/assignee: full decision tree with suppression.
                 if (nudgeStore.isSuppressed(agentName, identifier, NUDGE_SUPPRESSION_MS)) {
-                    log.info(`Nudge suppressed for ${agentName} — within 15-min window. ${identifier} silently queued.`);
+                    log.info(`Nudge suppressed for ${agentName} \u2014 within 15-min window. ${identifier} silently queued.`);
                     return;
                 }
                 nudgeStore.recordNudge(agentName, identifier);
                 const actionText = reason === "delegate"
                     ? `You were delegated ${identifier}`
                     : `You were assigned ${identifier}`;
-                message = `[NEW TASK] ${actionText}. Run \`linear considerWork ${identifier}\` to pick it up.`;
+                message = [
+                    `${actionText}: ${title}`,
+                    "",
+                    "This task has been delegated to you and you are expected to take the next action on it.",
+                    "",
+                    `Run \`linear consider-work ${identifier}\` NOW to review the issue and understand the request.`,
+                    "",
+                    "Next Steps:",
+                    "- If you need to do some work, run \`linear begin-work ${identifier}\`",
+                    "- If you cannot do the work...",
+                    "  - and need an agent to act instead, run \`linear refuse-work ${identifier} [delegate] --comment [reason]\`",
+                    "  - and need a human to help, run \`linear needs-human ${identifier} [human] --comment [reason]\`",
+                    "",
+                    "When you complete the work...",
+                    "- To have an agent review your work, run \`linear handoff-work ${identifier} [delegate] --comment [note]\`",
+                    "- To have a human review your work, run \`linear needs-human ${identifier} [human] --comment [note]\`",
+                    "- If the ticket\u2019s acceptance criteria is met, run \`linear complete ${identifier} --comment [summary]\`",
+                ].join("\n");
             }
             const sessionId = route.sessionKey;
             // Fire-and-forget delivery.
