@@ -4,6 +4,7 @@ import { verifyLinearSignatureMulti, parseWebhookSecrets } from "./signature";
 import { normalizeLinearEvent } from "./normalize";
 import { LinearEvent } from "./schema";
 import { EventStore } from "../store/event-store";
+import { NudgeStore } from "../store/nudge-store";
 import { routeEvent } from "../router";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session";
 import { getOpenclawAgentName } from "../agents";
@@ -26,8 +27,14 @@ export { normalizeLinearEvent } from "./normalize";
  *   LINEAR_WEBHOOK_SECRETS — comma-separated list of HMAC secrets (new, supports private teams)
  *   LINEAR_WEBHOOK_SECRET  — single HMAC secret (legacy, backward compatible)
  */
-export function createWebhookRouter(eventStore?: EventStore): Router {
+const NUDGE_DEDUP_WINDOW_MS = parseInt(process.env.NUDGE_DEDUP_WINDOW_MS ?? "30000", 10);
+
+export function createWebhookRouter(eventStore?: EventStore, nudgeStore?: NudgeStore): Router {
   const router = Router();
+
+  if (NUDGE_DEDUP_WINDOW_MS > 0) {
+    log.info(`Nudge dedup enabled: ${NUDGE_DEDUP_WINDOW_MS}ms window`);
+  }
 
   router.get("/", (_req: Request, res: Response) => {
     res.json({ status: "ok", service: "fancy-openclaw-linear-connector" });
@@ -148,6 +155,15 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
         return;
       }
+
+      // ── 9a. Nudge deduplication ───────────────────────────────────────────
+      // Suppress rapid-fire duplicate events for the same agent+ticket.
+      const ticketId = route.sessionKey;
+      if (NUDGE_DEDUP_WINDOW_MS > 0 && nudgeStore && nudgeStore.isSuppressed(route.agentId, ticketId, NUDGE_DEDUP_WINDOW_MS)) {
+        log.info(`Nudge dedup: skipping delivery for ${route.agentId} [${ticketId}] — within ${NUDGE_DEDUP_WINDOW_MS}ms window`);
+        return;
+      }
+      nudgeStore?.recordNudge(route.agentId, ticketId);
 
       const agentName = route.agentId;
       log.info(`Routed event to ${agentName} [${route.sessionKey}]`);

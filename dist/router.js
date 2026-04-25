@@ -139,8 +139,7 @@ function routeEvent(event) {
     const identifier = d?.identifier ??
         d?.issueIdentifier ??
         sessionData?.issue?.identifier;
-    const linearAgentSessionId = sessionData?.id;
-    const sessionKey = linearAgentSessionId ? `linear-session-${linearAgentSessionId}` : (identifier ? `linear-${identifier}` : `linear-${event.type}-${Date.now()}`);
+    const sessionKey = identifier ? `linear-${identifier}` : `linear-${event.type}-${Date.now()}`;
     log.info(`routeEvent: type=${event.type} identifier=${identifier ?? 'none'} reason=${result.reason}`);
     return {
         agentId: openclawName,

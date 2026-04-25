@@ -39,8 +39,10 @@ export function createApp() {
 
   // Webhook routes — pass the event store from the dedup module
   const { EventStore } = require("./store/event-store");
+  const { NudgeStore } = require("./store/nudge-store");
   const eventStore = new EventStore();
-  app.use("/", createWebhookRouter(eventStore));
+  const nudgeStore = new NudgeStore();
+  app.use("/", createWebhookRouter(eventStore, nudgeStore));
 
   return app;
 }

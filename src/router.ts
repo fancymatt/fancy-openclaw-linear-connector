@@ -153,8 +153,7 @@ export function routeEvent(event: LinearEvent): RouteResult | null {
     (d?.issueIdentifier as string | undefined) ??
     (sessionData?.issue as Record<string, unknown> | undefined)?.identifier as string | undefined;
   
-  const linearAgentSessionId = sessionData?.id as string | undefined;
-  const sessionKey = linearAgentSessionId ? `linear-session-${linearAgentSessionId}` : (identifier ? `linear-${identifier}` : `linear-${event.type}-${Date.now()}`);
+  const sessionKey = identifier ? `linear-${identifier}` : `linear-${event.type}-${Date.now()}`;
   
   log.info(`routeEvent: type=${event.type} identifier=${identifier ?? 'none'} reason=${result.reason}`);
 
