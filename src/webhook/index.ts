@@ -208,7 +208,7 @@ export function createWebhookRouter(eventStore?: EventStore): Router {
           const actionText = reason === "delegate"
             ? `You were delegated ${identifier}`
             : `You were assigned ${identifier}`;
-          message = `[NEW TASK] ${actionText}. Run \`linear considerWork ${identifier}\` to pick it up.`;
+          message = `[NEW TASK] ${actionText}: ${title}. Run \`linear considerWork ${identifier}\` to pick it up.`;
         }
         const sessionId = route.sessionKey;
 
