@@ -1,27 +1,19 @@
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.verifyLinearSignature = verifyLinearSignature;
-exports.verifyLinearSignatureMulti = verifyLinearSignatureMulti;
-exports.parseWebhookSecrets = parseWebhookSecrets;
-const crypto_1 = __importDefault(require("crypto"));
+import crypto from "crypto";
 /**
  * Verifies the HMAC-SHA256 signature for a single secret.
  *
  * Uses constant-time comparison to prevent timing attacks.
  */
-function verifyLinearSignature(rawBody, signature, secret) {
+export function verifyLinearSignature(rawBody, signature, secret) {
     if (!signature || !secret) {
         return false;
     }
-    const expected = crypto_1.default
+    const expected = crypto
         .createHmac("sha256", secret)
         .update(rawBody)
         .digest("hex");
     try {
-        return crypto_1.default.timingSafeEqual(Buffer.from(signature, "hex"), Buffer.from(expected, "hex"));
+        return crypto.timingSafeEqual(Buffer.from(signature, "hex"), Buffer.from(expected, "hex"));
     }
     catch {
         return false;
@@ -39,7 +31,7 @@ function verifyLinearSignature(rawBody, signature, secret) {
  * @param secrets   - Array of signing secrets to try.
  * @returns `true` if any secret validates the signature, `false` otherwise.
  */
-function verifyLinearSignatureMulti(rawBody, signature, secrets) {
+export function verifyLinearSignatureMulti(rawBody, signature, secrets) {
     if (!signature || secrets.length === 0) {
         return false;
     }
@@ -55,7 +47,7 @@ function verifyLinearSignatureMulti(rawBody, signature, secrets) {
  * If both are set, `LINEAR_WEBHOOK_SECRETS` takes precedence and
  * `LINEAR_WEBHOOK_SECRET` is included as the first entry.
  */
-function parseWebhookSecrets() {
+export function parseWebhookSecrets() {
     const multi = process.env.LINEAR_WEBHOOK_SECRETS;
     const single = process.env.LINEAR_WEBHOOK_SECRET;
     if (multi) {

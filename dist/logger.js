@@ -1,12 +1,8 @@
-"use strict";
 /**
  * Simple structured logger for the connector service.
  * Replaces the missing ../logger import that was blocking the build.
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.createLogger = createLogger;
-exports.componentLogger = componentLogger;
-function createLogger(level = "info") {
+export function createLogger(level = "info") {
     const levels = { debug: 0, info: 1, warn: 2, error: 3 };
     const minLevel = levels[level] ?? 1;
     function log(lvl, msg, args) {
@@ -23,7 +19,7 @@ function createLogger(level = "info") {
         debug: (msg, ...args) => log("debug", msg, args),
     };
 }
-function componentLogger(base, component) {
+export function componentLogger(base, component) {
     return {
         info: (msg, ...args) => base.info(`[${component}] ${msg}`, ...args),
         error: (msg, ...args) => base.error(`[${component}] ${msg}`, ...args),

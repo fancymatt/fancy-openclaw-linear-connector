@@ -1,6 +1,6 @@
-import { AgentQueue } from "./agent-queue.js";
-import type { RouteResult } from "../types.js";
-import type { LinearIssueCreatedEvent } from "../webhook/schema.js";
+import { AgentQueue } from "./agent-queue";
+import type { RouteResult } from "../types";
+import type { LinearIssueCreatedEvent } from "../webhook/schema";
 import os from "os";
 import path from "path";
 import fs from "fs";
@@ -14,6 +14,7 @@ function tmpDbPath(): string {
 
 function makeRouteResult(agentId: string, issueId: string): RouteResult {
   const timestamp = "2026-04-10T18:00:00.000Z";
+  const identifier = `ENG-${issueId}`;
   const event: LinearIssueCreatedEvent = {
     type: "Issue",
     action: "create",
@@ -21,7 +22,7 @@ function makeRouteResult(agentId: string, issueId: string): RouteResult {
     createdAt: timestamp,
     data: {
       id: issueId,
-      identifier: `ENG-${issueId}`,
+      identifier,
       title: `Task ${issueId}`,
       state: { id: "s1", name: "Todo", type: "unstarted" },
       priority: 2,
@@ -31,7 +32,7 @@ function makeRouteResult(agentId: string, issueId: string): RouteResult {
       assigneeId: "user-1",
       assigneeName: "Agent",
       labelIds: [],
-      url: `https://linear.app/org/issue/ENG-${issueId}`,
+      url: `https://linear.app/org/issue/${identifier}`,
       createdAt: timestamp,
       updatedAt: timestamp,
     },
@@ -40,7 +41,7 @@ function makeRouteResult(agentId: string, issueId: string): RouteResult {
 
   return {
     agentId,
-    sessionKey: `agent:${agentId}:main`,
+    sessionKey: `linear-${identifier}`,
     priority: 2,
     event,
   };
@@ -144,5 +145,58 @@ describe("AgentQueue", () => {
     expect(next).toEqual(r2);
     expect(queue.getActive("charles")).toEqual(r2);
     expect(queue.getQueued("charles")).toEqual([r3]);
+  });
+
+  // ── Coalescing tests ────────────────────────────────────────────────
+
+  it("enqueueOrCoalesce delivers first task normally", () => {
+    const result = makeRouteResult("charles", "1");
+    const { action } = queue.enqueueOrCoalesce(result);
+    expect(action).toBe("deliver");
+  });
+
+  it("enqueueOrCoalesce returns active-busy for same ticket as active", () => {
+    queue.enqueueOrCoalesce(makeRouteResult("charles", "1"));
+    const { action } = queue.enqueueOrCoalesce(makeRouteResult("charles", "1"));
+    expect(action).toBe("active-busy");
+    expect(queue.getQueued("charles")).toHaveLength(0);
+  });
+
+  it("enqueueOrCoalesce queues different ticket when active exists", () => {
+    queue.enqueueOrCoalesce(makeRouteResult("charles", "1"));
+    const { action } = queue.enqueueOrCoalesce(makeRouteResult("charles", "2"));
+    expect(action).toBe("queued");
+    expect(queue.getQueued("charles")).toHaveLength(1);
+  });
+
+  it("enqueueOrCoalesce replaces existing queued item for same ticket", () => {
+    queue.enqueueOrCoalesce(makeRouteResult("charles", "1"));
+    queue.enqueueOrCoalesce(makeRouteResult("charles", "2"));
+    const { action } = queue.enqueueOrCoalesce(makeRouteResult("charles", "2"));
+    expect(action).toBe("coalesced");
+    // Only one queued item (ticket 2), not two
+    expect(queue.getQueued("charles")).toHaveLength(1);
+  });
+
+  it("enqueueOrCoalesce handles multiple rapid events for same queued ticket", () => {
+    queue.enqueueOrCoalesce(makeRouteResult("charles", "1"));
+    queue.enqueueOrCoalesce(makeRouteResult("charles", "2"));
+    queue.enqueueOrCoalesce(makeRouteResult("charles", "2"));
+    queue.enqueueOrCoalesce(makeRouteResult("charles", "2"));
+    queue.enqueueOrCoalesce(makeRouteResult("charles", "2"));
+    // Only one item queued (ticket 2), all others coalesced
+    expect(queue.getQueued("charles")).toHaveLength(1);
+    // Complete active, promote ticket 2
+    const next = queue.complete("charles");
+    expect(next).not.toBeNull();
+    const nextData = next!.event.data as Record<string, unknown>;
+    expect(nextData.identifier).toBe("ENG-2");
+  });
+
+  it("enqueueOrCoalesce is independent per agent", () => {
+    const r1 = queue.enqueueOrCoalesce(makeRouteResult("charles", "1"));
+    const r2 = queue.enqueueOrCoalesce(makeRouteResult("laren", "1"));
+    expect(r1.action).toBe("deliver");
+    expect(r2.action).toBe("deliver");
   });
 });

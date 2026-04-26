@@ -1,4 +1,3 @@
-"use strict";
 /**
  * Event routing: determines which OpenClaw agent should handle a Linear event.
  *
@@ -8,19 +7,16 @@
  * Also filters self-triggered events to prevent feedback loops,
  * while allowing agent-to-agent delegation.
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.extractAgentTarget = extractAgentTarget;
-exports.routeEvent = routeEvent;
-const agents_1 = require("./agents");
-const logger_1 = require("./logger");
-const log = (0, logger_1.componentLogger)((0, logger_1.createLogger)(), "router");
+import { buildAgentMap, getAgent, getOpenclawAgentName, getAgents } from "./agents.js";
+import { createLogger, componentLogger } from "./logger.js";
+const log = componentLogger(createLogger(), "router");
 /**
  * Extract the target agent name from a webhook payload.
  * Checks delegate first (OAuth app actors), then assignee, then mentioned users.
  * Returns null if no agent target found or if it's a self-triggered event.
  */
-function extractAgentTarget(event) {
-    const agentMap = (0, agents_1.buildAgentMap)();
+export function extractAgentTarget(event) {
+    const agentMap = buildAgentMap();
     if (Object.keys(agentMap).length === 0) {
         log.warn("No agents configured — skipping event");
         return null;
@@ -99,7 +95,7 @@ function extractId(field) {
 }
 /** Build a lowercase-name → agentName map for body mention detection */
 function buildNameMap() {
-    const agents = (0, agents_1.getAgents)();
+    const agents = getAgents();
     const map = {};
     for (const agent of agents) {
         const name = agent.name.toLowerCase();
@@ -128,12 +124,12 @@ function detectMentionInBody(body, nameMap) {
  * Route a Linear event to an OpenClaw agent.
  * Returns a RouteResult if routing succeeded, null if no agent found.
  */
-function routeEvent(event) {
+export function routeEvent(event) {
     const result = extractAgentTarget(event);
     if (!result)
         return null;
-    const agent = (0, agents_1.getAgent)(result.name);
-    const openclawName = (0, agents_1.getOpenclawAgentName)(result.name);
+    const agent = getAgent(result.name);
+    const openclawName = getOpenclawAgentName(result.name);
     const d = event.data;
     const sessionData = d?.agentSession;
     const identifier = d?.identifier ??

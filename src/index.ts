@@ -6,6 +6,7 @@ import { createLogger, componentLogger } from "./logger.js";
 import { handleOAuthCallback } from "./oauth-callback.js";
 import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
+import { AgentQueue } from "./queue/index.js";
 
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -47,7 +48,8 @@ export function createApp() {
 
   const eventStore = new EventStore();
   const nudgeStore = new NudgeStore();
-  app.use("/", createWebhookRouter(eventStore, nudgeStore));
+  const agentQueue = new AgentQueue();
+  app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue));
 
   return app;
 }

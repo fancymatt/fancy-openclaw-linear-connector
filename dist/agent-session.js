@@ -1,16 +1,11 @@
-"use strict";
 /**
  * Agent session management for Linear's agent workspace UI.
  * Creates agent sessions on issues and emits thought activities
  * so the "Working" widget appears in Linear.
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.createSessionAndEmitThought = createSessionAndEmitThought;
-exports.emitThought = emitThought;
-exports.emitResponse = emitResponse;
-const agents_1 = require("./agents");
-const logger_1 = require("./logger");
-const log = (0, logger_1.componentLogger)((0, logger_1.createLogger)(), "agent-session");
+import { getAccessToken } from "./agents.js";
+import { createLogger, componentLogger } from "./logger.js";
+const log = componentLogger(createLogger(), "agent-session");
 const LINEAR_API = "https://api.linear.app/graphql";
 // Dedup: track recently-created sessions per issue
 const recentSessions = new Map();
@@ -21,7 +16,7 @@ const sessionCreationInFlight = new Map();
  * Create an agent session on an issue and emit a thought activity.
  * Uses in-flight lock and dedup to prevent duplicate sessions.
  */
-async function createSessionAndEmitThought(issueId, agentName, issueContext) {
+export async function createSessionAndEmitThought(issueId, agentName, issueContext) {
     const lockKey = `${issueId}:${agentName}`;
     // If another request is already creating a session, wait for it
     const inFlight = sessionCreationInFlight.get(lockKey);
@@ -45,7 +40,7 @@ async function createSessionAndEmitThought(issueId, agentName, issueContext) {
     }
 }
 async function doCreateSessionAndEmitThought(issueId, agentName, issueContext) {
-    const token = (0, agents_1.getAccessToken)(agentName);
+    const token = getAccessToken(agentName);
     if (!token)
         return { sessionId: null, result: `session skipped: no token for ${agentName}` };
     try {
@@ -104,8 +99,8 @@ async function doCreateSessionAndEmitThought(issueId, agentName, issueContext) {
     }
 }
 /** Emit a thought activity on an existing agent session */
-async function emitThought(sessionId, agentName, body) {
-    const token = (0, agents_1.getAccessToken)(agentName);
+export async function emitThought(sessionId, agentName, body) {
+    const token = getAccessToken(agentName);
     if (!token)
         return false;
     try {
@@ -135,8 +130,8 @@ async function emitThought(sessionId, agentName, body) {
     }
 }
 /** Emit a response activity (e.g. task completion) on an existing agent session */
-async function emitResponse(sessionId, agentName, body) {
-    const token = (0, agents_1.getAccessToken)(agentName);
+export async function emitResponse(sessionId, agentName, body) {
+    const token = getAccessToken(agentName);
     if (!token)
         return false;
     try {

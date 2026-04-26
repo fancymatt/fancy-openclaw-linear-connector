@@ -27,13 +27,27 @@ export class NudgeStore {
     // Drop old agent-only table if it exists and recreate with composite key
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS nudge_log (
-        agent_id      TEXT NOT NULL,
-        ticket_id     TEXT NOT NULL,
-        last_nudge_at TEXT NOT NULL DEFAULT (datetime('now')),
-        nudge_count   INTEGER NOT NULL DEFAULT 0,
+        agent_id          TEXT NOT NULL,
+        ticket_id         TEXT NOT NULL,
+        last_nudge_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        nudge_count       INTEGER NOT NULL DEFAULT 0,
+        coalesced_count   INTEGER NOT NULL DEFAULT 0,
+        last_event_type   TEXT,
+        last_event_action TEXT,
         PRIMARY KEY (agent_id, ticket_id)
       );
     `);
+
+    // Migrate legacy schema — add coalescing columns if missing
+    try {
+      this.db.exec(`ALTER TABLE nudge_log ADD COLUMN coalesced_count INTEGER NOT NULL DEFAULT 0`);
+    } catch { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE nudge_log ADD COLUMN last_event_type TEXT`);
+    } catch { /* column already exists */ }
+    try {
+      this.db.exec(`ALTER TABLE nudge_log ADD COLUMN last_event_action TEXT`);
+    } catch { /* column already exists */ }
   }
 
   /**
@@ -41,14 +55,23 @@ export class NudgeStore {
    * Returns true if a nudge should be skipped.
    */
   isSuppressed(agentId: string, ticketId: string, windowMs: number): boolean {
-    const row = this.db
-      .prepare("SELECT last_nudge_at FROM nudge_log WHERE agent_id = ? AND ticket_id = ?")
-      .get(agentId, ticketId) as { last_nudge_at: string } | undefined;
+    return this.getCoalesceInfo(agentId, ticketId, windowMs).suppressed;
+  }
 
-    if (!row) return false;
+  /**
+   * Get coalescing info for an agent+ticket pair.
+   * Returns suppression status and the count of coalesced events since last delivery.
+   */
+  getCoalesceInfo(agentId: string, ticketId: string, windowMs: number): { suppressed: boolean; coalescedCount: number } {
+    const row = this.db
+      .prepare("SELECT last_nudge_at, coalesced_count FROM nudge_log WHERE agent_id = ? AND ticket_id = ?")
+      .get(agentId, ticketId) as { last_nudge_at: string; coalesced_count: number } | undefined;
+
+    if (!row) return { suppressed: false, coalescedCount: 0 };
 
     const lastNudge = new Date(row.last_nudge_at + "Z").getTime();  // Force UTC — SQLite datetime('now') is UTC but JS parses space-separated strings as local
-    return Date.now() - lastNudge < windowMs;
+    const isSuppressed = Date.now() - lastNudge < windowMs;
+    return { suppressed: isSuppressed, coalescedCount: isSuppressed ? row.coalesced_count : 0 };
   }
 
   /**
@@ -56,12 +79,42 @@ export class NudgeStore {
    */
   recordNudge(agentId: string, ticketId: string): void {
     this.db.prepare(`
-      INSERT INTO nudge_log (agent_id, ticket_id, last_nudge_at, nudge_count)
-        VALUES (?, ?, datetime('now'), 1)
+      INSERT INTO nudge_log (agent_id, ticket_id, last_nudge_at, nudge_count, coalesced_count, last_event_type, last_event_action)
+        VALUES (?, ?, datetime('now'), 1, 0, NULL, NULL)
       ON CONFLICT (agent_id, ticket_id) DO UPDATE SET
         last_nudge_at = datetime('now'),
-        nudge_count = nudge_count + 1;
+        nudge_count = nudge_count + 1,
+        coalesced_count = 0;
     `).run(agentId, ticketId);
+  }
+
+  /**
+   * Record a coalesced (suppressed) event — increments the coalesced counter
+   * and tracks the latest event type/action for context.
+   */
+  recordCoalesced(agentId: string, ticketId: string, eventType?: string, eventAction?: string): void {
+    this.db.prepare(`
+      INSERT INTO nudge_log (agent_id, ticket_id, last_nudge_at, nudge_count, coalesced_count, last_event_type, last_event_action)
+        VALUES (?, ?, datetime('now'), 0, 1, NULL, NULL)
+      ON CONFLICT (agent_id, ticket_id) DO UPDATE SET
+        coalesced_count = coalesced_count + 1,
+        last_event_type = CASE WHEN excluded.last_event_type IS NOT NULL THEN excluded.last_event_type ELSE nudge_log.last_event_type END,
+        last_event_action = CASE WHEN excluded.last_event_action IS NOT NULL THEN excluded.last_event_action ELSE nudge_log.last_event_action END;
+    `).run(agentId, ticketId);
+  }
+
+  /**
+   * Get the coalesced count and reset it (called right before delivery).
+   */
+  drainCoalescedCount(agentId: string, ticketId: string): number {
+    const row = this.db
+      .prepare("SELECT coalesced_count FROM nudge_log WHERE agent_id = ? AND ticket_id = ?")
+      .get(agentId, ticketId) as { coalesced_count: number } | undefined;
+    if (!row || row.coalesced_count === 0) return 0;
+    const count = row.coalesced_count;
+    this.db.prepare("UPDATE nudge_log SET coalesced_count = 0 WHERE agent_id = ? AND ticket_id = ?")
+      .run(agentId, ticketId);
+    return count;
   }
 
   /**

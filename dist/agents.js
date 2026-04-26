@@ -1,36 +1,23 @@
-"use strict";
 /**
  * Agent configuration and credential management.
  * Stores per-agent OAuth credentials for Linear API access.
  * Modeled after the ILL webhook's agents.ts pattern.
  */
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.watchAgentsFile = watchAgentsFile;
-exports.getAgents = getAgents;
-exports.buildAgentMap = buildAgentMap;
-exports.getAccessToken = getAccessToken;
-exports.getAgent = getAgent;
-exports.getOpenclawAgentName = getOpenclawAgentName;
-exports.updateTokens = updateTokens;
-exports.upsertAgent = upsertAgent;
-const node_fs_1 = __importDefault(require("node:fs"));
-const node_os_1 = __importDefault(require("node:os"));
-const node_path_1 = __importDefault(require("node:path"));
-const logger_1 = require("./logger");
-const log = (0, logger_1.componentLogger)((0, logger_1.createLogger)(), "agents");
-const DEFAULT_AGENTS_PATH = node_path_1.default.resolve(process.cwd(), "agents.json");
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createLogger, componentLogger } from "./logger.js";
+const log = componentLogger(createLogger(), "agents");
+const DEFAULT_AGENTS_PATH = path.resolve(process.cwd(), "agents.json");
 function getAgentsPath() {
     return process.env.AGENTS_FILE ?? DEFAULT_AGENTS_PATH;
 }
 function load() {
     const filePath = getAgentsPath();
-    if (!node_fs_1.default.existsSync(filePath))
+    if (!fs.existsSync(filePath))
         return [];
     try {
-        const raw = node_fs_1.default.readFileSync(filePath, "utf8");
+        const raw = fs.readFileSync(filePath, "utf8");
         const data = JSON.parse(raw);
         return data.agents ?? [];
     }
@@ -41,16 +28,16 @@ function load() {
 }
 function save(agents) {
     const data = { agents };
-    node_fs_1.default.writeFileSync(getAgentsPath(), JSON.stringify(data, null, 2) + "\n", "utf8");
+    fs.writeFileSync(getAgentsPath(), JSON.stringify(data, null, 2) + "\n", "utf8");
 }
 // In-memory cache, kept in sync with disk via file watcher
 let _agents = load();
 /** Start watching agents.json for external changes (e.g. manual edits). */
-function watchAgentsFile() {
+export function watchAgentsFile() {
     const filePath = getAgentsPath();
     let debounceTimer = null;
     try {
-        const watcher = node_fs_1.default.watch(filePath, (eventType) => {
+        const watcher = fs.watch(filePath, (eventType) => {
             if (eventType === "change") {
                 // Debounce — editors often write in multiple steps
                 if (debounceTimer)
@@ -75,28 +62,31 @@ function watchAgentsFile() {
         // fs.watch not supported in this environment — non-fatal
     }
 }
-function getAgents() {
+export function reloadAgents() {
+    _agents = load();
+}
+export function getAgents() {
     return _agents;
 }
 /** Build linearUserId → agentName map for routing */
-function buildAgentMap() {
+export function buildAgentMap() {
     return Object.fromEntries(_agents.map((a) => [a.linearUserId, a.name]));
 }
 /** Get current access token for a named agent */
-function getAccessToken(agentName) {
+export function getAccessToken(agentName) {
     return _agents.find((a) => a.name === agentName)?.accessToken;
 }
 /** Get agent config by name */
-function getAgent(agentName) {
+export function getAgent(agentName) {
     return _agents.find((a) => a.name === agentName);
 }
 /** Get the OpenClaw agent name for routing */
-function getOpenclawAgentName(agentName) {
+export function getOpenclawAgentName(agentName) {
     const agent = _agents.find((a) => a.name === agentName);
     return agent?.openclawAgent ?? agentName;
 }
 /** Update tokens for an agent and persist to disk */
-function updateTokens(agentName, accessToken, refreshToken) {
+export function updateTokens(agentName, accessToken, refreshToken) {
     _agents = _agents.map((a) => a.name === agentName ? { ...a, accessToken, refreshToken } : a);
     save(_agents);
     syncWorkspaceSecrets(agentName, accessToken);
@@ -108,11 +98,11 @@ function syncWorkspaceSecrets(agentName, accessToken) {
     if (!agent)
         return;
     const secretsPath = agent.secretsPath ??
-        node_path_1.default.join(node_os_1.default.homedir(), `.openclaw/workspace-${agent.openclawAgent ?? agent.name}/.secrets/linear.env`);
+        path.join(os.homedir(), `.openclaw/workspace-${agent.openclawAgent ?? agent.name}/.secrets/linear.env`);
     try {
-        node_fs_1.default.mkdirSync(node_path_1.default.dirname(secretsPath), { recursive: true });
-        node_fs_1.default.writeFileSync(secretsPath, `LINEAR_API_KEY=${accessToken}\n`, "utf8");
-        node_fs_1.default.chmodSync(secretsPath, 0o600);
+        fs.mkdirSync(path.dirname(secretsPath), { recursive: true });
+        fs.writeFileSync(secretsPath, `LINEAR_OAUTH_TOKEN=${accessToken}\n`, "utf8");
+        fs.chmodSync(secretsPath, 0o600);
         log.info(`Synced token to ${secretsPath}`);
     }
     catch (err) {
@@ -120,7 +110,7 @@ function syncWorkspaceSecrets(agentName, accessToken) {
     }
 }
 /** Add or update an agent from OAuth callback */
-function upsertAgent(config) {
+export function upsertAgent(config) {
     // Match by name first (for partial entries that don't have linearUserId yet)
     // then fall back to linearUserId for token refresh updates
     const existing = _agents.find((a) => a.name === config.name) ??

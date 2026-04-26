@@ -7,8 +7,8 @@
  * Also filters self-triggered events to prevent feedback loops,
  * while allowing agent-to-agent delegation.
  */
-import type { LinearEvent } from "./webhook/schema";
-import type { RouteResult } from "./types";
+import type { LinearEvent } from "./webhook/schema.js";
+import type { RouteResult } from "./types.js";
 /**
  * Extract the target agent name from a webhook payload.
  * Checks delegate first (OAuth app actors), then assignee, then mentioned users.

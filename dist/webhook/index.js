@@ -1,23 +1,14 @@
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.normalizeLinearEvent = exports.verifyLinearSignature = void 0;
-exports.createWebhookRouter = createWebhookRouter;
-const crypto_1 = __importDefault(require("crypto"));
-const express_1 = require("express");
-const signature_1 = require("./signature");
-const normalize_1 = require("./normalize");
-const router_1 = require("../router");
-const agent_session_1 = require("../agent-session");
-const delivery_1 = require("../delivery");
-const logger_1 = require("../logger");
-const log = (0, logger_1.componentLogger)((0, logger_1.createLogger)(), "webhook");
-var signature_2 = require("./signature");
-Object.defineProperty(exports, "verifyLinearSignature", { enumerable: true, get: function () { return signature_2.verifyLinearSignature; } });
-var normalize_2 = require("./normalize");
-Object.defineProperty(exports, "normalizeLinearEvent", { enumerable: true, get: function () { return normalize_2.normalizeLinearEvent; } });
+import crypto from "crypto";
+import { Router } from "express";
+import { verifyLinearSignatureMulti, parseWebhookSecrets } from "./signature.js";
+import { normalizeLinearEvent } from "./normalize.js";
+import { routeEvent } from "../router.js";
+import { createSessionAndEmitThought } from "../agent-session.js";
+import { deliverToAgent } from "../delivery/index.js";
+import { createLogger, componentLogger } from "../logger.js";
+const log = componentLogger(createLogger(), "webhook");
+export { verifyLinearSignature } from "./signature.js";
+export { normalizeLinearEvent } from "./normalize.js";
 /**
  * Creates the Express router for the Linear webhook endpoint.
  *
@@ -29,9 +20,9 @@ Object.defineProperty(exports, "normalizeLinearEvent", { enumerable: true, get: 
  *   LINEAR_WEBHOOK_SECRETS — comma-separated list of HMAC secrets (new, supports private teams)
  *   LINEAR_WEBHOOK_SECRET  — single HMAC secret (legacy, backward compatible)
  */
-const NUDGE_DEDUP_WINDOW_MS = parseInt(process.env.NUDGE_DEDUP_WINDOW_MS ?? "30000", 10);
-function createWebhookRouter(eventStore, nudgeStore) {
-    const router = (0, express_1.Router)();
+const NUDGE_DEDUP_WINDOW_MS = parseInt(process.env.NUDGE_DEDUP_WINDOW_MS ?? "120000", 10);
+export function createWebhookRouter(eventStore, nudgeStore, agentQueue) {
+    const router = Router();
     if (NUDGE_DEDUP_WINDOW_MS > 0) {
         log.info(`Nudge dedup enabled: ${NUDGE_DEDUP_WINDOW_MS}ms window`);
     }
@@ -39,7 +30,7 @@ function createWebhookRouter(eventStore, nudgeStore) {
         res.json({ status: "ok", service: "fancy-openclaw-linear-connector" });
     });
     router.post("/", async (req, res) => {
-        const secrets = (0, signature_1.parseWebhookSecrets)();
+        const secrets = parseWebhookSecrets();
         // ── 1. Debug: log relevant headers ──────────────────────────────────
         log.info(`Webhook received. Headers: ${JSON.stringify(Object.keys(req.headers).filter(h => h.startsWith('x-') || h.startsWith('linear')))} `);
         log.info(`linear-event header: ${req.headers["linear-event"] || "(missing)"}`);
@@ -60,7 +51,7 @@ function createWebhookRouter(eventStore, nudgeStore) {
                 res.status(400).json({ error: "Empty or unreadable request body" });
                 return;
             }
-            const signatureValid = (0, signature_1.verifyLinearSignatureMulti)(rawBody, signature, secrets);
+            const signatureValid = verifyLinearSignatureMulti(rawBody, signature, secrets);
             log.info(`Signature validation result: ${signatureValid ? "valid" : "invalid"}`);
             if (!signatureValid) {
                 res.status(401).json({ error: "Invalid signature" });
@@ -84,7 +75,7 @@ function createWebhookRouter(eventStore, nudgeStore) {
         // ── 6. Normalize event ────────────────────────────────────────────────
         let event;
         try {
-            event = (0, normalize_1.normalizeLinearEvent)(payload);
+            event = normalizeLinearEvent(payload);
             log.info(`Event normalized: type=${event.type}`);
         }
         catch (err) {
@@ -96,7 +87,7 @@ function createWebhookRouter(eventStore, nudgeStore) {
         }
         // ── 7. Deduplication ──────────────────────────────────────────────────
         const deliveryId = req.headers["x-linear-delivery"] ??
-            crypto_1.default.createHash("sha256").update(rawBody ?? Buffer.from(JSON.stringify(payload))).digest("hex");
+            crypto.createHash("sha256").update(rawBody ?? Buffer.from(JSON.stringify(payload))).digest("hex");
         if (eventStore?.isDuplicate(deliveryId)) {
             log.info(`Checking duplicate for delivery: ${deliveryId}`);
             res.status(200).json({ ok: true, duplicate: true });
@@ -124,7 +115,7 @@ function createWebhookRouter(eventStore, nudgeStore) {
             const agentName = sessionData.user?.name || "unknown";
             let agentSessionId = null;
             try {
-                const sessionResult = await (0, agent_session_1.createSessionAndEmitThought)(issueId, agentName, {
+                const sessionResult = await createSessionAndEmitThought(issueId, agentName, {
                     identifier: issueData.identifier,
                     title: issueData.title,
                     description: issueData.description,
@@ -135,19 +126,30 @@ function createWebhookRouter(eventStore, nudgeStore) {
                 log.error(`Failed to create agent session: ${err instanceof Error ? err.message : String(err)}`);
             }
         }
-        const route = (0, router_1.routeEvent)(event);
+        const route = routeEvent(event);
         if (!route) {
             log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
             return;
         }
-        // ── 9a. Nudge deduplication ───────────────────────────────────────────
+        // ── 9a. Nudge deduplication + coalescing ─────────────────────────────
         // Suppress rapid-fire duplicate events for the same agent+ticket.
         const ticketId = route.sessionKey;
-        if (NUDGE_DEDUP_WINDOW_MS > 0 && nudgeStore && nudgeStore.isSuppressed(route.agentId, ticketId, NUDGE_DEDUP_WINDOW_MS)) {
-            log.info(`Nudge dedup: skipping delivery for ${route.agentId} [${ticketId}] — within ${NUDGE_DEDUP_WINDOW_MS}ms window`);
-            return;
+        let coalescedCount = 0;
+        if (NUDGE_DEDUP_WINDOW_MS > 0 && nudgeStore) {
+            const info = nudgeStore.getCoalesceInfo(route.agentId, ticketId, NUDGE_DEDUP_WINDOW_MS);
+            if (info.suppressed) {
+                log.info(`Nudge dedup: coalescing delivery for ${route.agentId} [${ticketId}] — within ${NUDGE_DEDUP_WINDOW_MS}ms window`);
+                nudgeStore.recordCoalesced(route.agentId, ticketId, event.type, "action" in event ? event.action : undefined);
+                return;
+            }
+            // Window expired — drain coalesced count before delivering
+            coalescedCount = nudgeStore.drainCoalescedCount(route.agentId, ticketId);
+            nudgeStore.recordNudge(route.agentId, ticketId);
+            if (coalescedCount > 0) {
+                log.info(`Nudge dedup: delivering for ${route.agentId} [${ticketId}] with ${coalescedCount} coalesced event(s)`);
+                route.coalescedCount = coalescedCount;
+            }
         }
-        nudgeStore?.recordNudge(route.agentId, ticketId);
         const agentName = route.agentId;
         log.info(`Routed event to ${agentName} [${route.sessionKey}]`);
         // ── 10. Create agent session + emit thought ───────────────────────────
@@ -156,7 +158,7 @@ function createWebhookRouter(eventStore, nudgeStore) {
         let agentSessionId = null;
         if (issueId && event.type === "Issue") {
             try {
-                const sessionResult = await (0, agent_session_1.createSessionAndEmitThought)(issueId, agentName, {
+                const sessionResult = await createSessionAndEmitThought(issueId, agentName, {
                     identifier: data?.identifier,
                     title: data?.title,
                     description: data?.description,
@@ -167,15 +169,55 @@ function createWebhookRouter(eventStore, nudgeStore) {
                 log.error(`Failed to create agent session: ${err instanceof Error ? err.message : String(err)}`);
             }
         }
+        // ── 10b. Agent queue with ticket-level coalescing ──────────────────
+        // Serialize per-agent: only one active delivery at a time.
+        // Same-ticket queued events are coalesced (replaced) not stacked.
+        if (agentQueue) {
+            const queueResult = agentQueue.enqueueOrCoalesce(route);
+            if (queueResult.action === "active-busy") {
+                log.info(`Agent queue: ${route.agentId} already has active task for [${ticketId}] — skipping`);
+                return;
+            }
+            if (queueResult.action === "coalesced") {
+                log.info(`Agent queue: coalesced queued event for ${route.agentId} [${ticketId}]`);
+                return;
+            }
+            if (queueResult.action === "queued") {
+                log.info(`Agent queue: queued event for ${route.agentId} [${ticketId}] (active task for different ticket)`);
+                return;
+            }
+            // action === "deliver" — proceed to delivery below
+            log.info(`Agent queue: delivering immediately for ${route.agentId} [${ticketId}]`);
+        }
         // Deliver to OpenClaw agent via delivery module
         try {
-            await (0, delivery_1.deliverToAgent)(route, {
+            await deliverToAgent(route, {
                 nodeBin: process.execPath,
                 hooksUrl: process.env.OPENCLAW_HOOKS_URL,
                 hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
                 hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
                 hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
             });
+            // After successful delivery, complete the active task and promote next
+            if (agentQueue) {
+                const next = agentQueue.complete(route.agentId);
+                if (next) {
+                    log.info(`Agent queue: promoting next task for ${route.agentId} [${next.sessionKey}]`);
+                    try {
+                        await deliverToAgent(next, {
+                            nodeBin: process.execPath,
+                            hooksUrl: process.env.OPENCLAW_HOOKS_URL,
+                            hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
+                            hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+                            hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+                        });
+                        agentQueue.complete(route.agentId);
+                    }
+                    catch (err) {
+                        log.error(`Agent queue: failed to promote next task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);
+                    }
+                }
+            }
         }
         catch (err) {
             log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);

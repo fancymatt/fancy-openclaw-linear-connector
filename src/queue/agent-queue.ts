@@ -119,6 +119,65 @@ export class AgentQueue {
   }
 
   /**
+   * Enqueue or coalesce: if a queued task already exists for the same
+   * agent+sessionKey (ticket), replace it with the newer payload instead
+   * of stacking duplicates. Active tasks are never replaced.
+   *
+   * Returns 'deliver' if no active task (becomes active), 'queued' if
+   * queued (new or replaced), 'coalesced' if an existing queued item was
+   * replaced, or 'active-busy' if the active task is for the same ticket.
+   */
+  enqueueOrCoalesce(result: RouteResult): { action: "deliver" | "queued" | "coalesced" | "active-busy" } {
+    const active = this.db
+      .prepare(
+        "SELECT payload FROM agent_queue WHERE agent_id = ? AND status = 'active'"
+      )
+      .get(result.agentId) as { payload: string } | undefined;
+
+    // If active task exists for the SAME ticket, don't deliver or queue
+    if (active) {
+      const activePayload = JSON.parse(active.payload) as RouteResult;
+      if (activePayload.sessionKey === result.sessionKey) {
+        return { action: "active-busy" };
+      }
+    }
+
+    // Check for existing queued task with the same sessionKey (ticket)
+    const existing = this.db
+      .prepare(
+        "SELECT id FROM agent_queue WHERE agent_id = ? AND status = 'queued' AND json_extract(payload, '$.sessionKey') = ?"
+      )
+      .get(result.agentId, result.sessionKey) as { id: number } | undefined;
+
+    if (existing) {
+      // Replace the queued payload with the newer event (coalesce)
+      this.db
+        .prepare(
+          "UPDATE agent_queue SET payload = ?, updated_at = datetime('now') WHERE id = ?"
+        )
+        .run(JSON.stringify(result), existing.id);
+      return { action: "coalesced" };
+    }
+
+    // No existing queued item for this ticket — normal enqueue
+    if (active) {
+      this.db
+        .prepare(
+          "INSERT INTO agent_queue (agent_id, payload, status) VALUES (?, ?, 'queued')"
+        )
+        .run(result.agentId, JSON.stringify(result));
+      return { action: "queued" };
+    }
+
+    this.db
+      .prepare(
+        "INSERT INTO agent_queue (agent_id, payload, status) VALUES (?, ?, 'active')"
+      )
+      .run(result.agentId, JSON.stringify(result));
+    return { action: "deliver" };
+  }
+
+  /**
    * Operational visibility: per-agent active status and queue depth.
    */
   getStats(): { agentId: string; active: boolean; queueDepth: number }[] {

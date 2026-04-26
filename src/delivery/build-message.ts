@@ -5,6 +5,9 @@ import type { RouteResult } from "../types.js";
  *
  * Mentions: full [NEW TASK] push with commenter name and response options.
  * Delegate/assignee: full decision-tree nudge.
+ *
+ * When coalescedCount > 0, appends a note indicating how many events
+ * were coalesced into this single delivery.
  */
 export function buildDeliveryMessage(route: RouteResult): string {
   const reason = route.routingReason ?? "assignee";
@@ -24,21 +27,23 @@ export function buildDeliveryMessage(route: RouteResult): string {
     issueData?.title ?? (data as Record<string, unknown>).issueTitle ?? "",
   );
 
+  let message: string;
+
   if (reason === "mention" || reason === "body-mention") {
-    return [
-      `You were mentioned on ${identifier}: ${title}`,
-      "",
-      `${actorName} mentioned you in a comment. Your input or awareness is requested \u2014 you are NOT expected to take ownership unless you choose to.`,
-      "",
-      `Run \`linear observe-issue ${identifier}\` to read the full context.`,
-      "",
-      "To respond:",
-      `- To add your input, run \`linear handoff-work ${identifier} [delegate] --comment "[your response]"\``,
-      `- If you want to take ownership, run \`linear consider-work ${identifier}\``,
-      "- If this isn\u2019t relevant to you, no action is needed.",
-    ].join("\n");
+    message = buildMentionMessage(actorName, identifier, title);
+  } else {
+    message = buildDelegationMessage(reason, identifier, title);
   }
 
+  // Append coalescence note if events were suppressed
+  if (route.coalescedCount && route.coalescedCount > 0) {
+    message += `\n\n> ${route.coalescedCount} additional event(s) for this ticket were coalesced into this delivery. Check \`linear observe-issue ${identifier}\` for the latest state.\n`;
+  }
+
+  return message;
+}
+
+function buildDelegationMessage(reason: string, identifier: string, title: string): string {
   const actionText =
     reason === "delegate"
       ? `You were delegated ${identifier}`
@@ -61,5 +66,20 @@ export function buildDeliveryMessage(route: RouteResult): string {
     `- To have an agent review your work, run \`linear handoff-work ${identifier} [delegate] --comment [note]\``,
     `- To have a human review your work, run \`linear needs-human ${identifier} [human] --comment [note]\``,
     `- If the ticket\u2019s acceptance criteria is met, run \`linear complete ${identifier} --comment [summary]\``,
+  ].join("\n");
+}
+
+function buildMentionMessage(actorName: string, identifier: string, title: string): string {
+  return [
+    `You were mentioned on ${identifier}: ${title}`,
+    "",
+    `${actorName} mentioned you in a comment. Your input or awareness is requested \u2014 you are NOT expected to take ownership unless you choose to.`,
+    "",
+    `Run \`linear observe-issue ${identifier}\` to read the full context.`,
+    "",
+    "To respond:",
+    `- To add your input, run \`linear handoff-work ${identifier} [delegate] --comment "[your response]"\``,
+    `- If you want to take ownership, run \`linear consider-work ${identifier}\``,
+    "- If this isn\u2019t relevant to you, no action is needed.",
   ].join("\n");
 }
