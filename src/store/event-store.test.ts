@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { EventStore } from "./event-store";
+import { EventStore } from "./event-store.js";
 
 function tmpDbPath(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "event-store-test-"));

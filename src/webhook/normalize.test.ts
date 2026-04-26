@@ -1,10 +1,10 @@
-import { normalizeLinearEvent } from "./normalize";
+import { normalizeLinearEvent } from "./normalize.js";
 import {
   LinearIssueCreatedEvent,
   LinearIssueUpdatedEvent,
   LinearCommentCreatedEvent,
   LinearUnknownEvent,
-} from "./schema";
+} from "./schema.js";
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 

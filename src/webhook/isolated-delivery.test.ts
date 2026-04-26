@@ -6,9 +6,15 @@
  * the /hooks/agent endpoint actually reads.
  */
 
+import { jest } from "@jest/globals";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 describe("isolated session delivery — payload field name", () => {
   it("uses agentId in the hooks payload, not agent", async () => {
-    const fetchMock = jest.fn().mockResolvedValue({
+    type FetchArgs = [string, { method: string; headers: Record<string, string>; body: string }];
+    const fetchMock = jest.fn<(...args: FetchArgs) => Promise<{ ok: boolean; json: () => Promise<{ runId: string }> }>>().mockResolvedValue({
       ok: true,
       json: async () => ({ runId: "test-run-id" }),
     });
@@ -29,7 +35,7 @@ describe("isolated session delivery — payload field name", () => {
     });
 
     const [, init] = fetchMock.mock.calls[0];
-    const payload = JSON.parse(init.body as string);
+    const payload = JSON.parse(init.body);
 
     expect(payload).toHaveProperty("agentId", "charles");
     expect(payload).not.toHaveProperty("agent");
@@ -39,8 +45,7 @@ describe("isolated session delivery — payload field name", () => {
   it("delivery module uses agentId not agent in hooks fetch body", () => {
     // Snapshot test: read the actual delivery source and confirm the field name.
     // This catches regressions if the field is accidentally reverted.
-    const fs = require("fs");
-    const path = require("path");
+    const __dirname = path.dirname(fileURLToPath(import.meta.url));
     const src = fs.readFileSync(
       path.join(__dirname, "..", "delivery", "deliver.ts"),
       "utf8"

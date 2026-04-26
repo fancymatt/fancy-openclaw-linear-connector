@@ -1,20 +1,20 @@
 import crypto from "crypto";
 import { Router, Request, Response } from "express";
-import { verifyLinearSignatureMulti, parseWebhookSecrets } from "./signature";
-import { normalizeLinearEvent } from "./normalize";
-import { LinearEvent } from "./schema";
-import { EventStore } from "../store/event-store";
-import { NudgeStore } from "../store/nudge-store";
-import { routeEvent } from "../router";
-import { createSessionAndEmitThought, emitResponse } from "../agent-session";
-import { deliverToAgent } from "../delivery";
-import { createLogger, componentLogger } from "../logger";
+import { verifyLinearSignatureMulti, parseWebhookSecrets } from "./signature.js";
+import { normalizeLinearEvent } from "./normalize.js";
+import { LinearEvent } from "./schema.js";
+import { EventStore } from "../store/event-store.js";
+import { NudgeStore } from "../store/nudge-store.js";
+import { routeEvent } from "../router.js";
+import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
+import { deliverToAgent } from "../delivery/index.js";
+import { createLogger, componentLogger } from "../logger.js";
 
 const log = componentLogger(createLogger(), "webhook");
 
-export { LinearEvent } from "./schema";
-export { verifyLinearSignature } from "./signature";
-export { normalizeLinearEvent } from "./normalize";
+export { LinearEvent } from "./schema.js";
+export { verifyLinearSignature } from "./signature.js";
+export { normalizeLinearEvent } from "./normalize.js";
 
 /**
  * Creates the Express router for the Linear webhook endpoint.

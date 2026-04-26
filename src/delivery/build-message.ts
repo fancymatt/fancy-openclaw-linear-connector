@@ -1,4 +1,4 @@
-import type { RouteResult } from "../types";
+import type { RouteResult } from "../types.js";
 
 /**
  * Build a routing-reason-specific delivery message for an agent.

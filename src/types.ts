@@ -2,7 +2,7 @@
  * Core type definitions for the connector service.
  */
 
-import type { LinearEvent } from "./webhook/schema";
+import type { LinearEvent } from "./webhook/schema.js";
 
 /** Routing decision mapping an event to an OpenClaw agent. */
 export interface RouteResult {

@@ -8,8 +8,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { extractAgentTarget, routeEvent } from "./router";
-import type { LinearEvent } from "./webhook/schema";
+import { extractAgentTarget, routeEvent } from "./router.js";
+import { reloadAgents } from "./agents.js";
+import type { LinearEvent } from "./webhook/schema.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -101,8 +102,7 @@ describe("extractAgentTarget", () => {
   beforeEach(() => {
     agentsFile = makeTempAgentsFile(BASE_AGENTS);
     process.env.AGENTS_FILE = agentsFile;
-    // Force reload of the agents module cache
-    jest.resetModules();
+    reloadAgents();
   });
 
   afterEach(() => {
@@ -111,7 +111,6 @@ describe("extractAgentTarget", () => {
   });
 
   it("routes via delegate field", () => {
-    const { extractAgentTarget } = require("./router");
     const event = makeIssueEvent({ delegateId: CHARLES_ID, delegateName: "Charles" });
     const result = extractAgentTarget(event);
     expect(result).not.toBeNull();
@@ -120,7 +119,6 @@ describe("extractAgentTarget", () => {
   });
 
   it("falls back to assignee when no delegate", () => {
-    const { extractAgentTarget } = require("./router");
     const event = makeIssueEvent({ assigneeId: ASTRID_ID });
     const result = extractAgentTarget(event);
     expect(result).not.toBeNull();
@@ -129,7 +127,6 @@ describe("extractAgentTarget", () => {
   });
 
   it("prefers delegate over assignee when both present", () => {
-    const { extractAgentTarget } = require("./router");
     const event = makeIssueEvent({ delegateId: CHARLES_ID, assigneeId: ASTRID_ID });
     const result = extractAgentTarget(event);
     expect(result?.name).toBe("charles");
@@ -137,7 +134,6 @@ describe("extractAgentTarget", () => {
   });
 
   it("routes via body mention in Comment event", () => {
-    const { extractAgentTarget } = require("./router");
     const event = makeIssueEvent({ commentBody: "Hey @charles can you look at this?" });
     const result = extractAgentTarget(event);
     expect(result).not.toBeNull();
@@ -148,8 +144,7 @@ describe("extractAgentTarget", () => {
   it("returns null when no agents are configured", () => {
     const emptyFile = makeTempAgentsFile([]);
     process.env.AGENTS_FILE = emptyFile;
-    jest.resetModules();
-    const { extractAgentTarget } = require("./router");
+    reloadAgents();
     const event = makeIssueEvent({ delegateId: CHARLES_ID });
     const result = extractAgentTarget(event);
     expect(result).toBeNull();
@@ -157,23 +152,18 @@ describe("extractAgentTarget", () => {
   });
 
   it("returns null when user ID does not match any agent", () => {
-    const { extractAgentTarget } = require("./router");
     const event = makeIssueEvent({ delegateId: "unknown-user-id" });
     const result = extractAgentTarget(event);
     expect(result).toBeNull();
   });
 
   it("suppresses self-triggered events (actor is the target agent)", () => {
-    const { extractAgentTarget } = require("./router");
-    // charles delegates to charles (actor = target — self-trigger)
     const event = makeIssueEvent({ actorId: CHARLES_ID, delegateId: CHARLES_ID });
     const result = extractAgentTarget(event);
     expect(result).toBeNull();
   });
 
   it("allows agent-to-agent delegation (actor is agent A, target is agent B)", () => {
-    const { extractAgentTarget } = require("./router");
-    // astrid delegates to charles
     const event = makeIssueEvent({ actorId: ASTRID_ID, delegateId: CHARLES_ID });
     const result = extractAgentTarget(event);
     expect(result).not.toBeNull();
@@ -189,7 +179,7 @@ describe("routeEvent", () => {
   beforeEach(() => {
     agentsFile = makeTempAgentsFile(BASE_AGENTS);
     process.env.AGENTS_FILE = agentsFile;
-    jest.resetModules();
+    reloadAgents();
   });
 
   afterEach(() => {
@@ -198,7 +188,6 @@ describe("routeEvent", () => {
   });
 
   it("returns a RouteResult with correct agentId and sessionKey", () => {
-    const { routeEvent } = require("./router");
     const event = makeIssueEvent({ delegateId: CHARLES_ID, identifier: "AI-393" });
     const result = routeEvent(event);
     expect(result).not.toBeNull();
@@ -207,7 +196,6 @@ describe("routeEvent", () => {
   });
 
   it("returns null when no agent target found", () => {
-    const { routeEvent } = require("./router");
     const event = makeIssueEvent({});
     const result = routeEvent(event);
     expect(result).toBeNull();

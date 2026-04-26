@@ -6,7 +6,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { NudgeStore } from "./nudge-store";
+import { NudgeStore } from "./nudge-store.js";
 
 function makeTempDb(): { dbPath: string; cleanup: () => void } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nudge-test-"));

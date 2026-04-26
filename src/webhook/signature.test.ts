@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { verifyLinearSignature, verifyLinearSignatureMulti, parseWebhookSecrets } from "./signature";
+import { verifyLinearSignature, verifyLinearSignatureMulti, parseWebhookSecrets } from "./signature.js";
 
 const SECRET = "test-webhook-secret-abc123";
 const PRIVATE_SECRET = "private-team-secret-xyz789";

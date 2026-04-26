@@ -1,9 +1,11 @@
 import express, { Request, Response, NextFunction } from "express";
-import { createWebhookRouter } from "./webhook";
-import { startTokenRefresh } from "./token-refresh";
-import { getAgents, watchAgentsFile } from "./agents";
-import { createLogger, componentLogger } from "./logger";
-import { handleOAuthCallback } from "./oauth-callback";
+import { createWebhookRouter } from "./webhook/index.js";
+import { startTokenRefresh } from "./token-refresh.js";
+import { getAgents, watchAgentsFile } from "./agents.js";
+import { createLogger, componentLogger } from "./logger.js";
+import { handleOAuthCallback } from "./oauth-callback.js";
+import { EventStore } from "./store/event-store.js";
+import { NudgeStore } from "./store/nudge-store.js";
 
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -37,11 +39,12 @@ export function createApp() {
   });
 
   // OAuth callback — handles Linear app authorization flow
+  // Both paths supported: /callback (legacy) and /oauth/callback (registered with Linear)
   app.get("/callback", handleOAuthCallback);
+  app.get("/oauth/callback", handleOAuthCallback);
 
   // Webhook routes — pass the event store from the dedup module
-  const { EventStore } = require("./store/event-store");
-  const { NudgeStore } = require("./store/nudge-store");
+
   const eventStore = new EventStore();
   const nudgeStore = new NudgeStore();
   app.use("/", createWebhookRouter(eventStore, nudgeStore));
@@ -50,7 +53,8 @@ export function createApp() {
 }
 
 // Only start listening when this file is the entry point, not when imported by tests
-if (require.main === module) {
+const isEntryPoint = process.argv[1]?.endsWith('index.js');
+if (isEntryPoint) {
   const agents = getAgents();
   log.info(`Starting connector [${DEPLOYMENT_NAME}] with ${agents.length} agent(s): ${agents.map((a) => a.name).join(", ")}`);
 

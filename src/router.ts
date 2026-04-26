@@ -8,10 +8,10 @@
  * while allowing agent-to-agent delegation.
  */
 
-import { buildAgentMap, getAccessToken, getAgent, getOpenclawAgentName, getAgents } from "./agents";
-import type { LinearEvent } from "./webhook/schema";
-import type { RouteResult } from "./types";
-import { createLogger, componentLogger } from "./logger";
+import { buildAgentMap, getAccessToken, getAgent, getOpenclawAgentName, getAgents } from "./agents.js";
+import type { LinearEvent } from "./webhook/schema.js";
+import type { RouteResult } from "./types.js";
+import { createLogger, componentLogger } from "./logger.js";
 
 const log = componentLogger(createLogger(), "router");
 

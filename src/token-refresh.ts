@@ -4,8 +4,8 @@
  * Modeled after the ILL webhook's token-refresh.ts.
  */
 
-import { getAgents, updateTokens } from "./agents";
-import { createLogger, componentLogger } from "./logger";
+import { getAgents, updateTokens } from "./agents.js";
+import { createLogger, componentLogger } from "./logger.js";
 
 const log = componentLogger(createLogger(), "token-refresh");
 const REFRESH_INTERVAL_MS = 20 * 60 * 60 * 1000; // 20 hours

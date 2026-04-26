@@ -11,8 +11,8 @@ import fs from "node:fs";
 import path from "node:path";
 import request from "supertest";
 import express from "express";
-import { NudgeStore } from "../store/nudge-store";
-import { createWebhookRouter } from "./index";
+import { NudgeStore } from "../store/nudge-store.js";
+import { createWebhookRouter } from "./index.js";
 
 const SECRET = "test-nudge-dedup-secret";
 

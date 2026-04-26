@@ -1,7 +1,7 @@
 import { spawn } from "child_process";
-import type { RouteResult } from "../types";
-import { createLogger, componentLogger } from "../logger";
-import { buildDeliveryMessage } from "./build-message";
+import type { RouteResult } from "../types.js";
+import { createLogger, componentLogger } from "../logger.js";
+import { buildDeliveryMessage } from "./build-message.js";
 
 const log = componentLogger(createLogger(), "delivery");
 

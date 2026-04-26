@@ -7,7 +7,7 @@
 
 import * as readline from "node:readline";
 import { execSync } from "node:child_process";
-import { getAgent, upsertAgent, AgentConfig } from "./agents";
+import { getAgent, upsertAgent, AgentConfig } from "./agents.js";
 
 // ── ANSI helpers ──────────────────────────────────────────────────────────────
 
