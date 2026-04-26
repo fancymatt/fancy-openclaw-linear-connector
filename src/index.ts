@@ -55,7 +55,7 @@ export function createApp() {
 }
 
 // Only start listening when this file is the entry point, not when imported by tests
-const isEntryPoint = process.argv[1]?.endsWith('index.js');
+const isEntryPoint = process.argv[1]?.endsWith('index.ts') || process.argv[1]?.endsWith('index.js');
 if (isEntryPoint) {
   const agents = getAgents();
   log.info(`Starting connector [${DEPLOYMENT_NAME}] with ${agents.length} agent(s): ${agents.map((a) => a.name).join(", ")}`);
