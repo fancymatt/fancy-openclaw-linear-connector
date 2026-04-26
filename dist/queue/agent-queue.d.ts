@@ -51,6 +51,11 @@ export declare class AgentQueue {
         active: boolean;
         queueDepth: number;
     }[];
+    /**
+     * Return distinct agent IDs that have any active or queued task.
+     * Used by the startup drainer to recover backlog from prior process state.
+     */
+    agentsWithBacklog(): string[];
     close(): void;
 }
 //# sourceMappingURL=agent-queue.d.ts.map

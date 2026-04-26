@@ -199,6 +199,19 @@ export class AgentQueue {
     }));
   }
 
+  /**
+   * Return distinct agent IDs that have any active or queued task.
+   * Used by the startup drainer to recover backlog from prior process state.
+   */
+  agentsWithBacklog(): string[] {
+    const rows = this.db
+      .prepare(
+        "SELECT DISTINCT agent_id FROM agent_queue WHERE status IN ('active', 'queued')"
+      )
+      .all() as { agent_id: string }[];
+    return rows.map((r) => r.agent_id);
+  }
+
   close(): void {
     this.db.close();
   }

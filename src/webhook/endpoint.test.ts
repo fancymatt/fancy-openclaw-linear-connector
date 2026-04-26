@@ -32,11 +32,11 @@ const validIssueBody = JSON.stringify({
 });
 
 describe("POST /", () => {
-  let app: ReturnType<typeof createApp>;
+  let app: ReturnType<typeof createApp>["app"];
 
   beforeEach(() => {
     process.env.LINEAR_WEBHOOK_SECRET = SECRET;
-    app = createApp();
+    ({ app } = createApp());
   });
 
   afterEach(() => {

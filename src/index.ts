@@ -7,6 +7,7 @@ import { handleOAuthCallback } from "./oauth-callback.js";
 import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
 import { AgentQueue } from "./queue/index.js";
+import { deliverToAgent } from "./delivery/index.js";
 
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -51,7 +52,45 @@ export function createApp() {
   const agentQueue = new AgentQueue();
   app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue));
 
-  return app;
+  return { app, agentQueue };
+}
+
+/**
+ * Recover queue backlog left behind by prior process state. For each agent
+ * with active or queued items, walk the queue via complete() in a loop —
+ * each call marks the active row completed and promotes the next queued.
+ * Items are delivered as they're promoted. Errors per item are logged and
+ * the drain continues so one bad item can't strand the rest.
+ */
+async function drainBacklog(agentQueue: AgentQueue): Promise<void> {
+  const agents = agentQueue.agentsWithBacklog();
+  if (agents.length === 0) {
+    log.info("Startup drain: no backlog to recover.");
+    return;
+  }
+  const deliveryConfig = {
+    nodeBin: process.execPath,
+    hooksUrl: process.env.OPENCLAW_HOOKS_URL,
+    hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
+    hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+    hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+  };
+  log.info(`Startup drain: recovering backlog for ${agents.length} agent(s): ${agents.join(", ")}`);
+  for (const agentId of agents) {
+    let drained = 0;
+    let next = agentQueue.complete(agentId);
+    while (next) {
+      log.info(`Startup drain: delivering recovered task for ${agentId} [${next.sessionKey}]`);
+      try {
+        await deliverToAgent(next, deliveryConfig);
+      } catch (err) {
+        log.error(`Startup drain: delivery failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      drained++;
+      next = agentQueue.complete(agentId);
+    }
+    log.info(`Startup drain: ${agentId} drained ${drained} task(s).`);
+  }
 }
 
 // Only start listening when this file is the entry point, not when imported by tests
@@ -68,9 +107,13 @@ if (isEntryPoint) {
     startTokenRefresh();
   }
 
-  const app = createApp();
+  const { app, agentQueue } = createApp();
   const server = app.listen(PORT, () => {
     log.info(`fancy-openclaw-linear-connector [${DEPLOYMENT_NAME}] listening on port ${PORT} (pid=${process.pid})`);
+    // Recover any backlog left behind by prior process state.
+    drainBacklog(agentQueue).catch((err) => {
+      log.error(`Startup drain failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
   });
 
   // Graceful shutdown — drain in-flight connections before exit

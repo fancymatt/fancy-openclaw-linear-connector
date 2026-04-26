@@ -190,37 +190,36 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue) {
             log.info(`Agent queue: delivering immediately for ${route.agentId} [${ticketId}]`);
         }
         // Deliver to OpenClaw agent via delivery module
+        const deliveryConfig = {
+            nodeBin: process.execPath,
+            hooksUrl: process.env.OPENCLAW_HOOKS_URL,
+            hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
+            hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+            hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+        };
         try {
-            await deliverToAgent(route, {
-                nodeBin: process.execPath,
-                hooksUrl: process.env.OPENCLAW_HOOKS_URL,
-                hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
-                hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
-                hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
-            });
-            // After successful delivery, complete the active task and promote next
-            if (agentQueue) {
-                const next = agentQueue.complete(route.agentId);
-                if (next) {
-                    log.info(`Agent queue: promoting next task for ${route.agentId} [${next.sessionKey}]`);
-                    try {
-                        await deliverToAgent(next, {
-                            nodeBin: process.execPath,
-                            hooksUrl: process.env.OPENCLAW_HOOKS_URL,
-                            hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
-                            hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
-                            hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
-                        });
-                        agentQueue.complete(route.agentId);
-                    }
-                    catch (err) {
-                        log.error(`Agent queue: failed to promote next task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);
-                    }
-                }
-            }
+            await deliverToAgent(route, deliveryConfig);
         }
         catch (err) {
             log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        finally {
+            // Drain the entire queue for this agent: complete the active task,
+            // promote+deliver next, repeat until the queue is empty. The drain
+            // runs in finally so a delivery throw can't leak the active row.
+            if (agentQueue) {
+                let next = agentQueue.complete(route.agentId);
+                while (next) {
+                    log.info(`Agent queue: promoting next task for ${route.agentId} [${next.sessionKey}]`);
+                    try {
+                        await deliverToAgent(next, deliveryConfig);
+                    }
+                    catch (err) {
+                        log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);
+                    }
+                    next = agentQueue.complete(route.agentId);
+                }
+            }
         }
     });
     return router;
