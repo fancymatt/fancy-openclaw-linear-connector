@@ -2,7 +2,7 @@ import crypto from "crypto";
 import { Router, Request, Response } from "express";
 import { verifyLinearSignatureMulti, parseWebhookSecrets } from "./signature.js";
 import { normalizeLinearEvent } from "./normalize.js";
-import { LinearEvent } from "./schema.js";
+import type { LinearEvent } from "./schema.js";
 import { EventStore } from "../store/event-store.js";
 import { NudgeStore } from "../store/nudge-store.js";
 import { routeEvent } from "../router.js";
@@ -13,7 +13,7 @@ import { createLogger, componentLogger } from "../logger.js";
 
 const log = componentLogger(createLogger(), "webhook");
 
-export { LinearEvent } from "./schema.js";
+export type { LinearEvent } from "./schema.js";
 export { verifyLinearSignature } from "./signature.js";
 export { normalizeLinearEvent } from "./normalize.js";
 
