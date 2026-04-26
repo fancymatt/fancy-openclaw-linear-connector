@@ -32,6 +32,18 @@ export declare class AgentQueue {
      */
     getQueued(agentId: string): RouteResult[];
     /**
+     * Enqueue or coalesce: if a queued task already exists for the same
+     * agent+sessionKey (ticket), replace it with the newer payload instead
+     * of stacking duplicates. Active tasks are never replaced.
+     *
+     * Returns 'deliver' if no active task (becomes active), 'queued' if
+     * queued (new or replaced), 'coalesced' if an existing queued item was
+     * replaced, or 'active-busy' if the active task is for the same ticket.
+     */
+    enqueueOrCoalesce(result: RouteResult): {
+        action: "deliver" | "queued" | "coalesced" | "active-busy";
+    };
+    /**
      * Operational visibility: per-agent active status and queue depth.
      */
     getStats(): {

@@ -11,6 +11,7 @@ export interface RouteResult {
   priority: number;
   event: LinearEvent;
   routingReason?: "delegate" | "assignee" | "mention" | "body-mention";
+  coalescedCount?: number;
 }
 
 /** Connector service configuration. */

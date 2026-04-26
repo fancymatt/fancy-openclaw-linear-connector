@@ -38,9 +38,11 @@ function createApp() {
     // Webhook routes — pass the event store from the dedup module
     const { EventStore } = require("./store/event-store");
     const { NudgeStore } = require("./store/nudge-store");
+    const { AgentQueue } = require("./queue");
     const eventStore = new EventStore();
     const nudgeStore = new NudgeStore();
-    app.use("/", (0, webhook_1.createWebhookRouter)(eventStore, nudgeStore));
+    const agentQueue = new AgentQueue();
+    app.use("/", (0, webhook_1.createWebhookRouter)(eventStore, nudgeStore, agentQueue));
     return app;
 }
 // Only start listening when this file is the entry point, not when imported by tests

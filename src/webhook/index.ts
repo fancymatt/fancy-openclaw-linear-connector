@@ -8,6 +8,7 @@ import { NudgeStore } from "../store/nudge-store.js";
 import { routeEvent } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
 import { deliverToAgent } from "../delivery/index.js";
+import { AgentQueue } from "../queue/index.js";
 import { createLogger, componentLogger } from "../logger.js";
 
 const log = componentLogger(createLogger(), "webhook");
@@ -27,9 +28,9 @@ export { normalizeLinearEvent } from "./normalize.js";
  *   LINEAR_WEBHOOK_SECRETS — comma-separated list of HMAC secrets (new, supports private teams)
  *   LINEAR_WEBHOOK_SECRET  — single HMAC secret (legacy, backward compatible)
  */
-const NUDGE_DEDUP_WINDOW_MS = parseInt(process.env.NUDGE_DEDUP_WINDOW_MS ?? "30000", 10);
+const NUDGE_DEDUP_WINDOW_MS = parseInt(process.env.NUDGE_DEDUP_WINDOW_MS ?? "120000", 10);
 
-export function createWebhookRouter(eventStore?: EventStore, nudgeStore?: NudgeStore): Router {
+export function createWebhookRouter(eventStore?: EventStore, nudgeStore?: NudgeStore, agentQueue?: AgentQueue): Router {
   const router = Router();
 
   if (NUDGE_DEDUP_WINDOW_MS > 0) {
@@ -156,14 +157,25 @@ export function createWebhookRouter(eventStore?: EventStore, nudgeStore?: NudgeS
         return;
       }
 
-      // ── 9a. Nudge deduplication ───────────────────────────────────────────
+      // ── 9a. Nudge deduplication + coalescing ─────────────────────────────
       // Suppress rapid-fire duplicate events for the same agent+ticket.
       const ticketId = route.sessionKey;
-      if (NUDGE_DEDUP_WINDOW_MS > 0 && nudgeStore && nudgeStore.isSuppressed(route.agentId, ticketId, NUDGE_DEDUP_WINDOW_MS)) {
-        log.info(`Nudge dedup: skipping delivery for ${route.agentId} [${ticketId}] — within ${NUDGE_DEDUP_WINDOW_MS}ms window`);
-        return;
+      let coalescedCount = 0;
+      if (NUDGE_DEDUP_WINDOW_MS > 0 && nudgeStore) {
+        const info = nudgeStore.getCoalesceInfo(route.agentId, ticketId, NUDGE_DEDUP_WINDOW_MS);
+        if (info.suppressed) {
+          log.info(`Nudge dedup: coalescing delivery for ${route.agentId} [${ticketId}] — within ${NUDGE_DEDUP_WINDOW_MS}ms window`);
+          nudgeStore.recordCoalesced(route.agentId, ticketId, event.type, "action" in event ? event.action : undefined);
+          return;
+        }
+        // Window expired — drain coalesced count before delivering
+        coalescedCount = nudgeStore.drainCoalescedCount(route.agentId, ticketId);
+        nudgeStore.recordNudge(route.agentId, ticketId);
+        if (coalescedCount > 0) {
+          log.info(`Nudge dedup: delivering for ${route.agentId} [${ticketId}] with ${coalescedCount} coalesced event(s)`);
+          route.coalescedCount = coalescedCount;
+        }
       }
-      nudgeStore?.recordNudge(route.agentId, ticketId);
 
       const agentName = route.agentId;
       log.info(`Routed event to ${agentName} [${route.sessionKey}]`);
@@ -186,6 +198,27 @@ export function createWebhookRouter(eventStore?: EventStore, nudgeStore?: NudgeS
         }
       }
 
+      // ── 10b. Agent queue with ticket-level coalescing ──────────────────
+      // Serialize per-agent: only one active delivery at a time.
+      // Same-ticket queued events are coalesced (replaced) not stacked.
+      if (agentQueue) {
+        const queueResult = agentQueue.enqueueOrCoalesce(route);
+        if (queueResult.action === "active-busy") {
+          log.info(`Agent queue: ${route.agentId} already has active task for [${ticketId}] — skipping`);
+          return;
+        }
+        if (queueResult.action === "coalesced") {
+          log.info(`Agent queue: coalesced queued event for ${route.agentId} [${ticketId}]`);
+          return;
+        }
+        if (queueResult.action === "queued") {
+          log.info(`Agent queue: queued event for ${route.agentId} [${ticketId}] (active task for different ticket)`);
+          return;
+        }
+        // action === "deliver" — proceed to delivery below
+        log.info(`Agent queue: delivering immediately for ${route.agentId} [${ticketId}]`);
+      }
+
       // Deliver to OpenClaw agent via delivery module
       try {
         await deliverToAgent(route, {
@@ -195,6 +228,25 @@ export function createWebhookRouter(eventStore?: EventStore, nudgeStore?: NudgeS
           hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
           hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
         });
+        // After successful delivery, complete the active task and promote next
+        if (agentQueue) {
+          const next = agentQueue.complete(route.agentId);
+          if (next) {
+            log.info(`Agent queue: promoting next task for ${route.agentId} [${next.sessionKey}]`);
+            try {
+              await deliverToAgent(next, {
+                nodeBin: process.execPath,
+                hooksUrl: process.env.OPENCLAW_HOOKS_URL,
+                hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
+                hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+                hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+              });
+              agentQueue.complete(route.agentId);
+            } catch (err) {
+              log.error(`Agent queue: failed to promote next task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+        }
       } catch (err) {
         log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
       }
