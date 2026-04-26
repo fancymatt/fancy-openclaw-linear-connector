@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import request from "supertest";
-import { createApp } from "../index";
+import { createApp } from "../index.js";
 
 const SECRET = "test-endpoint-secret";
 

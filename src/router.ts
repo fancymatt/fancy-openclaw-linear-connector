@@ -8,10 +8,10 @@
  * while allowing agent-to-agent delegation.
  */
 
-import { buildAgentMap, getAccessToken, getAgent, getOpenclawAgentName, getAgents } from "./agents";
-import type { LinearEvent } from "./webhook/schema";
-import type { RouteResult } from "./types";
-import { createLogger, componentLogger } from "./logger";
+import { buildAgentMap, getAccessToken, getAgent, getOpenclawAgentName, getAgents } from "./agents.js";
+import type { LinearEvent } from "./webhook/schema.js";
+import type { RouteResult } from "./types.js";
+import { createLogger, componentLogger } from "./logger.js";
 
 const log = componentLogger(createLogger(), "router");
 
@@ -153,8 +153,7 @@ export function routeEvent(event: LinearEvent): RouteResult | null {
     (d?.issueIdentifier as string | undefined) ??
     (sessionData?.issue as Record<string, unknown> | undefined)?.identifier as string | undefined;
   
-  const linearAgentSessionId = sessionData?.id as string | undefined;
-  const sessionKey = linearAgentSessionId ? `linear-session-${linearAgentSessionId}` : (identifier ? `linear-${identifier}` : `linear-${event.type}-${Date.now()}`);
+  const sessionKey = identifier ? `linear-${identifier}` : `linear-${event.type}-${Date.now()}`;
   
   log.info(`routeEvent: type=${event.type} identifier=${identifier ?? 'none'} reason=${result.reason}`);
 

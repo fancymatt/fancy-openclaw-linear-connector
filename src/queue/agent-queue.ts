@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import path from "path";
-import type { RouteResult } from "../types";
+import type { RouteResult } from "../types.js";
 
 /**
  * SQLite-backed per-agent serialized queue.

@@ -7,7 +7,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createLogger, componentLogger } from "./logger";
+import { createLogger, componentLogger } from "./logger.js";
 
 const log = componentLogger(createLogger(), "agents");
 
@@ -20,7 +20,7 @@ export interface AgentConfig {
   refreshToken: string;
   openclawAgent?: string;
   host?: "ishikawa" | "local";
-  /** Path to write LINEAR_API_KEY when tokens refresh */
+  /** Path to write LINEAR_OAUTH_TOKEN when tokens refresh */
   secretsPath?: string;
 }
 
@@ -85,6 +85,10 @@ export function watchAgentsFile(): void {
   }
 }
 
+export function reloadAgents(): void {
+  _agents = load();
+}
+
 export function getAgents(): AgentConfig[] {
   return _agents;
 }
@@ -134,7 +138,7 @@ function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
 
   try {
     fs.mkdirSync(path.dirname(secretsPath), { recursive: true });
-    fs.writeFileSync(secretsPath, `LINEAR_API_KEY=${accessToken}\n`, "utf8");
+    fs.writeFileSync(secretsPath, `LINEAR_OAUTH_TOKEN=${accessToken}\n`, "utf8");
     fs.chmodSync(secretsPath, 0o600);
     log.info(`Synced token to ${secretsPath}`);
   } catch (err) {

@@ -6,14 +6,20 @@
  * the /hooks/agent endpoint actually reads.
  */
 
+import { jest } from "@jest/globals";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 describe("isolated session delivery — payload field name", () => {
   it("uses agentId in the hooks payload, not agent", async () => {
-    const fetchMock = jest.fn().mockResolvedValue({
+    type FetchArgs = [string, { method: string; headers: Record<string, string>; body: string }];
+    const fetchMock = jest.fn<(...args: FetchArgs) => Promise<{ ok: boolean; json: () => Promise<{ runId: string }> }>>().mockResolvedValue({
       ok: true,
       json: async () => ({ runId: "test-run-id" }),
     });
 
-    // Simulate the delivery code path from webhook/index.ts
+    // Simulate the delivery code path
     const agentName = "charles";
     const message = "[NEW TASK] You were delegated AI-393.";
     const hooksUrl = "http://localhost:18789/hooks/agent";
@@ -29,20 +35,19 @@ describe("isolated session delivery — payload field name", () => {
     });
 
     const [, init] = fetchMock.mock.calls[0];
-    const payload = JSON.parse(init.body as string);
+    const payload = JSON.parse(init.body);
 
     expect(payload).toHaveProperty("agentId", "charles");
     expect(payload).not.toHaveProperty("agent");
     expect(payload).toHaveProperty("message");
   });
 
-  it("source code uses agentId not agent in hooks fetch body", () => {
-    // Snapshot test: read the actual source and confirm the field name.
+  it("delivery module uses agentId not agent in hooks fetch body", () => {
+    // Snapshot test: read the actual delivery source and confirm the field name.
     // This catches regressions if the field is accidentally reverted.
-    const fs = require("fs");
-    const path = require("path");
+    const __dirname = path.dirname(fileURLToPath(import.meta.url));
     const src = fs.readFileSync(
-      path.join(__dirname, "index.ts"),
+      path.join(__dirname, "..", "delivery", "deliver.ts"),
       "utf8"
     );
 

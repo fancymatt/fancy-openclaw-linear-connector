@@ -1,6 +1,6 @@
-import { AgentQueue } from "./agent-queue";
-import type { RouteResult } from "../types";
-import type { LinearIssueCreatedEvent } from "../webhook/schema";
+import { AgentQueue } from "./agent-queue.js";
+import type { RouteResult } from "../types.js";
+import type { LinearIssueCreatedEvent } from "../webhook/schema.js";
 import os from "os";
 import path from "path";
 import fs from "fs";

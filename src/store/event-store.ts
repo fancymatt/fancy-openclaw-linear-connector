@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
-import path from "path";
+import fs from "node:fs";
+import path from "node:path";
 
 /**
  * SQLite-backed operational event store for webhook deduplication and
@@ -16,7 +17,7 @@ export class EventStore {
     const resolvedPath = dbPath ?? path.join(process.cwd(), "data", "events.db");
     // Ensure directory exists
     const dir = path.dirname(resolvedPath);
-    const fs = require("fs");
+
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }

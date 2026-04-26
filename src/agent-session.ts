@@ -4,8 +4,8 @@
  * so the "Working" widget appears in Linear.
  */
 
-import { getAccessToken } from "./agents";
-import { createLogger, componentLogger } from "./logger";
+import { getAccessToken } from "./agents.js";
+import { createLogger, componentLogger } from "./logger.js";
 
 const log = componentLogger(createLogger(), "agent-session");
 const LINEAR_API = "https://api.linear.app/graphql";

@@ -1,6 +1,6 @@
 import { Request, Response } from "express";
-import { getAgent, upsertAgent, AgentConfig } from "./agents";
-import { createLogger, componentLogger } from "./logger";
+import { getAgent, upsertAgent, AgentConfig } from "./agents.js";
+import { createLogger, componentLogger } from "./logger.js";
 
 const log = componentLogger(createLogger(), "oauth-callback");
 

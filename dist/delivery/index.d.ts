@@ -1,2 +1,3 @@
-export { HttpOpenClawDeliveryAdapter, createAssignmentPayload, type OpenClawDeliveryAdapter, type OpenClawDeliveryAdapterOptions, } from "./adapter";
+export { deliverToAgent, type DeliveryConfig } from "./deliver";
+export { buildDeliveryMessage } from "./build-message";
 //# sourceMappingURL=index.d.ts.map

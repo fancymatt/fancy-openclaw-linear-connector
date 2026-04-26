@@ -3,7 +3,7 @@ import {
   LinearActor,
   LinearIssueData,
   LinearCommentData,
-} from "./schema";
+} from "./schema.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 

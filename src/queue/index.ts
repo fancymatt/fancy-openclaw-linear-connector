@@ -1,1 +1,1 @@
-export { AgentQueue } from "./agent-queue";
+export { AgentQueue } from "./agent-queue.js";
