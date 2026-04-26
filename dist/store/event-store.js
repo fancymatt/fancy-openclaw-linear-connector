@@ -1,11 +1,6 @@
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.EventStore = void 0;
-const better_sqlite3_1 = __importDefault(require("better-sqlite3"));
-const path_1 = __importDefault(require("path"));
+import Database from "better-sqlite3";
+import fs from "node:fs";
+import path from "node:path";
 /**
  * SQLite-backed operational event store for webhook deduplication and
  * restart safety.
@@ -14,16 +9,15 @@ const path_1 = __importDefault(require("path"));
  * It can be safely deleted; the only consequence is that events already
  * processed may be re-processed once.
  */
-class EventStore {
+export class EventStore {
     constructor(dbPath) {
-        const resolvedPath = dbPath ?? path_1.default.join(process.cwd(), "data", "events.db");
+        const resolvedPath = dbPath ?? path.join(process.cwd(), "data", "events.db");
         // Ensure directory exists
-        const dir = path_1.default.dirname(resolvedPath);
-        const fs = require("fs");
+        const dir = path.dirname(resolvedPath);
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
-        this.db = new better_sqlite3_1.default(resolvedPath);
+        this.db = new Database(resolvedPath);
         this.db.pragma("journal_mode = WAL");
         this.migrate();
     }
@@ -75,5 +69,4 @@ class EventStore {
         this.db.close();
     }
 }
-exports.EventStore = EventStore;
 //# sourceMappingURL=event-store.js.map

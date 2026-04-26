@@ -1,6 +1,3 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.normalizeLinearEvent = normalizeLinearEvent;
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function extractActor(payload) {
     const actor = (payload.actor ?? {});
@@ -66,7 +63,7 @@ function extractCommentData(data) {
  *
  * @throws {Error} if the payload is missing required top-level fields.
  */
-function normalizeLinearEvent(payload) {
+export function normalizeLinearEvent(payload) {
     if (!payload || typeof payload !== "object") {
         throw new Error("Payload must be a non-null object");
     }

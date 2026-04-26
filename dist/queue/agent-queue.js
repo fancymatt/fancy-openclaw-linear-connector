@@ -1,21 +1,15 @@
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.AgentQueue = void 0;
-const better_sqlite3_1 = __importDefault(require("better-sqlite3"));
-const path_1 = __importDefault(require("path"));
+import Database from "better-sqlite3";
+import path from "path";
 /**
  * SQLite-backed per-agent serialized queue.
  *
  * Each agent gets at most one active task at a time. Additional tasks
  * are queued FIFO and promoted when the active task completes.
  */
-class AgentQueue {
+export class AgentQueue {
     constructor(dbPath) {
-        const resolvedPath = dbPath ?? path_1.default.join(process.cwd(), "data", "agent-queue.db");
-        this.db = new better_sqlite3_1.default(resolvedPath);
+        const resolvedPath = dbPath ?? path.join(process.cwd(), "data", "agent-queue.db");
+        this.db = new Database(resolvedPath);
         this.db.pragma("journal_mode = WAL");
         this.migrate();
     }
@@ -155,5 +149,4 @@ class AgentQueue {
         this.db.close();
     }
 }
-exports.AgentQueue = AgentQueue;
 //# sourceMappingURL=agent-queue.js.map

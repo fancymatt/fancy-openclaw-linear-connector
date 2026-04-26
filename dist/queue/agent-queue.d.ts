@@ -1,4 +1,4 @@
-import type { RouteResult } from "../types";
+import type { RouteResult } from "../types.js";
 /**
  * SQLite-backed per-agent serialized queue.
  *

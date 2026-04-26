@@ -12,11 +12,12 @@ export interface AgentConfig {
     refreshToken: string;
     openclawAgent?: string;
     host?: "ishikawa" | "local";
-    /** Path to write LINEAR_API_KEY when tokens refresh */
+    /** Path to write LINEAR_OAUTH_TOKEN when tokens refresh */
     secretsPath?: string;
 }
 /** Start watching agents.json for external changes (e.g. manual edits). */
 export declare function watchAgentsFile(): void;
+export declare function reloadAgents(): void;
 export declare function getAgents(): AgentConfig[];
 /** Build linearUserId → agentName map for routing */
 export declare function buildAgentMap(): Record<string, string>;
