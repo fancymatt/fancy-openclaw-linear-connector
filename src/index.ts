@@ -15,6 +15,7 @@ const DEPLOYMENT_NAME = process.env.DEPLOYMENT_NAME ?? "fancymatt";
 
 export function createApp() {
   const app = express();
+  app.set("trust proxy", true);
 
   // Raw body capture for webhook signature validation.
   app.use(
