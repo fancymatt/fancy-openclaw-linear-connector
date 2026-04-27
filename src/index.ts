@@ -8,6 +8,8 @@ import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent } from "./delivery/index.js";
+import { PendingWorkBag, SessionTracker } from "./bag/index.js";
+import { sendWakeUpSignal } from "./bag/wake-up.js";
 
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -51,9 +53,52 @@ export function createApp() {
   const eventStore = new EventStore();
   const nudgeStore = new NudgeStore();
   const agentQueue = new AgentQueue();
-  app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue));
+  const bag = new PendingWorkBag();
+  const sessionTracker = new SessionTracker();
+  app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker));
 
-  return { app, agentQueue };
+  // ── v1.1: Session-end callback endpoint ──────────────────────────────
+  // The gateway (via plugin) calls this when an agent's session ends.
+  // The connector then checks the bag and sends another wake-up if needed.
+  app.post("/session-end", (req: express.Request, res: express.Response) => {
+    const { agentId } = req.body as { agentId?: string };
+    if (!agentId) {
+      res.status(400).json({ error: "agentId is required" });
+      return;
+    }
+    log.info(`Session-end callback received for ${agentId}`);
+    const pendingTickets = sessionTracker.endSession(agentId);
+    if (pendingTickets && pendingTickets.length > 0) {
+      // Re-signal: agent has work waiting
+      const wakeConfig = {
+        nodeBin: process.execPath,
+        hooksUrl: process.env.OPENCLAW_HOOKS_URL,
+        hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
+        hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+        hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+      };
+      sessionTracker.startSession(agentId, `wake-up-${Date.now()}`);
+      bag.recordSignal();
+      sendWakeUpSignal(agentId, pendingTickets, wakeConfig).catch((err) => {
+        log.error(`Re-signal failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+        sessionTracker.endSession(agentId);
+      });
+      res.json({ ok: true, pendingTickets: pendingTickets.length });
+    } else {
+      res.json({ ok: true, pendingTickets: 0 });
+    }
+  });
+
+  // ── v1.1: Metrics endpoint ───────────────────────────────────────────
+  app.get("/metrics", (_req: express.Request, res: express.Response) => {
+    res.json({
+      bag: bag.getStats(),
+      agentStats: bag.getAgentStats(),
+      activeSessions: sessionTracker.getActiveAgents(),
+    });
+  });
+
+  return { app, agentQueue, bag, sessionTracker };
 }
 
 /**
