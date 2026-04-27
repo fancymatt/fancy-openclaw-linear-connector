@@ -571,6 +571,7 @@ src/
     schema.ts           TypeScript event type definitions
     signature.ts        HMAC signature verification
   token-refresh.ts      OAuth token refresh cron (every 20h)
+  token-sync.ts         Pull-based token sync endpoint for remote agent hosts
   queue/
     agent-queue.ts      Per-agent task queue (prevents concurrent sessions)
 ```
@@ -601,6 +602,58 @@ Self-triggered events (agent acting on its own behalf) are filtered out to preve
 - **Session deduplication** — 30-second window prevents duplicate sessions from rapid webhooks.
 - **Nudge suppression** — per-ticket 15-minute window prevents spam from duplicate webhooks on the same interaction. Different tickets always deliver.
 
+## Remote Agent Token Sync
+
+Agents running on hosts other than the connector server can pull their OAuth tokens on a schedule instead of relying on the connector's local filesystem sync.
+
+### Setup
+
+1. **Generate a shared secret** on the connector host:
+   ```bash
+   openssl rand -hex 32
+     ```
+   Add it to the connector's `.env`:
+   ```bash
+   TOKEN_SYNC_SECRET=<generated-secret>
+   ```
+   Restart the connector.
+
+2. **Deploy the pull script** to each remote agent host:
+   ```bash
+   scp scripts/sync-linear-token.sh remote-host:/usr/local/bin/sync-linear-token.sh
+   ssh remote-host chmod +x /usr/local/bin/sync-linear-token.sh
+   ```
+
+3. **Set up a cron job** (hourly recommended):
+   ```bash
+   # crontab -e
+   0 * * * * CONNECTOR_URL=https://ill.fcy.sh AGENT_NAME=sakura TOKEN_SYNC_SECRET=<secret> /usr/local/bin/sync-linear-token.sh
+   ```
+
+   Or use a systemd timer for more control.
+
+### How it works
+
+- **Connector endpoint:** `GET /tokens/:agent` (bearer auth via `TOKEN_SYNC_SECRET`)
+- **Response:** `{ access_token, refresh_token, scope, updated_at }`
+- **Cadence:** Hourly. Linear tokens expire in ~24h, the connector refreshes every 20h, so hourly pulls give ~4h headroom — the agent is never more than ~1h behind a refresh.
+- **Security:** Per-agent endpoint scoping means a compromised host only leaks its own token. Atomic writes (`write .tmp` → `mv`) prevent partial reads.
+
+### Endpoint details
+
+```
+GET /tokens/:agent
+Authorization: Bearer <TOKEN_SYNC_SECRET>
+
+200 → { access_token, refresh_token, scope: "read", updated_at: "<ISO string>" }
+401 → { error: "Unauthorized" }
+404 → { error: "Agent not found" }
+```
+
+Every successful fetch is logged with the agent name and a redacted token prefix (first 20 chars).
+
+---
+
 ## Configuration Reference
 
 ### Environment Variables
@@ -616,8 +669,11 @@ Self-triggered events (agent acting on its own behalf) are filtered out to preve
 | `OPENCLAW_HOOKS_TOKEN` | No | — | Bearer token for the hooks endpoint |
 | `OPENCLAW_HOOKS_THINKING` | No | — | Thinking level for isolated sessions (e.g. `high`) |
 | `OPENCLAW_HOOKS_MODEL` | No | — | Model override for isolated sessions (e.g. `zai/glm-5-turbo`) |
+| `TOKEN_SYNC_SECRET` | No² | — | Shared secret for remote agent token pull endpoint (`GET /tokens/:agent`) |
 
 ¹ At least one of `LINEAR_WEBHOOK_SECRET` or `LINEAR_WEBHOOK_SECRETS` must be set for signature validation. If both are set, `LINEAR_WEBHOOK_SECRETS` takes precedence and `LINEAR_WEBHOOK_SECRET` is included as the first entry.
+
+² Required only if remote agent hosts need to pull tokens.
 
 ### Private Team Webhooks
 

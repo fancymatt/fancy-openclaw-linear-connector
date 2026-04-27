@@ -8,6 +8,7 @@ import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent } from "./delivery/index.js";
+import { createTokenSyncRouter } from "./token-sync.js";
 
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -44,6 +45,9 @@ export function createApp() {
   // Both paths supported: /callback (legacy) and /oauth/callback (registered with Linear)
   app.get("/callback", handleOAuthCallback);
   app.get("/oauth/callback", handleOAuthCallback);
+
+  // Token sync endpoint for remote agent hosts
+  app.use(createTokenSyncRouter());
 
   // Webhook routes — pass the event store from the dedup module
 
