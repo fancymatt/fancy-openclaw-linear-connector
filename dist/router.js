@@ -93,6 +93,60 @@ function extractId(field) {
     }
     return null;
 }
+/** Extract an identifier (e.g. "AI-42") from any depth in the event payload.
+ *
+ *  Tries known paths first (fast path), then walks the full data tree
+ *  looking for a field named "identifier" whose value looks like a Linear
+ *  issue key (TEAM-NNN). This ensures stable session keys even for event
+ *  shapes we haven't explicitly typed.
+ */
+function extractIssueIdentifier(event) {
+    const d = (event.data ?? {});
+    // Fast path: top-level fields from typed normalizer output
+    if (typeof d.identifier === "string" && d.identifier)
+        return d.identifier;
+    if (typeof d.issueIdentifier === "string" && d.issueIdentifier)
+        return d.issueIdentifier;
+    // Nested issue object (Comment events, notifications)
+    const issue = d.issue;
+    if (issue && typeof issue.identifier === "string" && issue.identifier) {
+        return issue.identifier;
+    }
+    // AgentSession → issue
+    const session = d.agentSession;
+    const sessionIssue = session?.issue;
+    if (sessionIssue && typeof sessionIssue.identifier === "string" && sessionIssue.identifier) {
+        return sessionIssue.identifier;
+    }
+    // Notification → issue
+    const notification = d.notification;
+    const notifIssue = notification?.issue;
+    if (notifIssue && typeof notifIssue.identifier === "string" && notifIssue.identifier) {
+        return notifIssue.identifier;
+    }
+    // Slow path: recursive walk for any future shapes
+    return deepFindIdentifier(d);
+}
+/** Linear issue identifier pattern: 1-10 uppercase letters, hyphen, 1-6 digits */
+const LINEAR_ID_RE = /^[A-Z]{1,10}-\d{1,6}$/;
+function deepFindIdentifier(obj, depth = 0) {
+    if (depth > 5 || !obj || typeof obj !== "object")
+        return null;
+    const rec = obj;
+    // Check direct "identifier" field
+    if (typeof rec.identifier === "string" && LINEAR_ID_RE.test(rec.identifier)) {
+        return rec.identifier;
+    }
+    // Recurse into child objects
+    for (const val of Object.values(rec)) {
+        if (val && typeof val === "object" && !Array.isArray(val)) {
+            const found = deepFindIdentifier(val, depth + 1);
+            if (found)
+                return found;
+        }
+    }
+    return null;
+}
 /** Build a lowercase-name → agentName map for body mention detection */
 function buildNameMap() {
     const agents = getAgents();
@@ -130,13 +184,19 @@ export function routeEvent(event) {
         return null;
     const agent = getAgent(result.name);
     const openclawName = getOpenclawAgentName(result.name);
-    const d = event.data;
-    const sessionData = d?.agentSession;
-    const identifier = d?.identifier ??
-        d?.issueIdentifier ??
-        sessionData?.issue?.identifier;
-    const sessionKey = identifier ? `linear-${identifier}` : `linear-${event.type}-${Date.now()}`;
-    log.info(`routeEvent: type=${event.type} identifier=${identifier ?? 'none'} reason=${result.reason}`);
+    const identifier = extractIssueIdentifier(event);
+    const sessionKey = identifier
+        ? `linear-${identifier}`
+        : `linear-${event.type}-${Date.now()}`;
+    if (!identifier) {
+        // Phase 1 diagnostic: log event shapes that slip through identifier extraction
+        const dataStr = JSON.stringify(event.data ?? {}).slice(0, 2048);
+        log.warn(`session-key fallback: type=${event.type} action=${event.action} key=${sessionKey}` +
+            ` data=${dataStr}`);
+    }
+    else {
+        log.info(`routeEvent: type=${event.type} identifier=${identifier} reason=${result.reason}`);
+    }
     return {
         agentId: openclawName,
         sessionKey,

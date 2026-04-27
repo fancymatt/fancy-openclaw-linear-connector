@@ -36,7 +36,7 @@ export async function handleOAuthCallback(req, res) {
             `Add them before authorizing.`);
         return;
     }
-    const redirectUri = process.env.OAUTH_REDIRECT_URI ?? `https://${req.hostname}/linear-webhook/callback`;
+    const redirectUri = process.env.OAUTH_REDIRECT_URI ?? `${req.protocol}://${req.get("host")}${req.path}`;
     // Step 1: Exchange code for tokens
     log.info(`Exchanging OAuth code for agent "${agentName}"...`);
     let tokenResponse;

@@ -112,6 +112,16 @@ export function normalizeLinearEvent(payload) {
             raw: payload,
         };
     }
+    if (type === "Comment" && action === "update") {
+        return {
+            type: "Comment",
+            action: "update",
+            actor,
+            createdAt,
+            data: extractCommentData(data),
+            raw: payload,
+        };
+    }
     // Fallthrough: unsupported but preserved
     return {
         type,

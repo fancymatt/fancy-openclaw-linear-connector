@@ -13,6 +13,7 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const DEPLOYMENT_NAME = process.env.DEPLOYMENT_NAME ?? "fancymatt";
 export function createApp() {
     const app = express();
+    app.set("trust proxy", true);
     // Raw body capture for webhook signature validation.
     app.use("/", express.raw({ type: "application/json", limit: "1mb" }), (req, _res, next) => {
         if (Buffer.isBuffer(req.body)) {
@@ -81,7 +82,7 @@ async function drainBacklog(agentQueue) {
     }
 }
 // Only start listening when this file is the entry point, not when imported by tests
-const isEntryPoint = process.argv[1]?.endsWith('index.js');
+const isEntryPoint = process.argv[1]?.endsWith('index.ts') || process.argv[1]?.endsWith('index.js');
 if (isEntryPoint) {
     const agents = getAgents();
     log.info(`Starting connector [${DEPLOYMENT_NAME}] with ${agents.length} agent(s): ${agents.map((a) => a.name).join(", ")}`);
