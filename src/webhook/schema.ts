@@ -93,6 +93,15 @@ export interface LinearCommentCreatedEvent {
   raw: unknown;
 }
 
+export interface LinearCommentUpdatedEvent {
+  type: "Comment";
+  action: "update";
+  actor: LinearActor;
+  createdAt: string;
+  data: LinearCommentData;
+  raw: unknown;
+}
+
 export interface LinearUnknownEvent {
   type: string;
   action: string;
@@ -108,4 +117,5 @@ export type LinearEvent =
   | LinearIssueCreatedEvent
   | LinearIssueUpdatedEvent
   | LinearCommentCreatedEvent
+  | LinearCommentUpdatedEvent
   | LinearUnknownEvent;

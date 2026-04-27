@@ -54,6 +54,9 @@ function makeIssueEvent(overrides: Partial<{
         issueId: "issue-1",
         issue: { id: "issue-1", identifier, title },
         userId: actorId,
+        mentionedUsers: [],
+        ...(delegateId ? { delegateId, delegate: { id: delegateId, name: delegateName ?? "Delegate" } } : {}),
+        ...(assigneeId ? { assigneeId, assignee: { id: assigneeId, name: "Assignee" } } : {}),
         createdAt: "2026-04-24T00:00:00.000Z",
         updatedAt: "2026-04-24T00:00:00.000Z",
       },
@@ -193,6 +196,95 @@ describe("routeEvent", () => {
     expect(result).not.toBeNull();
     expect(result?.agentId).toBe("charles");
     expect(result?.sessionKey).toContain("AI-393");
+  });
+
+  it("extracts identifier from nested issue object (Comment event)", () => {
+    const event = makeIssueEvent({ delegateId: CHARLES_ID, commentBody: "hello" });
+    // Comment events nest identifier under data.issue.identifier
+    const result = routeEvent(event);
+    expect(result).not.toBeNull();
+    expect(result?.sessionKey).toBe("linear-AI-1");
+  });
+
+  it("extracts identifier from deeply nested agentSession path", () => {
+    const event: LinearEvent = {
+      type: "AgentSessionEvent",
+      action: "create",
+      actor: { id: "actor-1", name: "System" },
+      createdAt: "2026-04-27T00:00:00.000Z",
+      data: {
+        agentSession: {
+          issue: { identifier: "SAK-50", id: "issue-1" },
+        },
+        delegate: { id: CHARLES_ID, name: "Charles" },
+      },
+      raw: {},
+    };
+    const result = routeEvent(event);
+    expect(result).not.toBeNull();
+    expect(result?.sessionKey).toBe("linear-SAK-50");
+  });
+
+  it("extracts identifier from notification.issue path", () => {
+    const event: LinearEvent = {
+      type: "IssueNotification",
+      action: "mentioned",
+      actor: { id: "actor-1", name: "System" },
+      createdAt: "2026-04-27T00:00:00.000Z",
+      data: {
+        notification: {
+          issue: { identifier: "ILL-68", id: "issue-1" },
+        },
+        mentionedUsers: [{ id: CHARLES_ID, name: "Charles" }],
+      },
+      raw: {},
+    };
+    const result = routeEvent(event);
+    expect(result).not.toBeNull();
+    expect(result?.sessionKey).toBe("linear-ILL-68");
+  });
+
+  it("uses deep recursive search for unknown nested shapes", () => {
+    const event: LinearEvent = {
+      type: "SomeNewEventType",
+      action: "create",
+      actor: { id: "actor-1", name: "System" },
+      createdAt: "2026-04-27T00:00:00.000Z",
+      data: {
+        deeply: {
+          nested: {
+            thing: {
+              identifier: "FCY-42",
+            },
+          },
+        },
+        delegate: { id: CHARLES_ID, name: "Charles" },
+      },
+      raw: {},
+    };
+    const result = routeEvent(event);
+    expect(result).not.toBeNull();
+    expect(result?.sessionKey).toBe("linear-FCY-42");
+  });
+
+  it("falls back to timestamp key only when no identifier found anywhere", () => {
+    const before = Date.now();
+    const event: LinearEvent = {
+      type: "MysteryEvent",
+      action: "create",
+      actor: { id: "actor-1", name: "System" },
+      createdAt: "2026-04-27T00:00:00.000Z",
+      data: {
+        delegate: { id: CHARLES_ID, name: "Charles" },
+      },
+      raw: {},
+    };
+    const result = routeEvent(event);
+    expect(result).not.toBeNull();
+    expect(result?.sessionKey).toMatch(/^linear-MysteryEvent-\d+$/);
+    const ts = parseInt(result!.sessionKey.split("-").pop()!, 10);
+    expect(ts).toBeGreaterThanOrEqual(before);
+    expect(ts).toBeLessThanOrEqual(Date.now());
   });
 
   it("returns null when no agent target found", () => {

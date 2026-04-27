@@ -3,6 +3,7 @@ import {
   LinearIssueCreatedEvent,
   LinearIssueUpdatedEvent,
   LinearCommentCreatedEvent,
+  LinearCommentUpdatedEvent,
   LinearUnknownEvent,
 } from "./schema.js";
 
@@ -124,6 +125,29 @@ describe("normalizeLinearEvent — Comment create", () => {
     expect(data.id).toBe("comment-1");
     expect(data.body).toBe("LGTM!");
     expect(data.issueIdentifier).toBe("ENG-42");
+  });
+});
+
+describe("normalizeLinearEvent — Comment update", () => {
+  it("returns type=Comment action=update", () => {
+    const payload = { ...commentPayload, action: "update" };
+    const event = normalizeLinearEvent(payload) as LinearCommentUpdatedEvent;
+    expect(event.type).toBe("Comment");
+    expect(event.action).toBe("update");
+  });
+
+  it("normalizes comment data fields on update", () => {
+    const payload = { ...commentPayload, action: "update" };
+    const event = normalizeLinearEvent(payload) as LinearCommentUpdatedEvent;
+    expect(event.data.id).toBe("comment-1");
+    expect(event.data.body).toBe("LGTM!");
+    expect(event.data.issueIdentifier).toBe("ENG-42");
+  });
+
+  it("preserves raw payload on update", () => {
+    const payload = { ...commentPayload, action: "update" };
+    const event = normalizeLinearEvent(payload) as LinearCommentUpdatedEvent;
+    expect(event.raw).toBe(payload);
   });
 });
 
