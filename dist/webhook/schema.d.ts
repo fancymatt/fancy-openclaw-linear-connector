@@ -89,6 +89,14 @@ export interface LinearCommentCreatedEvent {
     data: LinearCommentData;
     raw: unknown;
 }
+export interface LinearCommentUpdatedEvent {
+    type: "Comment";
+    action: "update";
+    actor: LinearActor;
+    createdAt: string;
+    data: LinearCommentData;
+    raw: unknown;
+}
 export interface LinearUnknownEvent {
     type: string;
     action: string;
@@ -99,5 +107,5 @@ export interface LinearUnknownEvent {
     /** Raw payload — we keep it so unsupported events aren't silently dropped */
     raw: unknown;
 }
-export type LinearEvent = LinearIssueCreatedEvent | LinearIssueUpdatedEvent | LinearCommentCreatedEvent | LinearUnknownEvent;
+export type LinearEvent = LinearIssueCreatedEvent | LinearIssueUpdatedEvent | LinearCommentCreatedEvent | LinearCommentUpdatedEvent | LinearUnknownEvent;
 //# sourceMappingURL=schema.d.ts.map
