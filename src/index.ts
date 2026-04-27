@@ -10,12 +10,32 @@ import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, DeliveryThrottle } from "./delivery/index.js";
 import { PendingWorkBag, SessionTracker } from "./bag/index.js";
 import { sendWakeUpSignal } from "./bag/wake-up.js";
+import crypto from "crypto";
 
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const DEPLOYMENT_NAME = process.env.DEPLOYMENT_NAME ?? "fancymatt";
 
-export function createApp() {
+/**
+ * Constant-time secret comparison to prevent timing attacks.
+ */
+function verifySecret(header: string, secret: string): boolean {
+  const a = Buffer.from(header, "utf8");
+  const b = Buffer.from(secret, "utf8");
+  if (a.length !== b.length) {
+    // Still compare to keep constant time — compare against self then fail
+    crypto.timingSafeEqual(a, a);
+    return false;
+  }
+  return crypto.timingSafeEqual(a, b);
+}
+
+export interface CreateAppOptions {
+  /** Override PendingWorkBag database path (for testing). */
+  bagDbPath?: string;
+}
+
+export function createApp(options?: CreateAppOptions) {
   const app = express();
   app.set("trust proxy", true);
 
@@ -53,7 +73,7 @@ export function createApp() {
   const eventStore = new EventStore();
   const nudgeStore = new NudgeStore();
   const agentQueue = new AgentQueue();
-  const bag = new PendingWorkBag();
+  const bag = new PendingWorkBag(options?.bagDbPath);
   const sessionTracker = new SessionTracker();
   const throttle = new DeliveryThrottle();
   app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle));
@@ -61,8 +81,37 @@ export function createApp() {
   // ── v1.1: Session-end callback endpoint ──────────────────────────────
   // The gateway (via plugin) calls this when an agent's session ends.
   // The connector then checks the bag and sends another wake-up if needed.
+  // Auth: x-session-end-secret header must match SESSION_END_SECRET env.
   app.post("/session-end", (req: express.Request, res: express.Response) => {
-    const { agentId } = req.body as { agentId?: string };
+    // Auth check — shared secret via constant-time compare
+    const secret = process.env.SESSION_END_SECRET;
+    if (secret) {
+      const header = req.headers["x-session-end-secret"];
+      if (typeof header !== "string" || !verifySecret(header, secret)) {
+        res.status(401).json({ error: "Unauthorized" });
+        return;
+      }
+    } else {
+      log.warn("SESSION_END_SECRET not set — /session-end is unauthenticated (set env var for production)");
+    }
+
+    // Parse body — parent express.raw() middleware captures it as Buffer
+    let body: { agentId?: string };
+    try {
+      if (Buffer.isBuffer(req.body)) {
+        body = JSON.parse(req.body.toString("utf8"));
+      } else if (typeof req.body === "object" && req.body !== null) {
+        body = req.body;
+      } else {
+        res.status(400).json({ error: "Invalid body" });
+        return;
+      }
+    } catch {
+      res.status(400).json({ error: "Malformed JSON" });
+      return;
+    }
+
+    const { agentId } = body;
     if (!agentId) {
       res.status(400).json({ error: "agentId is required" });
       return;
@@ -78,12 +127,18 @@ export function createApp() {
         hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
         hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
       };
-      sessionTracker.startSession(agentId, `wake-up-${Date.now()}`);
+      // Clear bag BEFORE sending signal (race fix: don't start session until signal succeeds)
+      bag.clearAgent(agentId);
       bag.recordSignal();
-      sendWakeUpSignal(agentId, pendingTickets, wakeConfig).catch((err) => {
-        log.error(`Re-signal failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
-        sessionTracker.endSession(agentId);
-      });
+      sendWakeUpSignal(agentId, pendingTickets, wakeConfig)
+        .then(() => {
+          // Only mark session as active AFTER successful signal
+          sessionTracker.startSession(agentId, `wake-up-${Date.now()}`);
+        })
+        .catch((err) => {
+          log.error(`Re-signal failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+          // Don't start session on failure — agent will be re-signaled on next webhook
+        });
       res.json({ ok: true, pendingTickets: pendingTickets.length });
     } else {
       res.json({ ok: true, pendingTickets: 0 });
@@ -91,7 +146,19 @@ export function createApp() {
   });
 
   // ── v1.1: Metrics endpoint ───────────────────────────────────────────
-  app.get("/metrics", (_req: express.Request, res: express.Response) => {
+  // Auth: x-metrics-secret header must match METRICS_SECRET env.
+  // Falls back to SESSION_END_SECRET if METRICS_SECRET is not set.
+  app.get("/metrics", (req: express.Request, res: express.Response) => {
+    const secret = process.env.METRICS_SECRET ?? process.env.SESSION_END_SECRET;
+    if (secret) {
+      const header = req.headers["x-metrics-secret"];
+      if (typeof header !== "string" || !verifySecret(header, secret)) {
+        res.status(401).json({ error: "Unauthorized" });
+        return;
+      }
+    } else {
+      log.warn("METRICS_SECRET not set — /metrics is unauthenticated (set env var for production)");
+    }
     res.json({
       bag: bag.getStats(),
       agentStats: bag.getAgentStats(),

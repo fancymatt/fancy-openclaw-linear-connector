@@ -9,7 +9,8 @@
 import { jest } from "@jest/globals";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+
+const deliverySrcDir = path.resolve(process.cwd(), "src", "delivery");
 
 describe("isolated session delivery — payload field name", () => {
   it("uses agentId in the hooks payload, not agent", async () => {
@@ -44,10 +45,9 @@ describe("isolated session delivery — payload field name", () => {
 
   it("delivery module uses agentId not agent in hooks fetch body", () => {
     // Snapshot test: read the actual delivery source and confirm the field name.
-    // This catches regressions if the field is accidentally reverted.
-    const __dirname = path.dirname(fileURLToPath(import.meta.url));
+    const deliveryDir = path.resolve(process.cwd(), "src", "delivery");
     const src = fs.readFileSync(
-      path.join(__dirname, "..", "delivery", "deliver.ts"),
+      path.join(deliveryDir, "deliver.ts"),
       "utf8"
     );
 

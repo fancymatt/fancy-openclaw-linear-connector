@@ -102,19 +102,25 @@ describe("PendingWorkBag", () => {
     expect(igor?.pendingCount).toBe(1);
   });
 
-  test("TTL prunes expired entries", () => {
-    // Use 1ms TTL so everything is immediately expired
-    const shortBag = new PendingWorkBag(dbPath, 1);
+  test("TTL prunes expired entries", async () => {
+    // SQLite datetime('now') has second-level precision.
+    // Both the INSERT's updated_at and the JS cutoff truncate to whole seconds.
+    // We need to wait >2s so that cutoff's second is strictly after updated_at's second.
+    const shortBag = new PendingWorkBag(dbPath, 1000);
     shortBag.add("charles", "AI-491", "Issue");
 
-    // Need to wait a tick for SQLite datetime comparison
-    // The TTL uses ISO string comparison, so entries created "now" should be
-    // pruned if TTL is 1ms and we query after a delay
+    await new Promise((r) => setTimeout(r, 2100));
+
     const tickets = shortBag.getPendingTickets("charles");
-    // With 1ms TTL, the entry might or might not be pruned depending on timing
-    // Just verify the mechanism doesn't crash
-    expect(Array.isArray(tickets)).toBe(true);
+    expect(tickets).toHaveLength(0);
     shortBag.close();
+  });
+
+  test("add returns true for new entry, false for coalesced update", () => {
+    const result1 = bag.add("charles", "AI-491", "Issue");
+    expect(result1).toBe(true);
+    const result2 = bag.add("charles", "AI-491", "Comment");
+    expect(result2).toBe(false); // coalesced
   });
 
   test("empty bag returns empty array", () => {

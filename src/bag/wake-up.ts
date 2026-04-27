@@ -4,6 +4,11 @@
  * Sends a thin "you have N pending tickets" message to an agent when the bag
  * has work for them and they're not in an active session. The agent then uses
  * `linear queue` / `linear my-next` to fetch and process work in priority order.
+ *
+ * NOTE: The session key `wake-up-${ts}` constructed below is a synthetic ID
+ * used only by the connector. The OpenClaw gateway has no knowledge of it.
+ * Once the gateway plugin is implemented (see follow-up ticket), the real
+ * gateway session ID should round-trip through the connector instead.
  */
 
 import { deliverToAgent, type DeliveryConfig } from "../delivery/index.js";

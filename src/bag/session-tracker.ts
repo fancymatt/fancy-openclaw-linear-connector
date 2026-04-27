@@ -8,6 +8,12 @@
  * Session-end detection: the connector exposes a POST /session-end endpoint
  * that the gateway (or a gateway plugin) calls when an agent's session ends.
  * If no callback arrives within a timeout, the session is assumed ended.
+ *
+ * NOTE: The session key `wake-up-${ts}` is a synthetic session ID used only
+ * by the connector to track signal state internally. The OpenClaw gateway has
+ * no knowledge of it. Once the gateway plugin is implemented (see follow-up
+ * ticket), the real gateway session ID should round-trip through the connector
+ * instead of generating a synthetic one.
  */
 
 import { createLogger, componentLogger } from "../logger.js";
@@ -114,15 +120,28 @@ export class SessionTracker {
     if (this.cleanupTimer) clearInterval(this.cleanupTimer);
   }
 
-  private cleanupStale(): void {
+  /**
+   * Clean up stale sessions that exceeded the timeout.
+   * Returns an array of { agentId, pendingTickets } for agents that had
+   * pending signals queued, so the caller can re-signal them.
+   */
+  cleanupStale(): { agentId: string; pendingTickets: string[] }[] {
     const now = Date.now();
+    const needsResignal: { agentId: string; pendingTickets: string[] }[] = [];
     for (const [agentId, session] of this.activeSessions) {
       if (now - session.startedAt > this.sessionTimeoutMs) {
         log.warn(
           `Stale session detected for ${agentId} [${session.sessionKey}] (${Math.round(this.sessionTimeoutMs / 60000)}min timeout). Ending.`
         );
         this.activeSessions.delete(agentId);
+        // Check for pending signals before discarding
+        const pending = this.pendingSignals.get(agentId);
+        if (pending && pending.length > 0) {
+          this.pendingSignals.delete(agentId);
+          needsResignal.push({ agentId, pendingTickets: pending });
+        }
       }
     }
+    return needsResignal;
   }
 }
