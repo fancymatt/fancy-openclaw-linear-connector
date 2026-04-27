@@ -223,6 +223,7 @@ export function createWebhookRouter(
 
         // No active session — send wake-up signal
         log.info(`Bag: sending wake-up signal to ${agentName} with ${pendingIds.length} ticket(s)`);
+        // Mark session active synchronously to gate concurrent requests
         sessionTracker.startSession(agentName, `wake-up-${Date.now()}`);
         bag.recordSignal();
 
@@ -235,8 +236,11 @@ export function createWebhookRouter(
         };
         try {
           await sendWakeUpSignal(agentName, pendingIds, wakeConfig);
+          // Clear bag after successful dispatch
+          bag.clearAgent(agentName);
         } catch (err) {
           log.error(`Wake-up signal failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
+          // End the session so the agent can be re-signaled on next event
           sessionTracker.endSession(agentName);
         }
         return;

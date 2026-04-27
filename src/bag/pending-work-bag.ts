@@ -85,6 +85,11 @@ export class PendingWorkBag {
     this.metrics.eventsReceived++;
 
     try {
+      // Check if the row already exists before UPSERT to detect coalescing.
+      const existing = this.db
+        .prepare("SELECT 1 FROM pending_bag WHERE agent_id = ? AND ticket_id = ?")
+        .get(agentId, ticketId);
+
       this.db
         .prepare(
           `INSERT INTO pending_bag (agent_id, ticket_id, event_type, updated_at)
@@ -94,7 +99,9 @@ export class PendingWorkBag {
              updated_at = datetime('now')`
         )
         .run(agentId, ticketId, eventType);
-      return true;
+
+      // Return true if it was a new entry, false if it was an update
+      return !existing;
     } catch (err) {
       log.error(`Failed to add to bag: ${err instanceof Error ? err.message : String(err)}`);
       return false;
