@@ -7,7 +7,7 @@ import { EventStore } from "../store/event-store.js";
 import { NudgeStore } from "../store/nudge-store.js";
 import { routeEvent } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
-import { deliverToAgent } from "../delivery/index.js";
+import { deliverToAgent, DeliveryThrottle } from "../delivery/index.js";
 import { AgentQueue } from "../queue/index.js";
 import { createLogger, componentLogger } from "../logger.js";
 
@@ -30,7 +30,7 @@ export { normalizeLinearEvent } from "./normalize.js";
  */
 const NUDGE_DEDUP_WINDOW_MS = parseInt(process.env.NUDGE_DEDUP_WINDOW_MS ?? "120000", 10);
 
-export function createWebhookRouter(eventStore?: EventStore, nudgeStore?: NudgeStore, agentQueue?: AgentQueue): Router {
+export function createWebhookRouter(eventStore?: EventStore, nudgeStore?: NudgeStore, agentQueue?: AgentQueue, throttle?: DeliveryThrottle): Router {
   const router = Router();
 
   if (NUDGE_DEDUP_WINDOW_MS > 0) {
@@ -228,6 +228,11 @@ export function createWebhookRouter(eventStore?: EventStore, nudgeStore?: NudgeS
         hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
       };
       try {
+        if (throttle) {
+          log.info(`Dispatch throttle: waiting for ${agentName}`);
+          await throttle.wait(route.agentId);
+          throttle.record(route.agentId);
+        }
         await deliverToAgent(route, deliveryConfig);
       } catch (err) {
         log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
@@ -240,6 +245,11 @@ export function createWebhookRouter(eventStore?: EventStore, nudgeStore?: NudgeS
           while (next) {
             log.info(`Agent queue: promoting next task for ${route.agentId} [${next.sessionKey}]`);
             try {
+              if (throttle) {
+                log.info(`Dispatch throttle: waiting for ${route.agentId} (drain)`);
+                await throttle.wait(route.agentId);
+                throttle.record(route.agentId);
+              }
               await deliverToAgent(next, deliveryConfig);
             } catch (err) {
               log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);

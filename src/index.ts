@@ -7,7 +7,7 @@ import { handleOAuthCallback } from "./oauth-callback.js";
 import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
 import { AgentQueue } from "./queue/index.js";
-import { deliverToAgent } from "./delivery/index.js";
+import { deliverToAgent, DeliveryThrottle } from "./delivery/index.js";
 
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -50,7 +50,8 @@ export function createApp() {
   const eventStore = new EventStore();
   const nudgeStore = new NudgeStore();
   const agentQueue = new AgentQueue();
-  app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue));
+  const throttle = new DeliveryThrottle();
+  app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, throttle));
 
   return { app, agentQueue };
 }
