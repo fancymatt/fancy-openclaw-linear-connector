@@ -7,7 +7,7 @@ import { EventStore } from "../store/event-store.js";
 import { NudgeStore } from "../store/nudge-store.js";
 import { routeEvent } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
-import { deliverToAgent } from "../delivery/index.js";
+import { deliverToAgent, DeliveryThrottle } from "../delivery/index.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker } from "../bag/index.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "../bag/wake-up.js";
@@ -38,6 +38,7 @@ export function createWebhookRouter(
   agentQueue?: AgentQueue,
   bag?: PendingWorkBag,
   sessionTracker?: SessionTracker,
+  throttle?: DeliveryThrottle,
 ): Router {
   const router = Router();
 
@@ -267,6 +268,11 @@ export function createWebhookRouter(
         hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
       };
       try {
+        if (throttle) {
+          log.info(`Dispatch throttle: waiting for ${agentName}`);
+          await throttle.wait(route.agentId);
+          throttle.record(route.agentId);
+        }
         await deliverToAgent(route, deliveryConfig);
       } catch (err) {
         log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
@@ -276,6 +282,11 @@ export function createWebhookRouter(
           while (next) {
             log.info(`Agent queue: promoting next task for ${route.agentId} [${next.sessionKey}]`);
             try {
+              if (throttle) {
+                log.info(`Dispatch throttle: waiting for ${route.agentId} (drain)`);
+                await throttle.wait(route.agentId);
+                throttle.record(route.agentId);
+              }
               await deliverToAgent(next, deliveryConfig);
             } catch (err) {
               log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);

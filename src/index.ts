@@ -7,7 +7,7 @@ import { handleOAuthCallback } from "./oauth-callback.js";
 import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
 import { AgentQueue } from "./queue/index.js";
-import { deliverToAgent } from "./delivery/index.js";
+import { deliverToAgent, DeliveryThrottle } from "./delivery/index.js";
 import { PendingWorkBag, SessionTracker } from "./bag/index.js";
 import { sendWakeUpSignal } from "./bag/wake-up.js";
 
@@ -55,7 +55,8 @@ export function createApp() {
   const agentQueue = new AgentQueue();
   const bag = new PendingWorkBag();
   const sessionTracker = new SessionTracker();
-  app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker));
+  const throttle = new DeliveryThrottle();
+  app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle));
 
   // ── v1.1: Session-end callback endpoint ──────────────────────────────
   // The gateway (via plugin) calls this when an agent's session ends.
