@@ -10,7 +10,7 @@ import fs from "fs";
  */
 export class NudgeStore {
     constructor(dbPath) {
-        const resolvedPath = dbPath ?? path.join(process.cwd(), "data", "nudges.db");
+        const resolvedPath = dbPath ?? path.join(process.env.DATA_DIR ?? path.join(process.cwd(), "data"), "nudges.db");
         const dir = path.dirname(resolvedPath);
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });

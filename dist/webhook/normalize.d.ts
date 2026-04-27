@@ -1,4 +1,4 @@
-import { LinearEvent } from "./schema.js";
+import type { LinearEvent } from "./schema.js";
 /**
  * Parses a raw Linear webhook payload into a normalized `LinearEvent`.
  *

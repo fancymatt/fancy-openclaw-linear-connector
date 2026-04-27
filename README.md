@@ -739,6 +739,72 @@ The gateway has a flawed `symlink-escape` check that compares the symlink target
 2. Or: Add `~/Code/openclaw-linear/fancy-openclaw-linear-skill` to the gateway’s allowed skill roots (configure `skills.allowlist=[...]`)
 3. Or: For immediate relief, agents can run `linear` CLI commands without skill loading (CLI is globally installed)
 
+---
+
+## Running with Docker
+
+The connector can run as a Docker container instead of bare systemd + node. This is useful for deploying on cloud hosts, NAS devices, or anywhere you'd rather not manage node/nvm/systemd.
+
+### Quick Start
+
+```bash
+docker run -d \
+  --name linear-connector \
+  -p 3000:3000 \
+  -e LINEAR_WEBHOOK_SECRET=your-secret \
+  -v ./data:/data \
+  -v ./secrets:/secrets \
+  -v ./config/agents.json:/config/agents.json:ro \
+  ghcr.io/fancymatt/openclaw-linear-connector:latest
+```
+
+### Volume Mounts
+
+| Container path | Purpose |
+|---|--|
+| `/data` | SQLite databases (`events.db`, `agent-queue.db`, `nudges.db`) |
+| `/secrets` | Per-agent OAuth token files (`{agent-name}/linear.env`) |
+| `/config/agents.json` | Agent configuration (mount read-only) |
+
+### Docker Compose
+
+An example `docker-compose.yml` is included in the repo root. Create a `.env` file with your configuration, then:
+
+```bash
+mkdir -p data secrets config
+cp config/agents.json config/agents.json  # or your custom config
+docker compose up -d
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DATA_DIR` | `/data` | Directory for SQLite database files |
+| `SECRETS_DIR` | `/secrets` | Directory for per-agent OAuth token files |
+| `AGENTS_FILE` | `/config/agents.json` | Path to agents configuration file |
+| `PORT` | `3000` | HTTP listen port |
+| `LINEAR_WEBHOOK_SECRET` | — | HMAC secret for webhook signature validation |
+| `LINEAR_WEBHOOK_SECRETS` | — | Comma-separated list of HMAC secrets (preferred) |
+| `OPENCLAW_HOOKS_URL` | — | OpenClaw webhook delivery URL |
+| `OPENCLAW_HOOKS_TOKEN` | — | OpenClaw webhook auth token |
+| `DEPLOYMENT_NAME` | `fancymatt` | Deployment identifier for logging |
+
+### Multi-Architecture
+
+Images are built for `linux/amd64` and `linux/arm64`. The correct image is pulled automatically based on your host architecture.
+
+### Health Check
+
+The container exposes a `/health` endpoint used by the built-in Docker healthcheck:
+
+```bash
+curl http://localhost:3000/health
+# { "status": "ok", "service": "fancy-openclaw-linear-connector", ... }
+```
+
+---
+
 ## License
 
 [MIT](LICENSE) © 2026 Matt Henry

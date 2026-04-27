@@ -8,7 +8,7 @@ import path from "path";
  */
 export class AgentQueue {
     constructor(dbPath) {
-        const resolvedPath = dbPath ?? path.join(process.cwd(), "data", "agent-queue.db");
+        const resolvedPath = dbPath ?? path.join(process.env.DATA_DIR ?? path.join(process.cwd(), "data"), "agent-queue.db");
         this.db = new Database(resolvedPath);
         this.db.pragma("journal_mode = WAL");
         this.migrate();

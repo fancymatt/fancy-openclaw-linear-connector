@@ -97,8 +97,17 @@ function syncWorkspaceSecrets(agentName, accessToken) {
     const agent = _agents.find((a) => a.name === agentName);
     if (!agent)
         return;
-    const secretsPath = agent.secretsPath ??
-        path.join(os.homedir(), `.openclaw/workspace-${agent.openclawAgent ?? agent.name}/.secrets/linear.env`);
+    const openclawConfigDir = process.env.OPENCLAW_CONFIG_DIR ?? path.join(os.homedir(), ".openclaw");
+    let secretsPath;
+    if (agent.secretsPath) {
+        secretsPath = agent.secretsPath;
+    }
+    else if (process.env.SECRETS_DIR) {
+        secretsPath = path.join(process.env.SECRETS_DIR, `${agent.openclawAgent ?? agent.name}`, "linear.env");
+    }
+    else {
+        secretsPath = path.join(openclawConfigDir, `workspace-${agent.openclawAgent ?? agent.name}/.secrets/linear.env`);
+    }
     try {
         fs.mkdirSync(path.dirname(secretsPath), { recursive: true });
         fs.writeFileSync(secretsPath, `LINEAR_OAUTH_TOKEN=${accessToken}\n`, "utf8");
