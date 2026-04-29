@@ -5,10 +5,10 @@
  * has work for them and they're not in an active session. The agent then uses
  * `linear queue` / `linear my-next` to fetch and process work in priority order.
  *
- * NOTE: The session key `wake-up-${ts}` constructed below is a synthetic ID
- * used only by the connector. The OpenClaw gateway has no knowledge of it.
- * Once the gateway plugin is implemented (see follow-up ticket), the real
- * gateway session ID should round-trip through the connector instead.
+ * NOTE: The session key uses the ticket's `linear-<IDENTIFIER>` format (e.g.
+ * `linear-ILL-148`) so that the wake-up session shares context with any
+ * subsequent webhook events for the same ticket. For multi-ticket wake-ups,
+ * the first ticket's identifier is used as the key.
  */
 
 import { deliverToAgent, type DeliveryConfig } from "../delivery/index.js";
@@ -44,7 +44,7 @@ export async function sendWakeUpSignal(
 
   const route: RouteResult = {
     agentId,
-    sessionKey: `wake-up-${Date.now()}`,
+    sessionKey: count === 1 ? ticketIds[0] : `wake-${ticketIds[0]}`,
     priority: 0,
     event: {
       type: "WakeUp",

@@ -222,9 +222,12 @@ export function createWebhookRouter(
         }
 
         // No active session — send wake-up signal
+        const sessionKey = pendingIds.length === 1
+          ? pendingIds[0]
+          : `wake-${pendingIds[0]}`;
         log.info(`Bag: sending wake-up signal to ${agentName} with ${pendingIds.length} ticket(s)`);
         // Mark session active synchronously to gate concurrent requests
-        sessionTracker.startSession(agentName, `wake-up-${Date.now()}`);
+        sessionTracker.startSession(agentName, sessionKey);
         bag.recordSignal();
 
         const wakeConfig: WakeUpConfig = {

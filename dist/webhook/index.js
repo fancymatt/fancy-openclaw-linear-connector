@@ -5,6 +5,7 @@ import { normalizeLinearEvent } from "./normalize.js";
 import { routeEvent } from "../router.js";
 import { createSessionAndEmitThought } from "../agent-session.js";
 import { deliverToAgent } from "../delivery/index.js";
+import { sendWakeUpSignal } from "../bag/wake-up.js";
 import { createLogger, componentLogger } from "../logger.js";
 const log = componentLogger(createLogger(), "webhook");
 export { verifyLinearSignature } from "./signature.js";
@@ -21,7 +22,7 @@ export { normalizeLinearEvent } from "./normalize.js";
  *   LINEAR_WEBHOOK_SECRET  — single HMAC secret (legacy, backward compatible)
  */
 const NUDGE_DEDUP_WINDOW_MS = parseInt(process.env.NUDGE_DEDUP_WINDOW_MS ?? "120000", 10);
-export function createWebhookRouter(eventStore, nudgeStore, agentQueue) {
+export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle) {
     const router = Router();
     if (NUDGE_DEDUP_WINDOW_MS > 0) {
         log.info(`Nudge dedup enabled: ${NUDGE_DEDUP_WINDOW_MS}ms window`);
@@ -134,7 +135,6 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue) {
         // ── 9a. Nudge deduplication + coalescing ─────────────────────────────
         // Suppress rapid-fire duplicate events for the same agent+ticket.
         const ticketId = route.sessionKey;
-        let coalescedCount = 0;
         if (NUDGE_DEDUP_WINDOW_MS > 0 && nudgeStore) {
             const info = nudgeStore.getCoalesceInfo(route.agentId, ticketId, NUDGE_DEDUP_WINDOW_MS);
             if (info.suppressed) {
@@ -143,7 +143,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue) {
                 return;
             }
             // Window expired — drain coalesced count before delivering
-            coalescedCount = nudgeStore.drainCoalescedCount(route.agentId, ticketId);
+            const coalescedCount = nudgeStore.drainCoalescedCount(route.agentId, ticketId);
             nudgeStore.recordNudge(route.agentId, ticketId);
             if (coalescedCount > 0) {
                 log.info(`Nudge dedup: delivering for ${route.agentId} [${ticketId}] with ${coalescedCount} coalesced event(s)`);
@@ -169,9 +169,47 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue) {
                 log.error(`Failed to create agent session: ${err instanceof Error ? err.message : String(err)}`);
             }
         }
-        // ── 10b. Agent queue with ticket-level coalescing ──────────────────
-        // Serialize per-agent: only one active delivery at a time.
-        // Same-ticket queued events are coalesced (replaced) not stacked.
+        // ── v1.1: Pull-based wake-up via PendingWorkBag ─────────────────────
+        // Add to bag (deduped by ticket ID). Send wake-up signal only if
+        // agent has no active session. Bursts collapse to 1 signal.
+        if (bag && sessionTracker) {
+            bag.add(agentName, ticketId, event.type);
+            const pending = bag.getPendingTickets(agentName);
+            const pendingIds = pending.map((e) => e.ticketId);
+            if (sessionTracker.isActive(agentName)) {
+                // Agent is busy — queue signal for session-end
+                sessionTracker.queueSignal(agentName, [ticketId]);
+                log.info(`Bag: added ${ticketId} for ${agentName}, queuing signal (session active)`);
+                return;
+            }
+            // No active session — send wake-up signal
+            const sessionKey = pendingIds.length === 1
+                ? pendingIds[0]
+                : `wake-${pendingIds[0]}`;
+            log.info(`Bag: sending wake-up signal to ${agentName} with ${pendingIds.length} ticket(s)`);
+            // Mark session active synchronously to gate concurrent requests
+            sessionTracker.startSession(agentName, sessionKey);
+            bag.recordSignal();
+            const wakeConfig = {
+                nodeBin: process.execPath,
+                hooksUrl: process.env.OPENCLAW_HOOKS_URL,
+                hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
+                hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+                hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+            };
+            try {
+                await sendWakeUpSignal(agentName, pendingIds, wakeConfig);
+                // Clear bag after successful dispatch
+                bag.clearAgent(agentName);
+            }
+            catch (err) {
+                log.error(`Wake-up signal failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
+                // End the session so the agent can be re-signaled on next event
+                sessionTracker.endSession(agentName);
+            }
+            return;
+        }
+        // ── v1.0 fallback: Agent queue with ticket-level coalescing ─────────
         if (agentQueue) {
             const queueResult = agentQueue.enqueueOrCoalesce(route);
             if (queueResult.action === "active-busy") {
@@ -186,10 +224,8 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue) {
                 log.info(`Agent queue: queued event for ${route.agentId} [${ticketId}] (active task for different ticket)`);
                 return;
             }
-            // action === "deliver" — proceed to delivery below
             log.info(`Agent queue: delivering immediately for ${route.agentId} [${ticketId}]`);
         }
-        // Deliver to OpenClaw agent via delivery module
         const deliveryConfig = {
             nodeBin: process.execPath,
             hooksUrl: process.env.OPENCLAW_HOOKS_URL,
@@ -198,20 +234,27 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue) {
             hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
         };
         try {
+            if (throttle) {
+                log.info(`Dispatch throttle: waiting for ${agentName}`);
+                await throttle.wait(route.agentId);
+                throttle.record(route.agentId);
+            }
             await deliverToAgent(route, deliveryConfig);
         }
         catch (err) {
             log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
         }
         finally {
-            // Drain the entire queue for this agent: complete the active task,
-            // promote+deliver next, repeat until the queue is empty. The drain
-            // runs in finally so a delivery throw can't leak the active row.
             if (agentQueue) {
                 let next = agentQueue.complete(route.agentId);
                 while (next) {
                     log.info(`Agent queue: promoting next task for ${route.agentId} [${next.sessionKey}]`);
                     try {
+                        if (throttle) {
+                            log.info(`Dispatch throttle: waiting for ${route.agentId} (drain)`);
+                            await throttle.wait(route.agentId);
+                            throttle.record(route.agentId);
+                        }
                         await deliverToAgent(next, deliveryConfig);
                     }
                     catch (err) {

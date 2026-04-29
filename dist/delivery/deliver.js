@@ -59,7 +59,8 @@ async function deliverViaHooks(route, config, opts) {
             });
             clearTimeout(timer);
             if (!response.ok) {
-                throw new Error(`hooks responded with ${response.status}`);
+                const errBody = await response.text().catch(() => "no body");
+                throw new Error(`hooks responded with ${response.status}: ${errBody}`);
             }
             const json = (await response.json());
             log.info(`Isolated delivery dispatched for ${agentName} [${sessionId}]: runId=${json.runId ?? "ok"}`);

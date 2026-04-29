@@ -87,7 +87,8 @@ async function deliverViaHooks(
       });
       clearTimeout(timer);
       if (!response.ok) {
-        throw new Error(`hooks responded with ${response.status}`);
+        const errBody = await response.text().catch(() => "no body");
+        throw new Error(`hooks responded with ${response.status}: ${errBody}`);
       }
       const json = (await response.json()) as { runId?: string };
       log.info(
