@@ -12,6 +12,7 @@
  */
 
 import { deliverToAgent, type DeliveryConfig } from "../delivery/index.js";
+import { normalizeSessionKey } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
 import type { RouteResult } from "../types.js";
 
@@ -42,9 +43,13 @@ export async function sendWakeUpSignal(
     .replace("{count}", String(count))
     .replace("{tickets}", tickets);
 
+  // Normalize to strip any legacy prefixes and enforce uppercase.
+  // Result is always exactly `linear-<TEAM>-<NUMBER>`.
+  const sessionKey = normalizeSessionKey(ticketIds[0]);
+
   const route: RouteResult = {
     agentId,
-    sessionKey: count === 1 ? ticketIds[0] : `wake-${ticketIds[0]}`,
+    sessionKey,
     priority: 0,
     event: {
       type: "WakeUp",

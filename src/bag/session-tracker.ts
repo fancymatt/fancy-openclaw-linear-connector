@@ -9,18 +9,18 @@
  * that the gateway (or a gateway plugin) calls when an agent's session ends.
  * If no callback arrives within a timeout, the session is assumed ended.
  *
- * NOTE: The session key `wake-up-${ts}` is a synthetic session ID used only
- * by the connector to track signal state internally. The OpenClaw gateway has
- * no knowledge of it. Once the gateway plugin is implemented (see follow-up
- * ticket), the real gateway session ID should round-trip through the connector
- * instead of generating a synthetic one.
+ * NOTE: Session keys follow the canonical `linear-<TEAM>-<NUMBER>` format
+ * (e.g. `linear-ILL-152`) so that connector sessions share context with
+ * subsequent webhook events for the same ticket. Once the gateway plugin
+ * is implemented (see follow-up ticket), the real gateway session ID
+ * should round-trip through the connector instead.
  */
 
 import { createLogger, componentLogger } from "../logger.js";
 
 const log = componentLogger(createLogger(), "session-tracker");
 
-const DEFAULT_SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+const DEFAULT_SESSION_TIMEOUT_MS = 120 * 60 * 1000; // 120 minutes
 
 export class SessionTracker {
   private activeSessions: Map<

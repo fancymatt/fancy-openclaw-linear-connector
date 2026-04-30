@@ -115,10 +115,13 @@ export function createApp(options) {
             // Clear bag BEFORE sending signal (race fix: don't start session until signal succeeds)
             bag.clearAgent(agentId);
             bag.recordSignal();
+            // Use the first pending ticket's canonical key (e.g. linear-ILL-152)
+            // so the re-signal session shares context with subsequent webhook events.
+            const resignalKey = pendingTickets[0];
             sendWakeUpSignal(agentId, pendingTickets, wakeConfig)
                 .then(() => {
                 // Only mark session as active AFTER successful signal
-                sessionTracker.startSession(agentId, `wake-up-${Date.now()}`);
+                sessionTracker.startSession(agentId, resignalKey);
             })
                 .catch((err) => {
                 log.error(`Re-signal failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);

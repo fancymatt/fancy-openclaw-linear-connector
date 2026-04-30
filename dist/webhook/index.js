@@ -183,9 +183,9 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
                 return;
             }
             // No active session — send wake-up signal
-            const sessionKey = pendingIds.length === 1
-                ? pendingIds[0]
-                : `wake-${pendingIds[0]}`;
+            // Always use the canonical linear-<IDENTIFIER> format (e.g. linear-ILL-152)
+            // so the wake-up session shares context with subsequent webhook events.
+            const sessionKey = pendingIds[0];
             log.info(`Bag: sending wake-up signal to ${agentName} with ${pendingIds.length} ticket(s)`);
             // Mark session active synchronously to gate concurrent requests
             sessionTracker.startSession(agentName, sessionKey);

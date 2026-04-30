@@ -11,6 +11,7 @@
 import { buildAgentMap, getAccessToken, getAgent, getOpenclawAgentName, getAgents } from "./agents.js";
 import type { LinearEvent } from "./webhook/schema.js";
 import type { RouteResult } from "./types.js";
+import { normalizeSessionKey } from "./session-key.js";
 import { createLogger, componentLogger } from "./logger.js";
 
 const log = componentLogger(createLogger(), "router");
@@ -207,9 +208,12 @@ export function routeEvent(event: LinearEvent): RouteResult | null {
   const agent = getAgent(result.name);
   const openclawName = getOpenclawAgentName(result.name);
   const identifier = extractIssueIdentifier(event);
-  const sessionKey = identifier
+  const rawKey = identifier
     ? `linear-${identifier}`
     : `linear-${event.type}-${Date.now()}`;
+  const sessionKey = identifier
+    ? normalizeSessionKey(rawKey)
+    : rawKey;
 
   if (!identifier) {
     // Phase 1 diagnostic: log event shapes that slip through identifier extraction
