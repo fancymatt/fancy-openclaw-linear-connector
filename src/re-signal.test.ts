@@ -10,6 +10,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { createApp } from "./index.js";
+import { reloadAgents } from "./agents.js";
 
 function tempDb(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "resignal-test-"));
@@ -24,12 +25,20 @@ describe("Session-end re-signal cycle", () => {
 
   beforeEach(() => {
     process.env.SESSION_END_SECRET = "test-secret-re";
+    delete process.env.LINEAR_OAUTH_TOKEN;
+    delete process.env.LINEAR_API_KEY;
+    process.env.AGENTS_FILE = path.join(path.dirname(tempDb()), "agents.json");
+    reloadAgents();
     dbPath = tempDb();
     ({ app, bag, sessionTracker } = createApp({ bagDbPath: dbPath }));
   });
 
   afterEach(() => {
     delete process.env.SESSION_END_SECRET;
+    delete process.env.LINEAR_OAUTH_TOKEN;
+    delete process.env.LINEAR_API_KEY;
+    delete process.env.AGENTS_FILE;
+    reloadAgents();
     bag.close();
     sessionTracker.close();
     fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
@@ -59,15 +68,17 @@ describe("Session-end re-signal cycle", () => {
     expect(res.body.ok).toBe(true);
     expect(res.body.pendingTickets).toBe(2);
 
-    // Agent should no longer be in the old session (endSession was called)
-    expect(sessionTracker.getActiveSessionKey("igor")).toBeNull();
+    // Agent should no longer be in the old session; it should now track the
+    // first successfully re-signaled per-ticket session.
+    expect(sessionTracker.getActiveSessionKey("igor")).toBe("linear-AI-500");
 
-    // Bag should be cleared (clearAgent called before re-signal)
+    // Bag should be cleared for successfully re-signaled tickets.
     expect(bag.getPendingTickets("igor")).toHaveLength(0);
 
-    // Signal count should be incremented
+    // Signal count should be incremented once per ticket so each ticket gets
+    // its own canonical per-ticket session key.
     const stats = bag.getStats();
-    expect(stats.signalsSent).toBe(1);
+    expect(stats.signalsSent).toBe(2);
   });
 
   test("session-end with no queued signals returns 0", async () => {
