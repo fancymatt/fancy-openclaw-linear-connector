@@ -5,13 +5,11 @@ import { startTokenRefresh } from "./token-refresh.js";
 import { getAgents, watchAgentsFile } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
 import { handleOAuthCallback } from "./oauth-callback.js";
-import { normalizeSessionKey } from "./session-key.js";
 import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, DeliveryThrottle } from "./delivery/index.js";
-import { PendingWorkBag, SessionTracker } from "./bag/index.js";
-import { sendWakeUpSignal } from "./bag/wake-up.js";
+import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "./bag/index.js";
 import crypto from "crypto";
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -59,14 +57,28 @@ export function createApp(options) {
     const nudgeStore = new NudgeStore();
     const agentQueue = new AgentQueue();
     const bag = new PendingWorkBag(options?.bagDbPath);
-    const sessionTracker = new SessionTracker();
+    const wakeConfig = {
+        nodeBin: process.execPath,
+        hooksUrl: process.env.OPENCLAW_HOOKS_URL,
+        hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
+        hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+        hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+        timeoutMs: process.env.NODE_ENV === "test" ? 50 : undefined,
+        maxRetries: process.env.NODE_ENV === "test" ? 0 : undefined,
+    };
+    const sessionTracker = new SessionTracker(undefined, async (staleSessions) => {
+        for (const stale of staleSessions) {
+            log.info(`Stale session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
+            await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true });
+        }
+    });
     const throttle = new DeliveryThrottle();
     app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle));
     // ── v1.1: Session-end callback endpoint ──────────────────────────────
     // The gateway (via plugin) calls this when an agent's session ends.
     // The connector then checks the bag and sends another wake-up if needed.
     // Auth: x-session-end-secret header must match SESSION_END_SECRET env.
-    app.post("/session-end", (req, res) => {
+    app.post("/session-end", async (req, res) => {
         // Auth check — shared secret via constant-time compare
         const secret = process.env.SESSION_END_SECRET;
         if (secret) {
@@ -105,28 +117,14 @@ export function createApp(options) {
         log.info(`Session-end callback received for ${agentId}`);
         const pendingTickets = sessionTracker.endSession(agentId);
         if (pendingTickets && pendingTickets.length > 0) {
-            // Re-signal: agent has work waiting
-            const wakeConfig = {
-                nodeBin: process.execPath,
-                hooksUrl: process.env.OPENCLAW_HOOKS_URL,
-                hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
-                hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
-                hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
-            };
-            // Clear bag BEFORE sending signal (race fix: don't start session until signal succeeds)
-            bag.clearAgent(agentId);
-            bag.recordSignal();
-            // Normalize the re-signal key to exactly `linear-<TEAM>-<NUMBER>`.
-            const resignalKey = normalizeSessionKey(pendingTickets[0]);
-            sendWakeUpSignal(agentId, pendingTickets, wakeConfig)
-                .then(() => {
-                // Only mark session as active AFTER successful signal
-                sessionTracker.startSession(agentId, resignalKey);
-            })
-                .catch((err) => {
-                log.error(`Re-signal failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
-                // Don't start session on failure — agent will be re-signaled on next webhook
-            });
+            // Re-signal: agent has work waiting. Send one signal per ticket so each
+            // issue is delivered into its own canonical per-ticket session key.
+            try {
+                await resignalPendingTickets(agentId, pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true });
+            }
+            catch (err) {
+                log.error(`Session-end re-signal failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+            }
             res.json({ ok: true, pendingTickets: pendingTickets.length });
         }
         else {

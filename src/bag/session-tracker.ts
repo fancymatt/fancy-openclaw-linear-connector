@@ -17,10 +17,15 @@
  */
 
 import { createLogger, componentLogger } from "../logger.js";
+import { normalizeSessionKey } from "../session-key.js";
 
 const log = componentLogger(createLogger(), "session-tracker");
 
 const DEFAULT_SESSION_TIMEOUT_MS = 120 * 60 * 1000; // 120 minutes
+
+export type StaleSessionHandler = (
+  staleSessions: { agentId: string; pendingTickets: string[] }[],
+) => void | Promise<void>;
 
 export class SessionTracker {
   private activeSessions: Map<
@@ -30,17 +35,26 @@ export class SessionTracker {
   private sessionTimeoutMs: number;
   private pendingSignals: Map<string, string[]> = new Map(); // agentId → ticketIds[]
   private cleanupTimer?: ReturnType<typeof setInterval>;
+  private onStaleSessions?: StaleSessionHandler;
 
-  constructor(sessionTimeoutMs?: number) {
+  constructor(sessionTimeoutMs?: number, onStaleSessions?: StaleSessionHandler) {
     this.sessionTimeoutMs =
       sessionTimeoutMs ??
       parseInt(
         process.env.SESSION_TIMEOUT_MS ?? `${DEFAULT_SESSION_TIMEOUT_MS}`,
         10
       );
+    this.onStaleSessions = onStaleSessions;
 
-    // Periodic cleanup of stale sessions
-    this.cleanupTimer = setInterval(() => this.cleanupStale(), 60_000);
+    // Periodic cleanup of stale sessions. Returned pending work must be
+    // re-signaled; otherwise stale cleanup silently strands queued tickets.
+    this.cleanupTimer = setInterval(() => {
+      const staleSessions = this.cleanupStale();
+      if (staleSessions.length === 0 || !this.onStaleSessions) return;
+      Promise.resolve(this.onStaleSessions(staleSessions)).catch((err) => {
+        log.error(`Stale-session re-signal handler failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }, 60_000);
     this.cleanupTimer.unref();
   }
 
@@ -104,6 +118,25 @@ export class SessionTracker {
     log.info(
       `Queued signal for ${agentId}: ${merged.length} ticket(s) (session active)`
     );
+  }
+
+  /** Remove a queued pending signal, optionally across all agents. */
+  removePendingTicket(ticketId: string, agentId?: string): number {
+    const normalizedTicketId = normalizeSessionKey(ticketId);
+    let removed = 0;
+    const targets = agentId ? [agentId] : [...this.pendingSignals.keys()];
+    for (const target of targets) {
+      const existing = this.pendingSignals.get(target);
+      if (!existing?.length) continue;
+      const next = existing.filter((id) => normalizeSessionKey(id) !== normalizedTicketId);
+      removed += existing.length - next.length;
+      if (next.length > 0) {
+        this.pendingSignals.set(target, next);
+      } else {
+        this.pendingSignals.delete(target);
+      }
+    }
+    return removed;
   }
 
   /** Get the session key for an active agent session, or null. */

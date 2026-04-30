@@ -10,9 +10,10 @@ import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
 import { deliverToAgent, DeliveryThrottle } from "../delivery/index.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { AgentQueue } from "../queue/index.js";
-import { PendingWorkBag, SessionTracker } from "../bag/index.js";
-import { sendWakeUpSignal, type WakeUpConfig } from "../bag/wake-up.js";
+import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
+import { type WakeUpConfig } from "../bag/wake-up.js";
 import { createLogger, componentLogger } from "../logger.js";
+import { isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
 
 const log = componentLogger(createLogger(), "webhook");
 
@@ -134,6 +135,22 @@ export function createWebhookRouter(
       // ── 9. Route to agent ─────────────────────────────────────────────────
       log.info(`Normalized event: type=${event.type} hasData=${"data" in event} dataKeys=${event.data ? Object.keys(event.data as object).join(',') : 'none'}`);
 
+      if (isTerminalIssueEvent(event)) {
+        const identifier = issueIdentifierFromEvent(event);
+        if (identifier) {
+          const sessionKey = normalizeSessionKey(identifier);
+          const removedBag = bag?.removeTicketForAllAgents(sessionKey) ?? 0;
+          const removedQueued = sessionTracker?.removePendingTicket(sessionKey) ?? 0;
+          log.info(
+            `Terminal issue event for ${sessionKey}: pruned ${removedBag} pending bag entr${removedBag === 1 ? "y" : "ies"}` +
+            ` and ${removedQueued} queued signal${removedQueued === 1 ? "" : "s"}; skipping agent dispatch`,
+          );
+        } else {
+          log.info("Terminal issue event without identifier; skipping agent dispatch");
+        }
+        return;
+      }
+
       // AgentSessionEvent — create session for Linear UI widget
       if (event.type === "AgentSessionEvent") {
         // Create a Linear agent session to show "Agent working" widget
@@ -211,24 +228,8 @@ export function createWebhookRouter(
       // Add to bag (deduped by ticket ID). Send wake-up signal only if
       // agent has no active session. Bursts collapse to 1 signal.
       if (bag && sessionTracker) {
-        bag.add(agentName, normalizeSessionKey(ticketId), event.type);
-        const pending = bag.getPendingTickets(agentName);
-        const pendingIds = pending.map((e) => e.ticketId);
-
-        if (sessionTracker.isActive(agentName)) {
-          // Agent is busy — queue signal for session-end
-          sessionTracker.queueSignal(agentName, [ticketId]);
-          log.info(`Bag: added ${ticketId} for ${agentName}, queuing signal (session active)`);
-          return;
-        }
-
-        // No active session — send wake-up signal
-        // Normalize to exactly `linear-<TEAM>-<NUMBER>` (uppercase).
-        const sessionKey = normalizeSessionKey(pendingIds[0]);
-        log.info(`Bag: sending wake-up signal to ${agentName} with ${pendingIds.length} ticket(s)`);
-        // Mark session active synchronously to gate concurrent requests
-        sessionTracker.startSession(agentName, sessionKey);
-        bag.recordSignal();
+        const normalizedTicketId = normalizeSessionKey(ticketId);
+        bag.add(agentName, normalizedTicketId, event.type);
 
         const wakeConfig: WakeUpConfig = {
           nodeBin: process.execPath,
@@ -236,16 +237,43 @@ export function createWebhookRouter(
           hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
           hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
           hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+          timeoutMs: process.env.NODE_ENV === "test" ? 50 : undefined,
+          maxRetries: process.env.NODE_ENV === "test" ? 0 : undefined,
         };
-        try {
-          await sendWakeUpSignal(agentName, pendingIds, wakeConfig);
-          // Clear bag after successful dispatch
-          bag.clearAgent(agentName);
-        } catch (err) {
-          log.error(`Wake-up signal failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
-          // End the session so the agent can be re-signaled on next event
-          sessionTracker.endSession(agentName);
+
+        if (sessionTracker.isActive(agentName)) {
+          const activeSessionKey = sessionTracker.getActiveSessionKey(agentName);
+          if (activeSessionKey === normalizedTicketId) {
+            // Same ticket, same active OpenClaw session: append immediately.
+            // Waiting for /session-end here strands conversational same-ticket updates.
+            log.info(`Bag: active same-ticket session for ${agentName} [${normalizedTicketId}], delivering immediately`);
+            try {
+              if (throttle) {
+                log.info(`Dispatch throttle: waiting for ${agentName} (same-ticket active)`);
+                await throttle.wait(route.agentId);
+                throttle.record(route.agentId);
+              }
+              await deliverToAgent(route, wakeConfig);
+              bag.removeTicket(agentName, normalizedTicketId);
+            } catch (err) {
+              log.error(`Same-ticket active delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
+              sessionTracker.queueSignal(agentName, [normalizedTicketId]);
+            }
+            return;
+          }
+
+          // Agent is busy on a different ticket — queue signal for session-end/stale drain.
+          sessionTracker.queueSignal(agentName, [normalizedTicketId]);
+          log.info(`Bag: added ${normalizedTicketId} for ${agentName}, queuing signal (different active session: ${activeSessionKey ?? "unknown"})`);
+          return;
         }
+
+        // No active session — send one wake-up per pending ticket so each Linear
+        // issue gets its own canonical per-ticket OpenClaw session key.
+        const pending = bag.getPendingTickets(agentName);
+        const pendingIds = pending.map((e) => e.ticketId);
+        log.info(`Bag: sending wake-up signal(s) to ${agentName} with ${pendingIds.length} ticket(s)`);
+        await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfig, { markActive: true });
         return;
       }
 

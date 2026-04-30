@@ -28,8 +28,8 @@ describe("PendingWorkBag", () => {
 
     const tickets = bag.getPendingTickets("charles");
     expect(tickets).toHaveLength(2);
-    expect(tickets.map((t) => t.ticketId)).toContain("AI-491");
-    expect(tickets.map((t) => t.ticketId)).toContain("AI-492");
+    expect(tickets.map((t) => t.ticketId)).toContain("linear-AI-491");
+    expect(tickets.map((t) => t.ticketId)).toContain("linear-AI-492");
   });
 
   test("dedup: adding same ticket twice does not create duplicate", () => {
@@ -67,7 +67,7 @@ describe("PendingWorkBag", () => {
 
     expect(bag.removeTicket("charles", "AI-491")).toBe(true);
     expect(bag.getPendingTickets("charles")).toHaveLength(1);
-    expect(bag.getPendingTickets("charles")[0].ticketId).toBe("AI-492");
+    expect(bag.getPendingTickets("charles")[0].ticketId).toBe("linear-AI-492");
   });
 
   test("agentsWithPendingWork returns distinct agent IDs", () => {

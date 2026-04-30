@@ -16,6 +16,7 @@
 import Database from "better-sqlite3";
 import path from "path";
 import { createLogger, componentLogger } from "../logger.js";
+import { normalizeSessionKey } from "../session-key.js";
 
 const log = componentLogger(createLogger(), "bag");
 
@@ -83,12 +84,13 @@ export class PendingWorkBag {
    */
   add(agentId: string, ticketId: string, eventType: string): boolean {
     this.metrics.eventsReceived++;
+    const normalizedTicketId = normalizeSessionKey(ticketId);
 
     try {
       // Check if the row already exists before UPSERT to detect coalescing.
       const existing = this.db
         .prepare("SELECT 1 FROM pending_bag WHERE agent_id = ? AND ticket_id = ?")
-        .get(agentId, ticketId);
+        .get(agentId, normalizedTicketId);
 
       this.db
         .prepare(
@@ -98,7 +100,7 @@ export class PendingWorkBag {
              event_type = excluded.event_type,
              updated_at = datetime('now')`
         )
-        .run(agentId, ticketId, eventType);
+        .run(agentId, normalizedTicketId, eventType);
 
       // Return true if it was a new entry, false if it was an update
       return !existing;
@@ -154,8 +156,20 @@ export class PendingWorkBag {
   removeTicket(agentId: string, ticketId: string): boolean {
     const result = this.db
       .prepare("DELETE FROM pending_bag WHERE agent_id = ? AND ticket_id = ?")
-      .run(agentId, ticketId);
+      .run(agentId, normalizeSessionKey(ticketId));
     return result.changes > 0;
+  }
+
+  /**
+   * Remove a ticket from every agent bag. Used when Linear tells us an issue is
+   * terminal; stale pending delegations for completed/canceled work should not
+   * wake anyone later.
+   */
+  removeTicketForAllAgents(ticketId: string): number {
+    const result = this.db
+      .prepare("DELETE FROM pending_bag WHERE ticket_id = ?")
+      .run(normalizeSessionKey(ticketId));
+    return result.changes;
   }
 
   /**
