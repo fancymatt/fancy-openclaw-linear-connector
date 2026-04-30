@@ -39,6 +39,10 @@ function tokenForAgent(agentId: string): string | undefined {
   );
 }
 
+function linearAuthorizationHeader(token: string): string {
+  return /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+}
+
 /**
  * Return false only when Linear confirms the issue is terminal or missing.
  * On auth/network/API uncertainty, keep the ticket actionable so we do not
@@ -54,7 +58,7 @@ export async function isLinearIssueActionable(ticketId: string, agentId: string)
       method: "POST",
       headers: {
         "content-type": "application/json",
-        authorization: token,
+        authorization: linearAuthorizationHeader(token),
       },
       body: JSON.stringify({
         query: `query IssueState($id: String!) { issue(id: $id) { id identifier state { name type } } }`,
