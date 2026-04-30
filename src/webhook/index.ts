@@ -211,7 +211,7 @@ export function createWebhookRouter(
       // Add to bag (deduped by ticket ID). Send wake-up signal only if
       // agent has no active session. Bursts collapse to 1 signal.
       if (bag && sessionTracker) {
-        bag.add(agentName, ticketId, event.type);
+        bag.add(agentName, normalizeSessionKey(ticketId), event.type);
         const pending = bag.getPendingTickets(agentName);
         const pendingIds = pending.map((e) => e.ticketId);
 
@@ -223,9 +223,8 @@ export function createWebhookRouter(
         }
 
         // No active session — send wake-up signal
-        // Always use the canonical linear-<IDENTIFIER> format (e.g. linear-ILL-152)
-        // so the wake-up session shares context with subsequent webhook events.
-        const sessionKey = pendingIds[0];
+        // Normalize to exactly `linear-<TEAM>-<NUMBER>` (uppercase).
+        const sessionKey = normalizeSessionKey(pendingIds[0]);
         log.info(`Bag: sending wake-up signal to ${agentName} with ${pendingIds.length} ticket(s)`);
         // Mark session active synchronously to gate concurrent requests
         sessionTracker.startSession(agentName, sessionKey);

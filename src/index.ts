@@ -5,6 +5,7 @@ import { startTokenRefresh } from "./token-refresh.js";
 import { getAgents, watchAgentsFile } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
 import { handleOAuthCallback } from "./oauth-callback.js";
+import { normalizeSessionKey } from "./session-key.js";
 import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
 import { AgentQueue } from "./queue/index.js";
@@ -131,9 +132,8 @@ export function createApp(options?: CreateAppOptions) {
       // Clear bag BEFORE sending signal (race fix: don't start session until signal succeeds)
       bag.clearAgent(agentId);
       bag.recordSignal();
-      // Use the first pending ticket's canonical key (e.g. linear-ILL-152)
-      // so the re-signal session shares context with subsequent webhook events.
-      const resignalKey = pendingTickets[0];
+      // Normalize the re-signal key to exactly `linear-<TEAM>-<NUMBER>`.
+      const resignalKey = normalizeSessionKey(pendingTickets[0]);
       sendWakeUpSignal(agentId, pendingTickets, wakeConfig)
         .then(() => {
           // Only mark session as active AFTER successful signal
