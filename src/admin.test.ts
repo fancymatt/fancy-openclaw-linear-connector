@@ -70,6 +70,7 @@ describe("admin dashboard", () => {
     const res = await request(appState.app).get("/admin/api/dashboard");
     expect(res.status).toBe(200);
     expect(res.body.attention[0].title).toContain("sage");
+    expect(res.body.attention[0].href).toBe("/admin/tasks#task-linear-ai-615");
     expect(res.body.agents[0].credentialState).toBe("configured");
     expect(res.body.tasks[0].sessionKey).toBe("linear-AI-615");
     expect(res.body.agents[0].lastSuccess).toContain("delivered");
@@ -85,6 +86,22 @@ describe("admin dashboard", () => {
     const res = await request(appState.app).get("/admin/");
     expect(res.status).toBe(200);
     expect(res.text).toContain("No attention needed. Connector is running and no tasks are blocked.");
+    expect(res.text).toContain("attention-ok");
     expect(res.text.indexOf("Attention Needed")).toBeLessThan(res.text.indexOf("System Status"));
   });
+
+  test("warning destinations point to specific anchored rows and task detail panels", async () => {
+    appState.bag.add("sage", "AI-615", "Issue");
+
+    const tasks = await request(appState.app).get("/admin/tasks");
+    expect(tasks.status).toBe(200);
+    expect(tasks.text).toContain('id="task-linear-ai-615"');
+    expect(tasks.text).toContain("Detail panel");
+    expect(tasks.text).toContain("Open task detail");
+    expect(tasks.text).toContain("Event / session");
+
+    const overview = await request(appState.app).get("/admin/");
+    expect(overview.text).toContain('/admin/tasks#task-linear-ai-615');
+  });
+
 });
