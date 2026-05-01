@@ -10,6 +10,7 @@ import { NudgeStore } from "./store/nudge-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, DeliveryThrottle } from "./delivery/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "./bag/index.js";
+import { createAdminRouter } from "./admin.js";
 import crypto from "crypto";
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -55,7 +56,7 @@ export function createApp(options) {
     // Webhook routes — pass the event store from the dedup module
     const eventStore = new EventStore();
     const nudgeStore = new NudgeStore();
-    const agentQueue = new AgentQueue();
+    const agentQueue = new AgentQueue(options?.agentQueueDbPath);
     const bag = new PendingWorkBag(options?.bagDbPath);
     const wakeConfig = {
         nodeBin: process.execPath,
@@ -73,6 +74,8 @@ export function createApp(options) {
         }
     });
     const throttle = new DeliveryThrottle();
+    // v1 admin dashboard — read-only operational UI and safe JSON API.
+    app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, deploymentName: DEPLOYMENT_NAME }));
     app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle));
     // ── v1.1: Session-end callback endpoint ──────────────────────────────
     // The gateway (via plugin) calls this when an agent's session ends.
