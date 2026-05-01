@@ -5,11 +5,13 @@ import type { PendingWorkBag, BagEntry } from "./bag/index.js";
 import type { SessionTracker } from "./bag/index.js";
 import type { RouteResult } from "./types.js";
 import type { LinearEvent } from "./webhook/schema.js";
+import type { OperationalEventStore, OperationalEventOutcome } from "./store/operational-event-store.js";
 
 interface AdminDeps {
   agentQueue: AgentQueue;
   bag: PendingWorkBag;
   sessionTracker: SessionTracker;
+  operationalEventStore?: OperationalEventStore;
   deploymentName: string;
 }
 
@@ -148,12 +150,21 @@ function buildDashboard(deps: AdminDeps) {
   const queueStats = deps.agentQueue.getStats();
   const pendingStats = deps.bag.getAgentStats();
   const activeAgents = deps.sessionTracker.getActiveAgents();
-  const agentRows = agents.map((agent) => safeAgent(
-    agent,
-    queueStats.find((s) => s.agentId === agent.name || s.agentId === (agent.openclawAgent ?? agent.name)),
-    pendingStats.find((s) => s.agentId === agent.name || s.agentId === (agent.openclawAgent ?? agent.name))?.pendingCount ?? 0,
-    deps.sessionTracker.getActiveSessionKey(agent.name) ?? deps.sessionTracker.getActiveSessionKey(agent.openclawAgent ?? agent.name),
-  ));
+  const agentRows = agents.map((agent) => {
+    const openclawAgent = agent.openclawAgent ?? agent.name;
+    const row = safeAgent(
+      agent,
+      queueStats.find((s) => s.agentId === agent.name || s.agentId === openclawAgent),
+      pendingStats.find((s) => s.agentId === agent.name || s.agentId === openclawAgent)?.pendingCount ?? 0,
+      deps.sessionTracker.getActiveSessionKey(agent.name) ?? deps.sessionTracker.getActiveSessionKey(openclawAgent),
+    );
+    const snapshot = deps.operationalEventStore?.snapshot({ agent: openclawAgent, limit: 25 });
+    return {
+      ...row,
+      lastSuccess: snapshot?.lastSuccess ? `${snapshot.lastSuccess.outcome} ${ageLabel(snapshot.lastSuccess.occurredAt)}` : row.lastSuccess,
+      lastError: snapshot?.lastError ? `${snapshot.lastError.outcome}: ${snapshot.lastError.errorSummary ?? ageLabel(snapshot.lastError.occurredAt)}` : row.lastError,
+    };
+  });
 
   const agentIds = (agent: AgentConfig) => [...new Set([agent.name, agent.openclawAgent ?? agent.name])];
   const pendingTasks = agents.flatMap((agent) => agentIds(agent).flatMap((id) => deps.bag.getPendingTickets(id).map(safeTaskFromBag)));
@@ -194,6 +205,7 @@ function buildDashboard(deps: AdminDeps) {
     },
     agents: agentRows,
     tasks,
+    events: deps.operationalEventStore?.query({ limit: 50 }) ?? [],
     settings: {
       effectiveConfig: {
         deployment: deps.deploymentName,
@@ -317,6 +329,26 @@ export function createAdminRouter(deps: AdminDeps): Router {
   const router = Router();
   router.get("/api/dashboard", (_req: Request, res: Response) => {
     res.json(buildDashboard(deps));
+  });
+  router.get("/api/events", (req: Request, res: Response) => {
+    if (!deps.operationalEventStore) {
+      res.json({ events: [] });
+      return;
+    }
+    const outcome = typeof req.query.outcome === "string" ? req.query.outcome as OperationalEventOutcome : undefined;
+    const limit = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : undefined;
+    res.json({ events: deps.operationalEventStore.query({
+      agent: typeof req.query.agent === "string" ? req.query.agent : undefined,
+      key: typeof req.query.key === "string" ? req.query.key : undefined,
+      type: typeof req.query.type === "string" ? req.query.type : undefined,
+      outcome,
+      since: typeof req.query.since === "string" ? req.query.since : undefined,
+      until: typeof req.query.until === "string" ? req.query.until : undefined,
+      limit: Number.isFinite(limit) ? limit : undefined,
+    }) });
+  });
+  router.get("/api/tasks/:key/events", (req: Request, res: Response) => {
+    res.json(deps.operationalEventStore?.snapshot({ key: req.params.key }) ?? { key: req.params.key, lifecycle: [] });
   });
   router.get(["/", "/agents", "/tasks", "/settings"], (req: Request, res: Response) => {
     const segment = req.path.split("/").filter(Boolean)[0];

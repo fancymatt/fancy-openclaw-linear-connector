@@ -37,6 +37,7 @@ describe("admin dashboard", () => {
     appState = createApp({
       bagDbPath: path.join(dir, "pending-bag.db"),
       agentQueueDbPath: path.join(dir, "agent-queue.db"),
+      operationalEventsDbPath: path.join(dir, "operational-events.db"),
     });
   });
 
@@ -44,6 +45,7 @@ describe("admin dashboard", () => {
     appState.bag.close();
     appState.sessionTracker.close();
     appState.agentQueue.close();
+    appState.operationalEventStore.close();
     delete process.env.AGENTS_FILE;
     fs.rmSync(dir, { recursive: true, force: true });
   });
@@ -63,12 +65,14 @@ describe("admin dashboard", () => {
 
   test("admin API exposes operational data without raw secrets", async () => {
     appState.bag.add("sage", "AI-615", "Issue");
+    appState.operationalEventStore.append({ outcome: "delivered", type: "Issue", agent: "sage", key: "linear-AI-615" });
 
     const res = await request(appState.app).get("/admin/api/dashboard");
     expect(res.status).toBe(200);
     expect(res.body.attention[0].title).toContain("sage");
     expect(res.body.agents[0].credentialState).toBe("configured");
     expect(res.body.tasks[0].sessionKey).toBe("linear-AI-615");
+    expect(res.body.agents[0].lastSuccess).toContain("delivered");
 
     const serialized = JSON.stringify(res.body);
     expect(serialized).not.toContain("access-token-secret-value");

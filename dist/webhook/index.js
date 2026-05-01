@@ -24,7 +24,20 @@ export { normalizeLinearEvent } from "./normalize.js";
  *   LINEAR_WEBHOOK_SECRET  — single HMAC secret (legacy, backward compatible)
  */
 const NUDGE_DEDUP_WINDOW_MS = parseInt(process.env.NUDGE_DEDUP_WINDOW_MS ?? "120000", 10);
-export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle) {
+function errorSummary(err) {
+    return err instanceof Error ? err.message : String(err);
+}
+function appendOperationalEvent(store, input) {
+    if (!store)
+        return;
+    try {
+        store.append(input);
+    }
+    catch (err) {
+        log.error(`Operational event write failed: ${errorSummary(err)}`);
+    }
+}
+export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle, operationalEventStore) {
     const router = Router();
     if (NUDGE_DEDUP_WINDOW_MS > 0) {
         log.info(`Nudge dedup enabled: ${NUDGE_DEDUP_WINDOW_MS}ms window`);
@@ -38,6 +51,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
         log.info(`Webhook received. Headers: ${JSON.stringify(Object.keys(req.headers).filter(h => h.startsWith('x-') || h.startsWith('linear')))} `);
         log.info(`linear-event header: ${req.headers["linear-event"] || "(missing)"}`);
         log.info(`linear-timestamp header: ${req.headers["linear-timestamp"] || "(missing)"}`);
+        appendOperationalEvent(operationalEventStore, { outcome: "received", type: typeof req.headers["linear-event"] === "string" ? req.headers["linear-event"] : null, detail: { headers: req.headers } });
         // ── 2. Get raw body ────────────────────────────────────────────────────
         const rawBody = req.rawBody;
         log.info(`Raw body length: ${rawBody?.length || 0} bytes`);
@@ -45,6 +59,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
         if (secrets.length > 0) {
             const signature = req.headers["x-linear-signature"] ?? req.headers["linear-signature"];
             if (!signature || typeof signature !== "string") {
+                appendOperationalEvent(operationalEventStore, { outcome: "signature-rejected", errorSummary: "Missing signature header" });
                 res.status(400).json({
                     error: "Missing signature header",
                 });
@@ -57,6 +72,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
             const signatureValid = verifyLinearSignatureMulti(rawBody, signature, secrets);
             log.info(`Signature validation result: ${signatureValid ? "valid" : "invalid"}`);
             if (!signatureValid) {
+                appendOperationalEvent(operationalEventStore, { outcome: "signature-rejected", errorSummary: "Invalid signature" });
                 res.status(401).json({ error: "Invalid signature" });
                 return;
             }
@@ -80,6 +96,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
         try {
             event = normalizeLinearEvent(payload);
             log.info(`Event normalized: type=${event.type}`);
+            appendOperationalEvent(operationalEventStore, { outcome: "normalized", type: event.type, detail: { action: event.action } });
         }
         catch (err) {
             res.status(400).json({
@@ -93,6 +110,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
             crypto.createHash("sha256").update(rawBody ?? Buffer.from(JSON.stringify(payload))).digest("hex");
         if (eventStore?.isDuplicate(deliveryId)) {
             log.info(`Checking duplicate for delivery: ${deliveryId}`);
+            appendOperationalEvent(operationalEventStore, { outcome: "duplicate", type: event.type, key: deliveryId });
             res.status(200).json({ ok: true, duplicate: true });
             return;
         }
@@ -110,6 +128,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
                 const removedQueued = sessionTracker?.removePendingTicket(sessionKey) ?? 0;
                 log.info(`Terminal issue event for ${sessionKey}: pruned ${removedBag} pending bag entr${removedBag === 1 ? "y" : "ies"}` +
                     ` and ${removedQueued} queued signal${removedQueued === 1 ? "" : "s"}; skipping agent dispatch`);
+                appendOperationalEvent(operationalEventStore, { outcome: "terminal-pruned", type: event.type, key: sessionKey, sessionKey, detail: { removedBag, removedQueued } });
             }
             else {
                 log.info("Terminal issue event without identifier; skipping agent dispatch");
@@ -146,6 +165,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
         const route = routeEvent(event);
         if (!route) {
             log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
+            appendOperationalEvent(operationalEventStore, { outcome: "no-route", type: event.type, errorSummary: `No agent target for ${event.type}` });
             return;
         }
         // ── 9a. Nudge deduplication + coalescing ─────────────────────────────
@@ -156,6 +176,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
             if (info.suppressed) {
                 log.info(`Nudge dedup: coalescing delivery for ${route.agentId} [${ticketId}] — within ${NUDGE_DEDUP_WINDOW_MS}ms window`);
                 nudgeStore.recordCoalesced(route.agentId, ticketId, event.type, "action" in event ? event.action : undefined);
+                appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "nudge-dedup" });
                 return;
             }
             // Window expired — drain coalesced count before delivering
@@ -168,6 +189,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
         }
         const agentName = route.agentId;
         log.info(`Routed event to ${agentName} [${route.sessionKey}]`);
+        appendOperationalEvent(operationalEventStore, { outcome: "routed", type: event.type, agent: agentName, key: route.sessionKey, sessionKey: route.sessionKey, deliveryMode: bag && sessionTracker ? "pending-bag" : agentQueue ? "agent-queue" : "direct" });
         // ── 10. Create agent session + emit thought ───────────────────────────
         const data = event.data;
         const issueId = data?.id;
@@ -191,6 +213,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
         if (bag && sessionTracker) {
             const normalizedTicketId = normalizeSessionKey(ticketId);
             bag.add(agentName, normalizedTicketId, event.type);
+            appendOperationalEvent(operationalEventStore, { outcome: "bag-added", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "pending-bag" });
             const wakeConfig = {
                 nodeBin: process.execPath,
                 hooksUrl: process.env.OPENCLAW_HOOKS_URL,
@@ -223,9 +246,11 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
                         }
                         await deliverToAgent(route, wakeConfig);
                         bag.removeTicket(agentName, normalizedTicketId);
+                        appendOperationalEvent(operationalEventStore, { outcome: "delivered", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "active-same-ticket", attemptCount: 1 });
                     }
                     catch (err) {
                         log.error(`Same-ticket active delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
+                        appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "active-same-ticket", attemptCount: 1, errorSummary: errorSummary(err) });
                         sessionTracker.queueSignal(agentName, [normalizedTicketId]);
                     }
                     return;
@@ -233,6 +258,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
                 // Agent is busy on a different ticket — queue signal for session-end/stale drain.
                 sessionTracker.queueSignal(agentName, [normalizedTicketId]);
                 log.info(`Bag: added ${normalizedTicketId} for ${agentName}, queuing signal (different active session: ${activeSessionKey ?? "unknown"})`);
+                appendOperationalEvent(operationalEventStore, { outcome: "queued", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "session-pending-signal" });
                 return;
             }
             // No active session — send one wake-up per pending ticket so each Linear
@@ -240,7 +266,8 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
             const pending = bag.getPendingTickets(agentName);
             const pendingIds = pending.map((e) => e.ticketId);
             log.info(`Bag: sending wake-up signal(s) to ${agentName} with ${pendingIds.length} ticket(s)`);
-            await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfig, { markActive: true });
+            const sent = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfig, { markActive: true });
+            appendOperationalEvent(operationalEventStore, { outcome: sent > 0 ? "delivered" : "delivery-failed", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "wake-up", attemptCount: pendingIds.length, errorSummary: sent > 0 ? null : "No wake-up signals delivered" });
             return;
         }
         // ── v1.0 fallback: Agent queue with ticket-level coalescing ─────────
@@ -248,14 +275,17 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
             const queueResult = agentQueue.enqueueOrCoalesce(route);
             if (queueResult.action === "active-busy") {
                 log.info(`Agent queue: ${route.agentId} already has active task for [${ticketId}] — skipping`);
+                appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "agent-queue-active-busy" });
                 return;
             }
             if (queueResult.action === "coalesced") {
                 log.info(`Agent queue: coalesced queued event for ${route.agentId} [${ticketId}]`);
+                appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "agent-queue-coalesced" });
                 return;
             }
             if (queueResult.action === "queued") {
                 log.info(`Agent queue: queued event for ${route.agentId} [${ticketId}] (active task for different ticket)`);
+                appendOperationalEvent(operationalEventStore, { outcome: "queued", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "agent-queue" });
                 return;
             }
             log.info(`Agent queue: delivering immediately for ${route.agentId} [${ticketId}]`);
@@ -274,9 +304,11 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
                 throttle.record(route.agentId);
             }
             await deliverToAgent(route, deliveryConfig);
+            appendOperationalEvent(operationalEventStore, { outcome: "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1 });
         }
         catch (err) {
             log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
+            appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, errorSummary: errorSummary(err) });
         }
         finally {
             if (agentQueue) {
@@ -290,9 +322,11 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
                             throttle.record(route.agentId);
                         }
                         await deliverToAgent(next, deliveryConfig);
+                        appendOperationalEvent(operationalEventStore, { outcome: "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1 });
                     }
                     catch (err) {
                         log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);
+                        appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, errorSummary: errorSummary(err) });
                     }
                     next = agentQueue.complete(route.agentId);
                 }
