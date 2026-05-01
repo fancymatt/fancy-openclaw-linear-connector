@@ -4,13 +4,73 @@
  * Modeled after the ILL webhook's agents.ts pattern.
  */
 import fs from "node:fs";
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { createLogger, componentLogger } from "./logger.js";
 const log = componentLogger(createLogger(), "agents");
 const DEFAULT_AGENTS_PATH = path.resolve(process.cwd(), "agents.json");
+const ENCRYPTED_AGENTS_VERSION = 2;
+const ENCRYPTED_AGENTS_ALG = "AES-256-GCM";
 function getAgentsPath() {
     return process.env.AGENTS_FILE ?? DEFAULT_AGENTS_PATH;
+}
+function isEncryptedAgentsFile(data) {
+    if (!data || typeof data !== "object")
+        return false;
+    const candidate = data;
+    return candidate.version === ENCRYPTED_AGENTS_VERSION &&
+        candidate.alg === ENCRYPTED_AGENTS_ALG &&
+        typeof candidate.iv === "string" &&
+        typeof candidate.tag === "string" &&
+        typeof candidate.ct === "string";
+}
+function resolveEncryptionKey() {
+    const keyValue = process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY ??
+        (process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE
+            ? fs.readFileSync(process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE, "utf8").trim()
+            : undefined);
+    if (!keyValue)
+        return undefined;
+    const key = Buffer.from(keyValue, "base64");
+    if (key.length !== 32) {
+        throw new Error("LINEAR_CONNECTOR_ENCRYPTION_KEY must be base64-encoded 32 bytes for AES-256-GCM");
+    }
+    return key;
+}
+function encryptAgentsFile(data, key) {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+    const plaintext = Buffer.from(JSON.stringify(data, null, 2) + "\n", "utf8");
+    const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return {
+        version: ENCRYPTED_AGENTS_VERSION,
+        alg: ENCRYPTED_AGENTS_ALG,
+        iv: iv.toString("base64"),
+        tag: tag.toString("base64"),
+        ct: ciphertext.toString("base64"),
+    };
+}
+function decryptAgentsFile(data, key) {
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(data.iv, "base64"));
+    decipher.setAuthTag(Buffer.from(data.tag, "base64"));
+    const plaintext = Buffer.concat([
+        decipher.update(Buffer.from(data.ct, "base64")),
+        decipher.final(),
+    ]).toString("utf8");
+    return JSON.parse(plaintext);
+}
+function parseAgentsFile(raw, filePath) {
+    const parsed = JSON.parse(raw);
+    if (!isEncryptedAgentsFile(parsed)) {
+        return parsed;
+    }
+    const key = resolveEncryptionKey();
+    if (!key) {
+        throw new Error(`Encrypted agents file present at ${filePath} but no LINEAR_CONNECTOR_ENCRYPTION_KEY or LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE is configured`);
+    }
+    return decryptAgentsFile(parsed, key);
 }
 function load() {
     const filePath = getAgentsPath();
@@ -18,17 +78,22 @@ function load() {
         return [];
     try {
         const raw = fs.readFileSync(filePath, "utf8");
-        const data = JSON.parse(raw);
+        const data = parseAgentsFile(raw, filePath);
         return data.agents ?? [];
     }
-    catch {
-        log.error(`Failed to load agents from ${filePath}`);
-        return [];
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        log.error(`Failed to load agents from ${filePath}: ${message}`);
+        throw err;
     }
 }
 function save(agents) {
     const data = { agents };
-    fs.writeFileSync(getAgentsPath(), JSON.stringify(data, null, 2) + "\n", "utf8");
+    const key = resolveEncryptionKey();
+    const serialized = key
+        ? JSON.stringify(encryptAgentsFile(data, key), null, 2) + "\n"
+        : JSON.stringify(data, null, 2) + "\n";
+    fs.writeFileSync(getAgentsPath(), serialized, "utf8");
 }
 // In-memory cache, kept in sync with disk via file watcher
 let _agents = load();
