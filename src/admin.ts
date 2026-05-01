@@ -278,23 +278,57 @@ function timingSafeEquals(actual: string, expected: string): boolean {
   return crypto.timingSafeEqual(actualBuffer, expectedBuffer);
 }
 
+function secretFromBasicAuthorization(authorization: string): string | null {
+  const encoded = authorization.slice("Basic ".length).trim();
+  if (!encoded) return null;
+  try {
+    const decoded = Buffer.from(encoded, "base64").toString("utf8");
+    const separator = decoded.indexOf(":");
+    return separator >= 0 ? decoded.slice(separator + 1) : null;
+  } catch {
+    return null;
+  }
+}
+
 function adminSecretFromRequest(req: Request): string | null {
   const header = req.headers["x-admin-secret"];
   if (typeof header === "string") return header;
   const authorization = req.headers.authorization;
   if (authorization?.startsWith("Bearer ")) return authorization.slice("Bearer ".length);
+  if (authorization?.startsWith("Basic ")) return secretFromBasicAuthorization(authorization);
   return null;
+}
+
+function wantsHtml(req: Request): boolean {
+  return !req.path.startsWith("/api/") && req.accepts(["html", "json"]) === "html";
+}
+
+function renderAuthFailurePage(status: number, title: string, message: string): string {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(title)} · Linear Connector Admin</title><style>
+    :root { color-scheme: dark; --bg:#0b0f14; --panel:#111821; --line:#263342; --text:#eef4f8; --muted:#9dafbe; --red:#ff837d; --yellow:#f2c96d; }
+    *{box-sizing:border-box} body{margin:0;min-height:100vh;display:grid;place-items:center;background:linear-gradient(180deg,#071018,#10151b);color:var(--text);font:15px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}.card{width:min(560px,calc(100vw - 32px));background:rgba(17,24,33,.94);border:1px solid var(--line);border-radius:18px;padding:24px;box-shadow:0 18px 50px rgba(0,0,0,.3)}.eyebrow{color:${status === 503 ? "var(--yellow)" : "var(--red)"};font-weight:700;text-transform:uppercase;letter-spacing:.08em;font-size:12px}h1{margin:8px 0 10px;font-size:24px}.muted{color:var(--muted)}code{background:#0b1118;border:1px solid var(--line);border-radius:7px;padding:2px 5px}
+  </style></head><body><main class="card"><div class="eyebrow">Admin access</div><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p><p class="muted">The dashboard is read-only and hides token values. Browser navigation supports HTTP Basic auth using <code>ADMIN_SECRET</code> as the password; API clients may use <code>x-admin-secret</code> or Bearer auth.</p></main></body></html>`;
+}
+
+function sendAdminAuthFailure(req: Request, res: Response, status: number, title: string, message: string): void {
+  if (wantsHtml(req)) {
+    if (status === 401) res.setHeader("WWW-Authenticate", 'Basic realm="Linear Connector Admin", charset="UTF-8"');
+    res.status(status).type("html").send(renderAuthFailurePage(status, title, message));
+    return;
+  }
+  if (status === 401) res.setHeader("WWW-Authenticate", 'Basic realm="Linear Connector Admin", charset="UTF-8"');
+  res.status(status).json({ error: title, message });
 }
 
 function adminAuth(req: Request, res: Response, next: NextFunction): void {
   const expected = process.env.ADMIN_SECRET;
   if (!expected) {
-    res.status(503).json({ error: "ADMIN_SECRET is not configured" });
+    sendAdminAuthFailure(req, res, 503, "ADMIN_SECRET is not configured", "Set ADMIN_SECRET before using the admin dashboard.");
     return;
   }
   const actual = adminSecretFromRequest(req);
   if (!actual || !timingSafeEquals(actual, expected)) {
-    res.status(401).json({ error: "Unauthorized" });
+    sendAdminAuthFailure(req, res, 401, "Unauthorized", "Enter the admin password to view the Linear connector dashboard.");
     return;
   }
   next();

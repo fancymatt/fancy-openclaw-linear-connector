@@ -15,6 +15,10 @@ function adminGet(app: ReturnType<typeof createApp>["app"], route: string) {
   return request(app).get(route).set("x-admin-secret", ADMIN_SECRET);
 }
 
+function adminBasicGet(app: ReturnType<typeof createApp>["app"], route: string) {
+  return request(app).get(route).auth("admin", ADMIN_SECRET);
+}
+
 function writeAgents(dir: string): string {
   const file = path.join(dir, "agents.json");
   fs.writeFileSync(file, JSON.stringify({
@@ -58,13 +62,34 @@ describe("admin dashboard", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  test("requires ADMIN_SECRET for admin routes", async () => {
+  test("requires ADMIN_SECRET for admin API routes", async () => {
     const unauthorized = await request(appState.app).get("/admin/api/dashboard");
     expect(unauthorized.status).toBe(401);
+    expect(unauthorized.headers["www-authenticate"]).toContain("Basic");
 
     delete process.env.ADMIN_SECRET;
     const unconfigured = await request(appState.app).get("/admin/api/dashboard").set("x-admin-secret", ADMIN_SECRET);
     expect(unconfigured.status).toBe(503);
+    process.env.ADMIN_SECRET = ADMIN_SECRET;
+  });
+
+  test("supports browser-compatible Basic auth and safe HTML auth failures", async () => {
+    const unauthorized = await request(appState.app).get("/admin/").set("Accept", "text/html");
+    expect(unauthorized.status).toBe(401);
+    expect(unauthorized.headers["www-authenticate"]).toContain("Basic");
+    expect(unauthorized.text).toContain("Enter the admin password");
+    expect(unauthorized.text).toContain("HTTP Basic auth");
+
+    const authed = await adminBasicGet(appState.app, "/admin/tasks");
+    expect(authed.status).toBe(200);
+    expect(authed.text).toContain("Linear Connector Admin");
+    expect(authed.text).toContain("Tasks");
+
+    delete process.env.ADMIN_SECRET;
+    const unconfigured = await request(appState.app).get("/admin/").set("Accept", "text/html");
+    expect(unconfigured.status).toBe(503);
+    expect(unconfigured.text).toContain("ADMIN_SECRET is not configured");
+    expect(unconfigured.text).not.toContain(ADMIN_SECRET);
     process.env.ADMIN_SECRET = ADMIN_SECRET;
   });
 
