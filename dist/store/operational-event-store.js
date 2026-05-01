@@ -2,14 +2,22 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 export const OPERATIONAL_EVENT_OUTCOMES = ["received", "signature-rejected", "duplicate", "normalized", "terminal-pruned", "no-route", "routed", "dedup-suppressed", "bag-added", "delivered", "queued", "delivery-failed", "session-ended", "stale-resignaled"];
-const SECRET_KEY_PATTERN = /(token|secret|password|authorization|signature|cookie|apikey|api_key|clientsecret|client_secret|accesstoken|access_token|refreshtoken|refresh_token)/i;
+const SECRET_KEY_PATTERN = /(token|secret|password|authorization|signature|cookie|api[-_]?key|x[-_]?api[-_]?key|client[-_]?secret|access[-_]?token|refresh[-_]?token|linear[-_]?signature)/i;
 const MAX_DETAIL_BYTES = 4096;
 const MAX_ERROR_BYTES = 512;
-const SECRET_VALUE_PATTERN = /\b[^\s,;]*?(?:token|secret|password|authorization|apikey|api_key)[^\s,;]*\b/ig;
+const SECRET_VALUE_PATTERNS = [
+    [/\b((?:authorization|proxy-authorization)\s*:\s*(?:bearer|basic)\s+)[^\s,;]+/ig, "$1[REDACTED]"],
+    [/\b((?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+/ig, "$1[REDACTED]"],
+    [/\b((?:api[-_ ]?key|x[-_ ]?api[-_ ]?key)\s*[:=]\s*)[^\s,;]+/ig, "$1[REDACTED]"],
+    [/\b((?:linear[-_ ]?signature|signature)\s*[:=]\s*)[^\s,;]+/ig, "$1[REDACTED]"],
+    [/\bsk_(?:live|test|proj)?_[A-Za-z0-9_-]+\b/ig, "[REDACTED]"],
+    [/\blin_wh_[A-Za-z0-9_-]+\b/ig, "[REDACTED]"],
+    [/\b[^\s,;]*?(?:token|secret|password|authorization|api[-_]?key)[^\s,;]*\b/ig, "[REDACTED]"],
+];
 const SUCCESS_OUTCOMES = new Set(["received", "normalized", "routed", "bag-added", "delivered", "queued", "session-ended", "stale-resignaled"]);
 const ERROR_OUTCOMES = new Set(["signature-rejected", "delivery-failed", "no-route"]);
 function redactText(value) {
-    return value.replace(SECRET_VALUE_PATTERN, "[REDACTED]");
+    return SECRET_VALUE_PATTERNS.reduce((output, [pattern, replacement]) => output.replace(pattern, replacement), value);
 }
 function truncateUtf8(value, maxBytes) {
     if (Buffer.byteLength(value, "utf8") <= maxBytes)
@@ -30,7 +38,7 @@ function sanitizeValue(value, seen = new WeakSet()) {
     if (typeof value === "number" || typeof value === "boolean")
         return value;
     if (value instanceof Error)
-        return { name: value.name, message: truncateUtf8(value.message, MAX_ERROR_BYTES) };
+        return { name: value.name, message: truncateUtf8(redactText(value.message), MAX_ERROR_BYTES) };
     if (Array.isArray(value))
         return value.slice(0, 50).map((item) => sanitizeValue(item, seen));
     if (typeof value === "object") {

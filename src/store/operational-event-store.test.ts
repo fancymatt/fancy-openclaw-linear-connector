@@ -45,6 +45,61 @@ describe("OperationalEventStore", () => {
     expect(serialized).toContain("kept");
   });
 
+  it("redacts credential value shapes embedded under non-sensitive detail keys", () => {
+    const sensitiveMessages = [
+      "Authorization: Bearer sk_live_1234567890abcdef",
+      "Bearer sk_live_1234567890abcdef",
+      "api key: sk_live_1234567890abcdef",
+      "x-api-key: sk_live_1234567890abcdef",
+      "linear-signature: lin_wh_abc123456789",
+    ];
+
+    for (const message of sensitiveMessages) {
+      const detail = redactOperationalDetail({ message });
+      const serialized = JSON.stringify(detail);
+      expect(serialized).not.toContain("sk_live_1234567890abcdef");
+      expect(serialized).not.toContain("lin_wh_abc123456789");
+      expect(serialized).toContain("[REDACTED]");
+    }
+  });
+
+  it("redacts credential value shapes from persisted error summaries", () => {
+    const sensitiveSummaries = [
+      "Authorization: Bearer sk_live_1234567890abcdef",
+      "Bearer sk_live_1234567890abcdef",
+      "api key: sk_live_1234567890abcdef",
+      "x-api-key: sk_live_1234567890abcdef",
+      "linear-signature: lin_wh_abc123456789",
+    ];
+
+    sensitiveSummaries.forEach((errorSummary, index) => store.append({
+      outcome: "delivery-failed",
+      agent: "igor",
+      key: `linear-AI-616-${index}`,
+      errorSummary,
+    }));
+
+    const serialized = JSON.stringify(store.query({ agent: "igor" }));
+    expect(serialized).not.toContain("sk_live_1234567890abcdef");
+    expect(serialized).not.toContain("lin_wh_abc123456789");
+    expect(serialized).toContain("[REDACTED]");
+  });
+
+  it("redacts hyphenated sensitive detail keys", () => {
+    const detail = redactOperationalDetail({
+      "api-key": "sk_live_1234567890abcdef",
+      "x-api-key": "sk_live_abcdef1234567890",
+      "linear-signature": "lin_wh_abc123456789",
+      safe: "kept",
+    });
+
+    const serialized = JSON.stringify(detail);
+    expect(serialized).not.toContain("sk_live_1234567890abcdef");
+    expect(serialized).not.toContain("sk_live_abcdef1234567890");
+    expect(serialized).not.toContain("lin_wh_abc123456789");
+    expect(serialized).toContain("kept");
+  });
+
   it("bounds large JSON details", () => {
     const detail = redactOperationalDetail({ big: "x".repeat(20_000) });
     expect(Buffer.byteLength(JSON.stringify(detail), "utf8")).toBeLessThanOrEqual(4200);
