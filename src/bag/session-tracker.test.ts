@@ -1,3 +1,4 @@
+import { jest } from "@jest/globals";
 import { SessionTracker } from "./session-tracker.js";
 
 describe("SessionTracker", () => {
@@ -105,5 +106,40 @@ describe("SessionTracker", () => {
     expect(tracker.getActiveSessionKey("igor")).toBeNull();
     tracker.startSession("igor", "session-abc");
     expect(tracker.getActiveSessionKey("igor")).toBe("session-abc");
+  });
+
+  test("getActiveSessionInfo exposes diagnostic session metadata", () => {
+    expect(tracker.getActiveSessionInfo("igor")).toBeNull();
+    tracker.startSession("igor", "linear-AI-123");
+
+    const info = tracker.getActiveSessionInfo("igor");
+    expect(info).toMatchObject({
+      agentId: "igor",
+      sessionKey: "linear-AI-123",
+    });
+    expect(info?.startedAt).toEqual(expect.any(Number));
+    expect(info?.ageMs).toEqual(expect.any(Number));
+    expect(info?.ageMs).toBeGreaterThanOrEqual(0);
+  });
+
+  test("default connector session timeout is 25 minutes, not a two-hour lock", async () => {
+    const original = process.env.SESSION_TIMEOUT_MS;
+    delete process.env.SESSION_TIMEOUT_MS;
+    const defaultTracker = new SessionTracker();
+    defaultTracker.startSession("igor", "linear-AI-999");
+
+    // Move wall clock forward just past the default timeout. This guards the
+    // production default without reaching into private fields.
+    const realNow = Date.now();
+    const nowSpy = jest.spyOn(Date, "now").mockReturnValue(realNow + 25 * 60 * 1000 + 1);
+    try {
+      defaultTracker.cleanupStale();
+      expect(defaultTracker.isActive("igor")).toBe(false);
+    } finally {
+      nowSpy.mockRestore();
+      defaultTracker.close();
+      if (original === undefined) delete process.env.SESSION_TIMEOUT_MS;
+      else process.env.SESSION_TIMEOUT_MS = original;
+    }
   });
 });

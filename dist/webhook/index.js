@@ -200,6 +200,15 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
                 timeoutMs: process.env.NODE_ENV === "test" ? 50 : undefined,
                 maxRetries: process.env.NODE_ENV === "test" ? 0 : undefined,
             };
+            // Before honoring in-memory active-session locks, synchronously expire
+            // stale sessions. The interval-based cleanup is only a backstop; webhook
+            // traffic should not wait up to another minute behind an already-expired
+            // lock, and stale cleanup must re-signal queued work instead of stranding it.
+            const staleSessions = sessionTracker.cleanupStale();
+            for (const stale of staleSessions) {
+                log.info(`Webhook stale-session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
+                await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true });
+            }
             if (sessionTracker.isActive(agentName)) {
                 const activeSessionKey = sessionTracker.getActiveSessionKey(agentName);
                 if (activeSessionKey === normalizedTicketId) {

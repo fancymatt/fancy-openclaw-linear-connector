@@ -146,10 +146,12 @@ export function createApp(options) {
         else {
             log.warn("METRICS_SECRET not set — /metrics is unauthenticated (set env var for production)");
         }
+        const activeSessions = sessionTracker.getActiveAgents();
         res.json({
             bag: bag.getStats(),
             agentStats: bag.getAgentStats(),
-            activeSessions: sessionTracker.getActiveAgents(),
+            activeSessions,
+            activeSessionDetails: activeSessions.map((agentId) => sessionTracker.getActiveSessionInfo(agentId)),
         });
     });
     return { app, agentQueue, bag, sessionTracker };

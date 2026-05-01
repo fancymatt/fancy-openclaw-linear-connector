@@ -21,7 +21,7 @@ import { normalizeSessionKey } from "../session-key.js";
 
 const log = componentLogger(createLogger(), "session-tracker");
 
-const DEFAULT_SESSION_TIMEOUT_MS = 120 * 60 * 1000; // 120 minutes
+const DEFAULT_SESSION_TIMEOUT_MS = 25 * 60 * 1000; // 25 minutes
 
 export type StaleSessionHandler = (
   staleSessions: { agentId: string; pendingTickets: string[] }[],
@@ -142,6 +142,18 @@ export class SessionTracker {
   /** Get the session key for an active agent session, or null. */
   getActiveSessionKey(agentId: string): string | null {
     return this.activeSessions.get(agentId)?.sessionKey ?? null;
+  }
+
+  /** Get active-session metadata for diagnostics/metrics, or null. */
+  getActiveSessionInfo(agentId: string): { agentId: string; sessionKey: string; startedAt: number; ageMs: number } | null {
+    const session = this.activeSessions.get(agentId);
+    if (!session) return null;
+    return {
+      agentId: session.agentId,
+      sessionKey: session.sessionKey,
+      startedAt: session.startedAt,
+      ageMs: Date.now() - session.startedAt,
+    };
   }
 
   /** Get all currently active agent IDs. */
