@@ -1,4 +1,5 @@
-import { Router, Request, Response } from "express";
+import { Router, Request, Response, NextFunction } from "express";
+import crypto from "node:crypto";
 import { getAgents, type AgentConfig } from "./agents.js";
 import type { AgentQueue } from "./queue/index.js";
 import type { PendingWorkBag, BagEntry } from "./bag/index.js";
@@ -267,8 +268,41 @@ function buildDashboard(deps: AdminDeps) {
   };
 }
 
+function timingSafeEquals(actual: string, expected: string): boolean {
+  const actualBuffer = Buffer.from(actual, "utf8");
+  const expectedBuffer = Buffer.from(expected, "utf8");
+  if (actualBuffer.length !== expectedBuffer.length) {
+    crypto.timingSafeEqual(expectedBuffer, expectedBuffer);
+    return false;
+  }
+  return crypto.timingSafeEqual(actualBuffer, expectedBuffer);
+}
+
+function adminSecretFromRequest(req: Request): string | null {
+  const header = req.headers["x-admin-secret"];
+  if (typeof header === "string") return header;
+  const authorization = req.headers.authorization;
+  if (authorization?.startsWith("Bearer ")) return authorization.slice("Bearer ".length);
+  return null;
+}
+
+function adminAuth(req: Request, res: Response, next: NextFunction): void {
+  const expected = process.env.ADMIN_SECRET;
+  if (!expected) {
+    res.status(503).json({ error: "ADMIN_SECRET is not configured" });
+    return;
+  }
+  const actual = adminSecretFromRequest(req);
+  if (!actual || !timingSafeEquals(actual, expected)) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  next();
+}
+
 function escapeHtml(value: unknown): string {
   return String(value ?? "").replace(/[&<>"]/g, (char) => ({
+
     "&": "&amp;",
     "<": "&lt;",
     ">": "&gt;",
@@ -351,6 +385,7 @@ function renderShell(initialPage: string, dashboard: ReturnType<typeof buildDash
 
 export function createAdminRouter(deps: AdminDeps): Router {
   const router = Router();
+  router.use(adminAuth);
   router.get("/api/dashboard", (_req: Request, res: Response) => {
     res.json(buildDashboard(deps));
   });

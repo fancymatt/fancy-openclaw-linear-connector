@@ -9,6 +9,12 @@ function tempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "admin-test-"));
 }
 
+const ADMIN_SECRET = "admin-test-secret";
+
+function adminGet(app: ReturnType<typeof createApp>["app"], route: string) {
+  return request(app).get(route).set("x-admin-secret", ADMIN_SECRET);
+}
+
 function writeAgents(dir: string): string {
   const file = path.join(dir, "agents.json");
   fs.writeFileSync(file, JSON.stringify({
@@ -33,6 +39,7 @@ describe("admin dashboard", () => {
   beforeEach(() => {
     dir = tempDir();
     process.env.AGENTS_FILE = writeAgents(dir);
+    process.env.ADMIN_SECRET = ADMIN_SECRET;
     reloadAgents();
     appState = createApp({
       bagDbPath: path.join(dir, "pending-bag.db"),
@@ -47,12 +54,23 @@ describe("admin dashboard", () => {
     appState.agentQueue.close();
     appState.operationalEventStore.close();
     delete process.env.AGENTS_FILE;
+    delete process.env.ADMIN_SECRET;
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("requires ADMIN_SECRET for admin routes", async () => {
+    const unauthorized = await request(appState.app).get("/admin/api/dashboard");
+    expect(unauthorized.status).toBe(401);
+
+    delete process.env.ADMIN_SECRET;
+    const unconfigured = await request(appState.app).get("/admin/api/dashboard").set("x-admin-secret", ADMIN_SECRET);
+    expect(unconfigured.status).toBe(503);
+    process.env.ADMIN_SECRET = ADMIN_SECRET;
   });
 
   test("renders nav and all v1 admin pages", async () => {
     for (const route of ["/admin/", "/admin/agents", "/admin/tasks", "/admin/settings"]) {
-      const res = await request(appState.app).get(route);
+      const res = await adminGet(appState.app, route);
       expect(res.status).toBe(200);
       expect(res.text).toContain("Linear Connector Admin");
       expect(res.text).toContain("Overview");
@@ -67,7 +85,7 @@ describe("admin dashboard", () => {
     appState.bag.add("sage", "AI-615", "Issue");
     appState.operationalEventStore.append({ outcome: "delivered", type: "Issue", agent: "sage", key: "linear-AI-615" });
 
-    const res = await request(appState.app).get("/admin/api/dashboard");
+    const res = await adminGet(appState.app, "/admin/api/dashboard");
     expect(res.status).toBe(200);
     expect(res.body.attention[0].title).toContain("sage");
     expect(res.body.attention[0].href).toBe("/admin/tasks#task-linear-ai-615");
@@ -83,7 +101,7 @@ describe("admin dashboard", () => {
   });
 
   test("healthy empty state is visible above tables", async () => {
-    const res = await request(appState.app).get("/admin/");
+    const res = await adminGet(appState.app, "/admin/");
     expect(res.status).toBe(200);
     expect(res.text).toContain("No attention needed. Connector is running and no tasks are blocked.");
     expect(res.text).toContain("attention-ok");
@@ -93,14 +111,14 @@ describe("admin dashboard", () => {
   test("warning destinations point to specific anchored rows and task detail panels", async () => {
     appState.bag.add("sage", "AI-615", "Issue");
 
-    const tasks = await request(appState.app).get("/admin/tasks");
+    const tasks = await adminGet(appState.app, "/admin/tasks");
     expect(tasks.status).toBe(200);
     expect(tasks.text).toContain('id="task-linear-ai-615"');
     expect(tasks.text).toContain("Detail panel");
     expect(tasks.text).toContain("Open task detail");
     expect(tasks.text).toContain("Event / session");
 
-    const overview = await request(appState.app).get("/admin/");
+    const overview = await adminGet(appState.app, "/admin/");
     expect(overview.text).toContain('/admin/tasks#task-linear-ai-615');
   });
 
