@@ -7,9 +7,11 @@ import { createLogger, componentLogger } from "./logger.js";
 import { handleOAuthCallback } from "./oauth-callback.js";
 import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
+import { OperationalEventStore } from "./store/operational-event-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, DeliveryThrottle } from "./delivery/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "./bag/index.js";
+import { createAdminRouter } from "./admin.js";
 import crypto from "crypto";
 
 const log = componentLogger(createLogger(), "server");
@@ -33,6 +35,10 @@ function verifySecret(header: string, secret: string): boolean {
 export interface CreateAppOptions {
   /** Override PendingWorkBag database path (for testing). */
   bagDbPath?: string;
+  /** Override AgentQueue database path (for testing). */
+  agentQueueDbPath?: string;
+  /** Override OperationalEventStore database path (for testing). */
+  operationalEventsDbPath?: string;
 }
 
 export function createApp(options?: CreateAppOptions) {
@@ -72,7 +78,8 @@ export function createApp(options?: CreateAppOptions) {
 
   const eventStore = new EventStore();
   const nudgeStore = new NudgeStore();
-  const agentQueue = new AgentQueue();
+  const operationalEventStore = new OperationalEventStore(options?.operationalEventsDbPath);
+  const agentQueue = new AgentQueue(options?.agentQueueDbPath);
   const bag = new PendingWorkBag(options?.bagDbPath);
   const wakeConfig = {
     nodeBin: process.execPath,
@@ -86,11 +93,16 @@ export function createApp(options?: CreateAppOptions) {
   const sessionTracker = new SessionTracker(undefined, async (staleSessions) => {
     for (const stale of staleSessions) {
       log.info(`Stale session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
-      await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true });
+      const sent = await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true });
+      operationalEventStore.append({ outcome: "stale-resignaled", agent: stale.agentId, key: stale.pendingTickets[0] ?? null, sessionKey: stale.pendingTickets[0] ?? null, deliveryMode: "stale-session-drain", attemptCount: stale.pendingTickets.length, detail: { requested: stale.pendingTickets.length, sent } });
     }
   });
   const throttle = new DeliveryThrottle();
-  app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle));
+
+  // v1 admin dashboard — read-only operational UI and safe JSON API.
+  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, deploymentName: DEPLOYMENT_NAME }));
+
+  app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle, operationalEventStore));
 
   // ── v1.1: Session-end callback endpoint ──────────────────────────────
   // The gateway (via plugin) calls this when an agent's session ends.
@@ -132,6 +144,7 @@ export function createApp(options?: CreateAppOptions) {
     }
     log.info(`Session-end callback received for ${agentId}`);
     const pendingTickets = sessionTracker.endSession(agentId);
+    operationalEventStore.append({ outcome: "session-ended", agent: agentId, deliveryMode: "session-end-callback", detail: { pendingTickets: pendingTickets ?? [] } });
     if (pendingTickets && pendingTickets.length > 0) {
       // Re-signal: agent has work waiting. Send one signal per ticket so each
       // issue is delivered into its own canonical per-ticket session key.
@@ -169,7 +182,7 @@ export function createApp(options?: CreateAppOptions) {
     });
   });
 
-  return { app, agentQueue, bag, sessionTracker };
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore };
 }
 
 /**
