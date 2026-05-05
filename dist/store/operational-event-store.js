@@ -2,6 +2,12 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 export const OPERATIONAL_EVENT_OUTCOMES = ["received", "signature-rejected", "duplicate", "normalized", "terminal-pruned", "no-route", "routed", "dedup-suppressed", "bag-added", "delivered", "queued", "delivery-failed", "session-ended", "stale-resignaled"];
+function parseEnvInt(name, defaultVal) {
+    const raw = process.env[name];
+    const parsed = raw !== undefined ? parseInt(raw, 10) : NaN;
+    return isNaN(parsed) || parsed <= 0 ? defaultVal : parsed;
+}
+const PRUNE_EVERY_N_WRITES = 100;
 const SECRET_KEY_PATTERN = /(token|secret|password|authorization|signature|cookie|api[-_]?key|x[-_]?api[-_]?key|client[-_]?secret|access[-_]?token|refresh[-_]?token|linear[-_]?signature)/i;
 const MAX_DETAIL_BYTES = 4096;
 const MAX_ERROR_BYTES = 512;
@@ -87,6 +93,9 @@ function rowToEvent(row) {
 }
 export class OperationalEventStore {
     constructor(dbPath) {
+        this.writeCount = 0;
+        this.maxAgeDays = parseEnvInt("OPERATIONAL_EVENT_MAX_AGE_DAYS", 30);
+        this.maxRows = parseEnvInt("OPERATIONAL_EVENT_MAX_ROWS", 10000);
         const resolvedPath = dbPath ?? path.join(process.env.DATA_DIR ?? path.join(process.cwd(), "data"), "operational-events.db");
         const dir = path.dirname(resolvedPath);
         if (!fs.existsSync(dir))
@@ -94,6 +103,7 @@ export class OperationalEventStore {
         this.db = new Database(resolvedPath);
         this.db.pragma("journal_mode = WAL");
         this.migrate();
+        this.prune();
     }
     migrate() {
         this.db.exec(`
@@ -117,6 +127,15 @@ export class OperationalEventStore {
       CREATE INDEX IF NOT EXISTS idx_operational_events_type_time ON operational_events(event_type, occurred_at DESC);
     `);
     }
+    prune() {
+        const ageResult = this.db.prepare(`DELETE FROM operational_events WHERE occurred_at < datetime('now', ?)`).run(`-${this.maxAgeDays} days`);
+        const capResult = this.db.prepare(`DELETE FROM operational_events WHERE id NOT IN (SELECT id FROM operational_events ORDER BY occurred_at DESC, id DESC LIMIT ?)`).run(this.maxRows);
+        const removed = ageResult.changes + capResult.changes;
+        if (removed > 0) {
+            console.info(`[operational-event-store] pruned ${removed} row(s) (age: ${ageResult.changes}, cap: ${capResult.changes})`);
+        }
+        return removed;
+    }
     append(input) {
         if (!OPERATIONAL_EVENT_OUTCOMES.includes(input.outcome))
             throw new Error(`Unsupported operational event outcome: ${input.outcome}`);
@@ -124,6 +143,9 @@ export class OperationalEventStore {
       INSERT INTO operational_events (occurred_at, outcome, event_type, agent, subject_key, delivery_mode, attempt_count, run_id, session_key, error_summary, detail_json)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(input.occurredAt ?? new Date().toISOString(), input.outcome, input.type ?? null, input.agent ?? null, input.key ?? input.sessionKey ?? null, input.deliveryMode ?? null, input.attemptCount ?? null, input.runId ?? null, input.sessionKey ?? input.key ?? null, input.errorSummary ? truncateUtf8(redactText(input.errorSummary), MAX_ERROR_BYTES) : null, JSON.stringify(redactOperationalDetail(input.detail)));
+        this.writeCount++;
+        if (this.writeCount % PRUNE_EVERY_N_WRITES === 0)
+            this.prune();
         return Number(result.lastInsertRowid);
     }
     query(query = {}) {

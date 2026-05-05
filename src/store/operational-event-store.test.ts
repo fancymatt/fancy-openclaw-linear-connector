@@ -1,3 +1,4 @@
+import { jest } from "@jest/globals";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -128,5 +129,103 @@ describe("OperationalEventStore", () => {
     expect(snapshot.lifecycle).toHaveLength(2);
     expect(snapshot.lastSuccess?.outcome).toBe("delivered");
     expect(snapshot.lastError?.errorSummary).toBe("agent unavailable");
+  });
+});
+
+describe("OperationalEventStore — retention/pruning", () => {
+  let dbPath: string;
+
+  beforeEach(() => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "operational-events-prune-test-"));
+    dbPath = path.join(dir, "events.db");
+  });
+
+  afterEach(() => {
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+    delete process.env.OPERATIONAL_EVENT_MAX_AGE_DAYS;
+    delete process.env.OPERATIONAL_EVENT_MAX_ROWS;
+  });
+
+  it("prune() removes rows older than OPERATIONAL_EVENT_MAX_AGE_DAYS", () => {
+    process.env.OPERATIONAL_EVENT_MAX_AGE_DAYS = "30";
+    const store = new OperationalEventStore(dbPath);
+    // One row from 60 days ago (stale) and one recent
+    store.append({ outcome: "received", occurredAt: new Date(Date.now() - 60 * 86_400_000).toISOString() });
+    store.append({ outcome: "routed", occurredAt: new Date().toISOString() });
+    expect(store.query()).toHaveLength(2);
+    const removed = store.prune();
+    expect(removed).toBe(1);
+    const remaining = store.query();
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0].outcome).toBe("routed");
+    store.close();
+  });
+
+  it("prune() enforces OPERATIONAL_EVENT_MAX_ROWS cap, keeping newest rows", () => {
+    process.env.OPERATIONAL_EVENT_MAX_ROWS = "3";
+    const store = new OperationalEventStore(dbPath);
+    const outcomes = ["received", "normalized", "routed", "bag-added", "delivered"] as const;
+    for (let i = 0; i < 5; i++) {
+      store.append({ outcome: outcomes[i], occurredAt: new Date(Date.now() + i * 1000).toISOString() });
+    }
+    expect(store.query({ limit: 10 })).toHaveLength(5);
+    const removed = store.prune();
+    expect(removed).toBe(2);
+    const remaining = store.query({ limit: 10 });
+    expect(remaining).toHaveLength(3);
+    // Newest 3 should be kept
+    expect(remaining.map((e) => e.outcome)).toContain("delivered");
+    store.close();
+  });
+
+  it("prune() logs removed row count at INFO level", () => {
+    process.env.OPERATIONAL_EVENT_MAX_ROWS = "1";
+    const store = new OperationalEventStore(dbPath);
+    store.append({ outcome: "received", occurredAt: "2020-01-01T00:00:00.000Z" });
+    store.append({ outcome: "routed", occurredAt: "2020-01-02T00:00:00.000Z" });
+    const spy = jest.spyOn(console, "info").mockImplementation(() => undefined);
+    store.prune();
+    expect(spy).toHaveBeenCalledWith(expect.stringMatching(/pruned \d+ row/));
+    spy.mockRestore();
+    store.close();
+  });
+
+  it("prune() does not log when no rows are removed", () => {
+    const store = new OperationalEventStore(dbPath);
+    store.append({ outcome: "received", occurredAt: new Date().toISOString() });
+    const spy = jest.spyOn(console, "info").mockImplementation(() => undefined);
+    store.prune();
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+    store.close();
+  });
+
+  it("prune() runs automatically on startup", () => {
+    // Insert two rows via a raw DB, then open OperationalEventStore with a tight max-age
+    process.env.OPERATIONAL_EVENT_MAX_AGE_DAYS = "1";
+    // Pre-seed using a temporary store without age constraint
+    const seed = new OperationalEventStore(dbPath);
+    seed.append({ outcome: "received", occurredAt: "2020-01-01T00:00:00.000Z" });
+    seed.append({ outcome: "routed", occurredAt: "2020-01-02T00:00:00.000Z" });
+    seed.close();
+    // Opening a new store with the strict max-age env var should prune on init
+    const store = new OperationalEventStore(dbPath);
+    expect(store.query({ limit: 10 })).toHaveLength(0);
+    store.close();
+  });
+
+  it("prune() runs automatically every 100 appends", () => {
+    process.env.OPERATIONAL_EVENT_MAX_ROWS = "50";
+    const store = new OperationalEventStore(dbPath);
+    // Insert 250 rows — prune fires at write 100 and write 200, each time capping at 50
+    for (let i = 0; i < 250; i++) {
+      store.append({ outcome: "received", occurredAt: new Date(Date.now() + i * 1000).toISOString() });
+    }
+    // After the 200th prune fires we have 50, then 50 more inserts → 100 total
+    // Confirms pruning fired (without it, all 250 would remain)
+    const remaining = store.query({ limit: 500 });
+    expect(remaining.length).toBeLessThan(250);
+    expect(remaining.length).toBeLessThanOrEqual(100);
+    store.close();
   });
 });
