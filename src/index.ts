@@ -15,7 +15,7 @@ import { createAdminRouter } from "./admin.js";
 import crypto from "crypto";
 
 const log = componentLogger(createLogger(), "server");
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
 const DEPLOYMENT_NAME = process.env.DEPLOYMENT_NAME ?? "fancymatt";
 
 /**
