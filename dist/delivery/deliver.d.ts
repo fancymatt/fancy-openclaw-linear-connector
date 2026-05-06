@@ -20,4 +20,6 @@ export interface DeliveryConfig {
  * Errors are logged, never thrown.
  */
 export declare function deliverToAgent(route: RouteResult, config: DeliveryConfig): Promise<void>;
+/** Deliver an explicit operator-authored message to an existing OpenClaw session. */
+export declare function deliverMessageToAgent(agentName: string, sessionId: string, message: string, config: DeliveryConfig): Promise<boolean>;
 //# sourceMappingURL=deliver.d.ts.map

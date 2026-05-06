@@ -2,6 +2,7 @@ import request from "supertest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import http from "node:http";
 import { createApp } from "./index.js";
 import { reloadAgents } from "./agents.js";
 
@@ -59,6 +60,8 @@ describe("admin dashboard", () => {
     appState.operationalEventStore.close();
     delete process.env.AGENTS_FILE;
     delete process.env.ADMIN_SECRET;
+    delete process.env.OPENCLAW_HOOKS_URL;
+    delete process.env.OPENCLAW_HOOKS_TOKEN;
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -145,6 +148,65 @@ describe("admin dashboard", () => {
 
     const overview = await adminGet(appState.app, "/admin/");
     expect(overview.text).toContain('/admin/tasks#task-linear-ai-615');
+    expect(tasks.text).toContain('class="nudge-button"');
+    expect(tasks.text).toContain('data-agent="sage"');
+    expect(tasks.text).toContain('data-ticket="AI-615"');
+  });
+
+  test("nudge endpoint requires auth, active session, then posts to hooks", async () => {
+    const deliveries: unknown[] = [];
+    const hookServer = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (chunk) => { raw += chunk; });
+      req.on("end", () => {
+        deliveries.push({ authorization: req.headers.authorization, body: JSON.parse(raw) });
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ runId: "test-run" }));
+      });
+    });
+    await new Promise<void>((resolve) => hookServer.listen(0, "127.0.0.1", resolve));
+    const address = hookServer.address();
+    if (!address || typeof address === "string") throw new Error("test hook server did not bind");
+    process.env.OPENCLAW_HOOKS_URL = `http://127.0.0.1:${address.port}`;
+    process.env.OPENCLAW_HOOKS_TOKEN = "hook-token";
+    appState.bag.close();
+    appState.sessionTracker.close();
+    appState.agentQueue.close();
+    appState.operationalEventStore.close();
+    appState = createApp({
+      bagDbPath: path.join(dir, "pending-bag.db"),
+      agentQueueDbPath: path.join(dir, "agent-queue.db"),
+      operationalEventsDbPath: path.join(dir, "operational-events.db"),
+    });
+
+    try {
+      const unauthorized = await request(appState.app).post("/nudge").send({ agent: "sage", ticketId: "AI-615" });
+      expect(unauthorized.status).toBe(401);
+
+      const inactive = await request(appState.app)
+        .post("/nudge")
+        .set("x-admin-secret", ADMIN_SECRET)
+        .send({ agent: "sage", ticketId: "AI-615" });
+      expect(inactive.status).toBe(404);
+      expect(inactive.body.error).toBe("No active session found");
+
+      appState.sessionTracker.startSession("sage", "linear-AI-615");
+      const sent = await request(appState.app)
+        .post("/nudge")
+        .set("x-admin-secret", ADMIN_SECRET)
+        .send({ agent: "sage", ticketId: "AI-615" });
+      expect(sent.status).toBe(200);
+      expect(sent.body).toMatchObject({ success: true, sessionId: "linear-AI-615", agent: "sage" });
+      expect(deliveries).toHaveLength(1);
+      expect(deliveries[0]).toMatchObject({ authorization: "Bearer hook-token" });
+      expect((deliveries[0] as { body: Record<string, unknown> }).body).toMatchObject({
+        agentId: "sage",
+        sessionKey: "linear-AI-615",
+        message: "Recheck AI-615 and continue work. Run linear consider-work AI-615.",
+      });
+    } finally {
+      await new Promise<void>((resolve) => hookServer.close(() => resolve()));
+    }
   });
 
 });

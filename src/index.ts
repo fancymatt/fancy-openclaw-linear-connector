@@ -9,8 +9,9 @@ import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import { AgentQueue } from "./queue/index.js";
-import { deliverToAgent, DeliveryThrottle } from "./delivery/index.js";
+import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "./bag/index.js";
+import { normalizeSessionKey } from "./session-key.js";
 import { createAdminRouter } from "./admin.js";
 import crypto from "crypto";
 
@@ -30,6 +31,51 @@ function verifySecret(header: string, secret: string): boolean {
     return false;
   }
   return crypto.timingSafeEqual(a, b);
+}
+
+function secretFromBasicAuthorization(authorization: string): string | null {
+  const encoded = authorization.slice("Basic ".length).trim();
+  if (!encoded) return null;
+  try {
+    const decoded = Buffer.from(encoded, "base64").toString("utf8");
+    const separator = decoded.indexOf(":");
+    return separator >= 0 ? decoded.slice(separator + 1) : null;
+  } catch {
+    return null;
+  }
+}
+
+function adminSecretFromRequest(req: Request): string | null {
+  const header = req.headers["x-admin-secret"];
+  if (typeof header === "string") return header;
+  const authorization = req.headers.authorization;
+  if (authorization?.startsWith("Bearer ")) return authorization.slice("Bearer ".length);
+  if (authorization?.startsWith("Basic ")) return secretFromBasicAuthorization(authorization);
+  return null;
+}
+
+function requireAdminSecret(req: Request, res: Response): boolean {
+  const expected = process.env.ADMIN_SECRET;
+  if (!expected) {
+    res.status(503).json({ success: false, error: "ADMIN_SECRET is not configured" });
+    return false;
+  }
+  const actual = adminSecretFromRequest(req);
+  if (!actual || !verifySecret(actual, expected)) {
+    res.status(401).json({ success: false, error: "Unauthorized" });
+    return false;
+  }
+  return true;
+}
+
+function parseJsonBody<T extends object>(req: Request): T | null {
+  if (Buffer.isBuffer(req.body)) {
+    return JSON.parse(req.body.toString("utf8")) as T;
+  }
+  if (typeof req.body === "object" && req.body !== null) {
+    return req.body as T;
+  }
+  return null;
 }
 
 export interface CreateAppOptions {
@@ -98,6 +144,67 @@ export function createApp(options?: CreateAppOptions) {
     }
   });
   const throttle = new DeliveryThrottle();
+
+  // Operator nudge endpoint — sends a short instruction into an already-active
+  // agent session. Phase 1 is local/Nakazawa only; no cross-gateway routing.
+  app.post("/nudge", async (req: express.Request, res: express.Response) => {
+    if (!requireAdminSecret(req, res)) return;
+
+    let body: { agent?: string; ticketId?: string; message?: string } | null;
+    try {
+      body = parseJsonBody(req);
+    } catch {
+      res.status(400).json({ success: false, error: "Malformed JSON" });
+      return;
+    }
+
+    const requestedAgent = body?.agent?.trim();
+    const ticketId = body?.ticketId?.trim();
+    if (!requestedAgent || !ticketId) {
+      res.status(400).json({ success: false, error: "agent and ticketId are required" });
+      return;
+    }
+
+    const agentConfig = getAgents().find((agent) =>
+      agent.name === requestedAgent || agent.openclawAgent === requestedAgent,
+    );
+    const candidates = [...new Set([
+      requestedAgent,
+      agentConfig?.name,
+      agentConfig?.openclawAgent,
+    ].filter((value): value is string => Boolean(value)))];
+    const activeAgent = candidates.find((agentId) => sessionTracker.isActive(agentId));
+    if (!activeAgent) {
+      res.status(404).json({ success: false, error: "No active session found" });
+      return;
+    }
+
+    const sessionId = sessionTracker.getActiveSessionKey(activeAgent);
+    if (!sessionId) {
+      res.status(404).json({ success: false, error: "No active session found" });
+      return;
+    }
+
+    const normalizedTicketId = normalizeSessionKey(ticketId).replace(/^linear-/, "");
+    const message = body?.message?.trim() ||
+      `Recheck ${normalizedTicketId} and continue work. Run linear consider-work ${normalizedTicketId}.`;
+    const delivered = await deliverMessageToAgent(activeAgent, sessionId, message, wakeConfig);
+    operationalEventStore.append({
+      outcome: delivered ? "delivered" : "delivery-failed",
+      type: "operator-nudge",
+      agent: activeAgent,
+      key: normalizeSessionKey(ticketId),
+      sessionKey: sessionId,
+      deliveryMode: "operator-nudge",
+      attemptCount: 1,
+      errorSummary: delivered ? null : "Nudge delivery failed",
+    });
+    if (!delivered) {
+      res.status(502).json({ success: false, error: "Nudge delivery failed" });
+      return;
+    }
+    res.json({ success: true, sessionId, agent: activeAgent });
+  });
 
   // v1 admin dashboard — read-only operational UI and safe JSON API.
   app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, deploymentName: DEPLOYMENT_NAME }));

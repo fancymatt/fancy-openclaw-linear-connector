@@ -34,30 +34,39 @@ export async function deliverToAgent(
   route: RouteResult,
   config: DeliveryConfig,
 ): Promise<void> {
-  const agentName = route.agentId;
-  const sessionId = route.sessionKey;
-  const message = buildDeliveryMessage(route);
+  await deliverMessageToAgent(
+    route.agentId,
+    route.sessionKey,
+    buildDeliveryMessage(route),
+    config,
+  );
+}
 
+/** Deliver an explicit operator-authored message to an existing OpenClaw session. */
+export async function deliverMessageToAgent(
+  agentName: string,
+  sessionId: string,
+  message: string,
+  config: DeliveryConfig,
+): Promise<boolean> {
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const retryDelayMs = config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
   const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
 
   if (config.hooksUrl && config.hooksToken) {
-    await deliverViaHooks(route, config, { message, timeoutMs, retryDelayMs, maxRetries });
-  } else {
-    await deliverViaCli(route, config, { message, timeoutMs, retryDelayMs, maxRetries });
+    return deliverViaHooks(agentName, sessionId, config, { message, timeoutMs, retryDelayMs, maxRetries });
   }
+  return deliverViaCli(agentName, sessionId, config, { message, timeoutMs, retryDelayMs, maxRetries });
 }
 
 // ── HTTP Hooks Mode ──────────────────────────────────────────────────────────
 
 async function deliverViaHooks(
-  route: RouteResult,
+  agentName: string,
+  sessionId: string,
   config: DeliveryConfig,
   opts: { message: string; timeoutMs: number; retryDelayMs: number; maxRetries: number },
-): Promise<void> {
-  const agentName = route.agentId;
-  const sessionId = route.sessionKey;
+): Promise<boolean> {
 
   let delivered = false;
   for (let attempt = 0; attempt <= opts.maxRetries && !delivered; attempt++) {
@@ -104,17 +113,17 @@ async function deliverViaHooks(
   if (!delivered) {
     log.error(`All delivery attempts exhausted for ${agentName} [${sessionId}]`);
   }
+  return delivered;
 }
 
 // ── CLI Spawn Mode ───────────────────────────────────────────────────────────
 
 async function deliverViaCli(
-  route: RouteResult,
+  agentName: string,
+  sessionId: string,
   config: DeliveryConfig,
   opts: { message: string; timeoutMs: number; retryDelayMs: number; maxRetries: number },
-): Promise<void> {
-  const agentName = route.agentId;
-  const sessionId = route.sessionKey;
+): Promise<boolean> {
 
   let delivered = false;
   for (let attempt = 0; attempt <= opts.maxRetries && !delivered; attempt++) {
@@ -167,4 +176,5 @@ async function deliverViaCli(
   } else {
     log.error(`All CLI delivery attempts exhausted for ${agentName} [${sessionId}]`);
   }
+  return delivered;
 }
