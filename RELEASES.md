@@ -6,8 +6,10 @@ This repo follows a maintenance-branch model: `main` tracks the next major versi
 
 | Branch / tag   | Purpose                              | Deploys to              |
 |----------------|--------------------------------------|-------------------------|
-| `main`         | Next major (v1.4 in development)     | fancymatt (after v1.4)  |
-| `release-1.3`  | v1.3 maintenance                     | fancymatt               |
+| `main`         | Next major (v1.5 in development)     | fancymatt (after v1.5)  |
+| `release-1.4`  | v1.4 maintenance                     | fancymatt               |
+| tag `v1.4.0`   | Frozen v1.4 release point            | —                       |
+| `release-1.3`  | v1.3 maintenance (superseded)        | —                       |
 | tag `v1.3.0`   | Frozen v1.3 release point            | —                       |
 | `release-1.0`  | v1.0 maintenance                     | ILL                     |
 | tag `v1.0.0`   | Frozen v1.0 release point            | —                       |
@@ -55,7 +57,8 @@ Each maintenance branch should have an EOL commitment when its successor ships. 
 
 | Release      | Status     | EOL    |
 |--------------|------------|--------|
-| v1.3.x       | Active     | TBD (set when v1.4 GAs) |
+| v1.4.x       | Active     | TBD (set when v1.5 GAs) |
+| v1.3.x       | Superseded | TBD    |
 | v1.0.x       | Active     | TBD    |
 
 ## Sibling repos
