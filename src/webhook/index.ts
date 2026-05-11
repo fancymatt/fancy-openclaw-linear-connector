@@ -273,38 +273,30 @@ export function createWebhookRouter(
           await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true });
         }
 
-        if (sessionTracker.isActive(agentName)) {
-          const activeSessionKey = sessionTracker.getActiveSessionKey(agentName);
-          if (activeSessionKey === normalizedTicketId) {
-            // Same ticket, same active OpenClaw session: append immediately.
-            // Waiting for /session-end here strands conversational same-ticket updates.
-            log.info(`Bag: active same-ticket session for ${agentName} [${normalizedTicketId}], delivering immediately`);
-            try {
-              if (throttle) {
-                log.info(`Dispatch throttle: waiting for ${agentName} (same-ticket active)`);
-                await throttle.wait(route.agentId);
-                throttle.record(route.agentId);
-              }
-              await deliverToAgent(route, wakeConfig);
-              bag.removeTicket(agentName, normalizedTicketId);
-              appendOperationalEvent(operationalEventStore, { outcome: "delivered", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "active-same-ticket", attemptCount: 1 });
-            } catch (err) {
-              log.error(`Same-ticket active delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
-              appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "active-same-ticket", attemptCount: 1, errorSummary: errorSummary(err) });
-              sessionTracker.queueSignal(agentName, [normalizedTicketId]);
+        if (sessionTracker.isActiveForTicket(agentName, normalizedTicketId)) {
+          // Same ticket already has an active session: deliver directly into it.
+          // Waiting for /session-end here would strand same-ticket conversational updates.
+          log.info(`Bag: active same-ticket session for ${agentName} [${normalizedTicketId}], delivering immediately`);
+          try {
+            if (throttle) {
+              log.info(`Dispatch throttle: waiting for ${agentName} (same-ticket active)`);
+              await throttle.wait(route.agentId);
+              throttle.record(route.agentId);
             }
-            return;
+            await deliverToAgent(route, wakeConfig);
+            bag.removeTicket(agentName, normalizedTicketId);
+            appendOperationalEvent(operationalEventStore, { outcome: "delivered", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "active-same-ticket", attemptCount: 1 });
+          } catch (err) {
+            log.error(`Same-ticket active delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
+            appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "active-same-ticket", attemptCount: 1, errorSummary: errorSummary(err) });
+            sessionTracker.queueSignal(agentName, [normalizedTicketId]);
           }
-
-          // Agent is busy on a different ticket — queue signal for session-end/stale drain.
-          sessionTracker.queueSignal(agentName, [normalizedTicketId]);
-          log.info(`Bag: added ${normalizedTicketId} for ${agentName}, queuing signal (different active session: ${activeSessionKey ?? "unknown"})`);
-          appendOperationalEvent(operationalEventStore, { outcome: "queued", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "session-pending-signal" });
           return;
         }
 
-        // No active session — send one wake-up per pending ticket so each Linear
-        // issue gets its own canonical per-ticket OpenClaw session key.
+        // No active session for this specific ticket key. Dispatch a wake-up
+        // immediately — even if the agent has other active sessions for other
+        // tickets. Each ticket gets its own independent per-ticket session.
         const pending = bag.getPendingTickets(agentName);
         const pendingIds = pending.map((e) => e.ticketId);
         log.info(`Bag: sending wake-up signal(s) to ${agentName} with ${pendingIds.length} ticket(s)`);

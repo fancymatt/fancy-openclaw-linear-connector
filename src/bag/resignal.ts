@@ -48,7 +48,7 @@ export async function resignalPendingTickets(
       await sendWakeUp(agentId, [ticketId], wakeConfig);
       bag.removeTicket(agentId, ticketId);
       bag.recordSignal();
-      if (options.markActive && sent === 0) {
+      if (options.markActive) {
         sessionTracker.startSession(agentId, ticketId);
       }
       sent++;
