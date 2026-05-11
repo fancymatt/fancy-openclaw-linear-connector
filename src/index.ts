@@ -10,7 +10,7 @@ import { NudgeStore } from "./store/nudge-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
-import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "./bag/index.js";
+import { PendingWorkBag, SessionTracker, resignalPendingTickets, replayPendingBag } from "./bag/index.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { createAdminRouter } from "./admin.js";
 import crypto from "crypto";
@@ -289,7 +289,7 @@ export function createApp(options?: CreateAppOptions) {
     });
   });
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore };
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig };
 }
 
 /**
@@ -344,12 +344,16 @@ if (isEntryPoint) {
     startTokenRefresh();
   }
 
-  const { app, agentQueue } = createApp();
+  const { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig } = createApp();
   const server = app.listen(PORT, () => {
     log.info(`fancy-openclaw-linear-connector [${DEPLOYMENT_NAME}] listening on port ${PORT} (pid=${process.pid})`);
-    // Recover any backlog left behind by prior process state.
+    // Recover any backlog left behind by prior process state (v1.0 queue).
     drainBacklog(agentQueue).catch((err) => {
       log.error(`Startup drain failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    // Replay persisted pending-bag work left behind by a prior process restart.
+    replayPendingBag(bag, sessionTracker, wakeConfig, operationalEventStore).catch((err) => {
+      log.error(`Startup replay failed: ${err instanceof Error ? err.message : String(err)}`);
     });
   });
 
