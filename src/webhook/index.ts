@@ -15,7 +15,7 @@ import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
 import { createLogger, componentLogger } from "../logger.js";
-import { isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
+import { isLinearIssueStillRoutedToAgent, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
 
 const log = componentLogger(createLogger(), "webhook");
 
@@ -203,9 +203,19 @@ export function createWebhookRouter(
         return;
       }
 
-      // ── 9a. Nudge deduplication + coalescing ─────────────────────────────
-      // Suppress rapid-fire duplicate events for the same agent+ticket.
+      // ── 9a. Stale-route guard ───────────────────────────────────────────
+      // Linear webhook payloads are snapshots. Before waking an agent from a
+      // delegate/assignee event, re-check Linear's current issue state so an
+      // accidental delegation that was already corrected does not let the old
+      // agent take ownership or mutate the ticket later.
       const ticketId = route.sessionKey;
+      if (!(await isLinearIssueStillRoutedToAgent(ticketId, route.agentId, route.routingReason))) {
+        appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "stale-route" });
+        return;
+      }
+
+      // ── 9b. Nudge deduplication + coalescing ─────────────────────────────
+      // Suppress rapid-fire duplicate events for the same agent+ticket.
       if (NUDGE_DEDUP_WINDOW_MS > 0 && nudgeStore) {
         const info = nudgeStore.getCoalesceInfo(route.agentId, ticketId, NUDGE_DEDUP_WINDOW_MS);
         if (info.suppressed) {
@@ -283,9 +293,13 @@ export function createWebhookRouter(
               await throttle.wait(route.agentId);
               throttle.record(route.agentId);
             }
-            await deliverToAgent(route, wakeConfig);
+            const sameTicketResult = await deliverToAgent(route, wakeConfig);
             bag.removeTicket(agentName, normalizedTicketId);
-            appendOperationalEvent(operationalEventStore, { outcome: "delivered", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "active-same-ticket", attemptCount: 1 });
+            appendOperationalEvent(operationalEventStore, {
+              outcome: sameTicketResult.runId ? "dispatch-accepted" : "delivered",
+              type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId,
+              deliveryMode: "active-same-ticket", attemptCount: 1, runId: sameTicketResult.runId ?? null
+            });
           } catch (err) {
             log.error(`Same-ticket active delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
             appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "active-same-ticket", attemptCount: 1, errorSummary: errorSummary(err) });
@@ -300,8 +314,15 @@ export function createWebhookRouter(
         const pending = bag.getPendingTickets(agentName);
         const pendingIds = pending.map((e) => e.ticketId);
         log.info(`Bag: sending wake-up signal(s) to ${agentName} with ${pendingIds.length} ticket(s)`);
-        const sent = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfig, { markActive: true });
-        appendOperationalEvent(operationalEventStore, { outcome: sent > 0 ? "delivered" : "delivery-failed", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "wake-up", attemptCount: pendingIds.length, errorSummary: sent > 0 ? null : "No wake-up signals delivered" });
+        const dispatchResults = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfig, { markActive: true });
+        const dispatched = dispatchResults.filter(r => r.dispatched).length;
+        const firstRunId = dispatchResults.find(r => r.runId)?.runId ?? null;
+        appendOperationalEvent(operationalEventStore, {
+          outcome: dispatched > 0 ? "dispatch-accepted" : "delivery-failed",
+          type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId,
+          deliveryMode: "wake-up", attemptCount: pendingIds.length, runId: firstRunId,
+          errorSummary: dispatched > 0 ? null : "No wake-up signals dispatched"
+        });
         return;
       }
 
@@ -341,8 +362,8 @@ export function createWebhookRouter(
           await throttle.wait(route.agentId);
           throttle.record(route.agentId);
         }
-        await deliverToAgent(route, deliveryConfig);
-        appendOperationalEvent(operationalEventStore, { outcome: "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1 });
+        const directResult = await deliverToAgent(route, deliveryConfig);
+        appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null });
       } catch (err) {
         log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
         appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, errorSummary: errorSummary(err) });
@@ -357,8 +378,8 @@ export function createWebhookRouter(
                 await throttle.wait(route.agentId);
                 throttle.record(route.agentId);
               }
-              await deliverToAgent(next, deliveryConfig);
-              appendOperationalEvent(operationalEventStore, { outcome: "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1 });
+              const drainResult = await deliverToAgent(next, deliveryConfig);
+              appendOperationalEvent(operationalEventStore, { outcome: drainResult.runId ? "dispatch-accepted" : "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, runId: drainResult.runId ?? null });
             } catch (err) {
               log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);
               appendOperationalEvent(operationalEventStore, { outcome: "delivery-failed", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, errorSummary: errorSummary(err) });

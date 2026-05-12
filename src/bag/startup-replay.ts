@@ -71,11 +71,12 @@ export async function replayPendingBag(
     const beforeCount = ticketIds.length;
 
     try {
-      const sent = await resignalPendingTickets(agentId, ticketIds, bag, sessionTracker, wakeConfig, {
+      const dispatchResults = await resignalPendingTickets(agentId, ticketIds, bag, sessionTracker, wakeConfig, {
         markActive: true,
         ...resignalOptions,
       });
-      const pruned = beforeCount - sent;
+      const sent = dispatchResults.filter(r => r.dispatched).length;
+      const pruned = beforeCount - dispatchResults.length;
       totalReplayed += sent;
       totalPruned += pruned;
 

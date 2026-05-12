@@ -61,8 +61,8 @@ describe("replayPendingBag", () => {
     expect(sentTickets).toEqual(["linear-AI-780"]);
     expect(result.replayed).toBe(1);
     expect(result.pruned).toBe(0);
-    // Ticket is consumed from the bag after replay
-    expect(bag2.getPendingTickets("igor")).toHaveLength(0);
+    // Ticket stays in bag until session-end confirms processing
+    expect(bag2.getPendingTickets("igor")).toHaveLength(1);
 
     bag2.close();
     sessionTracker2.close();

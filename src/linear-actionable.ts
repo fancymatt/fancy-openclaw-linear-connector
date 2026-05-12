@@ -1,4 +1,4 @@
-import { getAccessToken } from "./agents.js";
+import { getAccessToken, getAgent } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
 import { normalizeSessionKey } from "./session-key.js";
 import type { LinearEvent } from "./webhook/schema.js";
@@ -48,6 +48,70 @@ function linearAuthorizationHeader(token: string): string {
  * On auth/network/API uncertainty, keep the ticket actionable so we do not
  * silently drop legitimate work because Linear had a transient failure.
  */
+
+export async function isLinearIssueStillRoutedToAgent(
+  ticketId: string,
+  agentId: string,
+  routingReason: "delegate" | "assignee" | "mention" | "body-mention" | undefined,
+): Promise<boolean> {
+  if (routingReason === "mention" || routingReason === "body-mention") return true;
+
+  const token = tokenForAgent(agentId);
+  const agent = getAgent(agentId);
+  if (!token || !agent?.linearUserId) return true;
+
+  const identifier = issueIdentifierFromSessionKey(ticketId);
+  try {
+    const response = await fetch("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: linearAuthorizationHeader(token),
+      },
+      body: JSON.stringify({
+        query: `query IssueRouting($id: String!) { issue(id: $id) { id identifier delegate { id name } assignee { id name } state { name type } } }`,
+        variables: { id: identifier },
+      }),
+    });
+
+    if (!response.ok) {
+      log.warn(`Linear routing check failed for ${identifier}: HTTP ${response.status}`);
+      return true;
+    }
+
+    const body = await response.json() as {
+      data?: { issue?: { delegate?: { id?: string; name?: string } | null; assignee?: { id?: string; name?: string } | null; state?: { name?: string; type?: string } } | null };
+      errors?: Array<{ message?: string }>;
+    };
+
+    if (body.errors?.length) {
+      log.warn(`Linear routing check errored for ${identifier}: ${body.errors.map((e) => e.message).join("; ")}`);
+      return true;
+    }
+
+    const issue = body.data?.issue;
+    if (!issue) return false;
+    if (isTerminalIssueState(issue.state)) return false;
+
+    if (routingReason === "delegate") {
+      const ok = issue.delegate?.id === agent.linearUserId;
+      if (!ok) log.info(`Dropping stale delegate event for ${identifier}: ${agentId} is no longer delegate`);
+      return ok;
+    }
+
+    if (routingReason === "assignee") {
+      const ok = issue.assignee?.id === agent.linearUserId;
+      if (!ok) log.info(`Dropping stale assignee event for ${identifier}: ${agentId} is no longer assignee`);
+      return ok;
+    }
+
+    return true;
+  } catch (err) {
+    log.warn(`Linear routing check failed for ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
+    return true;
+  }
+}
+
 export async function isLinearIssueActionable(ticketId: string, agentId: string): Promise<boolean> {
   const token = tokenForAgent(agentId);
   if (!token) return true;
