@@ -78,8 +78,8 @@ function buildMentionMessage(actorName: string, identifier: string, title: strin
     `Run \`linear observe-issue ${identifier}\` to read the full context.`,
     "",
     "To respond:",
-    `- To add your input, run \`linear handoff-work ${identifier} [delegate] --comment "[your response]"\``,
-    `- If you want to take ownership, run \`linear consider-work ${identifier}\``,
-    "- If this isn\u2019t relevant to you, no action is needed.",
+    `- To add your input without changing owner/status, run \`linear note ${identifier} --comment "[your response]"\``,
+    `- Only if the issue is intentionally delegated/assigned to you, run \`linear consider-work ${identifier}\``,
+    "- If this isn\u2019t relevant to you, no action is needed. Do not refuse/handoff a task that is not currently yours.",
   ].join("\n");
 }

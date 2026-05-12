@@ -7,13 +7,19 @@ import { isLinearIssueActionable } from "../linear-actionable.js";
 
 const log = componentLogger(createLogger(), "resignal");
 
+export interface DispatchResult {
+  ticketId: string;
+  dispatched: boolean;
+  runId?: string;
+}
+
 export interface ResignalOptions {
   /** Mark the agent active for the first successfully signaled ticket. */
   markActive?: boolean;
   /** Optional test hook / policy override for pruning no-longer-actionable tickets. */
   isTicketActionable?: (ticketId: string, agentId: string) => boolean | Promise<boolean>;
   /** Optional test hook for delivery. */
-  sendWakeUp?: typeof sendWakeUpSignal;
+  sendWakeUp?: (agentId: string, ticketIds: string[], config: WakeUpConfig) => Promise<{ runId?: string } | void>;
 }
 
 /**
@@ -30,14 +36,20 @@ export async function resignalPendingTickets(
   sessionTracker: SessionTracker,
   wakeConfig: WakeUpConfig,
   options: ResignalOptions = {},
-): Promise<number> {
+): Promise<DispatchResult[]> {
   const normalizedTickets = [...new Set(ticketIds.map((ticketId) => normalizeSessionKey(ticketId)))];
   const isTicketActionable = options.isTicketActionable ?? isLinearIssueActionable;
   const sendWakeUp = options.sendWakeUp ?? sendWakeUpSignal;
-  let sent = 0;
+  const results: DispatchResult[] = [];
 
   for (const ticketId of normalizedTickets) {
     try {
+      // Skip if this ticket already has an active session — don't double-dispatch
+      if (sessionTracker.isActiveForTicket(agentId, ticketId)) {
+        log.info(`Session already active for ${agentId} [${ticketId}] — skipping resignal`);
+        continue;
+      }
+
       if (!(await isTicketActionable(ticketId, agentId))) {
         bag.removeTicket(agentId, ticketId);
         sessionTracker.removePendingTicket(ticketId, agentId);
@@ -45,19 +57,19 @@ export async function resignalPendingTickets(
         continue;
       }
 
-      await sendWakeUp(agentId, [ticketId], wakeConfig);
-      bag.removeTicket(agentId, ticketId);
+      const wakeResult = await sendWakeUp(agentId, [ticketId], wakeConfig);
       bag.recordSignal();
       if (options.markActive) {
         sessionTracker.startSession(agentId, ticketId);
       }
-      sent++;
+      results.push({ ticketId, dispatched: true, runId: (wakeResult as { runId?: string } | void | undefined)?.runId });
     } catch (err) {
       log.error(
         `Re-signal failed for ${agentId} [${ticketId}]: ${err instanceof Error ? err.message : String(err)}`,
       );
+      results.push({ ticketId, dispatched: false });
     }
   }
 
-  return sent;
+  return results;
 }

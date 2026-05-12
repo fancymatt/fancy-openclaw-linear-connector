@@ -37,7 +37,7 @@ describe("resignalPendingTickets", () => {
     sessionTracker.endSession("igor");
 
     const sentTickets: string[] = [];
-    const sent = await resignalPendingTickets("igor", ["AI-501", "AI-597"], bag, sessionTracker, wakeConfig, {
+    const results = await resignalPendingTickets("igor", ["AI-501", "AI-597"], bag, sessionTracker, wakeConfig, {
       markActive: true,
       isTicketActionable: (ticketId) => ticketId !== "linear-AI-501",
       sendWakeUp: async (_agentId, ticketIds) => {
@@ -45,9 +45,13 @@ describe("resignalPendingTickets", () => {
       },
     });
 
-    expect(sent).toBe(1);
+    expect(results.length).toBe(1);
+    expect(results[0].dispatched).toBe(true);
+    expect(results[0].ticketId).toBe("linear-AI-597");
     expect(sentTickets).toEqual(["linear-AI-597"]);
-    expect(bag.getPendingTickets("igor")).toHaveLength(0);
+    const remaining = bag.getPendingTickets("igor");
+    expect(remaining).toHaveLength(1); // dispatched ticket stays in bag until session-end
+    expect(remaining[0].ticketId).toBe("linear-AI-597");
     expect(bag.getStats().signalsSent).toBe(1);
     expect(sessionTracker.getActiveSessionKey("igor")).toBe("linear-AI-597");
   });

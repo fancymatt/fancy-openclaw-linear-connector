@@ -66,7 +66,7 @@ describe("per-ticket session isolation (AI-779)", () => {
       { markActive: true, sendWakeUp: mockSendWakeUp },
     );
 
-    expect(sentCount).toBe(1);
+    expect(sentCount).toHaveLength(1);
     expect(sent).toContain("linear-AI-777");
     // Both sessions are now active concurrently
     expect(sessionTracker.isActiveForTicket("signe", "linear-AI-776")).toBe(true);

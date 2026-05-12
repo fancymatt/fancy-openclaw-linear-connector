@@ -250,17 +250,27 @@ export function createApp(options?: CreateAppOptions) {
       return;
     }
     log.info(`Session-end callback received for ${agentId}`);
-    const pendingTickets = sessionTracker.endSession(agentId);
-    operationalEventStore.append({ outcome: "session-ended", agent: agentId, deliveryMode: "session-end-callback", detail: { pendingTickets: pendingTickets ?? [] } });
-    if (pendingTickets && pendingTickets.length > 0) {
+    const queuedTickets = sessionTracker.endSession(agentId);
+    // Also drain any dispatched-but-unconfirmed bag entries for this agent.
+    // These were dispatched on HTTP 200 but not confirmed as processed.
+    const bagTickets = bag.getPendingTickets(agentId).map(e => e.ticketId);
+    if (bagTickets.length > 0) bag.clearAgent(agentId);
+    // Normalize queued tickets so dedup works correctly vs already-normalized bag IDs.
+    const queuedNormalized = (queuedTickets ?? []).map(t => normalizeSessionKey(t));
+    const allPending = [...new Set([...queuedNormalized, ...bagTickets])];
+    operationalEventStore.append({
+      outcome: "session-ended", agent: agentId, deliveryMode: "session-end-callback",
+      detail: { queuedTickets: queuedTickets ?? [], bagTickets, allPending }
+    });
+    if (allPending.length > 0) {
       // Re-signal: agent has work waiting. Send one signal per ticket so each
       // issue is delivered into its own canonical per-ticket session key.
       try {
-        await resignalPendingTickets(agentId, pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true });
+        await resignalPendingTickets(agentId, allPending, bag, sessionTracker, wakeConfig, { markActive: true });
       } catch (err) {
         log.error(`Session-end re-signal failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
       }
-      res.json({ ok: true, pendingTickets: pendingTickets.length });
+      res.json({ ok: true, pendingTickets: allPending.length });
     } else {
       res.json({ ok: true, pendingTickets: 0 });
     }

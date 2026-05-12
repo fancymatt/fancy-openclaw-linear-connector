@@ -36,7 +36,7 @@ export async function sendWakeUpSignal(
   agentId: string,
   ticketIds: string[],
   config: WakeUpConfig,
-): Promise<void> {
+): Promise<{ runId?: string } | void> {
   const count = ticketIds.length;
   const tickets = ticketIds.join(", ");
   const message = (config.signalTemplate ?? DEFAULT_TEMPLATE)
@@ -63,7 +63,8 @@ export async function sendWakeUpSignal(
   log.info(`Sending wake-up signal to ${agentId}: ${count} ticket(s) [${tickets}]`);
 
   try {
-    await deliverToAgent(route, config);
+    const result = await deliverToAgent(route, config);
+    return result.runId ? { runId: result.runId } : undefined;
   } catch (err) {
     log.error(
       `Wake-up signal failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`
