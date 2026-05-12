@@ -16,6 +16,11 @@ export interface DeliveryConfig {
   maxRetries?: number;
 }
 
+export interface DeliveryResult {
+  dispatched: boolean;
+  runId?: string;
+}
+
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_RETRY_DELAY_MS = 5_000;
 const DEFAULT_MAX_RETRIES = 1;
@@ -33,8 +38,8 @@ const DEFAULT_MAX_RETRIES = 1;
 export async function deliverToAgent(
   route: RouteResult,
   config: DeliveryConfig,
-): Promise<void> {
-  await deliverMessageToAgent(
+): Promise<DeliveryResult> {
+  return await deliverMessageToAgent(
     route.agentId,
     route.sessionKey,
     buildDeliveryMessage(route),
@@ -48,7 +53,7 @@ export async function deliverMessageToAgent(
   sessionId: string,
   message: string,
   config: DeliveryConfig,
-): Promise<boolean> {
+): Promise<DeliveryResult> {
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const retryDelayMs = config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
   const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
@@ -66,10 +71,10 @@ async function deliverViaHooks(
   sessionId: string,
   config: DeliveryConfig,
   opts: { message: string; timeoutMs: number; retryDelayMs: number; maxRetries: number },
-): Promise<boolean> {
+): Promise<DeliveryResult> {
 
-  let delivered = false;
-  for (let attempt = 0; attempt <= opts.maxRetries && !delivered; attempt++) {
+  let result: DeliveryResult = { dispatched: false };
+  for (let attempt = 0; attempt <= opts.maxRetries && !result.dispatched; attempt++) {
     if (attempt > 0) {
       log.info(
         `Retrying isolated delivery for ${agentName} [${sessionId}] (attempt ${attempt + 1}/${opts.maxRetries + 1}) after ${opts.retryDelayMs}ms`,
@@ -103,17 +108,17 @@ async function deliverViaHooks(
       log.info(
         `Isolated delivery dispatched for ${agentName} [${sessionId}]: runId=${json.runId ?? "ok"}`,
       );
-      delivered = true;
+      result = { dispatched: true, runId: json.runId };
     } catch (err) {
       log.error(
         `Isolated delivery attempt ${attempt + 1} failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
-  if (!delivered) {
+  if (!result.dispatched) {
     log.error(`All delivery attempts exhausted for ${agentName} [${sessionId}]`);
   }
-  return delivered;
+  return result;
 }
 
 // ── CLI Spawn Mode ───────────────────────────────────────────────────────────
@@ -123,10 +128,10 @@ async function deliverViaCli(
   sessionId: string,
   config: DeliveryConfig,
   opts: { message: string; timeoutMs: number; retryDelayMs: number; maxRetries: number },
-): Promise<boolean> {
+): Promise<DeliveryResult> {
 
-  let delivered = false;
-  for (let attempt = 0; attempt <= opts.maxRetries && !delivered; attempt++) {
+  let result: DeliveryResult = { dispatched: false };
+  for (let attempt = 0; attempt <= opts.maxRetries && !result.dispatched; attempt++) {
     if (attempt > 0) {
       log.info(
         `Retrying CLI delivery for ${agentName} [${sessionId}] (attempt ${attempt + 1}/${opts.maxRetries + 1}) after ${opts.retryDelayMs}ms`,
@@ -134,7 +139,7 @@ async function deliverViaCli(
       await new Promise((r) => setTimeout(r, opts.retryDelayMs));
     }
     try {
-      delivered = await new Promise<boolean>((resolve) => {
+      result = { dispatched: await new Promise<boolean>((resolve) => {
         const child = spawn(
           config.nodeBin,
           ["openclaw", "agent", "--agent", agentName, "--message", opts.message, "--channel", "telegram", "--deliver"],
@@ -164,17 +169,17 @@ async function deliverViaCli(
           log.error(`CLI delivery spawn error for ${agentName}: ${err.message}`);
           resolve(false);
         });
-      });
+      }) };
     } catch (err) {
       log.error(
         `CLI delivery attempt ${attempt + 1} threw for ${agentName}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
-  if (delivered) {
+  if (result.dispatched) {
     log.info(`Delivery spawned for ${agentName} [${sessionId}]`);
   } else {
     log.error(`All CLI delivery attempts exhausted for ${agentName} [${sessionId}]`);
   }
-  return delivered;
+  return result;
 }

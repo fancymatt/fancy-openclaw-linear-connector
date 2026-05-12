@@ -130,6 +130,28 @@ describe("OperationalEventStore", () => {
     expect(snapshot.lastSuccess?.outcome).toBe("delivered");
     expect(snapshot.lastError?.errorSummary).toBe("agent unavailable");
   });
+
+  it("stores runId and dispatch-accepted outcome for hook-based dispatch", () => {
+    store.append({
+      outcome: "dispatch-accepted",
+      type: "Issue",
+      agent: "emi",
+      key: "linear-CT-52",
+      deliveryMode: "wake-up",
+      attemptCount: 1,
+      runId: "run-abc123",
+    });
+    const [event] = store.query({ agent: "emi" });
+    expect(event.outcome).toBe("dispatch-accepted");
+    expect(event.runId).toBe("run-abc123");
+  });
+
+  it("treats dispatch-accepted as a success outcome in snapshot", () => {
+    store.append({ outcome: "dispatch-accepted", agent: "emi", key: "linear-CT-52" });
+    const snapshot = store.snapshot({ agent: "emi" });
+    expect(snapshot.lastSuccess?.outcome).toBe("dispatch-accepted");
+    expect(snapshot.lastError).toBeUndefined();
+  });
 });
 
 describe("OperationalEventStore — retention/pruning", () => {
