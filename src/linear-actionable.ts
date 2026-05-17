@@ -26,6 +26,57 @@ export function isParkedIssueState(state: unknown): boolean {
   return PARKED_STATE_TYPES.has(type) || PARKED_STATE_NAMES.has(name);
 }
 
+export interface LinearIssueState {
+  name?: string;
+  type?: string;
+}
+
+export interface LinearIssueReference {
+  id?: string;
+  identifier?: string;
+  state?: LinearIssueState | null;
+}
+
+export interface LinearIssueRelation {
+  type?: string;
+  issue?: LinearIssueReference | null;
+  relatedIssue?: LinearIssueReference | null;
+}
+
+export interface LinearIssueWithRelations extends LinearIssueReference {
+  delegate?: { id?: string; name?: string } | null;
+  assignee?: { id?: string; name?: string } | null;
+  relations?: { nodes?: LinearIssueRelation[] | null } | null;
+}
+
+function isSameIssue(a: LinearIssueReference | null | undefined, b: LinearIssueReference): boolean {
+  if (!a) return false;
+  return Boolean(
+    (a.id && b.id && a.id === b.id) ||
+    (a.identifier && b.identifier && a.identifier === b.identifier),
+  );
+}
+
+function blockerOf(issue: LinearIssueWithRelations, relation: LinearIssueRelation): LinearIssueReference | null {
+  const type = relation.type?.toLowerCase();
+  if (!type) return null;
+  if ((type === "blocks" || type === "blocking") && isSameIssue(relation.relatedIssue, issue)) {
+    return relation.issue ?? null;
+  }
+  if ((type === "blocked_by" || type === "blocked-by" || type === "blockedby") && isSameIssue(relation.issue, issue)) {
+    return relation.relatedIssue ?? null;
+  }
+  return null;
+}
+
+export function isBlockedByOpenIssue(issue: LinearIssueWithRelations): boolean {
+  const nodes = issue.relations?.nodes ?? [];
+  return nodes.some((rel) => {
+    const blocker = blockerOf(issue, rel);
+    return blocker !== null && !isTerminalIssueState(blocker.state);
+  });
+}
+
 export function issueIdentifierFromSessionKey(ticketId: string): string {
   return normalizeSessionKey(ticketId).replace(/^linear-/, "");
 }
@@ -79,7 +130,17 @@ export async function isLinearIssueStillRoutedToAgent(
         authorization: linearAuthorizationHeader(token),
       },
       body: JSON.stringify({
-        query: `query IssueRouting($id: String!) { issue(id: $id) { id identifier delegate { id name } assignee { id name } state { name type } } }`,
+        query: `query IssueRouting($id: String!) {
+          issue(id: $id) {
+            id identifier
+            delegate { id name }
+            assignee { id name }
+            state { name type }
+            relations(first: 50) {
+              nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
+            }
+          }
+        }`,
         variables: { id: identifier },
       }),
     });
@@ -90,7 +151,7 @@ export async function isLinearIssueStillRoutedToAgent(
     }
 
     const body = await response.json() as {
-      data?: { issue?: { delegate?: { id?: string; name?: string } | null; assignee?: { id?: string; name?: string } | null; state?: { name?: string; type?: string } } | null };
+      data?: { issue?: LinearIssueWithRelations | null };
       errors?: Array<{ message?: string }>;
     };
 
@@ -102,6 +163,10 @@ export async function isLinearIssueStillRoutedToAgent(
     const issue = body.data?.issue;
     if (!issue) return false;
     if (isTerminalIssueState(issue.state) || isParkedIssueState(issue.state)) return false;
+    if (isBlockedByOpenIssue(issue)) {
+      log.info(`Dropping pending Linear ticket ${identifier}: blocked by unfinished prerequisite`);
+      return false;
+    }
 
     if (routingReason === "delegate") {
       const ok = issue.delegate?.id === agent.linearUserId;
@@ -135,7 +200,15 @@ export async function isLinearIssueActionable(ticketId: string, agentId: string)
         authorization: linearAuthorizationHeader(token),
       },
       body: JSON.stringify({
-        query: `query IssueState($id: String!) { issue(id: $id) { id identifier state { name type } } }`,
+        query: `query IssueState($id: String!) {
+          issue(id: $id) {
+            id identifier
+            state { name type }
+            relations(first: 50) {
+              nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
+            }
+          }
+        }`,
         variables: { id: identifier },
       }),
     });
@@ -146,7 +219,7 @@ export async function isLinearIssueActionable(ticketId: string, agentId: string)
     }
 
     const body = await response.json() as {
-      data?: { issue?: { state?: { name?: string; type?: string } } | null };
+      data?: { issue?: LinearIssueWithRelations | null };
       errors?: Array<{ message?: string }>;
     };
 
@@ -161,7 +234,7 @@ export async function isLinearIssueActionable(ticketId: string, agentId: string)
       return false;
     }
 
-    const nonActionable = isTerminalIssueState(issue.state) || isParkedIssueState(issue.state);
+    const nonActionable = isTerminalIssueState(issue.state) || isParkedIssueState(issue.state) || isBlockedByOpenIssue(issue);
     if (nonActionable) {
       log.info(`Dropping pending Linear ticket ${identifier}: state is ${issue.state?.name ?? issue.state?.type ?? "non-actionable"}`);
     }
