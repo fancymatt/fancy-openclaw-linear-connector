@@ -38,7 +38,7 @@ function appendOperationalEvent(store, input) {
         log.error(`Operational event write failed: ${errorSummary(err)}`);
     }
 }
-export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle, operationalEventStore) {
+export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle, operationalEventStore, onDispatched) {
     const router = Router();
     if (NUDGE_DEDUP_WINDOW_MS > 0) {
         log.info(`Nudge dedup enabled: ${NUDGE_DEDUP_WINDOW_MS}ms window`);
@@ -240,7 +240,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
             const staleSessions = sessionTracker.cleanupStale();
             for (const stale of staleSessions) {
                 log.info(`Webhook stale-session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
-                await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true });
+                await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true, onDispatched });
             }
             if (sessionTracker.isActiveForTicket(agentName, normalizedTicketId)) {
                 // Same ticket already has an active session: deliver directly into it.
@@ -273,7 +273,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
             const pending = bag.getPendingTickets(agentName);
             const pendingIds = pending.map((e) => e.ticketId);
             log.info(`Bag: sending wake-up signal(s) to ${agentName} with ${pendingIds.length} ticket(s)`);
-            const dispatchResults = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfig, { markActive: true });
+            const dispatchResults = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfig, { markActive: true, onDispatched });
             const dispatched = dispatchResults.filter(r => r.dispatched).length;
             const firstRunId = dispatchResults.find(r => r.runId)?.runId ?? null;
             appendOperationalEvent(operationalEventStore, {

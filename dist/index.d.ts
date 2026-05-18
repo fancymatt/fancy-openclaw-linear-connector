@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import { AgentQueue } from "./queue/index.js";
-import { PendingWorkBag, SessionTracker } from "./bag/index.js";
+import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector } from "./bag/index.js";
 export interface CreateAppOptions {
     /** Override PendingWorkBag database path (for testing). */
     bagDbPath?: string;
@@ -25,5 +25,8 @@ export declare function createApp(options?: CreateAppOptions): {
         timeoutMs: number | undefined;
         maxRetries: number | undefined;
     };
+    ackTracker: DispatchAckTracker;
+    watchdog: DispatchWatchdog;
+    noActivityDetector: NoActivityDetector;
 };
 //# sourceMappingURL=index.d.ts.map

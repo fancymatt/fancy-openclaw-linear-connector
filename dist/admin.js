@@ -1,6 +1,7 @@
 import { Router } from "express";
 import crypto from "node:crypto";
 import { getAgents } from "./agents.js";
+import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 function bool(value) {
     return typeof value === "string" ? value.length > 0 : Boolean(value);
 }
@@ -420,6 +421,16 @@ export function createAdminRouter(deps) {
     });
     router.get("/api/tasks/:key/events", (req, res) => {
         res.json(deps.operationalEventStore?.snapshot({ key: req.params.key }) ?? { key: req.params.key, lifecycle: [] });
+    });
+    router.get("/api/stale-digest", (_req, res) => {
+        const daysBack = typeof _req.query.days === "string" ? Number.parseInt(_req.query.days, 10) : 7;
+        const summary = aggregateDigest(undefined, daysBack);
+        res.json(summary);
+    });
+    router.get("/api/stale-digest/text", (_req, res) => {
+        const daysBack = typeof _req.query.days === "string" ? Number.parseInt(_req.query.days, 10) : 7;
+        const summary = aggregateDigest(undefined, daysBack);
+        res.type("text/plain").send(formatDigestSummary(summary));
     });
     router.get(["/", "/agents", "/tasks", "/settings"], (req, res) => {
         const segment = req.path.split("/").filter(Boolean)[0];

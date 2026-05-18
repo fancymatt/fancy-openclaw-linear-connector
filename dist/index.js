@@ -10,10 +10,13 @@ import { NudgeStore } from "./store/nudge-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
-import { PendingWorkBag, SessionTracker, resignalPendingTickets, replayPendingBag } from "./bag/index.js";
+import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, resignalPendingTickets, replayPendingBag } from "./bag/index.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { createAdminRouter } from "./admin.js";
+import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES } from "./bag/stale-session-forensics.js";
+import { getAccessToken } from "./agents.js";
 import crypto from "crypto";
+import path from "path";
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
 const DEPLOYMENT_NAME = process.env.DEPLOYMENT_NAME ?? "fancymatt";
@@ -116,14 +119,127 @@ export function createApp(options) {
         timeoutMs: process.env.NODE_ENV === "test" ? 50 : undefined,
         maxRetries: process.env.NODE_ENV === "test" ? 0 : undefined,
     };
-    const sessionTracker = new SessionTracker(undefined, async (staleSessions) => {
-        for (const stale of staleSessions) {
+    const forensicsConfig = {
+        diagnosticsDir: process.env.STALE_SESSION_DIAGNOSTICS_DIR,
+        openclawHome: process.env.OPENCLAW_HOME,
+        loopThreshold: process.env.STALE_LOOP_THRESHOLD ? parseInt(process.env.STALE_LOOP_THRESHOLD, 10) : undefined,
+        humanAssigneeLinearId: process.env.STALE_HUMAN_ASSIGNEE_LINEAR_ID,
+    };
+    /**
+     * Process a single stale session: capture forensics, classify, recover ticket.
+     */
+    async function processStaleSession(stale) {
+        log.warn(`Stale session: ${stale.agentId} [${stale.sessionKey}] ` +
+            `(started ${Math.round((Date.now() - stale.startedAt) / 60000)}min ago, timeout ${Math.round(stale.timeoutMs / 60000)}min)`);
+        // 1. Build forensic snapshot
+        const snapshot = buildSnapshot(stale, forensicsConfig);
+        // 2. Fetch current Linear ticket state for comparison
+        const linearState = await fetchLinearTicketState(stale.sessionKey, stale.agentId);
+        if (linearState) {
+            snapshot.linearTicket.stateAtTimeout = linearState.state?.name ?? null;
+            snapshot.linearTicket.commentCountAtTimeout = linearState.comments?.nodes?.length ?? 0;
+        }
+        // 3. Write snapshot to disk
+        const diagPath = writeSnapshot(snapshot, forensicsConfig);
+        snapshot.diagnosticPath = diagPath;
+        // 4. Append to digest JSONL
+        appendDigestEntry(snapshot, forensicsConfig);
+        // 5. Log classification
+        log.warn(`Stale session classified: ${stale.agentId} [${stale.sessionKey}] → ${snapshot.classification} (${STALE_CLASS_NAMES[snapshot.classification]})`);
+        operationalEventStore.append({
+            outcome: "stale-resignaled",
+            agent: stale.agentId,
+            key: stale.sessionKey,
+            sessionKey: stale.sessionKey,
+            deliveryMode: "stale-session-drain",
+            attemptCount: stale.pendingTickets.length,
+            detail: {
+                classification: snapshot.classification,
+                diagnosticPath: diagPath,
+                toolCallCount: snapshot.toolCallSummary.totalCalls,
+                stopReason: snapshot.lastAssistantMessage?.stopReason,
+                errorCount: snapshot.errors.length,
+            },
+        });
+        // 6. Recover the Linear ticket
+        const recovery = await recoverTicket(snapshot, stale.agentId, forensicsConfig);
+        if (!recovery.success) {
+            log.error(`Recovery failed for ${stale.sessionKey}: ${recovery.detail}`);
+        }
+        // 7. Re-signal pending tickets (if any)
+        if (stale.pendingTickets.length > 0) {
             log.info(`Stale session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
             const sent = await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true });
-            operationalEventStore.append({ outcome: "stale-resignaled", agent: stale.agentId, key: stale.pendingTickets[0] ?? null, sessionKey: stale.pendingTickets[0] ?? null, deliveryMode: "stale-session-drain", attemptCount: stale.pendingTickets.length, detail: { requested: stale.pendingTickets.length, sent } });
+            operationalEventStore.append({
+                outcome: "stale-resignaled",
+                agent: stale.agentId,
+                key: stale.pendingTickets[0] ?? null,
+                sessionKey: stale.pendingTickets[0] ?? null,
+                deliveryMode: "stale-session-resignal",
+                attemptCount: stale.pendingTickets.length,
+                detail: { requested: stale.pendingTickets.length, sent },
+            });
+        }
+    }
+    const sessionTracker = new SessionTracker(undefined, async (staleSessions) => {
+        for (const stale of staleSessions) {
+            try {
+                await processStaleSession(stale);
+            }
+            catch (err) {
+                log.error(`Stale session processing failed for ${stale.agentId} [${stale.sessionKey}]: ${err instanceof Error ? err.message : String(err)}`);
+            }
         }
     });
     const throttle = new DeliveryThrottle();
+    // ── v1.2: Dispatch acknowledgment tracking + early no-activity detection ──
+    const ackTracker = new DispatchAckTracker(options?.bagDbPath ? path.join(path.dirname(options.bagDbPath), "dispatch-acks.db") : undefined);
+    /**
+     * Post a comment on a Linear ticket via the GraphQL API.
+     * Used by NoActivityDetector to notify when dispatches fail silently.
+     */
+    async function postLinearComment(agentId, ticketId, message) {
+        const token = getAccessToken(agentId) ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+        if (!token) {
+            log.warn(`No Linear token for comment post on ${ticketId}`);
+            return false;
+        }
+        const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+        const identifier = ticketId.replace(/^linear-/, "");
+        try {
+            // Fetch issue ID
+            const issueRes = await fetch("https://api.linear.app/graphql", {
+                method: "POST",
+                headers: { "content-type": "application/json", authorization: authHeader },
+                body: JSON.stringify({
+                    query: `query($id: String!) { issue(id: $id) { id } }`,
+                    variables: { id: identifier },
+                }),
+            });
+            const issueBody = (await issueRes.json());
+            const issueId = issueBody.data?.issue?.id;
+            if (!issueId)
+                return false;
+            // Post comment
+            const commentRes = await fetch("https://api.linear.app/graphql", {
+                method: "POST",
+                headers: { "content-type": "application/json", authorization: authHeader },
+                body: JSON.stringify({
+                    query: `mutation($issueId: ID!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { comment { id } } }`,
+                    variables: { issueId, body: message },
+                }),
+            });
+            return commentRes.ok;
+        }
+        catch (err) {
+            log.error(`Linear comment failed for ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
+            return false;
+        }
+    }
+    const watchdog = new DispatchWatchdog({ bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig });
+    watchdog.start();
+    const noActivityDetector = new NoActivityDetector({ sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, postLinearComment });
+    noActivityDetector.start();
     // Operator nudge endpoint — sends a short instruction into an already-active
     // agent session. Phase 1 is local/Nakazawa only; no cross-gateway routing.
     app.post("/nudge", async (req, res) => {
@@ -181,7 +297,7 @@ export function createApp(options) {
     });
     // v1 admin dashboard — read-only operational UI and safe JSON API.
     app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, deploymentName: DEPLOYMENT_NAME }));
-    app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle, operationalEventStore));
+    app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle, operationalEventStore, (agentId, ticketId) => ackTracker.recordDispatch(agentId, ticketId)));
     // ── v1.1: Session-end callback endpoint ──────────────────────────────
     // The gateway (via plugin) calls this when an agent's session ends.
     // The connector then checks the bag and sends another wake-up if needed.
@@ -224,6 +340,11 @@ export function createApp(options) {
         }
         log.info(`Session-end callback received for ${agentId}`);
         const queuedTickets = sessionTracker.endSession(agentId);
+        // Acknowledge dispatches for this agent — the session completed (even briefly).
+        ackTracker.acknowledge(agentId);
+        // Clear no-activity warnings for any sessions that just ended.
+        const activeKeys = sessionTracker.getActiveSessionKeys(agentId); // Already ended, so empty — but clear anyway.
+        noActivityDetector.clearWarned(agentId, "*");
         // Also drain any dispatched-but-unconfirmed bag entries for this agent.
         // These were dispatched on HTTP 200 but not confirmed as processed.
         const bagTickets = bag.getPendingTickets(agentId).map(e => e.ticketId);
@@ -274,7 +395,7 @@ export function createApp(options) {
             activeSessionDetails: activeSessions.map((agentId) => sessionTracker.getActiveSessionInfo(agentId)),
         });
     });
-    return { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig };
+    return { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, ackTracker, watchdog, noActivityDetector };
 }
 /**
  * Recover queue backlog left behind by prior process state. For each agent
@@ -325,7 +446,7 @@ if (isEntryPoint) {
     if (agents.length > 0) {
         startTokenRefresh();
     }
-    const { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig } = createApp();
+    const { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, ackTracker, watchdog, noActivityDetector } = createApp();
     const server = app.listen(PORT, () => {
         log.info(`fancy-openclaw-linear-connector [${DEPLOYMENT_NAME}] listening on port ${PORT} (pid=${process.pid})`);
         // Recover any backlog left behind by prior process state (v1.0 queue).
@@ -333,7 +454,9 @@ if (isEntryPoint) {
             log.error(`Startup drain failed: ${err instanceof Error ? err.message : String(err)}`);
         });
         // Replay persisted pending-bag work left behind by a prior process restart.
-        replayPendingBag(bag, sessionTracker, wakeConfig, operationalEventStore).catch((err) => {
+        replayPendingBag(bag, sessionTracker, wakeConfig, operationalEventStore, {
+            onDispatched: (agentId, ticketId) => ackTracker.recordDispatch(agentId, ticketId),
+        }).catch((err) => {
             log.error(`Startup replay failed: ${err instanceof Error ? err.message : String(err)}`);
         });
     });

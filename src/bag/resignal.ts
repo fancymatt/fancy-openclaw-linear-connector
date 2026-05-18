@@ -20,6 +20,8 @@ export interface ResignalOptions {
   isTicketActionable?: (ticketId: string, agentId: string) => boolean | Promise<boolean>;
   /** Optional test hook for delivery. */
   sendWakeUp?: (agentId: string, ticketIds: string[], config: WakeUpConfig) => Promise<{ runId?: string } | void>;
+  /** Optional callback after successful dispatch — used for ack tracking. */
+  onDispatched?: (agentId: string, ticketId: string) => void;
 }
 
 /**
@@ -62,6 +64,7 @@ export async function resignalPendingTickets(
       if (options.markActive) {
         sessionTracker.startSession(agentId, ticketId);
       }
+      options.onDispatched?.(agentId, ticketId);
       results.push({ ticketId, dispatched: true, runId: (wakeResult as { runId?: string } | void | undefined)?.runId });
     } catch (err) {
       log.error(

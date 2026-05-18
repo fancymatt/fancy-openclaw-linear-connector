@@ -60,8 +60,26 @@ async function deliverViaHooks(agentName, sessionId, config, opts) {
                 throw new Error(`hooks responded with ${response.status}: ${errBody}`);
             }
             const json = (await response.json());
-            log.info(`Isolated delivery dispatched for ${agentName} [${sessionId}]: runId=${json.runId ?? "ok"}`);
-            result = { dispatched: true, runId: json.runId };
+            const runId = typeof json.runId === "string" ? json.runId : undefined;
+            const hookOk = json.ok !== false; // Treat missing 'ok' as success (backward compat)
+            if (!hookOk) {
+                // Gateway explicitly returned { ok: false } — the run was not started.
+                const errorSummary = typeof json.error === "string" ? json.error
+                    : typeof json.summary === "string" ? json.summary
+                        : JSON.stringify(json).slice(0, 200);
+                log.error(`Gateway returned hook error for ${agentName} [${sessionId}]: ${errorSummary}`);
+                result = {
+                    dispatched: false,
+                    runId,
+                    rawResponse: json,
+                    hookError: true,
+                    hookErrorSummary: errorSummary,
+                };
+            }
+            else {
+                log.info(`Isolated delivery dispatched for ${agentName} [${sessionId}]: runId=${runId ?? "ok"}`);
+                result = { dispatched: true, runId, rawResponse: json };
+            }
         }
         catch (err) {
             log.error(`Isolated delivery attempt ${attempt + 1} failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);

@@ -53,6 +53,7 @@ export function createWebhookRouter(
   sessionTracker?: SessionTracker,
   throttle?: DeliveryThrottle,
   operationalEventStore?: OperationalEventStore,
+  onDispatched?: (agentId: string, ticketId: string) => void,
 ): Router {
   const router = Router();
 
@@ -280,7 +281,7 @@ export function createWebhookRouter(
         const staleSessions = sessionTracker.cleanupStale();
         for (const stale of staleSessions) {
           log.info(`Webhook stale-session drain: re-signaling ${stale.agentId} for ${stale.pendingTickets.length} ticket(s)`);
-          await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true });
+          await resignalPendingTickets(stale.agentId, stale.pendingTickets, bag, sessionTracker, wakeConfig, { markActive: true, onDispatched });
         }
 
         if (sessionTracker.isActiveForTicket(agentName, normalizedTicketId)) {
@@ -314,7 +315,7 @@ export function createWebhookRouter(
         const pending = bag.getPendingTickets(agentName);
         const pendingIds = pending.map((e) => e.ticketId);
         log.info(`Bag: sending wake-up signal(s) to ${agentName} with ${pendingIds.length} ticket(s)`);
-        const dispatchResults = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfig, { markActive: true });
+        const dispatchResults = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfig, { markActive: true, onDispatched });
         const dispatched = dispatchResults.filter(r => r.dispatched).length;
         const firstRunId = dispatchResults.find(r => r.runId)?.runId ?? null;
         appendOperationalEvent(operationalEventStore, {

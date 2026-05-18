@@ -12,6 +12,12 @@ export interface DeliveryConfig {
 export interface DeliveryResult {
     dispatched: boolean;
     runId?: string;
+    /** Raw response body from the gateway, for observability. */
+    rawResponse?: Record<string, unknown>;
+    /** True when the gateway returned { ok: false } or an error body. */
+    hookError?: boolean;
+    /** Error summary from the gateway (if present in the response). */
+    hookErrorSummary?: string;
 }
 /**
  * Deliver a routed event to an OpenClaw agent.

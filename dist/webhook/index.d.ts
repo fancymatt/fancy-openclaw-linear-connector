@@ -8,5 +8,5 @@ import { PendingWorkBag, SessionTracker } from "../bag/index.js";
 export type { LinearEvent } from "./schema.js";
 export { verifyLinearSignature } from "./signature.js";
 export { normalizeLinearEvent } from "./normalize.js";
-export declare function createWebhookRouter(eventStore?: EventStore, nudgeStore?: NudgeStore, agentQueue?: AgentQueue, bag?: PendingWorkBag, sessionTracker?: SessionTracker, throttle?: DeliveryThrottle, operationalEventStore?: OperationalEventStore): Router;
+export declare function createWebhookRouter(eventStore?: EventStore, nudgeStore?: NudgeStore, agentQueue?: AgentQueue, bag?: PendingWorkBag, sessionTracker?: SessionTracker, throttle?: DeliveryThrottle, operationalEventStore?: OperationalEventStore, onDispatched?: (agentId: string, ticketId: string) => void): Router;
 //# sourceMappingURL=index.d.ts.map

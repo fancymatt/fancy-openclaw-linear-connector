@@ -10,13 +10,14 @@ import { NudgeStore } from "./store/nudge-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
-import { PendingWorkBag, SessionTracker, resignalPendingTickets, replayPendingBag } from "./bag/index.js";
+import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, resignalPendingTickets, replayPendingBag } from "./bag/index.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
 import { getAccessToken, getAgent } from "./agents.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
+import path from "path";
 
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
@@ -226,6 +227,62 @@ export function createApp(options?: CreateAppOptions) {
   });
   const throttle = new DeliveryThrottle();
 
+  // ── v1.2: Dispatch acknowledgment tracking + early no-activity detection ──
+  const ackTracker = new DispatchAckTracker(
+    options?.bagDbPath ? path.join(path.dirname(options.bagDbPath), "dispatch-acks.db") : undefined,
+  );
+
+  /**
+   * Post a comment on a Linear ticket via the GraphQL API.
+   * Used by NoActivityDetector to notify when dispatches fail silently.
+   */
+  async function postLinearComment(agentId: string, ticketId: string, message: string): Promise<boolean> {
+    const token = getAccessToken(agentId) ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+    if (!token) {
+      log.warn(`No Linear token for comment post on ${ticketId}`);
+      return false;
+    }
+    const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+    const identifier = ticketId.replace(/^linear-/, "");
+    try {
+      // Fetch issue ID
+      const issueRes = await fetch("https://api.linear.app/graphql", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: authHeader },
+        body: JSON.stringify({
+          query: `query($id: String!) { issue(id: $id) { id } }`,
+          variables: { id: identifier },
+        }),
+      });
+      const issueBody = (await issueRes.json()) as { data?: { issue?: { id: string } | null } };
+      const issueId = issueBody.data?.issue?.id;
+      if (!issueId) return false;
+      // Post comment
+      const commentRes = await fetch("https://api.linear.app/graphql", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: authHeader },
+        body: JSON.stringify({
+          query: `mutation($issueId: ID!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { comment { id } } }`,
+          variables: { issueId, body: message },
+        }),
+      });
+      return commentRes.ok;
+    } catch (err) {
+      log.error(`Linear comment failed for ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  }
+
+  const watchdog = new DispatchWatchdog(
+    { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig },
+  );
+  watchdog.start();
+
+  const noActivityDetector = new NoActivityDetector(
+    { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, postLinearComment },
+  );
+  noActivityDetector.start();
+
   // Operator nudge endpoint — sends a short instruction into an already-active
   // agent session. Phase 1 is local/Nakazawa only; no cross-gateway routing.
   app.post("/nudge", async (req: express.Request, res: express.Response) => {
@@ -290,7 +347,7 @@ export function createApp(options?: CreateAppOptions) {
   // v1 admin dashboard — read-only operational UI and safe JSON API.
   app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, deploymentName: DEPLOYMENT_NAME }));
 
-  app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle, operationalEventStore));
+  app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle, operationalEventStore, (agentId, ticketId) => ackTracker.recordDispatch(agentId, ticketId)));
 
   // ── v1.1: Session-end callback endpoint ──────────────────────────────
   // The gateway (via plugin) calls this when an agent's session ends.
@@ -332,6 +389,11 @@ export function createApp(options?: CreateAppOptions) {
     }
     log.info(`Session-end callback received for ${agentId}`);
     const queuedTickets = sessionTracker.endSession(agentId);
+    // Acknowledge dispatches for this agent — the session completed (even briefly).
+    ackTracker.acknowledge(agentId);
+    // Clear no-activity warnings for any sessions that just ended.
+    const activeKeys = sessionTracker.getActiveSessionKeys(agentId); // Already ended, so empty — but clear anyway.
+    noActivityDetector.clearWarned(agentId, "*");
     // Also drain any dispatched-but-unconfirmed bag entries for this agent.
     // These were dispatched on HTTP 200 but not confirmed as processed.
     const bagTickets = bag.getPendingTickets(agentId).map(e => e.ticketId);
@@ -380,7 +442,7 @@ export function createApp(options?: CreateAppOptions) {
     });
   });
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig };
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, ackTracker, watchdog, noActivityDetector };
 }
 
 /**
@@ -435,7 +497,7 @@ if (isEntryPoint) {
     startTokenRefresh();
   }
 
-  const { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig } = createApp();
+  const { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, ackTracker, watchdog, noActivityDetector } = createApp();
   const server = app.listen(PORT, () => {
     log.info(`fancy-openclaw-linear-connector [${DEPLOYMENT_NAME}] listening on port ${PORT} (pid=${process.pid})`);
     // Recover any backlog left behind by prior process state (v1.0 queue).
@@ -443,7 +505,9 @@ if (isEntryPoint) {
       log.error(`Startup drain failed: ${err instanceof Error ? err.message : String(err)}`);
     });
     // Replay persisted pending-bag work left behind by a prior process restart.
-    replayPendingBag(bag, sessionTracker, wakeConfig, operationalEventStore).catch((err) => {
+    replayPendingBag(bag, sessionTracker, wakeConfig, operationalEventStore, {
+      onDispatched: (agentId, ticketId) => ackTracker.recordDispatch(agentId, ticketId),
+    }).catch((err) => {
       log.error(`Startup replay failed: ${err instanceof Error ? err.message : String(err)}`);
     });
   });

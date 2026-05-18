@@ -19,6 +19,12 @@ export interface DeliveryConfig {
 export interface DeliveryResult {
   dispatched: boolean;
   runId?: string;
+  /** Raw response body from the gateway, for observability. */
+  rawResponse?: Record<string, unknown>;
+  /** True when the gateway returned { ok: false } or an error body. */
+  hookError?: boolean;
+  /** Error summary from the gateway (if present in the response). */
+  hookErrorSummary?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -104,11 +110,31 @@ async function deliverViaHooks(
         const errBody = await response.text().catch(() => "no body");
         throw new Error(`hooks responded with ${response.status}: ${errBody}`);
       }
-      const json = (await response.json()) as { runId?: string };
-      log.info(
-        `Isolated delivery dispatched for ${agentName} [${sessionId}]: runId=${json.runId ?? "ok"}`,
-      );
-      result = { dispatched: true, runId: json.runId };
+      const json = (await response.json()) as Record<string, unknown>;
+      const runId = typeof json.runId === "string" ? json.runId : undefined;
+      const hookOk = json.ok !== false; // Treat missing 'ok' as success (backward compat)
+
+      if (!hookOk) {
+        // Gateway explicitly returned { ok: false } — the run was not started.
+        const errorSummary = typeof json.error === "string" ? json.error
+          : typeof json.summary === "string" ? json.summary
+          : JSON.stringify(json).slice(0, 200);
+        log.error(
+          `Gateway returned hook error for ${agentName} [${sessionId}]: ${errorSummary}`,
+        );
+        result = {
+          dispatched: false,
+          runId,
+          rawResponse: json,
+          hookError: true,
+          hookErrorSummary: errorSummary,
+        };
+      } else {
+        log.info(
+          `Isolated delivery dispatched for ${agentName} [${sessionId}]: runId=${runId ?? "ok"}`,
+        );
+        result = { dispatched: true, runId, rawResponse: json };
+      }
     } catch (err) {
       log.error(
         `Isolated delivery attempt ${attempt + 1} failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`,
