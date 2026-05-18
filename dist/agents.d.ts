@@ -23,6 +23,11 @@ export interface AgentConfig {
 export declare function watchAgentsFile(): void;
 export declare function reloadAgents(): void;
 export declare function getAgents(): AgentConfig[];
+/** Check whether an agent's OpenClaw workspace exists on this host.
+ *  Uses the agent's openclawAgent name to look for
+ *  ~/.openclaw/workspace-{name}/ (or the OPENCLAW_CONFIG_DIR variant).
+ */
+export declare function isAgentLocal(agent: AgentConfig): boolean;
 /** Build linearUserId → agentName map for routing */
 export declare function buildAgentMap(): Record<string, string>;
 /** Get current access token for a named agent */

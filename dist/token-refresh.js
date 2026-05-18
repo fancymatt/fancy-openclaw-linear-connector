@@ -3,11 +3,16 @@
  * Access tokens expire after ~24h; this refreshes every 20h.
  * Modeled after the ILL webhook's token-refresh.ts.
  */
-import { getAgents, updateTokens } from "./agents.js";
+import { getAgents, updateTokens, isAgentLocal } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
 const log = componentLogger(createLogger(), "token-refresh");
 const REFRESH_INTERVAL_MS = 20 * 60 * 60 * 1000; // 20 hours
 async function refreshAgent(agent) {
+    // Skip agents whose OpenClaw workspace doesn't exist on this host
+    if (!isAgentLocal(agent)) {
+        log.info(`Skipping token refresh for ${agent.name}: not a local agent`);
+        return;
+    }
     log.info(`Refreshing token for ${agent.name}...`);
     // Skip refresh if no refresh token available (newly added agent)
     if (!agent.refreshToken || agent.refreshToken === "") {

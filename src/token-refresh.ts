@@ -4,7 +4,8 @@
  * Modeled after the ILL webhook's token-refresh.ts.
  */
 
-import { getAgents, updateTokens } from "./agents.js";
+import { getAgents, updateTokens, isAgentLocal } from "./agents.js";
+import type { AgentConfig } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
 
 const log = componentLogger(createLogger(), "token-refresh");
@@ -17,12 +18,13 @@ interface TokenResponse {
   token_type: string;
 }
 
-async function refreshAgent(agent: {
-  name: string;
-  clientId: string;
-  clientSecret: string;
-  refreshToken: string;
-}): Promise<void> {
+async function refreshAgent(agent: AgentConfig): Promise<void> {
+  // Skip agents whose OpenClaw workspace doesn't exist on this host
+  if (!isAgentLocal(agent)) {
+    log.info(`Skipping token refresh for ${agent.name}: not a local agent`);
+    return;
+  }
+
   log.info(`Refreshing token for ${agent.name}...`);
 
   // Skip refresh if no refresh token available (newly added agent)

@@ -133,6 +133,16 @@ export function reloadAgents() {
 export function getAgents() {
     return _agents;
 }
+/** Check whether an agent's OpenClaw workspace exists on this host.
+ *  Uses the agent's openclawAgent name to look for
+ *  ~/.openclaw/workspace-{name}/ (or the OPENCLAW_CONFIG_DIR variant).
+ */
+export function isAgentLocal(agent) {
+    const configDir = process.env.OPENCLAW_CONFIG_DIR ?? path.join(os.homedir(), ".openclaw");
+    const wsName = agent.openclawAgent ?? agent.name;
+    const wsDir = path.join(configDir, `workspace-${wsName}`);
+    return fs.existsSync(wsDir);
+}
 /** Build linearUserId → agentName map for routing */
 export function buildAgentMap() {
     return Object.fromEntries(_agents.map((a) => [a.linearUserId, a.name]));
