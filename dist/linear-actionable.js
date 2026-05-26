@@ -22,6 +22,31 @@ export function isParkedIssueState(state) {
     const name = typeof record.name === "string" ? record.name.toLowerCase() : "";
     return PARKED_STATE_TYPES.has(type) || PARKED_STATE_NAMES.has(name);
 }
+function isSameIssue(a, b) {
+    if (!a)
+        return false;
+    return Boolean((a.id && b.id && a.id === b.id) ||
+        (a.identifier && b.identifier && a.identifier === b.identifier));
+}
+function blockerOf(issue, relation) {
+    const type = relation.type?.toLowerCase();
+    if (!type)
+        return null;
+    if ((type === "blocks" || type === "blocking") && isSameIssue(relation.relatedIssue, issue)) {
+        return relation.issue ?? null;
+    }
+    if ((type === "blocked_by" || type === "blocked-by" || type === "blockedby") && isSameIssue(relation.issue, issue)) {
+        return relation.relatedIssue ?? null;
+    }
+    return null;
+}
+export function isBlockedByOpenIssue(issue) {
+    const nodes = issue.relations?.nodes ?? [];
+    return nodes.some((rel) => {
+        const blocker = blockerOf(issue, rel);
+        return blocker !== null && !isTerminalIssueState(blocker.state);
+    });
+}
 export function issueIdentifierFromSessionKey(ticketId) {
     return normalizeSessionKey(ticketId).replace(/^linear-/, "");
 }
@@ -64,7 +89,17 @@ export async function isLinearIssueStillRoutedToAgent(ticketId, agentId, routing
                 authorization: linearAuthorizationHeader(token),
             },
             body: JSON.stringify({
-                query: `query IssueRouting($id: String!) { issue(id: $id) { id identifier delegate { id name } assignee { id name } state { name type } } }`,
+                query: `query IssueRouting($id: String!) {
+          issue(id: $id) {
+            id identifier
+            delegate { id name }
+            assignee { id name }
+            state { name type }
+            relations(first: 50) {
+              nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
+            }
+          }
+        }`,
                 variables: { id: identifier },
             }),
         });
@@ -82,6 +117,10 @@ export async function isLinearIssueStillRoutedToAgent(ticketId, agentId, routing
             return false;
         if (isTerminalIssueState(issue.state) || isParkedIssueState(issue.state))
             return false;
+        if (isBlockedByOpenIssue(issue)) {
+            log.info(`Dropping pending Linear ticket ${identifier}: blocked by unfinished prerequisite`);
+            return false;
+        }
         if (routingReason === "delegate") {
             const ok = issue.delegate?.id === agent.linearUserId;
             if (!ok)
@@ -114,7 +153,15 @@ export async function isLinearIssueActionable(ticketId, agentId) {
                 authorization: linearAuthorizationHeader(token),
             },
             body: JSON.stringify({
-                query: `query IssueState($id: String!) { issue(id: $id) { id identifier state { name type } } }`,
+                query: `query IssueState($id: String!) {
+          issue(id: $id) {
+            id identifier
+            state { name type }
+            relations(first: 50) {
+              nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
+            }
+          }
+        }`,
                 variables: { id: identifier },
             }),
         });
@@ -132,7 +179,7 @@ export async function isLinearIssueActionable(ticketId, agentId) {
             log.info(`Dropping pending Linear ticket ${identifier}: issue no longer exists`);
             return false;
         }
-        const nonActionable = isTerminalIssueState(issue.state) || isParkedIssueState(issue.state);
+        const nonActionable = isTerminalIssueState(issue.state) || isParkedIssueState(issue.state) || isBlockedByOpenIssue(issue);
         if (nonActionable) {
             log.info(`Dropping pending Linear ticket ${identifier}: state is ${issue.state?.name ?? issue.state?.type ?? "non-actionable"}`);
         }

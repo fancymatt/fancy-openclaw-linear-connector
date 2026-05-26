@@ -3,7 +3,7 @@ import { createLogger, componentLogger } from "../logger.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./wake-up.js";
 import { PendingWorkBag } from "./pending-work-bag.js";
 import { SessionTracker } from "./session-tracker.js";
-import { isLinearIssueActionable } from "../linear-actionable.js";
+import { isLinearIssueActionable, isLinearIssueStillRoutedToAgent } from "../linear-actionable.js";
 
 const log = componentLogger(createLogger(), "resignal");
 
@@ -40,7 +40,12 @@ export async function resignalPendingTickets(
   options: ResignalOptions = {},
 ): Promise<DispatchResult[]> {
   const normalizedTickets = [...new Set(ticketIds.map((ticketId) => normalizeSessionKey(ticketId)))];
-  const isTicketActionable = options.isTicketActionable ?? isLinearIssueActionable;
+  // Use delegate-aware check by default: if the agent is no longer the delegate
+  // (needs-human / complete / handoff-work cleared it), skip the re-signal to
+  // prevent the session-end resignal loop that caused the ILL-331 triple-fire.
+  const isTicketActionable =
+    options.isTicketActionable ??
+    ((ticketId: string, agentId: string) => isLinearIssueStillRoutedToAgent(ticketId, agentId, "delegate"));
   const sendWakeUp = options.sendWakeUp ?? sendWakeUpSignal;
   const results: DispatchResult[] = [];
 
