@@ -60,12 +60,13 @@ function buildDelegationMessage(reason: string, identifier: string, title: strin
     `- If you need to do some work, run \`linear begin-work ${identifier}\``,
     "- If you cannot do the work...",
     `  - and need an agent to act instead, run \`linear refuse-work ${identifier} [delegate] --comment [reason]\``,
-    `  - and need a human to help, run \`linear needs-human ${identifier} [human] --comment [reason]\``,
+    `  - and need a human to help (e.g. credentials, access, infra provision), run \`linear needs-human ${identifier} [human] --comment [reason]\``,
     "",
     "When you complete the work...",
-    `- To have an agent review your work, run \`linear handoff-work ${identifier} [delegate] --comment [note]\``,
-    `- To have a human review your work, run \`linear needs-human ${identifier} [human] --comment [note]\``,
-    `- If the ticket\u2019s acceptance criteria is met, run \`linear complete ${identifier} --comment [summary]\``,
+    `- To hand off for review, run \`linear handoff-work ${identifier} [delegate] --comment [note]\` (use an agent delegate like Charles for code, Astrid for product)`,
+    `- If the ticket\u2019s acceptance criteria is met and you are NOT the implementer, run \`linear complete ${identifier} --comment [summary]\``,
+    "",
+    "\u26A0\uFE0F Important: do NOT hand off to Matt Henry for review, sign-off, or closure. Route reviews to the appropriate agent (Charles for code, Astrid for product, Laren for design). Only use \`needs-human\` for genuine blockers that require human action (credentials, access, approvals you cannot obtain yourself)."
   ].join("\n");
 }
 

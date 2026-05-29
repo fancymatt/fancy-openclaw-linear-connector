@@ -33,9 +33,15 @@ export const MULTI_TICKET_TEMPLATE =
  * Build the wake-up message text for a set of pending ticket IDs.
  * Exported for unit testing; delivery callers use sendWakeUpSignal.
  */
+/** Strip the `linear-` session-key prefix so the CLI gets plain identifiers (e.g. FCY-502). */
+const STRIP_LINEAR_PREFIX = /^linear-/i;
+
 export function buildWakeUpMessage(ticketIds: string[], signalTemplate?: string): string {
   const count = ticketIds.length;
-  const tickets = ticketIds.join(", ");
+  // Ticket IDs stored in the pending bag are in session-key format (linear-FCY-502).
+  // The CLI expects plain identifiers (FCY-502), so strip the prefix.
+  const plainIds = ticketIds.map(id => id.replace(STRIP_LINEAR_PREFIX, ""));
+  const tickets = plainIds.join(", ");
   const defaultTemplate = count === 1 ? SINGLE_TICKET_TEMPLATE : MULTI_TICKET_TEMPLATE;
   return (signalTemplate ?? defaultTemplate)
     .replace(/\{count\}/g, String(count))
