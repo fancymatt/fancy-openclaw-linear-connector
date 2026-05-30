@@ -24,8 +24,9 @@ export declare function watchAgentsFile(): void;
 export declare function reloadAgents(): void;
 export declare function getAgents(): AgentConfig[];
 /** Check whether an agent's OpenClaw workspace exists on this host.
- *  Uses the agent's openclawAgent name to look for
- *  ~/.openclaw/workspace-{name}/ (or the OPENCLAW_CONFIG_DIR variant).
+ *  Resolves the workspace dir via the canonical helper so the writer
+ *  (this connector), the reader (the Linear skill CLI), and the
+ *  local-presence probe all agree on layout.
  */
 export declare function isAgentLocal(agent: AgentConfig): boolean;
 /** Build linearUserId → agentName map for routing */

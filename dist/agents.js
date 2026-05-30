@@ -5,8 +5,8 @@
  */
 import fs from "node:fs";
 import crypto from "node:crypto";
-import os from "node:os";
 import path from "node:path";
+import { getAgentWorkspaceDir, getLinearSecretPath, } from "fancy-openclaw-linear-skill-cli";
 import { createLogger, componentLogger } from "./logger.js";
 const log = componentLogger(createLogger(), "agents");
 const DEFAULT_AGENTS_PATH = path.resolve(process.cwd(), "agents.json");
@@ -134,14 +134,13 @@ export function getAgents() {
     return _agents;
 }
 /** Check whether an agent's OpenClaw workspace exists on this host.
- *  Uses the agent's openclawAgent name to look for
- *  ~/.openclaw/workspace-{name}/ (or the OPENCLAW_CONFIG_DIR variant).
+ *  Resolves the workspace dir via the canonical helper so the writer
+ *  (this connector), the reader (the Linear skill CLI), and the
+ *  local-presence probe all agree on layout.
  */
 export function isAgentLocal(agent) {
-    const configDir = process.env.OPENCLAW_CONFIG_DIR ?? path.join(os.homedir(), ".openclaw");
     const wsName = agent.openclawAgent ?? agent.name;
-    const wsDir = path.join(configDir, `workspace-${wsName}`);
-    return fs.existsSync(wsDir);
+    return fs.existsSync(getAgentWorkspaceDir(wsName));
 }
 /** Build linearUserId → agentName map for routing */
 export function buildAgentMap() {
@@ -172,16 +171,18 @@ function syncWorkspaceSecrets(agentName, accessToken) {
     const agent = _agents.find((a) => a.name === agentName);
     if (!agent)
         return;
-    const openclawConfigDir = process.env.OPENCLAW_CONFIG_DIR ?? path.join(os.homedir(), ".openclaw");
+    const wsName = agent.openclawAgent ?? agent.name;
     let secretsPath;
     if (agent.secretsPath) {
         secretsPath = agent.secretsPath;
     }
     else if (process.env.SECRETS_DIR) {
-        secretsPath = path.join(process.env.SECRETS_DIR, `${agent.openclawAgent ?? agent.name}`, "linear.env");
+        secretsPath = path.join(process.env.SECRETS_DIR, wsName, "linear.env");
     }
     else {
-        secretsPath = path.join(openclawConfigDir, `workspace-${agent.openclawAgent ?? agent.name}/.secrets/linear.env`);
+        // Canonical path comes from the shared helper so the writer here
+        // and the reader in the Linear skill CLI can never disagree.
+        secretsPath = getLinearSecretPath(wsName);
     }
     try {
         fs.mkdirSync(path.dirname(secretsPath), { recursive: true });
