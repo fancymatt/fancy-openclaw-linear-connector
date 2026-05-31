@@ -18,8 +18,8 @@ const STEWARDSHIP_INSTRUCTIONS = [
     "1. Check subtask state. If a child resolved since your last review, decide whether the parent moves forward.",
     "2. Look for stalled children — anything in Backlog that should be To Do? Anything assigned to the wrong person?",
     "3. Verify assignee + delegate on each child match the current owner.",
-    "4. If something material changed, post a one-line note on the parent.",
-    "5. If nothing changed and the situation is genuinely the same, no comment needed.",
+    "4. If something material changed, post a delta-only note on the parent: what changed since the last stewardship comment, and where the current blocker/owner is now.",
+    "5. Do not restate unchanged child status, old blockers, or the whole project summary. If the only update would be a recap, post nothing.",
     "",
     "Move tickets out of Managing when they're complete, abandoned, or actively workable.",
 ].join("\n");
