@@ -45,9 +45,10 @@ describe("resignalPendingTickets", () => {
       },
     });
 
-    expect(results.length).toBe(1);
-    expect(results[0].dispatched).toBe(true);
-    expect(results[0].ticketId).toBe("linear-AI-597");
+    expect(results).toEqual([
+      { ticketId: "linear-AI-501", dispatched: false, pruned: true },
+      { ticketId: "linear-AI-597", dispatched: true, runId: undefined },
+    ]);
     expect(sentTickets).toEqual(["linear-AI-597"]);
     const remaining = bag.getPendingTickets("igor");
     expect(remaining).toHaveLength(1); // dispatched ticket stays in bag until session-end

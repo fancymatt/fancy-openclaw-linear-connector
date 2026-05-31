@@ -311,7 +311,12 @@ export function createApp(options) {
     });
     // v1 admin dashboard — read-only operational UI and safe JSON API.
     app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, deploymentName: DEPLOYMENT_NAME }));
-    app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle, operationalEventStore, (agentId, ticketId) => ackTracker.recordDispatch(agentId, ticketId)));
+    app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle, operationalEventStore, (agentId, ticketId) => ackTracker.recordDispatch(agentId, ticketId), (agentId, ticketId) => {
+        const acknowledged = ackTracker.acknowledge(agentId, ticketId);
+        if (acknowledged > 0) {
+            noActivityDetector.clearWarned(agentId, ticketId);
+        }
+    }));
     // ── v1.1: Session-end callback endpoint ──────────────────────────────
     // The gateway (via plugin) calls this when an agent's session ends.
     // The connector then checks the bag and sends another wake-up if needed.

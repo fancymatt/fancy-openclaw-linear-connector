@@ -11,6 +11,7 @@ export interface DispatchResult {
   ticketId: string;
   dispatched: boolean;
   runId?: string;
+  pruned?: boolean;
 }
 
 export interface ResignalOptions {
@@ -61,6 +62,7 @@ export async function resignalPendingTickets(
         bag.removeTicket(agentId, ticketId);
         sessionTracker.removePendingTicket(ticketId, agentId);
         log.info(`Pruned non-actionable pending ticket for ${agentId} [${ticketId}] before wake-up dispatch`);
+        results.push({ ticketId, dispatched: false, pruned: true });
         continue;
       }
 

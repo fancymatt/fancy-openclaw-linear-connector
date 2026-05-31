@@ -268,6 +268,41 @@ describe("DispatchWatchdog — CT-52 failure mode", () => {
     operationalEventStore.close();
   });
 
+  test("non-actionable watchdog recheck is acknowledged instead of retried forever", async () => {
+    const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+    const dispatchedTickets: string[] = [];
+
+    bag.add("emi", "linear-CT-52", "Issue");
+    sessionTracker.startSession("emi", "linear-CT-52");
+    ackTracker.recordDispatch("emi", "linear-CT-52");
+
+    const watchdog = new DispatchWatchdog(
+      {
+        bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig,
+        resignalOptions: {
+          isTicketActionable: () => false,
+          sendWakeUp: async (_agentId, ticketIds) => { dispatchedTickets.push(...ticketIds); },
+        },
+      },
+      { ackTimeoutMs: 0, maxResignals: 3, cycleIntervalMs: 60_000 },
+    );
+
+    const result = await watchdog.runCycle();
+
+    expect(result.unconfirmed).toBe(1);
+    expect(result.resignaled).toBe(0);
+    expect(result.autoAcknowledged).toBe(1);
+    expect(dispatchedTickets).toHaveLength(0);
+    expect(ackTracker.getPendingTimedOut(0)).toHaveLength(0);
+    expect(bag.getPendingTickets("emi")).toHaveLength(0);
+
+    watchdog.stop();
+    bag.close();
+    sessionTracker.close();
+    ackTracker.close();
+    operationalEventStore.close();
+  });
+
   test("ticket prematurely cleared from bag is re-added before re-signal", async () => {
     const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
     const dispatchedTickets: string[] = [];

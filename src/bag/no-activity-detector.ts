@@ -121,6 +121,14 @@ export class NoActivityDetector {
    * or when evidence of activity is observed).
    */
   clearWarned(agentId: string, sessionKey: string): void {
+    if (sessionKey === "*") {
+      for (const key of [...this.warnedSessions]) {
+        if (key.startsWith(`${agentId}:`)) {
+          this.warnedSessions.delete(key);
+        }
+      }
+      return;
+    }
     this.warnedSessions.delete(`${agentId}:${sessionKey}`);
   }
 

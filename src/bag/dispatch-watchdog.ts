@@ -192,12 +192,19 @@ export class DispatchWatchdog {
         { markActive: true, ...this.deps.resignalOptions },
       );
       const dispatched = results.some((r) => r.dispatched);
+      const pruned = results.some((r) => r.pruned);
 
       if (dispatched) {
         ackTracker.markResignaled(agentId, ticketId);
         resignaled++;
         log.info(
           `Watchdog: re-signaled ${agentId} [${ticketId}] (attempt ${attemptCount + 1})`,
+        );
+      } else if (pruned) {
+        ackTracker.acknowledge(agentId, ticketId);
+        autoAcknowledged++;
+        log.info(
+          `Watchdog: acknowledged ${agentId} [${ticketId}] after pruning non-actionable ticket`,
         );
       } else {
         log.error(

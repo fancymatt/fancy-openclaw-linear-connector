@@ -10,7 +10,7 @@ import { routeEvent } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
 import { deliverToAgent, DeliveryThrottle } from "../delivery/index.js";
 import { normalizeSessionKey } from "../session-key.js";
-import { getAgent } from "../agents.js";
+import { buildAgentMap, getAgent, getOpenclawAgentName } from "../agents.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
@@ -45,6 +45,26 @@ function appendOperationalEvent(store: OperationalEventStore | undefined, input:
   try { store.append(input); } catch (err) { log.error(`Operational event write failed: ${errorSummary(err)}`); }
 }
 
+function acknowledgeAgentAuthoredActivity(
+  event: LinearEvent,
+  onAgentActivity?: (agentId: string, ticketId: string) => void,
+): void {
+  if (!onAgentActivity) return;
+  const actorId = event.actor?.id;
+  if (!actorId) return;
+
+  const agentName = buildAgentMap()[actorId];
+  if (!agentName) return;
+
+  const identifier = issueIdentifierFromEvent(event);
+  if (!identifier) return;
+
+  const agentId = getOpenclawAgentName(agentName);
+  const ticketId = normalizeSessionKey(identifier);
+  onAgentActivity(agentId, ticketId);
+  log.info(`Agent-authored Linear activity acknowledged: ${agentId} [${ticketId}]`);
+}
+
 export function createWebhookRouter(
   eventStore?: EventStore,
   nudgeStore?: NudgeStore,
@@ -54,6 +74,7 @@ export function createWebhookRouter(
   throttle?: DeliveryThrottle,
   operationalEventStore?: OperationalEventStore,
   onDispatched?: (agentId: string, ticketId: string) => void,
+  onAgentActivity?: (agentId: string, ticketId: string) => void,
 ): Router {
   const router = Router();
 
@@ -169,6 +190,8 @@ export function createWebhookRouter(
         }
         return;
       }
+
+      acknowledgeAgentAuthoredActivity(event, onAgentActivity);
 
       // AgentSessionEvent — create session for Linear UI widget
       if (event.type === "AgentSessionEvent") {

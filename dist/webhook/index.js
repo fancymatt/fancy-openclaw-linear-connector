@@ -6,7 +6,7 @@ import { routeEvent } from "../router.js";
 import { createSessionAndEmitThought } from "../agent-session.js";
 import { deliverToAgent } from "../delivery/index.js";
 import { normalizeSessionKey } from "../session-key.js";
-import { getAgent } from "../agents.js";
+import { buildAgentMap, getAgent, getOpenclawAgentName } from "../agents.js";
 import { resignalPendingTickets } from "../bag/index.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { isLinearIssueStillRoutedToAgent, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
@@ -38,7 +38,24 @@ function appendOperationalEvent(store, input) {
         log.error(`Operational event write failed: ${errorSummary(err)}`);
     }
 }
-export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle, operationalEventStore, onDispatched) {
+function acknowledgeAgentAuthoredActivity(event, onAgentActivity) {
+    if (!onAgentActivity)
+        return;
+    const actorId = event.actor?.id;
+    if (!actorId)
+        return;
+    const agentName = buildAgentMap()[actorId];
+    if (!agentName)
+        return;
+    const identifier = issueIdentifierFromEvent(event);
+    if (!identifier)
+        return;
+    const agentId = getOpenclawAgentName(agentName);
+    const ticketId = normalizeSessionKey(identifier);
+    onAgentActivity(agentId, ticketId);
+    log.info(`Agent-authored Linear activity acknowledged: ${agentId} [${ticketId}]`);
+}
+export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle, operationalEventStore, onDispatched, onAgentActivity) {
     const router = Router();
     if (NUDGE_DEDUP_WINDOW_MS > 0) {
         log.info(`Nudge dedup enabled: ${NUDGE_DEDUP_WINDOW_MS}ms window`);
@@ -136,6 +153,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
             }
             return;
         }
+        acknowledgeAgentAuthoredActivity(event, onAgentActivity);
         // AgentSessionEvent — create session for Linear UI widget
         if (event.type === "AgentSessionEvent") {
             // Create a Linear agent session to show "Agent working" widget
