@@ -76,7 +76,7 @@ export async function replayPendingBag(
         ...resignalOptions,
       });
       const sent = dispatchResults.filter(r => r.dispatched).length;
-      const pruned = beforeCount - dispatchResults.length;
+      const pruned = dispatchResults.filter(r => r.pruned).length;
       totalReplayed += sent;
       totalPruned += pruned;
 
