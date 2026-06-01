@@ -4,7 +4,7 @@ import path from "path";
 import { PendingWorkBag } from "./pending-work-bag.js";
 import { SessionTracker } from "./session-tracker.js";
 import { resignalPendingTickets } from "./resignal.js";
-import type { WakeUpConfig } from "./wake-up.js";
+import { MENTION_TICKET_TEMPLATE, type WakeUpConfig } from "./wake-up.js";
 
 function tempDb(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "resignal-bag-test-"));
@@ -55,5 +55,80 @@ describe("resignalPendingTickets", () => {
     expect(remaining[0].ticketId).toBe("linear-AI-597");
     expect(bag.getStats().signalsSent).toBe(1);
     expect(sessionTracker.getActiveSessionKey("igor")).toBe("linear-AI-597");
+  });
+
+  test("ILL-331 regression: delegate-routed ticket is pruned when delegate was cleared", async () => {
+    // Simulate: ticket was delegate-routed but delegate has since been cleared (complete/handoff/needs-human).
+    bag.add("igor", "AI-600", "Issue", "delegate");
+
+    const results = await resignalPendingTickets("igor", ["AI-600"], bag, sessionTracker, wakeConfig, {
+      // isTicketActionable returns false — delegate no longer matches (cleared by complete/handoff)
+      isTicketActionable: () => false,
+      sendWakeUp: async () => {},
+    });
+
+    expect(results).toEqual([
+      { ticketId: "linear-AI-600", dispatched: false, pruned: true },
+    ]);
+    expect(bag.getPendingTickets("igor")).toHaveLength(0);
+  });
+
+  test("mention-routed ticket is NOT pruned when delegate is null", async () => {
+    // Ticket was routed via @mention — agent need not be delegate.
+    bag.add("igor", "AI-601", "Comment", "mention");
+
+    const sentTickets: string[] = [];
+    const sentConfigs: WakeUpConfig[] = [];
+    const results = await resignalPendingTickets("igor", ["AI-601"], bag, sessionTracker, wakeConfig, {
+      sendWakeUp: async (_agentId, ticketIds, cfg) => {
+        sentTickets.push(...ticketIds);
+        sentConfigs.push(cfg);
+      },
+    });
+
+    expect(results[0].dispatched).toBe(true);
+    expect(sentTickets).toEqual(["linear-AI-601"]);
+    // Must use mention template so agent knows to observe, not own
+    expect(sentConfigs[0].signalTemplate).toBe(MENTION_TICKET_TEMPLATE);
+  });
+
+  test("body-mention-routed ticket is NOT pruned when delegate is null", async () => {
+    bag.add("igor", "AI-602", "Issue", "body-mention");
+
+    const sentTickets: string[] = [];
+    const results = await resignalPendingTickets("igor", ["AI-602"], bag, sessionTracker, wakeConfig, {
+      sendWakeUp: async (_agentId, ticketIds) => { sentTickets.push(...ticketIds); },
+    });
+
+    expect(results[0].dispatched).toBe(true);
+    expect(sentTickets).toEqual(["linear-AI-602"]);
+  });
+
+  test("delegate-routed ticket uses default (non-mention) wake template", async () => {
+    bag.add("igor", "AI-603", "Issue", "delegate");
+
+    const sentConfigs: WakeUpConfig[] = [];
+    await resignalPendingTickets("igor", ["AI-603"], bag, sessionTracker, wakeConfig, {
+      isTicketActionable: () => true,
+      sendWakeUp: async (_agentId, _ticketIds, cfg) => { sentConfigs.push(cfg); },
+    });
+
+    expect(sentConfigs[0].signalTemplate).toBeUndefined(); // default template, not mention
+  });
+
+  test("legacy ticket with no stored reason falls back to delegate check", async () => {
+    // Pre-migration row — no routing_reason stored. Default = "delegate" so it
+    // follows the ILL-331 protection path.
+    bag.add("igor", "AI-604", "Issue"); // no routingReason
+
+    const sentTickets: string[] = [];
+    // isTicketActionable override simulates delegate check returning false
+    const results = await resignalPendingTickets("igor", ["AI-604"], bag, sessionTracker, wakeConfig, {
+      isTicketActionable: (_ticketId, _agentId) => false, // delegate cleared
+      sendWakeUp: async (_agentId, ticketIds) => { sentTickets.push(...ticketIds); },
+    });
+
+    expect(results[0].pruned).toBe(true);
+    expect(sentTickets).toHaveLength(0);
   });
 });

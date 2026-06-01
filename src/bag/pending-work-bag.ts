@@ -27,6 +27,7 @@ export interface BagEntry {
   ticketId: string;
   agentId: string;
   eventType: string;
+  routingReason?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -64,25 +65,31 @@ export class PendingWorkBag {
   private migrate(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS pending_bag (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        agent_id   TEXT NOT NULL,
-        ticket_id  TEXT NOT NULL,
-        event_type TEXT NOT NULL DEFAULT '',
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id       TEXT NOT NULL,
+        ticket_id      TEXT NOT NULL,
+        event_type     TEXT NOT NULL DEFAULT '',
+        routing_reason TEXT,
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_bag_agent_ticket
         ON pending_bag (agent_id, ticket_id);
       CREATE INDEX IF NOT EXISTS idx_pending_bag_agent
         ON pending_bag (agent_id);
     `);
+    // Add routing_reason to pre-existing databases that lack it.
+    const cols = this.db.prepare("PRAGMA table_info(pending_bag)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === "routing_reason")) {
+      this.db.exec("ALTER TABLE pending_bag ADD COLUMN routing_reason TEXT");
+    }
   }
 
   /**
    * Add a ticket to the bag (or update its timestamp if already present).
    * Returns true if this is a new entry, false if it was an update (coalesced).
    */
-  add(agentId: string, ticketId: string, eventType: string): boolean {
+  add(agentId: string, ticketId: string, eventType: string, routingReason?: string): boolean {
     this.metrics.eventsReceived++;
     const normalizedTicketId = normalizeSessionKey(ticketId);
 
@@ -94,13 +101,14 @@ export class PendingWorkBag {
 
       this.db
         .prepare(
-          `INSERT INTO pending_bag (agent_id, ticket_id, event_type, updated_at)
-           VALUES (?, ?, ?, datetime('now'))
+          `INSERT INTO pending_bag (agent_id, ticket_id, event_type, routing_reason, updated_at)
+           VALUES (?, ?, ?, ?, datetime('now'))
            ON CONFLICT(agent_id, ticket_id) DO UPDATE SET
              event_type = excluded.event_type,
+             routing_reason = excluded.routing_reason,
              updated_at = datetime('now')`
         )
-        .run(agentId, normalizedTicketId, eventType);
+        .run(agentId, normalizedTicketId, eventType, routingReason ?? null);
 
       // Return true if it was a new entry, false if it was an update
       return !existing;
@@ -118,7 +126,7 @@ export class PendingWorkBag {
     this.pruneAgent(agentId);
     const rows = this.db
       .prepare(
-        `SELECT ticket_id, agent_id, event_type, created_at, updated_at
+        `SELECT ticket_id, agent_id, event_type, routing_reason, created_at, updated_at
          FROM pending_bag
          WHERE agent_id = ?
          ORDER BY updated_at DESC`
@@ -127,6 +135,7 @@ export class PendingWorkBag {
       ticket_id: string;
       agent_id: string;
       event_type: string;
+      routing_reason: string | null;
       created_at: string;
       updated_at: string;
     }>;
@@ -135,9 +144,22 @@ export class PendingWorkBag {
       ticketId: r.ticket_id,
       agentId: r.agent_id,
       eventType: r.event_type,
+      routingReason: r.routing_reason ?? undefined,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
     }));
+  }
+
+  /**
+   * Return the routing reason stored for a specific pending ticket, or undefined
+   * if the ticket is not in the bag or was stored before routing reasons were tracked.
+   */
+  getTicketRoutingReason(agentId: string, ticketId: string): string | undefined {
+    const normalizedTicketId = normalizeSessionKey(ticketId);
+    const row = this.db
+      .prepare("SELECT routing_reason FROM pending_bag WHERE agent_id = ? AND ticket_id = ?")
+      .get(agentId, normalizedTicketId) as { routing_reason: string | null } | undefined;
+    return row?.routing_reason ?? undefined;
   }
 
   /**

@@ -138,4 +138,37 @@ describe("PendingWorkBag", () => {
     bag.clearAgent("igor");
     expect(bag.agentsWithPendingWork()).toHaveLength(0);
   });
+
+  test("routingReason is stored and returned in getPendingTickets", () => {
+    bag.add("charles", "AI-491", "Issue", "delegate");
+    bag.add("charles", "AI-492", "Comment", "mention");
+    bag.add("charles", "AI-493", "Issue"); // no reason
+
+    const tickets = bag.getPendingTickets("charles");
+    const t491 = tickets.find((t) => t.ticketId === "linear-AI-491");
+    const t492 = tickets.find((t) => t.ticketId === "linear-AI-492");
+    const t493 = tickets.find((t) => t.ticketId === "linear-AI-493");
+    expect(t491?.routingReason).toBe("delegate");
+    expect(t492?.routingReason).toBe("mention");
+    expect(t493?.routingReason).toBeUndefined();
+  });
+
+  test("routingReason updates on coalesced add", () => {
+    bag.add("charles", "AI-491", "Issue", "mention");
+    bag.add("charles", "AI-491", "Issue", "delegate"); // same ticket, new reason
+    const tickets = bag.getPendingTickets("charles");
+    expect(tickets).toHaveLength(1);
+    expect(tickets[0].routingReason).toBe("delegate");
+  });
+
+  test("getTicketRoutingReason returns stored reason", () => {
+    bag.add("charles", "AI-491", "Issue", "body-mention");
+    expect(bag.getTicketRoutingReason("charles", "AI-491")).toBe("body-mention");
+    expect(bag.getTicketRoutingReason("charles", "AI-999")).toBeUndefined(); // not in bag
+  });
+
+  test("getTicketRoutingReason returns undefined when no reason stored", () => {
+    bag.add("charles", "AI-491", "Issue");
+    expect(bag.getTicketRoutingReason("charles", "AI-491")).toBeUndefined();
+  });
 });

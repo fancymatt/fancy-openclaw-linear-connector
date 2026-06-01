@@ -284,7 +284,7 @@ export function createWebhookRouter(
       // agent has no active session. Bursts collapse to 1 signal.
       if (bag && sessionTracker) {
         const normalizedTicketId = normalizeSessionKey(ticketId);
-        bag.add(agentName, normalizedTicketId, event.type);
+        bag.add(agentName, normalizedTicketId, event.type, route.routingReason);
         appendOperationalEvent(operationalEventStore, { outcome: "bag-added", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "pending-bag" });
 
         const wakeConfig: WakeUpConfig = {

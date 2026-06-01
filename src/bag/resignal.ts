@@ -1,6 +1,6 @@
 import { normalizeSessionKey } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
-import { sendWakeUpSignal, type WakeUpConfig } from "./wake-up.js";
+import { sendWakeUpSignal, MENTION_TICKET_TEMPLATE, type WakeUpConfig } from "./wake-up.js";
 import { PendingWorkBag } from "./pending-work-bag.js";
 import { SessionTracker } from "./session-tracker.js";
 import { isLinearIssueActionable, isLinearIssueStillRoutedToAgent } from "../linear-actionable.js";
@@ -41,12 +41,6 @@ export async function resignalPendingTickets(
   options: ResignalOptions = {},
 ): Promise<DispatchResult[]> {
   const normalizedTickets = [...new Set(ticketIds.map((ticketId) => normalizeSessionKey(ticketId)))];
-  // Use delegate-aware check by default: if the agent is no longer the delegate
-  // (needs-human / complete / handoff-work cleared it), skip the re-signal to
-  // prevent the session-end resignal loop that caused the ILL-331 triple-fire.
-  const isTicketActionable =
-    options.isTicketActionable ??
-    ((ticketId: string, agentId: string) => isLinearIssueStillRoutedToAgent(ticketId, agentId, "delegate"));
   const sendWakeUp = options.sendWakeUp ?? sendWakeUpSignal;
   const results: DispatchResult[] = [];
 
@@ -58,6 +52,19 @@ export async function resignalPendingTickets(
         continue;
       }
 
+      // Resolve per-ticket actionability. For mention/body-mention–routed tickets the
+      // issue need not have this agent as delegate — mentions are always actionable.
+      // For everything else (or unknown/legacy rows) fall back to the delegate check,
+      // which preserves the ILL-331 protection: a ticket whose delegate was cleared by
+      // needs-human/complete/handoff-work is correctly pruned here.
+      const isTicketActionable =
+        options.isTicketActionable ??
+        ((tId: string, aId: string) => {
+          const storedReason = bag.getTicketRoutingReason(aId, tId);
+          const effectiveReason = (storedReason ?? "delegate") as "delegate" | "assignee" | "mention" | "body-mention";
+          return isLinearIssueStillRoutedToAgent(tId, aId, effectiveReason);
+        });
+
       if (!(await isTicketActionable(ticketId, agentId))) {
         bag.removeTicket(agentId, ticketId);
         sessionTracker.removePendingTicket(ticketId, agentId);
@@ -66,7 +73,14 @@ export async function resignalPendingTickets(
         continue;
       }
 
-      const wakeResult = await sendWakeUp(agentId, [ticketId], wakeConfig);
+      // Use a mention-specific wake message so the agent knows to observe, not own.
+      const storedReason = bag.getTicketRoutingReason(agentId, ticketId);
+      const isMention = storedReason === "mention" || storedReason === "body-mention";
+      const ticketWakeConfig = isMention
+        ? { ...wakeConfig, signalTemplate: MENTION_TICKET_TEMPLATE }
+        : wakeConfig;
+
+      const wakeResult = await sendWakeUp(agentId, [ticketId], ticketWakeConfig);
       bag.recordSignal();
       if (options.markActive) {
         sessionTracker.startSession(agentId, ticketId);
