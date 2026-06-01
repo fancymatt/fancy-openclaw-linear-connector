@@ -29,6 +29,11 @@ export const SINGLE_TICKET_TEMPLATE =
 export const MULTI_TICKET_TEMPLATE =
   "You have {count} pending ticket(s) waiting: {tickets}. Run `linear queue --next` to pick up the highest-priority one, or `linear queue` to see all.";
 
+// Used when the trigger is a mention/body-mention rather than a delegation.
+// Agents should observe (not own) mention-triggered tickets.
+export const MENTION_TICKET_TEMPLATE =
+  "You have been @mentioned on ticket: {tickets}. Run `linear observe-issue {tickets}` to review.";
+
 /**
  * Build the wake-up message text for a set of pending ticket IDs.
  * Exported for unit testing; delivery callers use sendWakeUpSignal.
