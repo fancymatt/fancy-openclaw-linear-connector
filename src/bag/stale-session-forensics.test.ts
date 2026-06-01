@@ -360,11 +360,9 @@ function makeFetchMock() {
     if (query.includes("commentCreate")) {
       return { ok: true, json: async () => ({ data: { commentCreate: { comment: { id: "comment-1" } } } }) };
     }
-    if (query.includes("issueUpdate")) {
+    // AI-1306: state + ownership are now a single RecoverIssue mutation (no separate OwnershipUpdate)
+    if (query.includes("RecoverIssue") || query.includes("issueUpdate")) {
       return { ok: true, json: async () => ({ data: { issueUpdate: { success: true, issue: { id: "issue-123", state: { name: "Todo" } } } } }) };
-    }
-    if (query.includes("OwnershipUpdate")) {
-      return { ok: true, json: async () => ({ data: { issueUpdate: { success: true } } }) };
     }
     return { ok: true, json: async () => ({}) };
   });
@@ -439,13 +437,15 @@ describe("recoverTicket — C2/C4 redispatch cap", () => {
     expect(commentBody.variables.body).toContain("Max re-dispatch attempts reached (**3/3**). Escalating to human review.");
     expect(commentBody.variables.body).not.toContain("Ticket returned to Todo for re-dispatch.");
 
-    const ownershipCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
+    // AI-1306: ownership is now combined into the single RecoverIssue mutation
+    const recoverCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
       const b = JSON.parse((opts?.body ?? "{}") as string);
-      return b.query?.includes("OwnershipUpdate");
+      return b.query?.includes("RecoverIssue");
     });
-    expect(ownershipCall).toBeDefined();
-    const ownershipBody = JSON.parse((ownershipCall![1].body ?? "{}") as string);
-    expect(ownershipBody.variables.input.assigneeId).toBe("human-linear-id");
+    expect(recoverCall).toBeDefined();
+    const recoverBody = JSON.parse((recoverCall![1].body ?? "{}") as string);
+    expect(recoverBody.variables.input.assigneeId).toBe("human-linear-id");
+    expect(recoverBody.variables.input.delegateId).toBeNull();
   });
 
   test("C4 below cap: re-dispatches normally with attempt count", async () => {
@@ -492,5 +492,41 @@ describe("recoverTicket — C2/C4 redispatch cap", () => {
     });
     const commentBody = JSON.parse((commentCall![1].body ?? "{}") as string);
     expect(commentBody.variables.body).toContain("Max re-dispatch attempts reached (**3/3**). Escalating to human review.");
+  });
+
+  test("AI-1306: recoverTicket issues a single atomic mutation (state + ownership, no separate OwnershipUpdate call)", async () => {
+    // Regression guard: two separate mutations (state, then ownership) created a race where the
+    // state-change webhook arrived before the delegate-clear propagated, re-waking the agent.
+    // The combined RecoverIssue mutation eliminates this window.
+    global.fetch = makeFetchMock() as unknown as typeof fetch;
+
+    const snapshot = makeSnapshot("C1"); // C1 → needs human, so assigneeId will be set
+    await recoverTicket(snapshot, "igor", {
+      redispatchDbPath: dbPath,
+      humanAssigneeLinearId: "human-linear-id",
+    });
+
+    const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
+    const allCalls = fetchMock.mock.calls as Array<[string, RequestInit]>;
+
+    // Must have exactly one RecoverIssue (combined) call — no separate OwnershipUpdate
+    const recoverCalls = allCalls.filter(([, opts]) => {
+      const b = JSON.parse((opts?.body ?? "{}") as string);
+      return b.query?.includes("RecoverIssue");
+    });
+    expect(recoverCalls).toHaveLength(1);
+
+    // The single call must carry BOTH stateId and ownership fields
+    const recoverBody = JSON.parse((recoverCalls[0][1].body ?? "{}") as string);
+    expect(recoverBody.variables.input.stateId).toBeDefined();
+    expect(recoverBody.variables.input.delegateId).toBeNull();
+    expect(recoverBody.variables.input.assigneeId).toBe("human-linear-id");
+
+    // No separate OwnershipUpdate call must exist
+    const ownershipOnlyCalls = allCalls.filter(([, opts]) => {
+      const b = JSON.parse((opts?.body ?? "{}") as string);
+      return b.query?.includes("OwnershipUpdate");
+    });
+    expect(ownershipOnlyCalls).toHaveLength(0);
   });
 });

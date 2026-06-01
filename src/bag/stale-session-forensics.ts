@@ -788,50 +788,53 @@ export async function recoverTicket(
       }),
     });
 
-    // Resolve state name to state ID using the team's workflow
-    let stateTransitioned = false;
-    if (targetStateName && teamId) {
-      const states = await fetchWorkflowStates(teamId, agentId);
-      const targetState = states.find((s) => s.name === targetStateName);
-      if (targetState) {
-        const stateRes = await fetch("https://api.linear.app/graphql", {
-          method: "POST",
-          headers: { "content-type": "application/json", authorization: authHeader },
-          body: JSON.stringify({
-            query: `mutation($issueId: ID!, $stateId: String!) { issueUpdate(input: { id: $issueId, stateId: $stateId }) { issue { id state { name } } success } }`,
-            variables: { issueId, stateId: targetState.id },
-          }),
-        });
-        const stateBody = (await stateRes.json()) as { data?: { issueUpdate?: { success: boolean } } };
-        stateTransitioned = stateBody.data?.issueUpdate?.success ?? false;
-      } else {
-        log.warn(`Target state "${targetStateName}" not found in team ${teamId} workflow`);
-      }
-    }
-
     // Apply needs-human semantics: set assignee + clear delegate.
     // C1/C3/C5/C6/C-UNK → assign to human owner and clear delegate (human must review).
     // C2/C4 → clear both (connector will re-dispatch normally), unless cap is breached.
     const needsHuman = NEEDS_HUMAN_CLASSES.has(snapshot.classification) || isRedispatchCapped;
     const humanId = config.humanAssigneeLinearId ?? process.env.STALE_HUMAN_ASSIGNEE_LINEAR_ID ?? null;
-    const ownershipInput: Record<string, string | null> = {
-      delegateId: null,
-      assigneeId: needsHuman ? (humanId ?? null) : null,
-    };
     if (needsHuman && !humanId) {
       log.warn(
         `Recovery for ${identifier}: class=${snapshot.classification} requires human assignment ` +
         `but STALE_HUMAN_ASSIGNEE_LINEAR_ID is not set — delegate cleared, assignee not set`,
       );
     }
-    await fetch("https://api.linear.app/graphql", {
+
+    // Build combined update input: ownership (always) + optional state transition.
+    // Using a single issueUpdate mutation instead of two sequential calls avoids the
+    // race where the state-change webhook arrives at the connector before the delegate-clear
+    // has propagated, causing the stale-route guard to see the old delegate and re-wake
+    // the same agent that just timed out.
+    const updateInput: Record<string, string | null> = {
+      delegateId: null,
+      assigneeId: needsHuman ? (humanId ?? null) : null,
+    };
+
+    let stateTransitioned = false;
+    if (targetStateName && teamId) {
+      const states = await fetchWorkflowStates(teamId, agentId);
+      const targetState = states.find((s) => s.name === targetStateName);
+      if (targetState) {
+        updateInput.stateId = targetState.id;
+      } else {
+        log.warn(`Target state "${targetStateName}" not found in team ${teamId} workflow`);
+      }
+    }
+
+    const updateRes = await fetch("https://api.linear.app/graphql", {
       method: "POST",
       headers: { "content-type": "application/json", authorization: authHeader },
       body: JSON.stringify({
-        query: `mutation OwnershipUpdate($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
-        variables: { id: identifier, input: ownershipInput },
+        query: `mutation RecoverIssue($id: String!, $input: IssueUpdateInput!) {
+          issueUpdate(id: $id, input: $input) { issue { id state { name } } success }
+        }`,
+        variables: { id: identifier, input: updateInput },
       }),
     });
+    const updateBody = (await updateRes.json()) as {
+      data?: { issueUpdate?: { issue?: { state?: { name?: string } }; success: boolean } };
+    };
+    stateTransitioned = updateBody.data?.issueUpdate?.success ?? false;
 
     const className = STALE_CLASS_NAMES[snapshot.classification];
     const ownershipTag = needsHuman ? (humanId ? "+needs-human(assignee+delegate-cleared)" : "+delegate-cleared") : "+delegate-cleared";

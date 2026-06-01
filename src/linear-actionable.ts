@@ -118,9 +118,9 @@ export async function isLinearIssueStillRoutedToAgent(
   if (routingReason === "mention" || routingReason === "body-mention") return true;
 
   const token = tokenForAgent(agentId);
-  const agent = getAgent(agentId);
-  if (!token || !agent?.linearUserId) return true;
+  if (!token) return true;
 
+  const agent = getAgent(agentId);
   const identifier = issueIdentifierFromSessionKey(ticketId);
   try {
     const response = await fetch("https://api.linear.app/graphql", {
@@ -169,15 +169,36 @@ export async function isLinearIssueStillRoutedToAgent(
     }
 
     if (routingReason === "delegate") {
-      const ok = issue.delegate?.id === agent.linearUserId;
-      if (!ok) log.info(`Dropping stale delegate event for ${identifier}: ${agentId} is no longer delegate`);
-      return ok;
+      // No delegate at all — ticket was handed back; drop regardless of whether we know our linearUserId
+      if (!issue.delegate) {
+        log.info(`Dropping stale delegate event for ${identifier}: ticket has no delegate (handed back)`);
+        return false;
+      }
+      // We know our linearUserId — verify exact ownership
+      if (agent?.linearUserId) {
+        const ok = issue.delegate.id === agent.linearUserId;
+        if (!ok) log.info(`Dropping stale delegate event for ${identifier}: ${agentId} is no longer delegate`);
+        return ok;
+      }
+      // linearUserId not configured — issue has a delegate but we can't identify which agent owns it
+      log.warn(`Agent ${agentId} missing linearUserId — cannot verify delegate ownership for ${identifier}; allowing through`);
+      return true;
     }
 
     if (routingReason === "assignee") {
-      const ok = issue.assignee?.id === agent.linearUserId;
-      if (!ok) log.info(`Dropping stale assignee event for ${identifier}: ${agentId} is no longer assignee`);
-      return ok;
+      // No assignee at all — ticket was unassigned; drop
+      if (!issue.assignee) {
+        log.info(`Dropping stale assignee event for ${identifier}: ticket has no assignee`);
+        return false;
+      }
+      // We know our linearUserId — verify exact ownership
+      if (agent?.linearUserId) {
+        const ok = issue.assignee.id === agent.linearUserId;
+        if (!ok) log.info(`Dropping stale assignee event for ${identifier}: ${agentId} is no longer assignee`);
+        return ok;
+      }
+      log.warn(`Agent ${agentId} missing linearUserId — cannot verify assignee ownership for ${identifier}; allowing through`);
+      return true;
     }
 
     return true;

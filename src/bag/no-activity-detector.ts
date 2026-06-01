@@ -282,10 +282,17 @@ export class NoActivityDetector {
       { markActive: true, ...this.deps.resignalOptions },
     );
     const dispatched = results.some((r) => r.dispatched);
+    const pruned = results.some((r) => r.pruned);
 
     if (dispatched) {
       ackTracker.markResignaled(agentId, ticketId);
       log.info(`No-activity: re-dispatched ${agentId} [${ticketId}] (attempt ${attemptCount + 1})`);
+    } else if (pruned) {
+      // Ownership check in resignalPendingTickets determined the agent no longer owns this ticket.
+      // Acknowledge so the ackTracker stops tracking it and the detector doesn't re-add it on
+      // subsequent cycles.
+      ackTracker.acknowledge(agentId, ticketId);
+      log.info(`No-activity: ticket ${ticketId} pruned (agent no longer owns it) — ack tracker cleared`);
     } else {
       log.error(`No-activity: re-dispatch failed for ${agentId} [${ticketId}]`);
     }

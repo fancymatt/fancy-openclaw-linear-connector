@@ -149,6 +149,73 @@ describe("isLinearIssueActionable", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("drops delegate-routed event when ticket has no delegate (AI-1306: handed-back guard)", async () => {
+    // Ticket was handed back — delegate is null. This should be dropped regardless of
+    // whether the agent's linearUserId is configured (fixes the missing-linearUserId short-circuit).
+    const fetchMock = jest.fn<(...args: Parameters<typeof fetch>) => Promise<any>>().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: {
+          issue: {
+            id: "issue-500", identifier: "POD-29",
+            delegate: null,   // handed back — no delegate
+            assignee: null,
+            state: { name: "Todo", type: "unstarted" },
+            relations: { nodes: [] },
+          },
+        },
+      }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    // Should drop even when agent has no linearUserId configured
+    await expect(isLinearIssueStillRoutedToAgent("linear-POD-29", "unknown-agent", "delegate")).resolves.toBe(false);
+  });
+
+  it("drops assignee-routed event when ticket has no assignee (AI-1306: handed-back guard)", async () => {
+    const fetchMock = jest.fn<(...args: Parameters<typeof fetch>) => Promise<any>>().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: {
+          issue: {
+            id: "issue-501", identifier: "POD-30",
+            delegate: null,
+            assignee: null,   // unassigned
+            state: { name: "Todo", type: "unstarted" },
+            relations: { nodes: [] },
+          },
+        },
+      }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await expect(isLinearIssueStillRoutedToAgent("linear-POD-30", "unknown-agent", "assignee")).resolves.toBe(false);
+  });
+
+  it("allows delegate-routed event when ticket has a delegate but linearUserId is missing", async () => {
+    // Issue has a delegate set; agent's linearUserId is unknown — allow through (can't verify which agent)
+    const fetchMock = jest.fn<(...args: Parameters<typeof fetch>) => Promise<any>>().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: {
+          issue: {
+            id: "issue-502", identifier: "AI-999",
+            delegate: { id: "some-other-agent-uuid", name: "SomeAgent" },
+            assignee: null,
+            state: { name: "Todo", type: "unstarted" },
+            relations: { nodes: [] },
+          },
+        },
+      }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    // No LINEAR_API_KEY means tokenForAgent returns undefined and we return true early.
+    // With a token set, we proceed and return true (has delegate, can't verify identity).
+    process.env.LINEAR_API_KEY = "lin_test_token";
+    await expect(isLinearIssueStillRoutedToAgent("linear-AI-999", "unknown-agent", "delegate")).resolves.toBe(true);
+  });
+
   it("correctly identifies the blocked side of a blocks relation", () => {
     const blockedIssue = {
       id: "issue-982", identifier: "AI-982",

@@ -279,6 +279,47 @@ describe("NoActivityDetector", () => {
     operationalEventStore.close();
   });
 
+  test("AI-1306: acknowledges ackTracker when resignal prunes ticket (agent no longer owns it)", async () => {
+    const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+    const dispatchedTickets: string[] = [];
+
+    bag.add("emi", "linear-AI-1040", "Issue", "delegate");
+    sessionTracker.startSession("emi", "linear-AI-1040");
+    ackTracker.recordDispatch("emi", "linear-AI-1040");
+
+    const detector = new NoActivityDetector(
+      {
+        sessionTracker,
+        ackTracker,
+        bag,
+        operationalEventStore,
+        wakeConfig,
+        resignalOptions: {
+          // Simulate ownership check failing — agent no longer delegate
+          isTicketActionable: () => false,
+          sendWakeUp: async (_agentId, ticketIds) => { dispatchedTickets.push(...ticketIds); },
+        },
+      },
+      { warnMs: 0, failMs: 0, pollMs: 60_000 },
+    );
+
+    const result = await detector.runCycle();
+
+    expect(result.failed).toBe(1);
+    expect(dispatchedTickets).toHaveLength(0);
+
+    // ackTracker must be acknowledged — not left as pending — so the detector
+    // doesn't keep re-adding and re-pruning this ticket on every cycle.
+    const timedOut = ackTracker.getPendingTimedOut(0);
+    expect(timedOut).toHaveLength(0);
+
+    detector.stop();
+    bag.close();
+    sessionTracker.close();
+    ackTracker.close();
+    operationalEventStore.close();
+  });
+
   test("clearWarned resets the warned state for a session", async () => {
     const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
 
