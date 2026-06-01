@@ -4,8 +4,8 @@ import { normalizeSessionKey } from "./session-key.js";
 const log = componentLogger(createLogger(), "linear-actionable");
 const TERMINAL_STATE_TYPES = new Set(["completed", "canceled", "cancelled"]);
 const TERMINAL_STATE_NAMES = new Set(["done", "canceled", "cancelled"]);
-const PARKED_STATE_TYPES = new Set(["backlog"]);
-const PARKED_STATE_NAMES = new Set(["backlog"]);
+const PARKED_STATE_TYPES = new Set();
+const PARKED_STATE_NAMES = new Set();
 export function isTerminalIssueState(state) {
     if (!state || typeof state !== "object")
         return false;
