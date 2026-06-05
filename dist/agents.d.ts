@@ -18,6 +18,8 @@ export interface AgentConfig {
     hooksUrl?: string;
     /** Per-agent OpenClaw hooks token override */
     hooksToken?: string;
+    /** Maximum concurrent sessions this agent can handle. Overrides the global default. */
+    maxConcurrent?: number;
 }
 /** Start watching agents.json for external changes (e.g. manual edits). */
 export declare function watchAgentsFile(): void;

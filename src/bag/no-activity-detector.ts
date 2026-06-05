@@ -24,12 +24,15 @@
  * evidence of starting.
  *
  * Configuration (env vars, all optional):
- *   NO_ACTIVITY_WARN_MS   — warn threshold (default: 2 min)
- *   NO_ACTIVITY_FAIL_MS   — hard fail threshold (default: 5 min)
- *   NO_ACTIVITY_POLL_MS   — check interval (default: 30 sec)
+ *   NO_ACTIVITY_WARN_MS              — warn threshold (default: 2 min)
+ *   NO_ACTIVITY_FAIL_MS              — hard fail threshold (default: 5 min)
+ *   NO_ACTIVITY_POLL_MS              — check interval (default: 30 sec)
+ *   AGENT_DEFAULT_MAX_CONCURRENT     — concurrent session cap per agent (default: 3)
+ *   NO_ACTIVITY_DEFERRED_STALE_MS   — how long a deferred entry may sit before rescue (default: 90 min)
  */
 
 import { createLogger, componentLogger } from "../logger.js";
+import type { AgentConfig } from "../agents.js";
 import type { DispatchAckTracker } from "./dispatch-ack-tracker.js";
 import type { SessionTracker } from "./session-tracker.js";
 import type { PendingWorkBag } from "./pending-work-bag.js";
@@ -40,9 +43,11 @@ import { isLinearIssueActionable } from "../linear-actionable.js";
 
 const log = componentLogger(createLogger(), "no-activity-detector");
 
-const DEFAULT_WARN_MS = 2 * 60 * 1000;    // 2 minutes
-const DEFAULT_FAIL_MS = 5 * 60 * 1000;     // 5 minutes
-const DEFAULT_POLL_MS = 30 * 1000;          // 30 seconds
+const DEFAULT_WARN_MS = 2 * 60 * 1000;          // 2 minutes
+const DEFAULT_FAIL_MS = 5 * 60 * 1000;           // 5 minutes
+const DEFAULT_POLL_MS = 30 * 1000;               // 30 seconds
+const DEFAULT_MAX_CONCURRENT = 3;
+const DEFAULT_DEFERRED_STALE_MS = 90 * 60 * 1000; // 90 minutes
 
 export interface NoActivityConfig {
   /** Warn threshold — log + event after this much silence. Default: 2 min. */
@@ -51,6 +56,10 @@ export interface NoActivityConfig {
   failMs: number;
   /** How often to check for no-activity sessions. Default: 30 sec. */
   pollMs: number;
+  /** Max concurrent sessions per agent for capacity classification. Default: 3. */
+  maxConcurrent: number;
+  /** How long a deferred entry may sit before the stale-rescue sweep re-dispatches it. Default: 90 min. */
+  deferredStaleMs: number;
 }
 
 export interface NoActivityDeps {
@@ -63,12 +72,18 @@ export interface NoActivityDeps {
   resignalOptions?: Partial<ResignalOptions>;
   /** Optional: custom Linear comment poster for failed dispatches. */
   postLinearComment?: (agentId: string, ticketId: string, message: string) => Promise<boolean>;
+  /** Optional: per-agent max concurrent override. Return 0 to use the global default. */
+  getAgentMaxConcurrent?: (agentId: string) => number;
+  /** Optional: per-agent config lookup (used to read maxConcurrent from AgentConfig). */
+  getAgentConfig?: (agentId: string) => AgentConfig | undefined;
 }
 
 export interface NoActivityCycleResult {
   warned: number;
   failed: number;
   alreadyEnded: number;
+  /** Sessions classified as alive-but-at-capacity and deferred (not escalated). */
+  deferredAtCapacity: number;
 }
 
 function parseEnvInt(name: string, defaultVal: number): number {
@@ -83,6 +98,8 @@ export class NoActivityDetector {
   private deps: NoActivityDeps;
   /** Track warned sessions to avoid repeated WARN logs for the same dispatch. */
   private warnedSessions: Set<string> = new Set();
+  /** In-memory map of agentId → Set<ticketId> for tickets deferred due to at-capacity. */
+  private deferredAtCapacity: Map<string, Set<string>> = new Map();
 
   constructor(deps: NoActivityDeps, config?: Partial<NoActivityConfig>) {
     this.deps = deps;
@@ -90,6 +107,8 @@ export class NoActivityDetector {
       warnMs: config?.warnMs ?? parseEnvInt("NO_ACTIVITY_WARN_MS", DEFAULT_WARN_MS),
       failMs: config?.failMs ?? parseEnvInt("NO_ACTIVITY_FAIL_MS", DEFAULT_FAIL_MS),
       pollMs: config?.pollMs ?? parseEnvInt("NO_ACTIVITY_POLL_MS", DEFAULT_POLL_MS),
+      maxConcurrent: config?.maxConcurrent ?? parseEnvInt("AGENT_DEFAULT_MAX_CONCURRENT", DEFAULT_MAX_CONCURRENT),
+      deferredStaleMs: config?.deferredStaleMs ?? parseEnvInt("NO_ACTIVITY_DEFERRED_STALE_MS", DEFAULT_DEFERRED_STALE_MS),
     };
   }
 
@@ -132,12 +151,110 @@ export class NoActivityDetector {
     this.warnedSessions.delete(`${agentId}:${sessionKey}`);
   }
 
+  private getAgentMaxConcurrentValue(agentId: string): number {
+    const fromAgentConfig = this.deps.getAgentConfig?.(agentId)?.maxConcurrent;
+    if (fromAgentConfig) return fromAgentConfig;
+    const fromDep = this.deps.getAgentMaxConcurrent?.(agentId);
+    if (fromDep) return fromDep;
+    return this.config.maxConcurrent;
+  }
+
+  private async handleAtCapacity(
+    entry: { agentId: string; ticketId: string; attemptCount: number; dispatchedAt: string },
+    sessionKey: string,
+  ): Promise<void> {
+    const { agentId, ticketId } = entry;
+    const { operationalEventStore, sessionTracker } = this.deps;
+    const ageMs = Date.now() - new Date(entry.dispatchedAt.replace(' ', 'T') + 'Z').getTime();
+    const activeCount = sessionTracker.getActiveSessionKeys(agentId).length;
+    const maxConcurrent = this.getAgentMaxConcurrentValue(agentId);
+
+    log.info(
+      `No-activity: deferring ${agentId} [${sessionKey}] — at capacity ` +
+      `(${activeCount}/${maxConcurrent} sessions). Re-arm when a slot frees.`,
+    );
+    operationalEventStore.append({
+      outcome: "deferred-at-capacity",
+      agent: agentId,
+      key: sessionKey,
+      sessionKey,
+      deliveryMode: "no-activity-detector",
+      attemptCount: entry.attemptCount,
+      detail: { dispatchedAt: entry.dispatchedAt, ageMs, activeCount, maxConcurrent },
+    });
+
+    let set = this.deferredAtCapacity.get(agentId);
+    if (!set) {
+      set = new Set();
+      this.deferredAtCapacity.set(agentId, set);
+    }
+    set.add(ticketId);
+  }
+
+  /**
+   * Re-arm deferred at-capacity tickets when a session slot frees.
+   * Call this after sessionTracker.endSession() for an agent.
+   */
+  public async checkDeferredOnSessionEnd(agentId: string): Promise<void> {
+    const { sessionTracker, bag, operationalEventStore, wakeConfig } = this.deps;
+    const set = this.deferredAtCapacity.get(agentId);
+    if (!set || set.size === 0) return;
+
+    const activeCount = sessionTracker.getActiveSessionKeys(agentId).length;
+    const maxConcurrent = this.getAgentMaxConcurrentValue(agentId);
+    if (activeCount >= maxConcurrent) return;
+
+    const isTicketActionable = this.deps.resignalOptions?.isTicketActionable ?? isLinearIssueActionable;
+    for (const ticketId of [...set]) {
+      set.delete(ticketId);
+
+      // End the stale session so resignalPendingTickets can open a fresh one.
+      sessionTracker.endSession(agentId, ticketId);
+      this.clearWarned(agentId, ticketId);
+
+      if (!(await isTicketActionable(ticketId, agentId))) {
+        log.info(`No-activity: deferred ticket ${ticketId} no longer actionable — skipping`);
+        continue;
+      }
+
+      const pendingIds = bag.getPendingTickets(agentId).map((e) => e.ticketId);
+      if (!pendingIds.includes(ticketId)) {
+        bag.add(agentId, ticketId, "Issue");
+      }
+
+      const results = await resignalPendingTickets(
+        agentId,
+        [ticketId],
+        bag,
+        sessionTracker,
+        wakeConfig,
+        { markActive: true, ...this.deps.resignalOptions },
+      );
+
+      if (results.some((r) => r.dispatched)) {
+        operationalEventStore.append({
+          outcome: "deferred-capacity-rearm",
+          agent: agentId,
+          key: ticketId,
+          sessionKey: ticketId,
+          deliveryMode: "no-activity-detector",
+          detail: { agentId, ticketId },
+        });
+        log.info(`No-activity: re-armed deferred ticket ${ticketId} for ${agentId}`);
+      }
+    }
+
+    if (set.size === 0) {
+      this.deferredAtCapacity.delete(agentId);
+    }
+  }
+
   /**
    * Run one detection cycle. Returns a summary of actions taken.
    */
   async runCycle(): Promise<NoActivityCycleResult> {
-    const { sessionTracker, ackTracker, operationalEventStore } = this.deps;
-    const result: NoActivityCycleResult = { warned: 0, failed: 0, alreadyEnded: 0 };
+    const { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig } = this.deps;
+    const result: NoActivityCycleResult = { warned: 0, failed: 0, alreadyEnded: 0, deferredAtCapacity: 0 };
 
     // Get all currently tracked dispatches that are still pending/unconfirmed
     const pending = ackTracker.getPendingTimedOut(0); // 0ms → all pending
@@ -161,9 +278,21 @@ export class NoActivityDetector {
       const sessionKeyWarn = `${agentId}:${sessionKey}`;
 
       if (ageMs >= this.config.failMs) {
-        // Hard fail — session produced no activity for >5 minutes
-        await this.handleFailure(entry, sessionKey);
-        result.failed++;
+        // Check capacity before deciding: at-capacity → defer; hard-down → escalate
+        const activeCount = sessionTracker.getActiveSessionKeys(agentId).length;
+        const maxConcurrent = this.getAgentMaxConcurrentValue(agentId);
+        if (activeCount >= maxConcurrent) {
+          await this.handleAtCapacity(entry, sessionKey);
+          result.deferredAtCapacity++;
+          continue;
+        }
+        // Hard fail — session produced no activity for >failMs and agent is not at capacity
+        const deferred = await this.handleFailure(entry, sessionKey);
+        if (deferred) {
+          result.deferredAtCapacity++;
+        } else {
+          result.failed++;
+        }
       } else if (ageMs >= this.config.warnMs) {
         // Warn — suspicious but not yet failed
         if (!this.warnedSessions.has(sessionKeyWarn)) {
@@ -191,16 +320,54 @@ export class NoActivityDetector {
       }
     }
 
+    // Rescue deferred entries that have been waiting too long (session-end may not have fired).
+    const staleDeferred = ackTracker.getDeferredStale(this.config.deferredStaleMs);
+    for (const entry of staleDeferred) {
+      const { agentId, ticketId } = entry;
+      const deferredSessionKey = ticketId;
+      log.warn(
+        `Stale deferred dispatch for ${agentId} [${deferredSessionKey}] ` +
+        `(>${Math.round(this.config.deferredStaleMs / 60_000)}min) — rescuing`
+      );
+      const pendingIds = bag.getPendingTickets(agentId).map((e) => e.ticketId);
+      if (!pendingIds.includes(ticketId)) {
+        bag.add(agentId, ticketId, "Issue");
+      }
+      const isTicketActionable = this.deps.resignalOptions?.isTicketActionable ?? isLinearIssueActionable;
+      if (!(await isTicketActionable(ticketId, agentId))) {
+        bag.removeTicket(agentId, ticketId);
+        sessionTracker.removePendingTicket(ticketId, agentId);
+        ackTracker.acknowledge(agentId, ticketId);
+        log.info(`No-activity: stale-deferred ticket ${ticketId} no longer actionable — pruning`);
+        continue;
+      }
+      const rescueResults = await resignalPendingTickets(
+        agentId,
+        [ticketId],
+        bag,
+        sessionTracker,
+        wakeConfig,
+        { markActive: true, ...this.deps.resignalOptions },
+      );
+      if (rescueResults.some((r) => r.dispatched)) {
+        ackTracker.markResignaled(agentId, ticketId);
+        log.info(`No-activity: rescued stale-deferred ${agentId} [${deferredSessionKey}]`);
+      } else if (rescueResults.some((r) => r.pruned)) {
+        ackTracker.acknowledge(agentId, ticketId);
+      }
+    }
+
     return result;
   }
 
   /**
-   * Handle a no-activity failure: end session, log, post comment, re-dispatch.
+   * Handle a no-activity failure: end session, classify, and either defer or escalate/re-dispatch.
+   * Returns true if the ticket was deferred (agent alive but at capacity), false for hard failure.
    */
   private async handleFailure(
     entry: { agentId: string; ticketId: string; attemptCount: number; dispatchedAt: string },
     sessionKey: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const { agentId, ticketId, attemptCount } = entry;
     const { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig } = this.deps;
     const ageMs = Date.now() - new Date(entry.dispatchedAt.replace(' ', 'T') + 'Z').getTime();
@@ -214,7 +381,43 @@ export class NoActivityDetector {
     sessionTracker.endSession(agentId, sessionKey);
     this.clearWarned(agentId, sessionKey);
 
-    // 2. Log operational event
+    // 1a. Classify failure: alive-but-at-capacity vs. hard-down
+    const remainingActiveSessions = sessionTracker.getActiveSessionKeys(agentId).length;
+    const maxConcurrent = (this.deps.getAgentMaxConcurrent?.(agentId) || 0) || this.config.maxConcurrent;
+    const agentAlive = remainingActiveSessions > 0;
+    // After removing the failing session, if remaining >= maxConcurrent-1, the agent was full.
+    const atCapacity = remainingActiveSessions >= maxConcurrent - 1;
+
+    if (agentAlive && atCapacity) {
+      log.info(
+        `No-activity: deferring ${agentId} [${sessionKey}] — alive but at capacity ` +
+        `(${remainingActiveSessions}/${maxConcurrent} sessions). Re-dispatch when a slot frees.`,
+      );
+      operationalEventStore.append({
+        outcome: "deferred-at-capacity",
+        agent: agentId,
+        key: sessionKey,
+        sessionKey,
+        deliveryMode: "no-activity-detector",
+        attemptCount,
+        detail: {
+          dispatchedAt: entry.dispatchedAt,
+          ageMs,
+          remainingActiveSessions,
+          maxConcurrent,
+        },
+      });
+      // Keep ticket in bag so the session-end re-signal picks it up automatically.
+      const pendingIds = bag.getPendingTickets(agentId).map((e) => e.ticketId);
+      if (!pendingIds.includes(ticketId)) {
+        bag.add(agentId, ticketId, "Issue");
+        log.info(`No-activity: re-added ${ticketId} to bag for ${agentId} (deferred)`);
+      }
+      ackTracker.markDeferred(agentId, ticketId);
+      return true;
+    }
+
+    // 2. Log operational event (hard failure)
     operationalEventStore.append({
       outcome: "no-activity-failed",
       agent: agentId,
@@ -253,7 +456,7 @@ export class NoActivityDetector {
           log.error(`Failed to post escalation comment for ${sessionKey}: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
-      return;
+      return false;
     }
 
     // 5. Re-add to bag if needed and re-dispatch
@@ -270,7 +473,7 @@ export class NoActivityDetector {
       sessionTracker.removePendingTicket(ticketId, agentId);
       log.info(`No-activity: ticket ${ticketId} no longer actionable — pruning`);
       ackTracker.acknowledge(agentId, ticketId);
-      return;
+      return false;
     }
 
     const results = await resignalPendingTickets(
@@ -296,5 +499,6 @@ export class NoActivityDetector {
     } else {
       log.error(`No-activity: re-dispatch failed for ${agentId} [${ticketId}]`);
     }
+    return false;
   }
 }
