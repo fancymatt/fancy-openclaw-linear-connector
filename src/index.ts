@@ -434,6 +434,10 @@ export function createApp(options?: CreateAppOptions) {
     }
     log.info(`Session-end callback received for ${agentId}`);
     const queuedTickets = sessionTracker.endSession(agentId);
+    // Re-arm any tickets that were deferred because the agent was at capacity.
+    noActivityDetector.checkDeferredOnSessionEnd(agentId).catch((err) => {
+      log.error(`checkDeferredOnSessionEnd failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+    });
     // Acknowledge dispatches for this agent — the session completed (even briefly).
     ackTracker.acknowledge(agentId);
     // Clear no-activity warnings for any sessions that just ended.

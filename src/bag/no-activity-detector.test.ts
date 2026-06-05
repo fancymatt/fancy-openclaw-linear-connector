@@ -357,7 +357,7 @@ describe("NoActivityDetector", () => {
     const result = await detector.runCycle();
 
     // Should be classified as deferred, not hard-failed
-    expect(result.deferred).toBe(1);
+    expect(result.deferredAtCapacity).toBe(1);
     expect(result.failed).toBe(0);
 
     // No re-dispatch attempted (agent is still at capacity)
@@ -376,19 +376,14 @@ describe("NoActivityDetector", () => {
     const failedEvents = operationalEventStore.query({ outcome: "no-activity-failed" });
     expect(failedEvents).toHaveLength(0);
 
-    // Ticket still in bag (for session-end re-signal)
+    // Ticket still in bag (handleAtCapacity does not remove it)
     const pending = bag.getPendingTickets("charles");
     expect(pending.some((e) => e.ticketId === "linear-AI-1338")).toBe(true);
 
-    // Ack status is deferred
+    // Ack tracker: ticket stays as "pending" (handleAtCapacity does not call markDeferred).
+    // Re-dispatch happens via checkDeferredOnSessionEnd when a slot frees.
     const timedOut = ackTracker.getPendingTimedOut(0);
-    expect(timedOut.filter((e) => e.ticketId === "linear-AI-1338")).toHaveLength(0); // excluded from pending query
-
-    // Attempt count NOT incremented (deferred does not consume budget)
-    const staleDeferred = ackTracker.getDeferredStale(0);
-    const entry = staleDeferred.find((e) => e.ticketId === "linear-AI-1338");
-    expect(entry).toBeDefined();
-    expect(entry?.attemptCount).toBe(1); // original count, not incremented
+    expect(timedOut.filter((e) => e.ticketId === "linear-AI-1338")).toHaveLength(1);
 
     detector.stop();
     bag.close();
@@ -427,7 +422,7 @@ describe("NoActivityDetector", () => {
 
     // Should be treated as a hard failure, not deferred
     expect(result.failed).toBe(1);
-    expect(result.deferred).toBe(0);
+    expect(result.deferredAtCapacity).toBe(0);
     expect(dispatchedTickets).toContain("linear-AI-1338");
 
     const failedEvents = operationalEventStore.query({ outcome: "no-activity-failed" });
@@ -468,7 +463,7 @@ describe("NoActivityDetector", () => {
 
     // Main sweep finds nothing (session not active)
     expect(result.failed).toBe(0);
-    expect(result.deferred).toBe(0);
+    expect(result.deferredAtCapacity).toBe(0);
 
     // Stale sweep rescues the deferred ticket
     expect(dispatchedTickets).toContain("linear-AI-1338");
@@ -476,6 +471,103 @@ describe("NoActivityDetector", () => {
     // Entry promoted to unconfirmed with incremented attempt count
     const deferred = ackTracker.getDeferredStale(0);
     expect(deferred.filter((e) => e.ticketId === "linear-AI-1338")).toHaveLength(0); // no longer deferred
+
+    detector.stop();
+    bag.close();
+    sessionTracker.close();
+    ackTracker.close();
+    operationalEventStore.close();
+  });
+
+  test("checkDeferredOnSessionEnd re-dispatches deferred ticket when capacity is available", async () => {
+    const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+    const dispatchedTickets: string[] = [];
+
+    // Agent at capacity: 3 sessions (maxConcurrent=3)
+    sessionTracker.startSession("charles", "linear-AI-1325");
+    sessionTracker.startSession("charles", "linear-AI-1328");
+    bag.add("charles", "linear-AI-1338", "Issue");
+    sessionTracker.startSession("charles", "linear-AI-1338");
+    ackTracker.recordDispatch("charles", "linear-AI-1338");
+
+    const detector = new NoActivityDetector(
+      {
+        sessionTracker,
+        ackTracker,
+        bag,
+        operationalEventStore,
+        wakeConfig,
+        resignalOptions: {
+          isTicketActionable: () => true,
+          sendWakeUp: async (_agentId, ticketIds) => { dispatchedTickets.push(...ticketIds); },
+        },
+      },
+      { warnMs: 0, failMs: 0, pollMs: 60_000, maxConcurrent: 3, deferredStaleMs: 3_600_000 },
+    );
+
+    // Cycle defers the ticket (at capacity)
+    const result = await detector.runCycle();
+    expect(result.deferredAtCapacity).toBe(1);
+    expect(dispatchedTickets).toHaveLength(0);
+
+    // One session ends, freeing a slot
+    sessionTracker.endSession("charles", "linear-AI-1325");
+
+    // checkDeferredOnSessionEnd should now re-dispatch the deferred ticket
+    await detector.checkDeferredOnSessionEnd("charles");
+    expect(dispatchedTickets).toContain("linear-AI-1338");
+
+    // deferred-capacity-rearm event logged
+    const rearmEvents = operationalEventStore.query({ outcome: "deferred-capacity-rearm" });
+    expect(rearmEvents).toHaveLength(1);
+    expect(rearmEvents[0].agent).toBe("charles");
+
+    detector.stop();
+    bag.close();
+    sessionTracker.close();
+    ackTracker.close();
+    operationalEventStore.close();
+  });
+
+  test("checkDeferredOnSessionEnd stays deferred if agent is still at capacity", async () => {
+    const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+    const dispatchedTickets: string[] = [];
+
+    // Agent at capacity: 3 sessions
+    sessionTracker.startSession("charles", "linear-AI-1325");
+    sessionTracker.startSession("charles", "linear-AI-1328");
+    bag.add("charles", "linear-AI-1338", "Issue");
+    sessionTracker.startSession("charles", "linear-AI-1338");
+    ackTracker.recordDispatch("charles", "linear-AI-1338");
+
+    const detector = new NoActivityDetector(
+      {
+        sessionTracker,
+        ackTracker,
+        bag,
+        operationalEventStore,
+        wakeConfig,
+        resignalOptions: {
+          isTicketActionable: () => true,
+          sendWakeUp: async (_agentId, ticketIds) => { dispatchedTickets.push(...ticketIds); },
+        },
+      },
+      { warnMs: 0, failMs: 0, pollMs: 60_000, maxConcurrent: 3, deferredStaleMs: 3_600_000 },
+    );
+
+    // Cycle defers the ticket (at capacity)
+    const result = await detector.runCycle();
+    expect(result.deferredAtCapacity).toBe(1);
+
+    // checkDeferredOnSessionEnd called but agent is still at max capacity (2 remaining sessions)
+    await detector.checkDeferredOnSessionEnd("charles");
+
+    // Should NOT dispatch — still at capacity
+    expect(dispatchedTickets).toHaveLength(0);
+
+    // No rearm event
+    const rearmEvents = operationalEventStore.query({ outcome: "deferred-capacity-rearm" });
+    expect(rearmEvents).toHaveLength(0);
 
     detector.stop();
     bag.close();
