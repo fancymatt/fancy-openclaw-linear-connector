@@ -320,6 +320,170 @@ describe("NoActivityDetector", () => {
     operationalEventStore.close();
   });
 
+  test("defers dispatch when agent is alive but at capacity", async () => {
+    const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+    const dispatchedTickets: string[] = [];
+    const comments: Array<{ agentId: string; ticketId: string; message: string }> = [];
+
+    // Simulate agent at capacity: start maxConcurrent-1 other sessions so remaining >= maxConcurrent-1
+    // maxConcurrent defaults to 3; start 2 other sessions so after removing the failing one, remaining=2 >= 2
+    sessionTracker.startSession("charles", "linear-AI-1325"); // long-running task
+    sessionTracker.startSession("charles", "linear-AI-1328"); // another task
+
+    // The failing session for AI-1338
+    bag.add("charles", "linear-AI-1338", "Issue");
+    sessionTracker.startSession("charles", "linear-AI-1338");
+    ackTracker.recordDispatch("charles", "linear-AI-1338");
+
+    const detector = new NoActivityDetector(
+      {
+        sessionTracker,
+        ackTracker,
+        bag,
+        operationalEventStore,
+        wakeConfig,
+        resignalOptions: {
+          isTicketActionable: () => true,
+          sendWakeUp: async (_agentId, ticketIds) => { dispatchedTickets.push(...ticketIds); },
+        },
+        postLinearComment: async (agentId, ticketId, message) => {
+          comments.push({ agentId, ticketId, message });
+          return true;
+        },
+      },
+      { warnMs: 0, failMs: 0, pollMs: 60_000, maxConcurrent: 3, deferredStaleMs: 3_600_000 },
+    );
+
+    const result = await detector.runCycle();
+
+    // Should be classified as deferred, not hard-failed
+    expect(result.deferred).toBe(1);
+    expect(result.failed).toBe(0);
+
+    // No re-dispatch attempted (agent is still at capacity)
+    expect(dispatchedTickets).toHaveLength(0);
+
+    // No Linear comment posted (no noise)
+    expect(comments).toHaveLength(0);
+
+    // deferred-at-capacity event logged
+    const deferredEvents = operationalEventStore.query({ outcome: "deferred-at-capacity" });
+    expect(deferredEvents).toHaveLength(1);
+    expect(deferredEvents[0].agent).toBe("charles");
+    expect(deferredEvents[0].key).toBe("linear-AI-1338");
+
+    // No hard-failure event
+    const failedEvents = operationalEventStore.query({ outcome: "no-activity-failed" });
+    expect(failedEvents).toHaveLength(0);
+
+    // Ticket still in bag (for session-end re-signal)
+    const pending = bag.getPendingTickets("charles");
+    expect(pending.some((e) => e.ticketId === "linear-AI-1338")).toBe(true);
+
+    // Ack status is deferred
+    const timedOut = ackTracker.getPendingTimedOut(0);
+    expect(timedOut.filter((e) => e.ticketId === "linear-AI-1338")).toHaveLength(0); // excluded from pending query
+
+    // Attempt count NOT incremented (deferred does not consume budget)
+    const staleDeferred = ackTracker.getDeferredStale(0);
+    const entry = staleDeferred.find((e) => e.ticketId === "linear-AI-1338");
+    expect(entry).toBeDefined();
+    expect(entry?.attemptCount).toBe(1); // original count, not incremented
+
+    detector.stop();
+    bag.close();
+    sessionTracker.close();
+    ackTracker.close();
+    operationalEventStore.close();
+  });
+
+  test("treats as hard failure when agent has sessions but is not at capacity", async () => {
+    const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+    const dispatchedTickets: string[] = [];
+
+    // One other session active — agent alive but NOT at capacity (1 of 3)
+    sessionTracker.startSession("charles", "linear-AI-1100");
+
+    bag.add("charles", "linear-AI-1338", "Issue");
+    sessionTracker.startSession("charles", "linear-AI-1338");
+    ackTracker.recordDispatch("charles", "linear-AI-1338");
+
+    const detector = new NoActivityDetector(
+      {
+        sessionTracker,
+        ackTracker,
+        bag,
+        operationalEventStore,
+        wakeConfig,
+        resignalOptions: {
+          isTicketActionable: () => true,
+          sendWakeUp: async (_agentId, ticketIds) => { dispatchedTickets.push(...ticketIds); },
+        },
+      },
+      { warnMs: 0, failMs: 0, pollMs: 60_000, maxConcurrent: 3, deferredStaleMs: 3_600_000 },
+    );
+
+    const result = await detector.runCycle();
+
+    // Should be treated as a hard failure, not deferred
+    expect(result.failed).toBe(1);
+    expect(result.deferred).toBe(0);
+    expect(dispatchedTickets).toContain("linear-AI-1338");
+
+    const failedEvents = operationalEventStore.query({ outcome: "no-activity-failed" });
+    expect(failedEvents).toHaveLength(1);
+
+    detector.stop();
+    bag.close();
+    sessionTracker.close();
+    ackTracker.close();
+    operationalEventStore.close();
+  });
+
+  test("stale-deferred entries are rescued by the sweep", async () => {
+    const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+    const dispatchedTickets: string[] = [];
+
+    bag.add("charles", "linear-AI-1338", "Issue");
+    // Session already ended — only a deferred ack entry remains
+    ackTracker.recordDispatch("charles", "linear-AI-1338");
+    ackTracker.markDeferred("charles", "linear-AI-1338");
+
+    const detector = new NoActivityDetector(
+      {
+        sessionTracker,
+        ackTracker,
+        bag,
+        operationalEventStore,
+        wakeConfig,
+        resignalOptions: {
+          isTicketActionable: () => true,
+          sendWakeUp: async (_agentId, ticketIds) => { dispatchedTickets.push(...ticketIds); },
+        },
+      },
+      { warnMs: 60_000, failMs: 60_000, pollMs: 60_000, maxConcurrent: 3, deferredStaleMs: 0 }, // deferredStaleMs=0 → all deferred entries are stale
+    );
+
+    const result = await detector.runCycle();
+
+    // Main sweep finds nothing (session not active)
+    expect(result.failed).toBe(0);
+    expect(result.deferred).toBe(0);
+
+    // Stale sweep rescues the deferred ticket
+    expect(dispatchedTickets).toContain("linear-AI-1338");
+
+    // Entry promoted to unconfirmed with incremented attempt count
+    const deferred = ackTracker.getDeferredStale(0);
+    expect(deferred.filter((e) => e.ticketId === "linear-AI-1338")).toHaveLength(0); // no longer deferred
+
+    detector.stop();
+    bag.close();
+    sessionTracker.close();
+    ackTracker.close();
+    operationalEventStore.close();
+  });
+
   test("clearWarned resets the warned state for a session", async () => {
     const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
 

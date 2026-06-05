@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 
-export const OPERATIONAL_EVENT_OUTCOMES = ["received", "signature-rejected", "duplicate", "normalized", "terminal-pruned", "no-route", "routed", "dedup-suppressed", "bag-added", "delivered", "dispatch-accepted", "queued", "delivery-failed", "delivery-unconfirmed", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "no-activity-warn", "no-activity-failed"] as const;
+export const OPERATIONAL_EVENT_OUTCOMES = ["received", "signature-rejected", "duplicate", "normalized", "terminal-pruned", "no-route", "routed", "dedup-suppressed", "bag-added", "delivered", "dispatch-accepted", "queued", "delivery-failed", "delivery-unconfirmed", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "no-activity-warn", "no-activity-failed", "deferred-at-capacity"] as const;
 export type OperationalEventOutcome = typeof OPERATIONAL_EVENT_OUTCOMES[number];
 
 export interface OperationalEventInput {
@@ -43,7 +43,7 @@ const SECRET_VALUE_PATTERNS: Array<[RegExp, string]> = [
   [/\b[^\s,;]*?(?:token|secret|password|authorization|api[-_]?key)[^\s,;]*\b/ig, "[REDACTED]"],
 ];
 const SUCCESS_OUTCOMES = new Set<OperationalEventOutcome>(["received", "normalized", "routed", "bag-added", "delivered", "dispatch-accepted", "queued", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned"]);
-const ERROR_OUTCOMES = new Set<OperationalEventOutcome>(["signature-rejected", "delivery-failed", "no-route", "no-activity-warn", "no-activity-failed"]);
+const ERROR_OUTCOMES = new Set<OperationalEventOutcome>(["signature-rejected", "delivery-failed", "no-route", "no-activity-warn", "no-activity-failed", "deferred-at-capacity"]);
 
 function redactText(value: string): string {
   return SECRET_VALUE_PATTERNS.reduce((output, [pattern, replacement]) => output.replace(pattern, replacement), value);

@@ -23,7 +23,7 @@ import { normalizeSessionKey } from "../session-key.js";
 
 const log = componentLogger(createLogger(), "dispatch-ack-tracker");
 
-export type AckStatus = "pending" | "acknowledged" | "unconfirmed" | "escalated";
+export type AckStatus = "pending" | "acknowledged" | "unconfirmed" | "escalated" | "deferred";
 
 export interface DispatchAckEntry {
   id: number;
@@ -211,6 +211,63 @@ export class DispatchAckTracker {
       )
       .run(agentId, normalizedId);
     log.error(`Dispatch escalated: ${agentId} [${normalizedId}] — max re-signals exceeded`);
+  }
+
+  /**
+   * Mark a dispatch as deferred — agent is alive but at capacity.
+   * Does NOT increment attempt_count; this is not a retry, just a hold.
+   * The entry will be rescued when a session-end fires or by the stale-deferred sweep.
+   */
+  markDeferred(agentId: string, ticketId: string): void {
+    const normalizedId = normalizeSessionKey(ticketId);
+    this.db
+      .prepare(
+        `UPDATE dispatch_acks
+         SET ack_status = 'deferred',
+             last_signal_at = datetime('now')
+         WHERE agent_id = ? AND ticket_id = ?`,
+      )
+      .run(agentId, normalizedId);
+    log.info(`Dispatch deferred (at-capacity): ${agentId} [${normalizedId}]`);
+  }
+
+  /**
+   * Return deferred entries whose last_signal_at is older than staleMs.
+   * Used by the no-activity detector to rescue entries that were never
+   * re-dispatched by a session-end signal.
+   */
+  getDeferredStale(staleMs: number): DispatchAckEntry[] {
+    const cutoff = new Date(Date.now() - staleMs)
+      .toISOString()
+      .replace("T", " ")
+      .replace(/\.\d{3}Z$/, "");
+    const rows = this.db
+      .prepare(
+        `SELECT id, agent_id, ticket_id, dispatched_at, last_signal_at,
+                ack_status, attempt_count
+         FROM dispatch_acks
+         WHERE ack_status = 'deferred' AND last_signal_at <= ?
+         ORDER BY last_signal_at ASC
+         LIMIT 50`,
+      )
+      .all(cutoff) as Array<{
+        id: number;
+        agent_id: string;
+        ticket_id: string;
+        dispatched_at: string;
+        last_signal_at: string;
+        ack_status: string;
+        attempt_count: number;
+      }>;
+    return rows.map((r) => ({
+      id: r.id,
+      agentId: r.agent_id,
+      ticketId: r.ticket_id,
+      dispatchedAt: r.dispatched_at,
+      lastSignalAt: r.last_signal_at,
+      ackStatus: r.ack_status as AckStatus,
+      attemptCount: r.attempt_count,
+    }));
   }
 
   /**
