@@ -523,3 +523,208 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
     expect(res.body.data).toBeDefined();
   });
 });
+
+// ── Phase 3 / B2: state-label transition application ─────────────────────
+
+const DEV_IMPL_IN_PROGRESS_WITH_IDS = {
+  data: {
+    issue: {
+      id: "internal-uuid",
+      team: { id: "team-uuid" },
+      labels: {
+        nodes: [
+          { id: "wf-lbl", name: "wf:dev-impl" },
+          { id: "state-lbl", name: "state:in-progress" },
+        ],
+      },
+    },
+  },
+};
+
+const TEAM_LABELS_WITH_AR = {
+  data: {
+    team: {
+      labels: {
+        nodes: [
+          { id: "ar-lbl", name: "state:awaiting-review" },
+          { id: "ip-lbl", name: "state:in-progress" },
+        ],
+      },
+    },
+  },
+};
+
+describe("proxy enforcement — B2 state-label transition application", () => {
+  let dir: string;
+  let appState: ReturnType<typeof createApp>;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-b2-test-"));
+    process.env.AGENTS_FILE = writeAgents(dir);
+    process.env.CAPABILITY_POLICY_PATH = writePolicyFile(dir, TEST_POLICY_WITH_MERGE_YAML);
+    writeWorkflowFile(dir);
+    resetPolicyCache();
+    resetWorkflowCache();
+    reloadAgents();
+    appState = createApp({
+      bagDbPath: path.join(dir, "bag.db"),
+      agentQueueDbPath: path.join(dir, "queue.db"),
+      operationalEventsDbPath: path.join(dir, "events.db"),
+    });
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    appState.bag.close();
+    appState.sessionTracker.close();
+    appState.agentQueue.close();
+    appState.operationalEventStore.close();
+    appState.watchdog.stop();
+    appState.noActivityDetector.stop();
+    appState.managingPoller.stop();
+  });
+
+  /**
+   * Full-stack B2 fetch mock. Handles:
+   *   IssueLabels   — B1 validation fetch (returns label names)
+   *   IssueWithLabels — B2 transition fetch (returns label IDs + team)
+   *   TeamLabels    — B2 label lookup
+   *   ApplyStateTransition — B2 issueUpdate mutation
+   *   everything else → MOCK_RESPONSE (the agent's main mutation)
+   * Records every call so tests can assert transition behavior.
+   */
+  function makeB2Fetch(opts: {
+    b1LabelResponse: object;
+    b2IssueResponse?: object;
+    b2TeamLabels?: object;
+    updateSuccess?: boolean;
+  }): { fetch: typeof globalThis.fetch; calls: Array<{ query: string; variables: unknown }> } {
+    const calls: Array<{ query: string; variables: unknown }> = [];
+
+    const mockFetch: typeof globalThis.fetch = async (url, init) => {
+      if (typeof url !== "string" || !url.includes("api.linear.app")) {
+        return originalFetch(url, init);
+      }
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string; variables?: unknown };
+      calls.push({ query: parsed.query ?? "", variables: parsed.variables });
+
+      const q = parsed.query ?? "";
+
+      if (q.includes("IssueLabels") && !q.includes("IssueWithLabels")) {
+        return new Response(JSON.stringify(opts.b1LabelResponse), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (q.includes("IssueWithLabels")) {
+        return new Response(
+          JSON.stringify(opts.b2IssueResponse ?? DEV_IMPL_IN_PROGRESS_WITH_IDS),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (q.includes("TeamLabels")) {
+        return new Response(
+          JSON.stringify(opts.b2TeamLabels ?? TEAM_LABELS_WITH_AR),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (q.includes("ApplyStateTransition")) {
+        const success = opts.updateSuccess ?? true;
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      // Main agent mutation → success response.
+      return new Response(JSON.stringify(MOCK_RESPONSE), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    };
+
+    return { fetch: mockFetch, calls };
+  }
+
+  it("applies state transition after a legal command is forwarded", async () => {
+    const { fetch: mock, calls } = makeB2Fetch({
+      b1LabelResponse: DEV_IMPL_IN_PROGRESS_RESPONSE,
+    });
+    globalThis.fetch = mock;
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    // B2 transition call should have fired.
+    expect(calls.some((c) => c.query.includes("ApplyStateTransition"))).toBe(true);
+    // The issueUpdate should use internal UUID and contain the new label.
+    const b2call = calls.find((c) => c.query.includes("ApplyStateTransition"));
+    expect(b2call).toBeDefined();
+    const vars = b2call!.variables as { issueId: string; labelIds: string[] };
+    expect(vars.issueId).toBe("internal-uuid");
+    expect(vars.labelIds).toContain("ar-lbl");
+    expect(vars.labelIds).not.toContain("state-lbl");
+  });
+
+  it("does NOT apply transition on a blocked command", async () => {
+    const { fetch: mock, calls } = makeB2Fetch({
+      b1LabelResponse: DEV_IMPL_IN_PROGRESS_RESPONSE,
+    });
+    globalThis.fetch = mock;
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "approve") // illegal in in-progress
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(calls.some((c) => c.query.includes("ApplyStateTransition"))).toBe(false);
+  });
+
+  it("does NOT apply transition when no intent header (pure pass-through)", async () => {
+    const { fetch: mock, calls } = makeB2Fetch({
+      b1LabelResponse: DEV_IMPL_IN_PROGRESS_RESPONSE,
+    });
+    globalThis.fetch = mock;
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      // No X-Openclaw-Linear-Intent header.
+      .send({ query: "{ viewer { id } }" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(MOCK_RESPONSE);
+    expect(calls.some((c) => c.query.includes("ApplyStateTransition"))).toBe(false);
+  });
+
+  it("returns the upstream response even when the B2 transition fails", async () => {
+    const { fetch: mock, calls } = makeB2Fetch({
+      b1LabelResponse: DEV_IMPL_IN_PROGRESS_RESPONSE,
+      updateSuccess: false,
+    });
+    globalThis.fetch = mock;
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    // Agent response is still 200 even though label update returned non-success.
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    expect(calls.some((c) => c.query.includes("ApplyStateTransition"))).toBe(true);
+  });
+});

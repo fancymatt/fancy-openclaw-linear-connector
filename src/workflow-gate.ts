@@ -1,10 +1,19 @@
 /**
  * Phase 3 / B1 — Workflow-def-driven inbound command validation (AI-1352).
+ * Phase 3 / B2 — Atomic state-label transition application (AI-1353).
  *
- * Generalizes the Phase 2 single-rule escalation-gate (escalation-gate.ts) into
+ * B1: Generalizes the Phase 2 single-rule escalation-gate (escalation-gate.ts) into
  * a full legal-move validator driven by the workflow definition YAML. The rule
  * table in the escalation-gate is superseded by this data-driven approach for
  * workflow tickets; both checks run in proxy.ts (defense in depth).
+ *
+ * B2: After a legal command is forwarded upstream, the proxy applies the state
+ * transition by atomically swapping the old state:* label for the new one via a
+ * single issueUpdate mutation. The proxy owns the transition (not the CLI) so
+ * the state change is coupled to the validated forward — an agent cannot skip it.
+ * State is derived independently via a fresh label fetch; agent-supplied state is
+ * never trusted (§11). Fails open on any API error — label update failures are
+ * logged but do not fail the proxied request.
  *
  * For workflow tickets (wf:*):
  *   1. Resolves the ticket's current state from its state:* label via an independent
@@ -12,6 +21,7 @@
  *   2. Rejects any command not in the legal set for that state, naming the legal moves.
  *   3. Break-glass (escape) is always legal from every state (§4.4).
  *   4. Merge requires repo:merge capability; only the merge-gate body (Hanzo) holds it.
+ *   5. On a forwarded legal command, swaps state:old → state:new in one mutation.
  *
  * Ad-hoc tickets (no wf:* label) are full pass-through — §4.6 mode switch.
  *
@@ -20,7 +30,7 @@
  * from the request body itself is a separate follow-up — do not block on it here.
  * TODO(AI-1347): derive intent/issue from request body when headers are absent.
  *
- * Design: design.md §4.4, §4.6, §11, §13, §16.1, §16.2.
+ * Design: design.md §4.2, §4.4, §4.6, §11, §13, §16.1, §16.2.
  */
 
 import fs from "node:fs/promises";
@@ -89,6 +99,11 @@ export function resetWorkflowCache(): void {
 
 // ── Label fetch ────────────────────────────────────────────────────────────
 
+interface LabelNode {
+  id: string;
+  name: string;
+}
+
 /**
  * Fetch label names for a Linear issue using the caller's auth token.
  * Independent of escalation-gate's label fetch — the proxy resolves state
@@ -113,6 +128,120 @@ async function fetchTicketLabels(issueId: string, authToken: string): Promise<st
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: label fetch failed for ${issueId}: ${msg} — failing open`);
     return [];
+  }
+}
+
+/**
+ * Fetch label nodes with IDs plus the team ID for a Linear issue.
+ * Used by B2 to build the label set for the atomic state swap mutation.
+ * Returns null on any error — caller fails open.
+ */
+async function fetchIssueWithLabels(
+  issueId: string,
+  authToken: string,
+): Promise<{ internalId: string; teamId: string; labels: LabelNode[] } | null> {
+  const query = `
+    query IssueWithLabels($id: String!) {
+      issue(id: $id) {
+        id
+        team { id }
+        labels { nodes { id name } }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    type Resp = {
+      data?: {
+        issue?: {
+          id: string;
+          team: { id: string };
+          labels: { nodes: LabelNode[] };
+        };
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const issue = data.data?.issue;
+    if (!issue) return null;
+    return { internalId: issue.id, teamId: issue.team.id, labels: issue.labels.nodes };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: issue fetch failed for ${issueId}: ${msg}`);
+    return null;
+  }
+}
+
+/**
+ * Find an existing label by name in the team, or create it if absent.
+ * Returns the label ID, or null if both lookup and creation fail.
+ */
+async function findOrCreateLabel(
+  teamId: string,
+  labelName: string,
+  authToken: string,
+): Promise<string | null> {
+  const lookupQuery = `
+    query TeamLabels($teamId: String!) {
+      team(id: $teamId) {
+        labels { nodes { id name } }
+      }
+    }
+  `;
+  try {
+    const lookupRes = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: lookupQuery, variables: { teamId } }),
+    });
+    type LookupResp = { data?: { team?: { labels: { nodes: LabelNode[] } } } };
+    const lookupData = (await lookupRes.json()) as LookupResp;
+    const existing = (lookupData.data?.team?.labels?.nodes ?? []).find(
+      (n) => n.name === labelName,
+    );
+    if (existing) return existing.id;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: team label lookup failed for team=${teamId}: ${msg}`);
+    return null;
+  }
+
+  // Label does not yet exist — create it with a neutral grey color.
+  const createMutation = `
+    mutation CreateLabel($teamId: String!, $name: String!, $color: String!) {
+      issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color }) {
+        success
+        issueLabel { id }
+      }
+    }
+  `;
+  try {
+    const createRes = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({
+        query: createMutation,
+        variables: { teamId, name: labelName, color: "#94a3b8" },
+      }),
+    });
+    type CreateResp = {
+      data?: { issueLabelCreate?: { success: boolean; issueLabel?: { id: string } } };
+    };
+    const createData = (await createRes.json()) as CreateResp;
+    const result = createData.data?.issueLabelCreate;
+    if (result?.success && result.issueLabel) {
+      log.info(`workflow-gate: created label '${labelName}' in team ${teamId}`);
+      return result.issueLabel.id;
+    }
+    log.warn(`workflow-gate: label creation returned non-success for '${labelName}'`);
+    return null;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: label creation failed for '${labelName}': ${msg}`);
+    return null;
   }
 }
 
@@ -203,4 +332,167 @@ export async function checkWorkflowRules(
   }
 
   return null;
+}
+
+// ── B2: Atomic state-label transition application ─────────────────────────
+
+/**
+ * Apply the state-label transition triggered by a legal command (AI-1353 / §4.2).
+ *
+ * Called by proxy.ts after a validated command is successfully forwarded to Linear.
+ * Re-derives the ticket's current state via an independent label fetch (never trusts
+ * the caller's state snapshot — §11). Applies the transition by swapping state:old →
+ * state:new in a single issueUpdate mutation so the ticket never carries zero or two
+ * state:* labels.
+ *
+ * Seam decision (documented per ticket): the proxy applies the transition, not the
+ * CLI. This couples the state change to the validated forward — an agent cannot issue
+ * a raw GraphQL mutation and skip the transition. The CLI only needs to send the
+ * x-openclaw-linear-intent header; the connector handles the bookkeeping.
+ *
+ * Idempotent: if the ticket is already in the target state, no mutation is issued.
+ * Fail-open: any API error is logged; the caller's response is not affected.
+ *
+ * Special targets:
+ *   __ad_hoc__ — ticket leaves the workflow; removes state:* and wf:* labels entirely.
+ *   escape     — terminal break-glass state; transitions to state:escape normally.
+ */
+export async function applyStateTransition(
+  intent: string,
+  issueId: string | null,
+  authToken: string,
+): Promise<void> {
+  // TODO(AI-1347): no-op on missing issueId carries the same fail-open posture as B1.
+  if (!issueId) return;
+
+  const issue = await fetchIssueWithLabels(issueId, authToken);
+  if (!issue) {
+    log.warn(`workflow-gate: B2 apply: could not fetch labels for ${issueId} — skipping`);
+    return;
+  }
+
+  const labelNames = issue.labels.map((l) => l.name);
+  const workflowId = getWorkflowId(labelNames);
+  if (!workflowId) return; // ad-hoc ticket — no-op
+
+  let def: WorkflowDef;
+  try {
+    def = await loadWorkflowDef();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: B2 apply: failed to load workflow def: ${msg} — skipping`);
+    return;
+  }
+
+  if (workflowId !== def.id) return; // unknown workflow — no-op
+
+  const currentStateName = getCurrentState(labelNames);
+  if (!currentStateName) {
+    log.warn(`workflow-gate: B2 apply: no state:* label on ${issueId} — skipping`);
+    return;
+  }
+
+  const breakGlassCommand = def.break_glass?.command ?? "escape";
+  let toStateName: string;
+
+  if (intent === breakGlassCommand) {
+    toStateName = def.break_glass?.to ?? "escape";
+  } else {
+    const stateNode = def.states.find((s) => s.id === currentStateName);
+    const transition = stateNode?.transitions?.find((t) => t.command === intent);
+    if (!transition) {
+      // Should not happen — B1 already validated the command — but fail-open.
+      log.warn(
+        `workflow-gate: B2 apply: no transition for '${intent}' in state '${currentStateName}' on ${issueId} — skipping`,
+      );
+      return;
+    }
+    toStateName = transition.to;
+  }
+
+  // ── Special target: __ad_hoc__ ─────────────────────────────────────────
+  // Ticket is demoted out of the workflow — remove state:* and wf:* labels.
+  if (toStateName === "__ad_hoc__") {
+    const keepIds = issue.labels
+      .filter((l) => !l.name.startsWith("state:") && !l.name.startsWith("wf:"))
+      .map((l) => l.id);
+    await issueUpdateLabels(issue.internalId, keepIds, authToken);
+    log.info(
+      `workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels`,
+    );
+    return;
+  }
+
+  // ── Idempotency check ──────────────────────────────────────────────────
+  if (currentStateName === toStateName) {
+    log.info(
+      `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' — no-op`,
+    );
+    return;
+  }
+
+  // ── Atomic label swap ──────────────────────────────────────────────────
+  const oldLabel = issue.labels.find((l) => l.name === `state:${currentStateName}`);
+  if (!oldLabel) {
+    log.warn(
+      `workflow-gate: B2 apply: could not find label id for state:${currentStateName} on ${issueId} — skipping`,
+    );
+    return;
+  }
+
+  const newLabelId = await findOrCreateLabel(
+    issue.teamId,
+    `state:${toStateName}`,
+    authToken,
+  );
+  if (!newLabelId) {
+    log.warn(
+      `workflow-gate: B2 apply: could not resolve label id for state:${toStateName} — skipping`,
+    );
+    return;
+  }
+
+  const newLabelIds = [
+    ...issue.labels.filter((l) => l.id !== oldLabel.id).map((l) => l.id),
+    newLabelId,
+  ];
+
+  const applied = await issueUpdateLabels(issue.internalId, newLabelIds, authToken);
+  if (applied) {
+    log.info(
+      `workflow-gate: B2 apply: ${issueId} state:${currentStateName} → state:${toStateName}`,
+    );
+  }
+}
+
+async function issueUpdateLabels(
+  internalId: string,
+  labelIds: string[],
+  authToken: string,
+): Promise<boolean> {
+  const mutation = `
+    mutation ApplyStateTransition($issueId: String!, $labelIds: [String!]!) {
+      issueUpdate(id: $issueId, input: { labelIds: $labelIds }) {
+        success
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId: internalId, labelIds } }),
+    });
+    type Resp = { data?: { issueUpdate?: { success: boolean } } };
+    const data = (await res.json()) as Resp;
+    if (!data.data?.issueUpdate?.success) {
+      log.warn(`workflow-gate: B2 apply: issueUpdate returned non-success for ${internalId}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: B2 apply: issueUpdate failed for ${internalId}: ${msg}`);
+    return false;
+  }
 }
