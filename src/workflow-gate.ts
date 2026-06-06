@@ -54,20 +54,21 @@ export const WORKFLOW_DEF_PATH =
 
 // ── YAML schema types ──────────────────────────────────────────────────────
 
-interface WorkflowTransition {
+export interface WorkflowTransition {
   command: string;
   to: string;
   requires_capability?: string;
+  feedback?: { required?: boolean; category_enum?: string[] };
 }
 
-interface WorkflowState {
+export interface WorkflowState {
   id: string;
   owner_role?: string;
   kind?: string;
   transitions?: WorkflowTransition[];
 }
 
-interface WorkflowDef {
+export interface WorkflowDef {
   id: string;
   version?: number;
   archetype?: string;
@@ -81,7 +82,7 @@ interface WorkflowDef {
 
 let _workflowCache: WorkflowDef | null = null;
 
-async function loadWorkflowDef(): Promise<WorkflowDef> {
+export async function loadWorkflowDef(): Promise<WorkflowDef> {
   if (_workflowCache) return _workflowCache;
   const raw = await fs.readFile(WORKFLOW_DEF_PATH, "utf8");
   const def = yaml.load(raw) as WorkflowDef;
@@ -245,14 +246,37 @@ async function findOrCreateLabel(
   }
 }
 
-function getWorkflowId(labels: string[]): string | null {
+export function getWorkflowId(labels: string[]): string | null {
   const label = labels.find((l) => /^wf:/i.test(l));
   return label ? label.slice(label.indexOf(":") + 1).toLowerCase() : null;
 }
 
-function getCurrentState(labels: string[]): string | null {
+export function getCurrentState(labels: string[]): string | null {
   const label = labels.find((l) => /^state:/i.test(l));
   return label ? label.slice(label.indexOf(":") + 1).toLowerCase() : null;
+}
+
+/**
+ * Fetch label names for a Linear issue.
+ * Used by the outbound delivery path (B3) to detect workflow/state labels.
+ * Returns an empty array on any error — callers fail open.
+ */
+export async function fetchWorkflowLabels(issueId: string, authToken: string): Promise<string[]> {
+  const query = `query IssueLabels($id: String!) { issue(id: $id) { labels { nodes { name } } } }`;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    type LabelResp = { data?: { issue?: { labels?: { nodes: Array<{ name: string }> } } } };
+    const data = (await res.json()) as LabelResp;
+    return (data.data?.issue?.labels?.nodes ?? []).map((n) => n.name);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: outbound label fetch failed for ${issueId}: ${msg} — failing open`);
+    return [];
+  }
 }
 
 // ── Public enforcement API ─────────────────────────────────────────────────

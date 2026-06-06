@@ -2,6 +2,7 @@ import { spawn } from "child_process";
 import type { RouteResult } from "../types.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { buildDeliveryMessage } from "./build-message.js";
+import { getAccessToken } from "../agents.js";
 
 const log = componentLogger(createLogger(), "delivery");
 
@@ -45,10 +46,18 @@ export async function deliverToAgent(
   route: RouteResult,
   config: DeliveryConfig,
 ): Promise<DeliveryResult> {
+  const rawToken =
+    getAccessToken(route.agentId) ??
+    process.env.LINEAR_OAUTH_TOKEN ??
+    process.env.LINEAR_API_KEY;
+  const authToken = rawToken
+    ? /^Bearer\s+/i.test(rawToken) ? rawToken : `Bearer ${rawToken}`
+    : undefined;
+  const message = await buildDeliveryMessage(route, authToken);
   return await deliverMessageToAgent(
     route.agentId,
     route.sessionKey,
-    buildDeliveryMessage(route),
+    message,
     config,
   );
 }
