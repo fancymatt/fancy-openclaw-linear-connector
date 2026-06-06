@@ -8,9 +8,16 @@
 #   ai-systems/projects/fleet-orchestration-redesign/workflows/dev-impl.yaml
 # Used as a test fixture so CI can exercise the canonical schema without
 # depending on the vault being present. Keep in sync with the vault source.
+#
+# Shape principle (design decision 2026-06-06): a STATE is a work-phase — one
+#   kind of work, one owner role; "awaiting X" and "doing X" are the same state.
+#   A TRANSITION is a decision/event (may carry payload) — never a resting place.
+#   Decision-results (`approved`, `merged`) are transitions, not states.
+#   Hanzo's container is the DEPLOYMENT container: merging is one operation it
+#   authorizes (`deploy:execute`), not its definition.
 
 id: dev-impl
-version: 2
+version: 3
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
@@ -26,33 +33,28 @@ states:
     kind: normal
     transitions:
       - command: accept
-        to: ready-for-impl
+        to: implementation
       - command: demote
         to: __ad_hoc__          # ticket leaves the workflow entirely (design.md §4.5)
 
-  - id: ready-for-impl
+  - id: implementation
     owner_role: dev
     kind: normal
-    transitions:
-      - command: begin
-        to: in-progress
-
-  - id: in-progress
-    owner_role: dev
-    kind: normal
+    # entered from intake/accept, code-review/request-changes, and
+    # deployment/reject — one dev work-phase, no awaiting-vs-doing split.
     transitions:
       - command: submit
-        to: awaiting-review
+        to: code-review
 
-  - id: awaiting-review
+  - id: code-review
     owner_role: code-review
     kind: normal
     sla: 24h                    # time-in-state; breach → stall escalation (design.md §5.5)
     transitions:
       - command: approve
-        to: approved
+        to: deployment
       - command: request-changes
-        to: changes-requested
+        to: implementation
         feedback:
           required: true
           category_enum:
@@ -62,37 +64,23 @@ states:
             - correctness
             - ac-mismatch
 
-  - id: changes-requested
-    owner_role: dev
+  - id: deployment
+    owner_role: deployment      # filled by Hanzo; the deployment container (§16.2)
     kind: normal
     transitions:
-      - command: resubmit
-        to: awaiting-review
-
-  - id: approved
-    owner_role: merge-gate
-    kind: normal
-    transitions:
-      - command: merge
-        to: merged
-        requires_capability: repo:merge   # Layer A enforcement (design.md §16.2)
-      - command: reject
-        to: changes-requested
-        feedback:
-          required: true
-          category_enum:
-            - missing-tests
-            - style
-            - scope-creep
-            - correctness
-            - ac-mismatch
-
-  - id: merged
-    owner_role: steward
-    kind: normal
-    transitions:
-      - command: close
+      - command: deploy
         to: done
+        requires_capability: deploy:execute   # Layer A enforcement (design.md §16.2)
+      - command: reject
+        to: implementation
+        feedback:
+          required: true
+          category_enum:
+            - missing-tests
+            - style
+            - scope-creep
+            - correctness
+            - ac-mismatch
 
   - id: done
     kind: terminal

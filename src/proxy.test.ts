@@ -35,24 +35,24 @@ bodies:
     fills_roles: []
 `;
 
-// Extended policy for Phase 3 workflow-gate tests (adds repo:merge + hanzo).
+// Extended policy for Phase 3 workflow-gate tests (adds deploy:execute + hanzo).
 const TEST_POLICY_WITH_MERGE_YAML = `
 capabilities:
   - id: human:escalate
   - id: linear:transition
-  - id: repo:merge
+  - id: deploy:execute
 containers:
   - id: steward
     grants: [linear:transition, human:escalate]
   - id: dev
     grants: [linear:transition]
-  - id: merge-gate
-    grants: [linear:transition, repo:merge]
+  - id: deployment
+    grants: [linear:transition, deploy:execute]
 roles:
   - id: steward
     requires: [human:escalate]
-  - id: merge-gate
-    requires: [repo:merge]
+  - id: deployment
+    requires: [deploy:execute]
 bodies:
   - id: astrid
     container: steward
@@ -61,8 +61,8 @@ bodies:
     container: dev
     fills_roles: []
   - id: hanzo
-    container: merge-gate
-    fills_roles: [merge-gate]
+    container: deployment
+    fills_roles: [deployment]
 `;
 
 const TEST_WORKFLOW_YAML = `
@@ -78,28 +78,30 @@ states:
     kind: normal
     transitions:
       - command: accept
-        to: ready-for-impl
-  - id: in-progress
+        to: implementation
+  - id: implementation
     owner_role: dev
     kind: normal
     transitions:
       - command: submit
-        to: awaiting-review
-  - id: awaiting-review
+        to: code-review
+  - id: code-review
     owner_role: code-review
     kind: normal
     transitions:
       - command: approve
-        to: approved
+        to: deployment
       - command: request-changes
-        to: changes-requested
-  - id: approved
-    owner_role: merge-gate
+        to: implementation
+  - id: deployment
+    owner_role: deployment
     kind: normal
     transitions:
-      - command: merge
-        to: merged
-        requires_capability: repo:merge
+      - command: deploy
+        to: done
+        requires_capability: deploy:execute
+      - command: reject
+        to: implementation
   - id: done
     kind: terminal
     transitions: []
@@ -372,11 +374,11 @@ describe("proxy enforcement — needs-human (Phase 2 slice 1)", () => {
 
 // ── Phase 3 / B1: workflow-def-driven command validation ──────────────────
 
-const DEV_IMPL_IN_PROGRESS_RESPONSE = {
-  data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:in-progress" }] } } },
+const DEV_IMPL_IMPLEMENTATION_RESPONSE = {
+  data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] } } },
 };
-const DEV_IMPL_APPROVED_RESPONSE = {
-  data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:approved" }] } } },
+const DEV_IMPL_DEPLOYMENT_RESPONSE = {
+  data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] } } },
 };
 
 describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
@@ -431,8 +433,8 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
     };
   }
 
-  it("blocks an illegal command ('approve') on a dev-impl in-progress ticket", async () => {
-    globalThis.fetch = makeFetch(DEV_IMPL_IN_PROGRESS_RESPONSE);
+  it("blocks an illegal command ('approve') on a dev-impl implementation ticket", async () => {
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
 
     const res = await request(appState.app)
       .post("/proxy/graphql")
@@ -445,11 +447,11 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
     expect(res.body.errors).toBeDefined();
     expect(res.body.errors[0].message).toContain("[Proxy]");
     expect(res.body.errors[0].message).toContain("approve");
-    expect(res.body.errors[0].message).toContain("in-progress");
+    expect(res.body.errors[0].message).toContain("implementation");
   });
 
-  it("allows the legal command ('submit') on a dev-impl in-progress ticket", async () => {
-    globalThis.fetch = makeFetch(DEV_IMPL_IN_PROGRESS_RESPONSE);
+  it("allows the legal command ('submit') on a dev-impl implementation ticket", async () => {
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
 
     const res = await request(appState.app)
       .post("/proxy/graphql")
@@ -464,7 +466,7 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
   });
 
   it("allows escape from any state (break-glass §4.4)", async () => {
-    globalThis.fetch = makeFetch(DEV_IMPL_IN_PROGRESS_RESPONSE);
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
 
     const res = await request(appState.app)
       .post("/proxy/graphql")
@@ -477,30 +479,30 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
     expect(res.body.errors).toBeUndefined();
   });
 
-  it("blocks merge from non-merge-gate body (charles) in approved state", async () => {
-    globalThis.fetch = makeFetch(DEV_IMPL_APPROVED_RESPONSE);
+  it("blocks deploy from non-deployment body (charles) in deployment state", async () => {
+    globalThis.fetch = makeFetch(DEV_IMPL_DEPLOYMENT_RESPONSE);
 
     const res = await request(appState.app)
       .post("/proxy/graphql")
       .set("Authorization", "Bearer test-token")
       .set("X-Openclaw-Agent", "charles")
-      .set("X-Openclaw-Linear-Intent", "merge")
+      .set("X-Openclaw-Linear-Intent", "deploy")
       .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
 
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeDefined();
     expect(res.body.errors[0].message).toContain("[Proxy]");
-    expect(res.body.errors[0].message).toContain("repo:merge");
+    expect(res.body.errors[0].message).toContain("deploy:execute");
   });
 
-  it("allows merge from hanzo (merge-gate body) in approved state", async () => {
-    globalThis.fetch = makeFetch(DEV_IMPL_APPROVED_RESPONSE);
+  it("allows deploy from hanzo (deployment body) in deployment state", async () => {
+    globalThis.fetch = makeFetch(DEV_IMPL_DEPLOYMENT_RESPONSE);
 
     const res = await request(appState.app)
       .post("/proxy/graphql")
       .set("Authorization", "Bearer test-token")
       .set("X-Openclaw-Agent", "hanzo")
-      .set("X-Openclaw-Linear-Intent", "merge")
+      .set("X-Openclaw-Linear-Intent", "deploy")
       .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
 
     expect(res.status).toBe(200);
@@ -515,7 +517,7 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
       .post("/proxy/graphql")
       .set("Authorization", "Bearer test-token")
       .set("X-Openclaw-Agent", "charles")
-      .set("X-Openclaw-Linear-Intent", "merge")
+      .set("X-Openclaw-Linear-Intent", "deploy")
       .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
 
     expect(res.status).toBe(200);
@@ -526,7 +528,7 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
 
 // ── Phase 3 / B2: state-label transition application ─────────────────────
 
-const DEV_IMPL_IN_PROGRESS_WITH_IDS = {
+const DEV_IMPL_IMPLEMENTATION_WITH_IDS = {
   data: {
     issue: {
       id: "internal-uuid",
@@ -534,20 +536,20 @@ const DEV_IMPL_IN_PROGRESS_WITH_IDS = {
       labels: {
         nodes: [
           { id: "wf-lbl", name: "wf:dev-impl" },
-          { id: "state-lbl", name: "state:in-progress" },
+          { id: "state-lbl", name: "state:implementation" },
         ],
       },
     },
   },
 };
 
-const TEAM_LABELS_WITH_AR = {
+const TEAM_LABELS_WITH_CR = {
   data: {
     team: {
       labels: {
         nodes: [
-          { id: "ar-lbl", name: "state:awaiting-review" },
-          { id: "ip-lbl", name: "state:in-progress" },
+          { id: "cr-lbl", name: "state:code-review" },
+          { id: "impl-lbl", name: "state:implementation" },
         ],
       },
     },
@@ -620,13 +622,13 @@ describe("proxy enforcement — B2 state-label transition application", () => {
       }
       if (q.includes("IssueWithLabels")) {
         return new Response(
-          JSON.stringify(opts.b2IssueResponse ?? DEV_IMPL_IN_PROGRESS_WITH_IDS),
+          JSON.stringify(opts.b2IssueResponse ?? DEV_IMPL_IMPLEMENTATION_WITH_IDS),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
       if (q.includes("TeamLabels")) {
         return new Response(
-          JSON.stringify(opts.b2TeamLabels ?? TEAM_LABELS_WITH_AR),
+          JSON.stringify(opts.b2TeamLabels ?? TEAM_LABELS_WITH_CR),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -648,7 +650,7 @@ describe("proxy enforcement — B2 state-label transition application", () => {
 
   it("applies state transition after a legal command is forwarded", async () => {
     const { fetch: mock, calls } = makeB2Fetch({
-      b1LabelResponse: DEV_IMPL_IN_PROGRESS_RESPONSE,
+      b1LabelResponse: DEV_IMPL_IMPLEMENTATION_RESPONSE,
     });
     globalThis.fetch = mock;
 
@@ -668,13 +670,13 @@ describe("proxy enforcement — B2 state-label transition application", () => {
     expect(b2call).toBeDefined();
     const vars = b2call!.variables as { issueId: string; labelIds: string[] };
     expect(vars.issueId).toBe("internal-uuid");
-    expect(vars.labelIds).toContain("ar-lbl");
+    expect(vars.labelIds).toContain("cr-lbl");
     expect(vars.labelIds).not.toContain("state-lbl");
   });
 
   it("does NOT apply transition on a blocked command", async () => {
     const { fetch: mock, calls } = makeB2Fetch({
-      b1LabelResponse: DEV_IMPL_IN_PROGRESS_RESPONSE,
+      b1LabelResponse: DEV_IMPL_IMPLEMENTATION_RESPONSE,
     });
     globalThis.fetch = mock;
 
@@ -682,7 +684,7 @@ describe("proxy enforcement — B2 state-label transition application", () => {
       .post("/proxy/graphql")
       .set("Authorization", "Bearer test-token")
       .set("X-Openclaw-Agent", "charles")
-      .set("X-Openclaw-Linear-Intent", "approve") // illegal in in-progress
+      .set("X-Openclaw-Linear-Intent", "approve") // illegal in implementation
       .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
 
     expect(res.status).toBe(200);
@@ -692,7 +694,7 @@ describe("proxy enforcement — B2 state-label transition application", () => {
 
   it("does NOT apply transition when no intent header (pure pass-through)", async () => {
     const { fetch: mock, calls } = makeB2Fetch({
-      b1LabelResponse: DEV_IMPL_IN_PROGRESS_RESPONSE,
+      b1LabelResponse: DEV_IMPL_IMPLEMENTATION_RESPONSE,
     });
     globalThis.fetch = mock;
 
@@ -710,7 +712,7 @@ describe("proxy enforcement — B2 state-label transition application", () => {
 
   it("returns the upstream response even when the B2 transition fails", async () => {
     const { fetch: mock, calls } = makeB2Fetch({
-      b1LabelResponse: DEV_IMPL_IN_PROGRESS_RESPONSE,
+      b1LabelResponse: DEV_IMPL_IMPLEMENTATION_RESPONSE,
       updateSuccess: false,
     });
     globalThis.fetch = mock;

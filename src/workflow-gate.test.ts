@@ -2,6 +2,13 @@
  * Unit tests for workflow-gate enforcement (AI-1352 Phase 3 / B1)
  * and state-label transition application (AI-1353 Phase 3 / B2).
  *
+ * Retargeted to the 5-state dev-impl shape (AI-1356, 2026-06-06):
+ *   intake → implementation → code-review → deployment → done (+escape).
+ *   capability repo:merge → deploy:execute; role/container merge-gate →
+ *   deployment; command merge → deploy. A state is a work-phase; a
+ *   transition is a decision (the old approved/merged/changes-requested
+ *   "resting places" collapsed into transitions).
+ *
  * Uses minimal in-memory YAML files injected via WORKFLOW_DEF_PATH and
  * CAPABILITY_POLICY_PATH so tests never depend on vault / project paths.
  *
@@ -13,7 +20,6 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   checkWorkflowRules,
   applyStateTransition,
@@ -21,38 +27,39 @@ import {
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CANONICAL_FIXTURE = path.resolve(__dirname, "__fixtures__/canonical-dev-impl.yaml");
+// Resolved from the project root (jest cwd) so it works under both the
+// ESM tsc build and the CommonJS ts-jest transpile.
+const CANONICAL_FIXTURE = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
 
 // ── Minimal test capability policy ────────────────────────────────────────
-// Includes repo:merge so we can test the merge capability gate.
+// Includes deploy:execute so we can test the deployment capability gate.
 
 const TEST_POLICY_YAML = `
 capabilities:
   - id: linear:transition
   - id: human:escalate
-  - id: repo:merge
+  - id: deploy:execute
 
 containers:
   - id: dev
     grants: [linear:transition]
-  - id: merge-gate
-    grants: [linear:transition, repo:merge]
+  - id: deployment
+    grants: [linear:transition, deploy:execute]
   - id: steward
     grants: [linear:transition, human:escalate]
 
 roles:
   - id: dev
     requires: [linear:transition]
-  - id: merge-gate
-    requires: [repo:merge]
+  - id: deployment
+    requires: [deploy:execute]
   - id: steward
     requires: [human:escalate]
 
 bodies:
   - id: hanzo
-    container: merge-gate
-    fills_roles: [merge-gate]
+    container: deployment
+    fills_roles: [deployment]
   - id: charles
     container: dev
     fills_roles: [dev]
@@ -78,54 +85,35 @@ states:
     kind: normal
     transitions:
       - command: accept
-        to: ready-for-impl
+        to: implementation
       - command: demote
         to: __ad_hoc__
 
-  - id: ready-for-impl
-    owner_role: dev
-    kind: normal
-    transitions:
-      - command: begin
-        to: in-progress
-
-  - id: in-progress
+  - id: implementation
     owner_role: dev
     kind: normal
     transitions:
       - command: submit
-        to: awaiting-review
+        to: code-review
 
-  - id: awaiting-review
+  - id: code-review
     owner_role: code-review
     kind: normal
     transitions:
       - command: approve
-        to: approved
+        to: deployment
       - command: request-changes
-        to: changes-requested
+        to: implementation
 
-  - id: changes-requested
-    owner_role: dev
+  - id: deployment
+    owner_role: deployment
     kind: normal
     transitions:
-      - command: resubmit
-        to: awaiting-review
-
-  - id: approved
-    owner_role: merge-gate
-    kind: normal
-    transitions:
-      - command: merge
-        to: merged
-        requires_capability: repo:merge
-
-  - id: merged
-    owner_role: steward
-    kind: normal
-    transitions:
-      - command: close
+      - command: deploy
         to: done
+        requires_capability: deploy:execute
+      - command: reject
+        to: implementation
 
   - id: done
     kind: terminal
@@ -175,7 +163,7 @@ describe("checkWorkflowRules — mode switch", () => {
   afterEach(() => { globalThis.fetch = originalFetch; });
 
   it("returns null when issueId is null (fail open)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:in-progress"]);
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
     expect(await checkWorkflowRules("submit", null, "Bearer tok", "charles")).toBeNull();
   });
 
@@ -185,7 +173,7 @@ describe("checkWorkflowRules — mode switch", () => {
   });
 
   it("returns null for unknown workflow id (wf:other-workflow) — fail open", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:other-workflow", "state:in-progress"]);
+    globalThis.fetch = makeLabelFetch(["wf:other-workflow", "state:implementation"]);
     expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles")).toBeNull();
   });
 
@@ -208,8 +196,7 @@ describe("checkWorkflowRules — break-glass escape", () => {
   afterEach(() => { globalThis.fetch = originalFetch; });
 
   const allStates = [
-    "intake", "ready-for-impl", "in-progress", "awaiting-review",
-    "changes-requested", "approved", "merged", "done",
+    "intake", "implementation", "code-review", "deployment", "done",
   ];
 
   for (const state of allStates) {
@@ -247,159 +234,121 @@ describe("checkWorkflowRules — intake state", () => {
     expect(result).toContain("accept");
   });
 
-  it("blocks 'merge' in intake", async () => {
+  it("blocks 'deploy' in intake", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
-    const result = await checkWorkflowRules("merge", "issue-uuid", "Bearer tok", "hanzo");
+    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
     expect(result).not.toBeNull();
-    expect(result).toContain("merge");
+    expect(result).toContain("deploy");
     expect(result).toContain("intake");
   });
 });
 
-describe("checkWorkflowRules — ready-for-impl state", () => {
+describe("checkWorkflowRules — implementation state", () => {
   let originalFetch: typeof globalThis.fetch;
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("allows 'begin' in ready-for-impl", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:ready-for-impl"]);
-    expect(await checkWorkflowRules("begin", "issue-uuid", "Bearer tok", "charles")).toBeNull();
-  });
-
-  it("blocks 'merge' in ready-for-impl", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:ready-for-impl"]);
-    const result = await checkWorkflowRules("merge", "issue-uuid", "Bearer tok", "hanzo");
-    expect(result).not.toBeNull();
-    expect(result).toContain("ready-for-impl");
-  });
-});
-
-describe("checkWorkflowRules — in-progress state", () => {
-  let originalFetch: typeof globalThis.fetch;
-  beforeEach(() => { originalFetch = globalThis.fetch; });
-  afterEach(() => { globalThis.fetch = originalFetch; });
-
-  it("allows 'submit' in in-progress", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:in-progress"]);
+  it("allows 'submit' in implementation", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
     expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles")).toBeNull();
   });
 
-  it("blocks 'merge' in in-progress", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:in-progress"]);
-    const result = await checkWorkflowRules("merge", "issue-uuid", "Bearer tok", "hanzo");
+  it("blocks 'deploy' in implementation", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
     expect(result).not.toBeNull();
+    expect(result).toContain("implementation");
   });
 
-  it("blocks 'approve' in in-progress (not at review)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:in-progress"]);
+  it("blocks 'approve' in implementation (not at review)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
     const result = await checkWorkflowRules("approve", "issue-uuid", "Bearer tok", "charles");
     expect(result).not.toBeNull();
     expect(result).toContain("approve");
-    expect(result).toContain("in-progress");
+    expect(result).toContain("implementation");
     expect(result).toContain("submit");
   });
 });
 
-describe("checkWorkflowRules — awaiting-review state", () => {
+describe("checkWorkflowRules — code-review state", () => {
   let originalFetch: typeof globalThis.fetch;
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("allows 'approve' in awaiting-review", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:awaiting-review"]);
+  it("allows 'approve' in code-review", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
     expect(await checkWorkflowRules("approve", "issue-uuid", "Bearer tok", "charles")).toBeNull();
   });
 
-  it("allows 'request-changes' in awaiting-review", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:awaiting-review"]);
+  it("allows 'request-changes' in code-review", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
     expect(await checkWorkflowRules("request-changes", "issue-uuid", "Bearer tok", "charles")).toBeNull();
   });
 
-  it("blocks 'merge' in awaiting-review", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:awaiting-review"]);
-    const result = await checkWorkflowRules("merge", "issue-uuid", "Bearer tok", "hanzo");
+  it("blocks 'deploy' in code-review", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
+    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
     expect(result).not.toBeNull();
-    expect(result).toContain("awaiting-review");
-  });
-});
-
-describe("checkWorkflowRules — changes-requested state", () => {
-  let originalFetch: typeof globalThis.fetch;
-  beforeEach(() => { originalFetch = globalThis.fetch; });
-  afterEach(() => { globalThis.fetch = originalFetch; });
-
-  it("allows 'resubmit' in changes-requested", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:changes-requested"]);
-    expect(await checkWorkflowRules("resubmit", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+    expect(result).toContain("code-review");
   });
 
-  it("blocks 'submit' in changes-requested (wrong command — resubmit is correct)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:changes-requested"]);
+  it("blocks 'submit' in code-review (wrong phase — already submitted)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
     const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles");
     expect(result).not.toBeNull();
-    expect(result).toContain("changes-requested");
-    expect(result).toContain("resubmit");
+    expect(result).toContain("code-review");
+    expect(result).toContain("approve");
+    expect(result).toContain("request-changes");
   });
 });
 
-// ── Merge capability gate (Hanzo-only) ────────────────────────────────────
+// ── Deploy capability gate (Hanzo-only) ────────────────────────────────────
 
-describe("checkWorkflowRules — merge capability gate (approved state)", () => {
+describe("checkWorkflowRules — deploy capability gate (deployment state)", () => {
   let originalFetch: typeof globalThis.fetch;
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("allows 'merge' from Hanzo (merge-gate body) in approved state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:approved"]);
-    expect(await checkWorkflowRules("merge", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  it("allows 'deploy' from Hanzo (deployment body) in deployment state", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+    expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 
-  it("blocks 'merge' from Charles (dev body, no repo:merge) in approved state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:approved"]);
-    const result = await checkWorkflowRules("merge", "issue-uuid", "Bearer tok", "charles");
+  it("blocks 'deploy' from Charles (dev body, no deploy:execute) in deployment state", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "charles");
     expect(result).not.toBeNull();
     expect(result).toContain("[Proxy]");
-    expect(result).toContain("repo:merge");
-    expect(result).toContain("merge-gate");
+    expect(result).toContain("deploy:execute");
+    expect(result).toContain("deployment");
   });
 
-  it("blocks 'merge' from Astrid (steward body, no repo:merge) in approved state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:approved"]);
-    const result = await checkWorkflowRules("merge", "issue-uuid", "Bearer tok", "astrid");
+  it("blocks 'deploy' from Astrid (steward body, no deploy:execute) in deployment state", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "astrid");
     expect(result).not.toBeNull();
-    expect(result).toContain("repo:merge");
+    expect(result).toContain("deploy:execute");
   });
 
-  it("blocks illegal command 'submit' in approved state even for Hanzo", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:approved"]);
+  it("blocks illegal command 'submit' in deployment state even for Hanzo", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
     const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "hanzo");
     expect(result).not.toBeNull();
-    expect(result).toContain("approved");
-    expect(result).toContain("merge");
+    expect(result).toContain("deployment");
+    expect(result).toContain("deploy");
   });
 });
 
-// ── Merged / done states ───────────────────────────────────────────────────
+// ── done state (terminal) ───────────────────────────────────────────────────
 
-describe("checkWorkflowRules — merged / done states", () => {
+describe("checkWorkflowRules — done state (terminal)", () => {
   let originalFetch: typeof globalThis.fetch;
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
-
-  it("allows 'close' in merged state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merged"]);
-    expect(await checkWorkflowRules("close", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
-  });
-
-  it("blocks 'merge' in merged state (already merged)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merged"]);
-    const result = await checkWorkflowRules("merge", "issue-uuid", "Bearer tok", "hanzo");
-    expect(result).not.toBeNull();
-  });
 
   it("blocks any non-escape command in done state (terminal)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:done"]);
-    const result = await checkWorkflowRules("close", "issue-uuid", "Bearer tok", "astrid");
+    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
     expect(result).not.toBeNull();
     expect(result).toContain("done");
   });
@@ -418,7 +367,7 @@ describe("checkWorkflowRules — error message format", () => {
   afterEach(() => { globalThis.fetch = originalFetch; });
 
   it("names the legal moves in the rejection for an illegal command", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:in-progress"]);
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
     const result = await checkWorkflowRules("approve", "issue-uuid", "Bearer tok", "charles");
     expect(result).toContain("submit");
     expect(result).toContain("escape");
@@ -457,15 +406,14 @@ describe("checkWorkflowRules — canonical vault schema (src/__fixtures__/canoni
   afterEach(() => { globalThis.fetch = originalFetch; });
 
   it("parses the canonical YAML without error (passes for a legal command)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:in-progress"]);
-    // 'submit' is legal in in-progress; null means pass-through
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    // 'submit' is legal in implementation; null means pass-through
     expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles")).toBeNull();
   });
 
   it("canonical: escape is legal from every state (§4.4)", async () => {
     const allStates = [
-      "intake", "ready-for-impl", "in-progress", "awaiting-review",
-      "changes-requested", "approved", "merged", "done", "escape",
+      "intake", "implementation", "code-review", "deployment", "done", "escape",
     ];
     for (const state of allStates) {
       resetWorkflowCache();
@@ -475,35 +423,34 @@ describe("checkWorkflowRules — canonical vault schema (src/__fixtures__/canoni
     }
   });
 
-  it("canonical: approved state allows merge and reject (not just merge)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:approved"]);
-    // 'reject' exists in canonical but was missing from the simplified fixture
+  it("canonical: deployment state allows deploy and reject (not just deploy)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+    // 'reject' requires no capability — should pass through
     const result = await checkWorkflowRules("reject", "issue-uuid", "Bearer tok", "astrid");
-    // 'reject' is legal (no capability required) — should pass through
     expect(result).toBeNull();
   });
 
-  it("canonical: approved state blocks 'submit' (illegal), names merge and reject as legal", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:approved"]);
+  it("canonical: deployment state blocks 'submit' (illegal), names deploy and reject as legal", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
     const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles");
     expect(result).not.toBeNull();
     expect(result).toContain("[Proxy]");
-    expect(result).toContain("merge");
+    expect(result).toContain("deploy");
     expect(result).toContain("reject");
     expect(result).toContain("escape");
   });
 
-  it("canonical: merge in approved state is blocked for non-merge-gate (charles)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:approved"]);
-    const result = await checkWorkflowRules("merge", "issue-uuid", "Bearer tok", "charles");
+  it("canonical: deploy in deployment state is blocked for non-deployment body (charles)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "charles");
     expect(result).not.toBeNull();
-    expect(result).toContain("repo:merge");
-    expect(result).toContain("merge-gate");
+    expect(result).toContain("deploy:execute");
+    expect(result).toContain("deployment");
   });
 
-  it("canonical: merge in approved state is allowed for Hanzo (merge-gate body)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:approved"]);
-    expect(await checkWorkflowRules("merge", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  it("canonical: deploy in deployment state is allowed for Hanzo (deployment body)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+    expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 });
 
@@ -625,37 +572,33 @@ describe("applyStateTransition — no-ops (fail-open / mode switch)", () => {
   });
 
   it("is a no-op when already in target state (idempotent re-apply)", async () => {
-    // In-progress + submit → awaiting-review, but if already awaiting-review, no-op.
+    // implementation + submit → code-review, but if already code-review, no-op.
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:awaiting-review" },
+        { id: "state-lbl", name: "state:code-review" },
       ],
     });
     globalThis.fetch = mock;
-    // 'submit' transitions in-progress → awaiting-review, but ticket is already awaiting-review.
-    // The transition lookup finds 'submit' only in in-progress, not awaiting-review.
-    // So this actually logs a warn (no transition for submit in awaiting-review) and returns.
+    // 'submit' transitions implementation → code-review, but ticket is already code-review.
+    // The transition lookup finds 'submit' only in implementation, not code-review.
+    // So this logs a warn (no transition for submit in code-review) and returns.
     await applyStateTransition("submit", "issue-uuid", "Bearer tok");
     expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
   });
 
-  it("idempotent: no issueUpdate when current state already equals target", async () => {
-    // Ticket is already in in-progress. If 'begin' command fires (ready-for-impl → in-progress),
-    // but current state is already in-progress, the transition lookup from ready-for-impl's
-    // begin edge would map to in-progress. Since current == target, no-op.
+  it("idempotent: no issueUpdate when current state already past the command's source", async () => {
+    // 'accept' lives in intake (intake → implementation). If the ticket is already
+    // in implementation, a re-delivered 'accept' finds no 'accept' transition in
+    // implementation → skips. No issueUpdate.
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        // 'begin' lives in ready-for-impl, but we're simulating a ticket that's already in-progress
-        { id: "state-lbl", name: "state:in-progress" },
+        { id: "state-lbl", name: "state:implementation" },
       ],
     });
     globalThis.fetch = mock;
-    // Simulating a re-delivery: 'begin' already advanced the ticket, so current == in-progress.
-    // apply() re-fetches and sees in-progress; looks up 'begin' transition from in-progress
-    // → not found (in-progress only has 'submit') → skips. No issueUpdate.
-    await applyStateTransition("begin", "issue-uuid", "Bearer tok");
+    await applyStateTransition("accept", "issue-uuid", "Bearer tok");
     expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
   });
 });
@@ -665,15 +608,15 @@ describe("applyStateTransition — normal state advance", () => {
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("advances state:in-progress → state:awaiting-review on 'submit'", async () => {
+  it("advances state:implementation → state:code-review on 'submit'", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:in-progress" },
+        { id: "state-lbl", name: "state:implementation" },
         { id: "other-lbl", name: "priority:high" },
       ],
       teamLabels: [
-        { id: "existing-ar-lbl", name: "state:awaiting-review" },
+        { id: "existing-cr-lbl", name: "state:code-review" },
       ],
     });
     globalThis.fetch = mock;
@@ -683,10 +626,10 @@ describe("applyStateTransition — normal state advance", () => {
     expect(updateCall).toBeDefined();
     const vars = updateCall!.body.variables as { issueId: string; labelIds: string[] };
     expect(vars.issueId).toBe("internal-uuid");
-    // Should have: wf-lbl, other-lbl (kept), existing-ar-lbl (new state) — NOT state-lbl
+    // Should have: wf-lbl, other-lbl (kept), existing-cr-lbl (new state) — NOT state-lbl
     expect(vars.labelIds).toContain("wf-lbl");
     expect(vars.labelIds).toContain("other-lbl");
-    expect(vars.labelIds).toContain("existing-ar-lbl");
+    expect(vars.labelIds).toContain("existing-cr-lbl");
     expect(vars.labelIds).not.toContain("state-lbl");
   });
 
@@ -694,9 +637,9 @@ describe("applyStateTransition — normal state advance", () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:in-progress" },
+        { id: "state-lbl", name: "state:implementation" },
       ],
-      teamLabels: [], // no state:awaiting-review label yet
+      teamLabels: [], // no state:code-review label yet
     });
     globalThis.fetch = mock;
     await applyStateTransition("submit", "issue-uuid", "Bearer tok");
@@ -713,24 +656,24 @@ describe("applyStateTransition — normal state advance", () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:ready-for-impl" },
+        { id: "state-lbl", name: "state:intake" },
       ],
-      teamLabels: [{ id: "ip-lbl", name: "state:in-progress" }],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
     });
     globalThis.fetch = mock;
-    await applyStateTransition("begin", "issue-uuid", "Bearer tok");
+    await applyStateTransition("accept", "issue-uuid", "Bearer tok");
 
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
     expect(updateCall).toBeDefined();
     const vars = updateCall!.body.variables as { labelIds: string[] };
     const stateLabelCount = vars.labelIds.filter((id) =>
-      [{ id: "state-lbl", name: "state:ready-for-impl" }, { id: "ip-lbl", name: "state:in-progress" }]
+      [{ id: "state-lbl", name: "state:intake" }, { id: "impl-lbl", name: "state:implementation" }]
         .map((n) => n.id)
         .includes(id),
     ).length;
     // Exactly one state label: the new one only.
     expect(stateLabelCount).toBe(1);
-    expect(vars.labelIds).toContain("ip-lbl");
+    expect(vars.labelIds).toContain("impl-lbl");
     expect(vars.labelIds).not.toContain("state-lbl");
   });
 
@@ -738,9 +681,9 @@ describe("applyStateTransition — normal state advance", () => {
     const { fetch: mock } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:in-progress" },
+        { id: "state-lbl", name: "state:implementation" },
       ],
-      teamLabels: [{ id: "ar-lbl", name: "state:awaiting-review" }],
+      teamLabels: [{ id: "cr-lbl", name: "state:code-review" }],
       issueUpdateSuccess: false,
     });
     globalThis.fetch = mock;
@@ -751,9 +694,9 @@ describe("applyStateTransition — normal state advance", () => {
     const { fetch: mock } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:in-progress" },
+        { id: "state-lbl", name: "state:implementation" },
       ],
-      teamLabels: [{ id: "ar-lbl", name: "state:awaiting-review" }],
+      teamLabels: [{ id: "cr-lbl", name: "state:code-review" }],
       updateError: true,
     });
     globalThis.fetch = mock;
@@ -770,7 +713,7 @@ describe("applyStateTransition — break-glass escape", () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:in-progress" },
+        { id: "state-lbl", name: "state:implementation" },
       ],
       teamLabels: [{ id: "escape-lbl", name: "state:escape" }],
     });

@@ -20,7 +20,7 @@
  *      Linear query — the proxy NEVER trusts agent-supplied state (§11).
  *   2. Rejects any command not in the legal set for that state, naming the legal moves.
  *   3. Break-glass (escape) is always legal from every state (§4.4).
- *   4. Merge requires repo:merge capability; only the merge-gate body (Hanzo) holds it.
+ *   4. Deploy requires deploy:execute capability; only the deployment body (Hanzo) holds it.
  *   5. On a forwarded legal command, swaps state:old → state:new in one mutation.
  *
  * Ad-hoc tickets (no wf:* label) are full pass-through — §4.6 mode switch.
@@ -344,13 +344,13 @@ export async function checkWorkflowRules(
     );
   }
 
-  // Capability gate — e.g. repo:merge is Hanzo-only (§16.2).
+  // Capability gate — e.g. deploy:execute is Hanzo-only (§16.2).
   if (match.requires_capability) {
     const allowed = await bodyHasCapability(bodyId, match.requires_capability);
     if (!allowed) {
       return (
         `[Proxy] '${intent}' requires the '${match.requires_capability}' capability; ` +
-        `handoff to the merge-gate body to proceed.`
+        `handoff to the deployment body to proceed.`
       );
     }
   }

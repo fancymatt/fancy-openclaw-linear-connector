@@ -20,7 +20,7 @@ import { resetWorkflowCache } from "../workflow-gate.js";
 
 const TEST_WORKFLOW_YAML = `
 id: dev-impl
-version: 1
+version: 3
 archetype: single-task
 entry_state: intake
 
@@ -34,62 +34,42 @@ states:
     kind: normal
     transitions:
       - command: accept
-        to: ready-for-impl
+        to: implementation
       - command: demote
         to: __ad_hoc__
 
-  - id: ready-for-impl
-    owner_role: dev
-    kind: normal
-    transitions:
-      - command: begin
-        to: in-progress
-
-  - id: in-progress
+  - id: implementation
     owner_role: dev
     kind: normal
     transitions:
       - command: submit
-        to: awaiting-review
+        to: code-review
 
-  - id: awaiting-review
+  - id: code-review
     owner_role: code-review
     kind: normal
+    sla: 24h
     transitions:
       - command: approve
-        to: approved
+        to: deployment
       - command: request-changes
-        to: changes-requested
+        to: implementation
         feedback:
           required: true
-          category_enum: [missing-tests, style, correctness]
+          category_enum: [missing-tests, style, scope-creep, correctness, ac-mismatch]
 
-  - id: changes-requested
-    owner_role: dev
+  - id: deployment
+    owner_role: deployment
     kind: normal
     transitions:
-      - command: resubmit
-        to: awaiting-review
-
-  - id: approved
-    owner_role: merge-gate
-    kind: normal
-    transitions:
-      - command: merge
-        to: merged
-        requires_capability: repo:merge
-      - command: reject
-        to: changes-requested
-        feedback:
-          required: true
-          category_enum: [missing-tests, correctness]
-
-  - id: merged
-    owner_role: steward
-    kind: normal
-    transitions:
-      - command: close
+      - command: deploy
         to: done
+        requires_capability: deploy:execute
+      - command: reject
+        to: implementation
+        feedback:
+          required: true
+          category_enum: [missing-tests, style, scope-creep, correctness, ac-mismatch]
 
   - id: done
     kind: terminal
@@ -176,43 +156,28 @@ describe("B3 — outbound per-step instruction injection", () => {
       {
         state: "intake",
         expectedCommands: ["linear accept AI-001", "linear demote AI-001"],
-        notExpected: ["linear begin AI-001", "linear submit AI-001"],
+        notExpected: ["linear submit AI-001", "linear approve AI-001"],
       },
       {
-        state: "ready-for-impl",
-        expectedCommands: ["linear begin AI-001"],
-        notExpected: ["linear accept AI-001", "linear submit AI-001"],
-      },
-      {
-        state: "in-progress",
+        state: "implementation",
         expectedCommands: ["linear submit AI-001"],
-        notExpected: ["linear begin AI-001", "linear approve AI-001"],
+        notExpected: ["linear accept AI-001", "linear approve AI-001"],
       },
       {
-        state: "awaiting-review",
+        state: "code-review",
         expectedCommands: [
           "linear approve AI-001",
           "linear request-changes AI-001 --category <",
         ],
-        notExpected: ["linear submit AI-001", "linear resubmit AI-001"],
+        notExpected: ["linear submit AI-001", "linear deploy AI-001"],
       },
       {
-        state: "changes-requested",
-        expectedCommands: ["linear resubmit AI-001"],
-        notExpected: ["linear approve AI-001", "linear submit AI-001"],
-      },
-      {
-        state: "approved",
+        state: "deployment",
         expectedCommands: [
-          "linear merge AI-001",
+          "linear deploy AI-001",
           "linear reject AI-001 --category <",
         ],
         notExpected: ["linear approve AI-001", "linear submit AI-001"],
-      },
-      {
-        state: "merged",
-        expectedCommands: ["linear close AI-001"],
-        notExpected: ["linear merge AI-001", "linear approve AI-001"],
       },
     ];
 
@@ -294,7 +259,7 @@ describe("B3 — outbound per-step instruction injection", () => {
 
   describe("mention routing — mention message regardless of workflow", () => {
     it("mention event → mention message, no workflow injection", async () => {
-      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:in-progress"]);
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
 
       const buildDeliveryMessage = await getbuildDeliveryMessage();
       const msg = await buildDeliveryMessage(
@@ -344,7 +309,7 @@ describe("B3 — outbound per-step instruction injection", () => {
 
   describe("coalescence note appended on both paths", () => {
     it("workflow ticket with coalescedCount → workflow message + coalescing note", async () => {
-      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:in-progress"]);
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
 
       const buildDeliveryMessage = await getbuildDeliveryMessage();
       const route = { ...makeRoute("AI-008", "Coalesced"), coalescedCount: 3 };
