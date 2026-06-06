@@ -1,14 +1,13 @@
 /**
- * GraphQL pass-through proxy — Phase 0B, design.md §4.6.
+ * GraphQL proxy — Phase 0B (transparent pass-through) + Phase 2 slice 1
+ * (inbound command enforcement), design.md §4.6, §11, §13.
  *
- * Sits between the Linear CLI and api.linear.app. v0 is transparent:
- * every request is forwarded unchanged so the proxy can be validated as
- * load-bearing before any enforcement logic is added.
- *
- * Future phases add outbound instruction injection (§4.6 outbound) and
- * inbound command validation (§4.6 inbound) scoped to workflow tickets.
+ * Slice 1 adds the first enforced inbound rule: on workflow tickets (wf:*)
+ * the `needs-human` command is steward-only. All other commands remain
+ * transparent pass-through.
  */
 import { componentLogger, createLogger } from "./logger.js";
+import { checkEnforcementRules } from "./escalation-gate.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 function parseBody(req) {
@@ -26,19 +25,26 @@ function parseBody(req) {
     return null;
 }
 /**
- * Best-effort extraction of ticket identifier(s) from a GraphQL request.
- * Looks for common variable names that carry Linear issue identifiers.
+ * Best-effort extraction of ticket identifier from GraphQL variables.
+ * Returns the first non-empty string found in common ID variable names, or null.
  */
-function extractTicketContext(body) {
+function extractIssueId(body) {
     if (!body?.variables)
-        return "";
+        return null;
     const vars = body.variables;
     for (const key of ["id", "issueId", "identifier"]) {
         const v = vars[key];
         if (typeof v === "string" && v.length > 0)
-            return ` ticket=${v}`;
+            return v;
     }
-    return "";
+    return null;
+}
+/**
+ * Build the ticket context string for log lines (empty string when no ID found).
+ */
+function extractTicketContext(body) {
+    const id = extractIssueId(body);
+    return id ? ` ticket=${id}` : "";
 }
 export async function handleProxyRequest(req, res) {
     const authorization = req.headers["authorization"];
@@ -47,10 +53,21 @@ export async function handleProxyRequest(req, res) {
         return;
     }
     const agentId = req.headers["x-openclaw-agent"] ?? "unknown";
+    const intent = req.headers["x-openclaw-linear-intent"] ?? null;
     const body = parseBody(req);
     const opName = body?.operationName ?? "(unnamed)";
-    const ticketCtx = extractTicketContext(body);
-    log.info(`forward agent=${agentId} op=${opName}${ticketCtx}`);
+    const issueId = extractIssueId(body);
+    const ticketCtx = issueId ? ` ticket=${issueId}` : "";
+    log.info(`forward agent=${agentId} op=${opName}${ticketCtx}${intent ? ` intent=${intent}` : ""}`);
+    // Phase 2 / slice 1: evaluate enforcement rules before forwarding.
+    if (intent) {
+        const rejection = await checkEnforcementRules(intent, issueId, authorization, agentId);
+        if (rejection) {
+            log.warn(`enforcement-block agent=${agentId} intent=${intent}${ticketCtx}: ${rejection}`);
+            res.status(200).json({ errors: [{ message: rejection }] });
+            return;
+        }
+    }
     let upstreamRes;
     try {
         upstreamRes = await fetch(LINEAR_API_URL, {
