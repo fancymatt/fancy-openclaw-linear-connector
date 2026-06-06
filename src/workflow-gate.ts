@@ -35,12 +35,12 @@ const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 /**
  * Path to the dev-impl workflow definition YAML. Override via env for tests.
- * Defaults to config/workflows/dev-impl.yaml relative to the process cwd
- * (which is the project root when running normally or under jest).
+ * Canonical source lives in the vault; this default is absolute so the path is
+ * stable regardless of process cwd.
  */
 export const WORKFLOW_DEF_PATH =
   process.env.WORKFLOW_DEF_PATH ??
-  path.join(process.cwd(), "config/workflows/dev-impl.yaml");
+  "/home/fancymatt/obsidian-vault/ai-systems/projects/fleet-orchestration-redesign/workflows/dev-impl.yaml";
 
 // ── YAML schema types ──────────────────────────────────────────────────────
 
