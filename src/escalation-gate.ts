@@ -38,6 +38,8 @@ export const POLICY_PATH =
 
 interface PolicyBody {
   id: string;
+  /** Optional OpenClaw runtime agent alias. Resolves `x-openclaw-agent` headers that differ from `id` (e.g. main → ai). */
+  openclaw_agent?: string;
   container: string;
   fills_roles: string[];
 }
@@ -103,7 +105,7 @@ export function resetPolicyCache(): void {
  */
 async function resolveBodyCapabilities(bodyId: string): Promise<Set<string>> {
   const policy = await loadPolicy();
-  const body = policy.bodies.find((b) => b.id === bodyId);
+  const body = policy.bodies.find((b) => b.id === bodyId || b.openclaw_agent === bodyId);
   if (!body) {
     log.warn(`escalation-gate: unknown body '${bodyId}' — treating as no capabilities`);
     return new Set();

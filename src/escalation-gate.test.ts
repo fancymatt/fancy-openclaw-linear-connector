@@ -42,6 +42,7 @@ bodies:
     container: dev
     fills_roles: []
   - id: ai
+    openclaw_agent: main
     container: main-agent
     fills_roles: []
 `;
@@ -90,6 +91,12 @@ describe("bodyHasCapability", () => {
 
   it("returns false for unknown body", async () => {
     expect(await bodyHasCapability("unknown-body", "human:escalate")).toBe(false);
+  });
+
+  // AI-1348: runtime sends OPENCLAW_MCP_AGENT_ID=main but policy body id is ai
+  it("resolves main (openclaw_agent alias) to ai body capabilities", async () => {
+    expect(await bodyHasCapability("main", "linear:transition")).toBe(true);
+    expect(await bodyHasCapability("main", "human:escalate")).toBe(false);
   });
 });
 
