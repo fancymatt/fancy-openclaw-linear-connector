@@ -1,16 +1,22 @@
 /**
  * GraphQL proxy — Phase 0B (transparent pass-through) + Phase 2 slice 1
- * (inbound command enforcement) + Phase 3 B1 (workflow-def-driven validation),
- * design.md §4.6, §11, §13, §16.
+ * (inbound command enforcement) + Phase 3 B1 (workflow-def-driven validation)
+ * + Phase 3 B2 (atomic state-label transition application),
+ * design.md §4.2, §4.6, §11, §13, §16.
  *
  * Enforcement order (defense in depth):
  *   1. Phase 2 escalation-gate — capability rule table (needs-human steward-only).
- *   2. Phase 3 workflow-gate  — full legal-move validation against dev-impl.yaml.
+ *   2. Phase 3 B1 workflow-gate — full legal-move validation against dev-impl.yaml.
  * Both must pass for the request to be forwarded.
+ *
+ * After a successful forward, Phase 3 B2 applies the state:* label transition
+ * atomically (single issueUpdate mutation). Seam: proxy-side, not CLI-side — the
+ * state change is coupled to the validated forward so an agent cannot skip it.
+ * Transition failures are fail-open: logged but never propagate to the response.
  */
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
-import { checkWorkflowRules } from "./workflow-gate.js";
+import { checkWorkflowRules, applyStateTransition } from "./workflow-gate.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 function parseBody(req) {
@@ -98,6 +104,18 @@ export async function handleProxyRequest(req, res) {
     }
     const responseText = await upstreamRes.text();
     log.info(`response agent=${agentId} op=${opName} status=${upstreamRes.status}`);
+    // Phase 3 B2: apply state:* label transition after a successful forward.
+    // Only runs when the command was validated (intent present, no P2/P3 block).
+    // Fail-open: errors are logged and never propagate to the agent's response.
+    if (intent && upstreamRes.ok) {
+        try {
+            await applyStateTransition(intent, issueId, authorization);
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.warn(`state-transition failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+        }
+    }
     res
         .status(upstreamRes.status)
         .set("Content-Type", "application/json")

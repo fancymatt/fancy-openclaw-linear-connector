@@ -1,6 +1,7 @@
 import { spawn } from "child_process";
 import { createLogger, componentLogger } from "../logger.js";
 import { buildDeliveryMessage } from "./build-message.js";
+import { getAccessToken } from "../agents.js";
 const log = componentLogger(createLogger(), "delivery");
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_RETRY_DELAY_MS = 5000;
@@ -16,7 +17,14 @@ const DEFAULT_MAX_RETRIES = 1;
  * Errors are logged, never thrown.
  */
 export async function deliverToAgent(route, config) {
-    return await deliverMessageToAgent(route.agentId, route.sessionKey, buildDeliveryMessage(route), config);
+    const rawToken = getAccessToken(route.agentId) ??
+        process.env.LINEAR_OAUTH_TOKEN ??
+        process.env.LINEAR_API_KEY;
+    const authToken = rawToken
+        ? /^Bearer\s+/i.test(rawToken) ? rawToken : `Bearer ${rawToken}`
+        : undefined;
+    const message = await buildDeliveryMessage(route, authToken);
+    return await deliverMessageToAgent(route.agentId, route.sessionKey, message, config);
 }
 /** Deliver an explicit operator-authored message to an existing OpenClaw session. */
 export async function deliverMessageToAgent(agentName, sessionId, message, config) {
