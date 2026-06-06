@@ -27,12 +27,16 @@ const LINEAR_API_URL = "https://api.linear.app/graphql";
 /**
  * Canonical vault path for the capability policy. Override via env for tests.
  */
-export const POLICY_PATH =
-  process.env.CAPABILITY_POLICY_PATH ??
+const DEFAULT_POLICY_PATH =
   path.join(
     process.env.HOME ?? "/home/fancymatt",
     "obsidian-vault/ai-systems/projects/fleet-orchestration-redesign/config/capability-policy.yaml"
   );
+
+/** Resolve the policy path dynamically (reads env each call so test beforeAll works). */
+function policyPath(): string {
+  return process.env.CAPABILITY_POLICY_PATH ?? DEFAULT_POLICY_PATH;
+}
 
 // ── YAML schema types ──────────────────────────────────────────────────────
 
@@ -87,7 +91,7 @@ let _policyCache: CapabilityPolicy | null = null;
 
 async function loadPolicy(): Promise<CapabilityPolicy> {
   if (_policyCache) return _policyCache;
-  const raw = await fs.readFile(POLICY_PATH, "utf8");
+  const raw = await fs.readFile(policyPath(), "utf8");
   _policyCache = yaml.load(raw) as CapabilityPolicy;
   return _policyCache;
 }

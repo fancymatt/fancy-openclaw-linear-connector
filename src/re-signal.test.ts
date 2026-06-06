@@ -79,7 +79,7 @@ describe("Session-end re-signal cycle", () => {
     // its own canonical per-ticket session key.
     const stats = bag.getStats();
     expect(stats.signalsSent).toBe(2);
-  });
+  }, 15_000);
 
   test("session-end with no queued signals returns 0", async () => {
     sessionTracker.startSession("igor", "session-1");

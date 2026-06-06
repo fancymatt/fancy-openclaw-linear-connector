@@ -1,0 +1,141 @@
+/**
+ * Phase 2 / slice 1 — escalation gate enforcement (AI-1346).
+ *
+ * Enforces inbound Linear CLI rules in the connector proxy. Slice 1 rule:
+ * on workflow tickets (carrying a wf:* label), `needs-human` is steward-only.
+ * Ad-hoc tickets (no wf:* label) are full pass-through — §4.6 mode switch.
+ *
+ * The rule table is data-driven so Phase 3 (full per-step command validation)
+ * can add rules as config rather than surgery.
+ *
+ * Authority model:
+ *   body → container (capability-policy.yaml) → grants capabilities[]
+ *   The proxy NEVER trusts agent-supplied state; it fetches labels independently.
+ *
+ * Design: design.md §4.6, §11, §13.
+ */
+import fs from "node:fs/promises";
+import path from "node:path";
+import yaml from "js-yaml";
+import { componentLogger, createLogger } from "./logger.js";
+const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "escalation-gate");
+const LINEAR_API_URL = "https://api.linear.app/graphql";
+/**
+ * Canonical vault path for the capability policy. Override via env for tests.
+ */
+const DEFAULT_POLICY_PATH = path.join(process.env.HOME ?? "/home/fancymatt", "obsidian-vault/ai-systems/projects/fleet-orchestration-redesign/config/capability-policy.yaml");
+/** Resolve the policy path dynamically (reads env each call so test beforeAll works). */
+function policyPath() {
+    return process.env.CAPABILITY_POLICY_PATH ?? DEFAULT_POLICY_PATH;
+}
+/**
+ * Phase 2 enforcement rules (slice 1: one rule).
+ * Phase 3 will extend this table — adding a rule is config, not code surgery.
+ */
+export const ENFORCEMENT_RULES = [
+    {
+        intent: "needs-human",
+        requiredCapability: "human:escalate",
+        legalMove: "escalate → steward (Astrid)",
+    },
+];
+// ── Policy cache ───────────────────────────────────────────────────────────
+let _policyCache = null;
+async function loadPolicy() {
+    if (_policyCache)
+        return _policyCache;
+    const raw = await fs.readFile(policyPath(), "utf8");
+    _policyCache = yaml.load(raw);
+    return _policyCache;
+}
+/** Invalidate the in-process policy cache (used in tests). */
+export function resetPolicyCache() {
+    _policyCache = null;
+}
+// ── Body → capability resolution ───────────────────────────────────────────
+/**
+ * Returns the set of capabilities granted to a body via its container.
+ * Unknown body IDs return an empty set (fail-closed).
+ */
+async function resolveBodyCapabilities(bodyId) {
+    const policy = await loadPolicy();
+    const body = policy.bodies.find((b) => b.id === bodyId || b.openclaw_agent === bodyId);
+    if (!body) {
+        log.warn(`escalation-gate: unknown body '${bodyId}' — treating as no capabilities`);
+        return new Set();
+    }
+    const container = policy.containers.find((c) => c.id === body.container);
+    if (!container) {
+        log.warn(`escalation-gate: unknown container '${body.container}' for body '${bodyId}'`);
+        return new Set();
+    }
+    return new Set(container.grants);
+}
+/**
+ * Returns true when the body holds the given capability via its container.
+ * Exported for unit tests.
+ */
+export async function bodyHasCapability(bodyId, capability) {
+    const caps = await resolveBodyCapabilities(bodyId);
+    return caps.has(capability);
+}
+// ── Workflow ticket detection ──────────────────────────────────────────────
+/**
+ * Fetch label names for a Linear issue using the caller's auth token.
+ * The proxy does NOT trust agent-supplied state (design.md §11 Phase 2):
+ * it independently queries Linear to determine ticket context.
+ * Returns an empty array on any error (network failure, unknown issue) —
+ * enforcement fails open rather than blocking legitimate traffic.
+ */
+async function fetchTicketLabels(issueId, authToken) {
+    const query = `query IssueLabels($id: String!) { issue(id: $id) { labels { nodes { name } } } }`;
+    try {
+        const res = await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: authToken,
+            },
+            body: JSON.stringify({ query, variables: { id: issueId } }),
+        });
+        const data = (await res.json());
+        return (data.data?.issue?.labels?.nodes ?? []).map((n) => n.name);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`escalation-gate: label fetch failed for issue ${issueId}: ${msg} — failing open`);
+        return [];
+    }
+}
+/** True when any label matches the wf:* pattern (§4.6 mode switch). */
+function isWorkflowTicket(labels) {
+    return labels.some((l) => /^wf:/i.test(l));
+}
+// ── Public enforcement API ─────────────────────────────────────────────────
+/**
+ * Evaluate enforcement rules for an inbound proxied request.
+ *
+ * Returns a rejection message string when the request should be blocked,
+ * or `null` if it should be forwarded unchanged.
+ *
+ * Fails open on ambiguity (no issue context, label fetch failure, unknown body):
+ * enforcement only blocks when it has affirmative evidence of a violation.
+ */
+export async function checkEnforcementRules(intent, issueId, authToken, bodyId) {
+    const rule = ENFORCEMENT_RULES.find((r) => r.intent === intent);
+    if (!rule)
+        return null;
+    // Without a ticket ID we can't determine workflow context — fail open.
+    if (!issueId)
+        return null;
+    const labels = await fetchTicketLabels(issueId, authToken);
+    // §4.6 mode switch: ad-hoc tickets (no wf:* label) are full pass-through.
+    if (!isWorkflowTicket(labels))
+        return null;
+    const allowed = await bodyHasCapability(bodyId, rule.requiredCapability);
+    if (allowed)
+        return null;
+    return (`[Proxy] '${intent}' on a workflow ticket requires the '${rule.requiredCapability}' capability. ` +
+        `Legal move: ${rule.legalMove}.`);
+}
+//# sourceMappingURL=escalation-gate.js.map

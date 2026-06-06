@@ -48,9 +48,13 @@ const LINEAR_API_URL = "https://api.linear.app/graphql";
  * Canonical source lives in the vault; this default is absolute so the path is
  * stable regardless of process cwd.
  */
-export const WORKFLOW_DEF_PATH =
-  process.env.WORKFLOW_DEF_PATH ??
+const DEFAULT_WORKFLOW_DEF_PATH =
   "/home/fancymatt/obsidian-vault/ai-systems/projects/fleet-orchestration-redesign/workflows/dev-impl.yaml";
+
+/** Resolve the workflow def path dynamically (reads env each call so test beforeAll works). */
+function workflowDefPath(): string {
+  return process.env.WORKFLOW_DEF_PATH ?? DEFAULT_WORKFLOW_DEF_PATH;
+}
 
 // ── YAML schema types ──────────────────────────────────────────────────────
 
@@ -84,10 +88,10 @@ let _workflowCache: WorkflowDef | null = null;
 
 export async function loadWorkflowDef(): Promise<WorkflowDef> {
   if (_workflowCache) return _workflowCache;
-  const raw = await fs.readFile(WORKFLOW_DEF_PATH, "utf8");
+  const raw = await fs.readFile(workflowDefPath(), "utf8");
   const def = yaml.load(raw) as WorkflowDef;
   if (def.break_glass && !def.break_glass.command) {
-    log.warn(`workflow-gate: break_glass block in ${WORKFLOW_DEF_PATH} has no 'command' field — falling back to hardcoded "escape". Canonicalize the YAML to add command: escape.`);
+    log.warn(`workflow-gate: break_glass block in ${workflowDefPath()} has no 'command' field — falling back to hardcoded "escape". Canonicalize the YAML to add command: escape.`);
   }
   _workflowCache = def;
   return _workflowCache;
