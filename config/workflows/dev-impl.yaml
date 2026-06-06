@@ -1,0 +1,78 @@
+# dev-impl workflow definition — Phase 3 / B1 (AI-1352)
+# Archetype A (single-task). See design.md §13, §16.1.
+#
+# Commands listed per state match the x-openclaw-linear-intent header values
+# the Linear CLI sends. The break_glass command (escape) is implicitly legal
+# from every state (§4.4) and must never be blocked.
+#
+# requires_capability on a transition is enforced via the capability-policy.yaml
+# container grants — only a body whose container grants the capability may run
+# that command (§16.2). The exclusive merge-gate capability (repo:merge) means
+# only Hanzo can fire the merge transition.
+
+id: dev-impl
+version: 1
+archetype: single-task
+entry_state: intake
+
+break_glass:
+  command: escape
+
+states:
+  - id: intake
+    owner_role: steward
+    kind: normal
+    transitions:
+      - command: accept
+        to: ready-for-impl
+      - command: demote
+        to: __ad_hoc__
+
+  - id: ready-for-impl
+    owner_role: dev
+    kind: normal
+    transitions:
+      - command: begin
+        to: in-progress
+
+  - id: in-progress
+    owner_role: dev
+    kind: normal
+    transitions:
+      - command: submit
+        to: awaiting-review
+
+  - id: awaiting-review
+    owner_role: code-review
+    kind: normal
+    transitions:
+      - command: approve
+        to: approved
+      - command: request-changes
+        to: changes-requested
+
+  - id: changes-requested
+    owner_role: dev
+    kind: normal
+    transitions:
+      - command: resubmit
+        to: awaiting-review
+
+  - id: approved
+    owner_role: merge-gate
+    kind: normal
+    transitions:
+      - command: merge
+        to: merged
+        requires_capability: repo:merge
+
+  - id: merged
+    owner_role: steward
+    kind: normal
+    transitions:
+      - command: close
+        to: done
+
+  - id: done
+    kind: terminal
+    transitions: []

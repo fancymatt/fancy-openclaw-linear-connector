@@ -1,13 +1,16 @@
 /**
  * GraphQL proxy — Phase 0B (transparent pass-through) + Phase 2 slice 1
- * (inbound command enforcement), design.md §4.6, §11, §13.
+ * (inbound command enforcement) + Phase 3 B1 (workflow-def-driven validation),
+ * design.md §4.6, §11, §13, §16.
  *
- * Slice 1 adds the first enforced inbound rule: on workflow tickets (wf:*)
- * the `needs-human` command is steward-only. All other commands remain
- * transparent pass-through.
+ * Enforcement order (defense in depth):
+ *   1. Phase 2 escalation-gate — capability rule table (needs-human steward-only).
+ *   2. Phase 3 workflow-gate  — full legal-move validation against dev-impl.yaml.
+ * Both must pass for the request to be forwarded.
  */
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
+import { checkWorkflowRules } from "./workflow-gate.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 function parseBody(req) {
@@ -59,12 +62,18 @@ export async function handleProxyRequest(req, res) {
     const issueId = extractIssueId(body);
     const ticketCtx = issueId ? ` ticket=${issueId}` : "";
     log.info(`forward agent=${agentId} op=${opName}${ticketCtx}${intent ? ` intent=${intent}` : ""}`);
-    // Phase 2 / slice 1: evaluate enforcement rules before forwarding.
+    // Phase 2 / slice 1 + Phase 3 B1: evaluate enforcement rules before forwarding.
     if (intent) {
-        const rejection = await checkEnforcementRules(intent, issueId, authorization, agentId);
-        if (rejection) {
-            log.warn(`enforcement-block agent=${agentId} intent=${intent}${ticketCtx}: ${rejection}`);
-            res.status(200).json({ errors: [{ message: rejection }] });
+        const p2rejection = await checkEnforcementRules(intent, issueId, authorization, agentId);
+        if (p2rejection) {
+            log.warn(`enforcement-block agent=${agentId} intent=${intent}${ticketCtx}: ${p2rejection}`);
+            res.status(200).json({ errors: [{ message: p2rejection }] });
+            return;
+        }
+        const p3rejection = await checkWorkflowRules(intent, issueId, authorization, agentId);
+        if (p3rejection) {
+            log.warn(`workflow-block agent=${agentId} intent=${intent}${ticketCtx}: ${p3rejection}`);
+            res.status(200).json({ errors: [{ message: p3rejection }] });
             return;
         }
     }
