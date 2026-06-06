@@ -63,7 +63,7 @@ describe("per-ticket session isolation (AI-779)", () => {
       bag,
       sessionTracker,
       wakeConfig,
-      { markActive: true, sendWakeUp: mockSendWakeUp },
+      { markActive: true, sendWakeUp: mockSendWakeUp, isTicketActionable: () => true },
     );
 
     expect(sentCount).toHaveLength(1);
@@ -110,7 +110,7 @@ describe("per-ticket session isolation (AI-779)", () => {
       bag,
       sessionTracker,
       wakeConfig,
-      { markActive: true, sendWakeUp: mockSendWakeUp },
+      { markActive: true, sendWakeUp: mockSendWakeUp, isTicketActionable: () => true },
     );
 
     // All three tickets are now tracked as active sessions

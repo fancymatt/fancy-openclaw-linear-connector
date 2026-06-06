@@ -107,11 +107,14 @@ export async function resignalPendingTickets(
         ? { ...wakeConfig, signalTemplate: MENTION_TICKET_TEMPLATE }
         : wakeConfig;
 
-      const wakeResult = await sendWakeUp(agentId, [ticketId], ticketWakeConfig);
+      // Record intent before delivery — prevents double-dispatch even on failure;
+      // stale session detection handles cleanup if delivery never completes.
       bag.recordSignal();
       if (options.markActive) {
         sessionTracker.startSession(agentId, ticketId);
       }
+
+      const wakeResult = await sendWakeUp(agentId, [ticketId], ticketWakeConfig);
       options.onDispatched?.(agentId, ticketId);
       results.push({ ticketId, dispatched: true, runId: (wakeResult as { runId?: string } | void | undefined)?.runId });
     } catch (err) {

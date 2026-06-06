@@ -34,13 +34,20 @@ const validIssueBody = JSON.stringify({
 describe("POST /", () => {
   let app: ReturnType<typeof createApp>["app"];
 
+  let savedWebhookSecrets: string | undefined;
+
   beforeEach(() => {
+    savedWebhookSecrets = process.env.LINEAR_WEBHOOK_SECRETS;
+    delete process.env.LINEAR_WEBHOOK_SECRETS;
     process.env.LINEAR_WEBHOOK_SECRET = SECRET;
     ({ app } = createApp());
   });
 
   afterEach(() => {
     delete process.env.LINEAR_WEBHOOK_SECRET;
+    if (savedWebhookSecrets !== undefined) {
+      process.env.LINEAR_WEBHOOK_SECRETS = savedWebhookSecrets;
+    }
   });
 
   it("returns 200 for a valid signed request", async () => {
@@ -96,8 +103,9 @@ describe("POST /", () => {
     expect(res.status).toBe(400);
   });
 
-  it("skips signature validation when LINEAR_WEBHOOK_SECRET is not set", async () => {
+  it("skips signature validation when no webhook secrets are configured", async () => {
     delete process.env.LINEAR_WEBHOOK_SECRET;
+    delete process.env.LINEAR_WEBHOOK_SECRETS;
     const res = await request(app)
       .post("/")
       .set("Content-Type", "application/json")
