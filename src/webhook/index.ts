@@ -285,6 +285,13 @@ export function createWebhookRouter(
       if (bag && sessionTracker) {
         const normalizedTicketId = normalizeSessionKey(ticketId);
         bag.add(agentName, normalizedTicketId, event.type, route.routingReason);
+        // Purge stale bag entries for this ticket from all other agents. When a
+        // delegate changes, the previous holder's bag entry must be removed so it
+        // doesn't receive a spurious consider-work wake for a ticket it no longer owns.
+        const purgedStale = bag.removeTicketForOtherAgents(agentName, normalizedTicketId);
+        if (purgedStale > 0) {
+          log.info(`Bag: purged stale entries for ${normalizedTicketId} from ${purgedStale} other agent(s)`);
+        }
         appendOperationalEvent(operationalEventStore, { outcome: "bag-added", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "pending-bag" });
 
         const wakeConfig: WakeUpConfig = {
