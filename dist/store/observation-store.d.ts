@@ -55,6 +55,32 @@ export interface ObservationQuery {
     until?: string;
     limit?: number;
 }
+/** A single metric row in the rollup. */
+export interface MetricRow {
+    workflow: string;
+    step: string;
+    reasonCode: string;
+    count: number;
+    fromBody?: string;
+    exceedsThreshold: boolean;
+}
+/** Summary statistics for the metric rollup. */
+export interface MetricSummary {
+    totalObservations: number;
+    uniqueWorkflows: number;
+    uniqueSteps: number;
+    stepsAboveThreshold: Array<{
+        workflow: string;
+        step: string;
+        total: number;
+    }>;
+}
+/** The full metric rollup response. */
+export interface MetricRollup {
+    items: MetricRow[];
+    summary: MetricSummary;
+    query: Record<string, unknown>;
+}
 export declare class ObservationStore {
     private db;
     constructor(dbPath?: string);
@@ -90,6 +116,39 @@ export declare class ObservationStore {
         reasonCode: string;
         count: number;
     }>;
+    /**
+     * Count observations grouped by (workflow, step, reason_code, from_body).
+     * The P4-2 "macro" layer — where a step everyone fails becomes visible.
+     * Optionally includes a body dimension for per-implementer breakdowns.
+     */
+    countsByBody(query?: {
+        workflow?: string;
+        step?: string;
+        reasonCode?: ReasonCode;
+        since?: string;
+        until?: string;
+    }): Array<{
+        workflow: string;
+        step: string;
+        reasonCode: string;
+        fromBody: string;
+        count: number;
+    }>;
+    /**
+     * Compute metrics: the ranked reason-code counts per step.
+     * This is the "missing-tests ×14 this month" view.
+     * Returns results sorted by count descending, grouped by (workflow, step, reason_code).
+     * If includeBody is true, also breaks down by from_body.
+     * Returns empty cleanly when no observations exist.
+     */
+    metrics(query?: {
+        workflow?: string;
+        step?: string;
+        since?: string;
+        until?: string;
+        includeBody?: boolean;
+        threshold?: number;
+    }): MetricRollup;
     close(): void;
 }
 //# sourceMappingURL=observation-store.d.ts.map

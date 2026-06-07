@@ -460,6 +460,23 @@ export function createAdminRouter(deps) {
                 until: typeof req.query.until === "string" ? req.query.until : undefined,
             }) });
     });
+    // Phase 4 / P4-2: Metric aggregation endpoint.
+    router.get("/api/observations/metrics", (req, res) => {
+        if (!deps.observationStore) {
+            res.json({ items: [], summary: { totalObservations: 0, uniqueWorkflows: 0, uniqueSteps: 0, stepsAboveThreshold: [] }, query: {} });
+            return;
+        }
+        const thresholdParam = typeof req.query.threshold === "string" ? Number.parseInt(req.query.threshold, 10) : undefined;
+        const threshold = Number.isFinite(thresholdParam ?? NaN) && (thresholdParam ?? 0) > 0 ? thresholdParam : undefined;
+        res.json(deps.observationStore.metrics({
+            workflow: typeof req.query.workflow === "string" ? req.query.workflow : undefined,
+            step: typeof req.query.step === "string" ? req.query.step : undefined,
+            since: typeof req.query.since === "string" ? req.query.since : undefined,
+            until: typeof req.query.until === "string" ? req.query.until : undefined,
+            includeBody: req.query.includeBody === "true",
+            threshold,
+        }));
+    });
     router.get(["/", "/agents", "/tasks", "/settings"], (req, res) => {
         const segment = req.path.split("/").filter(Boolean)[0];
         const initialPage = ["agents", "tasks", "settings"].includes(segment) ? segment : "overview";
