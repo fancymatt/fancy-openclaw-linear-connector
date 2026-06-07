@@ -131,6 +131,17 @@ export async function bodyHasCapability(bodyId: string, capability: string): Pro
   return caps.has(capability);
 }
 
+/**
+ * Returns body IDs that fill the given role (§16.2).
+ * Used by the workflow gate to derive legal assignment targets.
+ */
+export async function resolveBodiesForRole(roleId: string): Promise<string[]> {
+  const policy = await loadPolicy();
+  return policy.bodies
+    .filter((b) => b.fills_roles.includes(roleId))
+    .map((b) => b.id);
+}
+
 // ── Workflow ticket detection ──────────────────────────────────────────────
 
 /**

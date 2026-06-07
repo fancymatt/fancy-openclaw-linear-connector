@@ -39,6 +39,11 @@ export declare function resetPolicyCache(): void;
  */
 export declare function bodyHasCapability(bodyId: string, capability: string): Promise<boolean>;
 /**
+ * Returns body IDs that fill the given role (§16.2).
+ * Used by the workflow gate to derive legal assignment targets.
+ */
+export declare function resolveBodiesForRole(roleId: string): Promise<string[]>;
+/**
  * Evaluate enforcement rules for an inbound proxied request.
  *
  * Returns a rejection message string when the request should be blocked,
