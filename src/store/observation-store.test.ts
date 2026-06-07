@@ -205,6 +205,164 @@ describe("ObservationStore", () => {
   });
 });
 
+describe("ObservationStore — countsByBody", () => {
+  let dbPath: string;
+  let store: ObservationStore;
+
+  beforeEach(() => {
+    dbPath = tmpDbPath();
+    store = new ObservationStore(dbPath);
+  });
+
+  afterEach(() => {
+    store.close();
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+  });
+
+  it("groups counts by (workflow, step, reason_code, from_body)", () => {
+    store.append({ ticket: "AI-1", workflow: "dev-impl", step: "code-review", fromBody: "igor", reviewerBody: "charles", reasonCode: "missing-tests" });
+    store.append({ ticket: "AI-2", workflow: "dev-impl", step: "code-review", fromBody: "igor", reviewerBody: "charles", reasonCode: "missing-tests" });
+    store.append({ ticket: "AI-3", workflow: "dev-impl", step: "code-review", fromBody: "felix", reviewerBody: "charles", reasonCode: "missing-tests" });
+    store.append({ ticket: "AI-4", workflow: "dev-impl", step: "deployment", fromBody: "igor", reviewerBody: "hanzo", reasonCode: "correctness" });
+
+    const counts = store.countsByBody({ workflow: "dev-impl" });
+    expect(counts).toHaveLength(3);
+
+    const igorMT = counts.find((c) => c.fromBody === "igor" && c.step === "code-review");
+    expect(igorMT?.count).toBe(2);
+
+    const felixMT = counts.find((c) => c.fromBody === "felix" && c.step === "code-review");
+    expect(felixMT?.count).toBe(1);
+
+    const igorCorrect = counts.find((c) => c.fromBody === "igor" && c.step === "deployment");
+    expect(igorCorrect?.count).toBe(1);
+  });
+
+  it("returns empty array for no observations", () => {
+    const counts = store.countsByBody();
+    expect(counts).toEqual([]);
+  });
+
+  it("filters by reasonCode", () => {
+    store.append({ ticket: "AI-1", workflow: "dev-impl", step: "code-review", fromBody: "igor", reviewerBody: "charles", reasonCode: "missing-tests" });
+    store.append({ ticket: "AI-2", workflow: "dev-impl", step: "code-review", fromBody: "igor", reviewerBody: "charles", reasonCode: "style" });
+
+    const counts = store.countsByBody({ reasonCode: "style" });
+    expect(counts).toHaveLength(1);
+    expect(counts[0].reasonCode).toBe("style");
+  });
+});
+
+describe("ObservationStore — metrics", () => {
+  let dbPath: string;
+  let store: ObservationStore;
+
+  beforeEach(() => {
+    dbPath = tmpDbPath();
+    store = new ObservationStore(dbPath);
+  });
+
+  afterEach(() => {
+    store.close();
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+  });
+
+  it("returns metric rollup with correct counts per (workflow, step, reason_code)", () => {
+    store.append({ ticket: "AI-1", workflow: "dev-impl", step: "code-review", fromBody: "igor", reviewerBody: "charles", reasonCode: "missing-tests" });
+    store.append({ ticket: "AI-2", workflow: "dev-impl", step: "code-review", fromBody: "felix", reviewerBody: "charles", reasonCode: "missing-tests" });
+    store.append({ ticket: "AI-3", workflow: "dev-impl", step: "code-review", fromBody: "igor", reviewerBody: "charles", reasonCode: "style" });
+    store.append({ ticket: "AI-4", workflow: "dev-impl", step: "deployment", fromBody: "sage", reviewerBody: "hanzo", reasonCode: "correctness" });
+
+    const rollup = store.metrics({ workflow: "dev-impl" });
+    expect(rollup.items).toHaveLength(3); // 3 distinct (step, reason_code) combos
+
+    const mt = rollup.items.find((i) => i.reasonCode === "missing-tests" && i.step === "code-review");
+    expect(mt?.count).toBe(2);
+    expect(mt?.exceedsThreshold).toBe(false); // no threshold set
+  });
+
+  it("includes body breakdown when includeBody is true", () => {
+    store.append({ ticket: "AI-1", workflow: "dev-impl", step: "code-review", fromBody: "igor", reviewerBody: "charles", reasonCode: "missing-tests" });
+    store.append({ ticket: "AI-2", workflow: "dev-impl", step: "code-review", fromBody: "felix", reviewerBody: "charles", reasonCode: "missing-tests" });
+
+    const rollup = store.metrics({ workflow: "dev-impl", includeBody: true });
+    expect(rollup.items).toHaveLength(2);
+    expect(rollup.items[0].fromBody).toBeDefined();
+    expect(rollup.items[1].fromBody).toBeDefined();
+  });
+
+  it("identifies reason codes crossing a threshold", () => {
+    for (let i = 0; i < 5; i++) {
+      store.append({ ticket: `AI-${i}`, workflow: "dev-impl", step: "code-review", fromBody: "igor", reviewerBody: "charles", reasonCode: "missing-tests" });
+    }
+    store.append({ ticket: "AI-10", workflow: "dev-impl", step: "code-review", fromBody: "igor", reviewerBody: "charles", reasonCode: "style" });
+
+    const rollup = store.metrics({ workflow: "dev-impl", threshold: 3 });
+
+    const mt = rollup.items.find((i) => i.reasonCode === "missing-tests");
+    expect(mt?.exceedsThreshold).toBe(true);
+
+    const style = rollup.items.find((i) => i.reasonCode === "style");
+    expect(style?.exceedsThreshold).toBe(false);
+  });
+
+  it("populates summary with correct totals", () => {
+    store.append({ ticket: "AI-1", workflow: "dev-impl", step: "code-review", fromBody: "igor", reviewerBody: "charles", reasonCode: "missing-tests" });
+    store.append({ ticket: "AI-2", workflow: "dev-impl", step: "code-review", fromBody: "felix", reviewerBody: "charles", reasonCode: "style" });
+    store.append({ ticket: "AI-3", workflow: "dev-impl", step: "deployment", fromBody: "sage", reviewerBody: "hanzo", reasonCode: "correctness" });
+
+    const rollup = store.metrics();
+    expect(rollup.summary.totalObservations).toBe(3);
+    expect(rollup.summary.uniqueWorkflows).toBe(1);
+    expect(rollup.summary.uniqueSteps).toBe(2);
+  });
+
+  it("identifies steps above threshold in summary", () => {
+    for (let i = 0; i < 5; i++) {
+      store.append({ ticket: `AI-${i}`, workflow: "dev-impl", step: "code-review", fromBody: "igor", reviewerBody: "charles", reasonCode: "missing-tests" });
+    }
+    store.append({ ticket: "AI-10", workflow: "dev-impl", step: "deployment", fromBody: "igor", reviewerBody: "hanzo", reasonCode: "correctness" });
+
+    const rollup = store.metrics({ threshold: 3 });
+    expect(rollup.summary.stepsAboveThreshold).toHaveLength(1);
+    expect(rollup.summary.stepsAboveThreshold[0]).toMatchObject({
+      workflow: "dev-impl",
+      step: "code-review",
+      total: 5,
+    });
+  });
+
+  it("returns clean empty result for no observations", () => {
+    const rollup = store.metrics();
+    expect(rollup.items).toEqual([]);
+    expect(rollup.summary.totalObservations).toBe(0);
+    expect(rollup.summary.uniqueWorkflows).toBe(0);
+    expect(rollup.summary.uniqueSteps).toBe(0);
+    expect(rollup.summary.stepsAboveThreshold).toEqual([]);
+  });
+
+  it("output is stable: same input produces same numbers", () => {
+    store.append({ ticket: "AI-1", workflow: "dev-impl", step: "code-review", fromBody: "igor", reviewerBody: "charles", reasonCode: "missing-tests" });
+    store.append({ ticket: "AI-2", workflow: "dev-impl", step: "code-review", fromBody: "igor", reviewerBody: "charles", reasonCode: "missing-tests" });
+
+    const r1 = store.metrics({ workflow: "dev-impl" });
+    const r2 = store.metrics({ workflow: "dev-impl" });
+
+    expect(r1.items).toEqual(r2.items);
+    expect(r1.summary).toEqual(r2.summary);
+  });
+
+  it("filters by time range (since, until)", () => {
+    store.append({ ticket: "AI-1", workflow: "dev-impl", step: "code-review", fromBody: "igor", reviewerBody: "charles", reasonCode: "missing-tests", timestamp: "2026-06-01T10:00:00.000Z" });
+    store.append({ ticket: "AI-2", workflow: "dev-impl", step: "code-review", fromBody: "felix", reviewerBody: "charles", reasonCode: "style", timestamp: "2026-06-03T10:00:00.000Z" });
+    store.append({ ticket: "AI-3", workflow: "dev-impl", step: "code-review", fromBody: "sage", reviewerBody: "charles", reasonCode: "correctness", timestamp: "2026-06-05T10:00:00.000Z" });
+
+    const rollup = store.metrics({ since: "2026-06-02T00:00:00.000Z", until: "2026-06-04T00:00:00.000Z" });
+    expect(rollup.items).toHaveLength(1);
+    expect(rollup.items[0].reasonCode).toBe("style");
+  });
+});
+
 describe("ObservationStore — validateReasonCode", () => {
   it("accepts all valid reason codes", () => {
     const validCodes: string[] = [...REASON_CODES];

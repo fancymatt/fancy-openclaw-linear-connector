@@ -165,6 +165,90 @@ export class ObservationStore {
             count: r.cnt,
         }));
     }
+    /**
+     * Count observations grouped by (workflow, step, reason_code, from_body).
+     * The P4-2 "macro" layer — where a step everyone fails becomes visible.
+     * Optionally includes a body dimension for per-implementer breakdowns.
+     */
+    countsByBody(query = {}) {
+        const clauses = [];
+        const params = [];
+        if (query.workflow) {
+            clauses.push("workflow = ?");
+            params.push(query.workflow);
+        }
+        if (query.step) {
+            clauses.push("step = ?");
+            params.push(query.step);
+        }
+        if (query.reasonCode) {
+            clauses.push("reason_code = ?");
+            params.push(query.reasonCode);
+        }
+        if (query.since) {
+            clauses.push("created_at >= ?");
+            params.push(query.since);
+        }
+        if (query.until) {
+            clauses.push("created_at <= ?");
+            params.push(query.until);
+        }
+        const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+        const rows = this.db
+            .prepare(`SELECT workflow, step, reason_code, from_body, COUNT(*) as cnt
+         FROM observations ${where}
+         GROUP BY workflow, step, reason_code, from_body
+         ORDER BY cnt DESC`)
+            .all(...params);
+        return rows.map((r) => ({
+            workflow: r.workflow,
+            step: r.step,
+            reasonCode: r.reason_code,
+            fromBody: r.from_body,
+            count: r.cnt,
+        }));
+    }
+    /**
+     * Compute metrics: the ranked reason-code counts per step.
+     * This is the "missing-tests ×14 this month" view.
+     * Returns results sorted by count descending, grouped by (workflow, step, reason_code).
+     * If includeBody is true, also breaks down by from_body.
+     * Returns empty cleanly when no observations exist.
+     */
+    metrics(query = {}) {
+        const threshold = query.threshold;
+        const countsData = query.includeBody
+            ? this.countsByBody(query)
+            : this.counts(query);
+        const items = countsData.map((row) => ({
+            workflow: row.workflow,
+            step: row.step,
+            reasonCode: row.reasonCode,
+            count: row.count,
+            ...("fromBody" in row ? { fromBody: row.fromBody } : {}),
+            exceedsThreshold: threshold !== undefined && row.count >= threshold,
+        }));
+        // Compute totals per workflow+step for summary
+        const stepTotals = new Map();
+        for (const item of items) {
+            const key = `${item.workflow}|${item.step}`;
+            stepTotals.set(key, (stepTotals.get(key) ?? 0) + item.count);
+        }
+        const summary = {
+            totalObservations: items.reduce((sum, i) => sum + i.count, 0),
+            uniqueWorkflows: new Set(items.map((i) => i.workflow)).size,
+            uniqueSteps: new Set(items.map((i) => i.step)).size,
+            stepsAboveThreshold: threshold
+                ? Array.from(stepTotals.entries())
+                    .filter(([, total]) => total >= threshold)
+                    .map(([key, total]) => {
+                    const [workflow, step] = key.split("|");
+                    return { workflow, step, total };
+                })
+                : [],
+        };
+        return { items, summary, query: { ...query } };
+    }
     close() {
         this.db.close();
     }

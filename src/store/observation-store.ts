@@ -74,6 +74,31 @@ export interface ObservationQuery {
   limit?: number;
 }
 
+/** A single metric row in the rollup. */
+export interface MetricRow {
+  workflow: string;
+  step: string;
+  reasonCode: string;
+  count: number;
+  fromBody?: string;
+  exceedsThreshold: boolean;
+}
+
+/** Summary statistics for the metric rollup. */
+export interface MetricSummary {
+  totalObservations: number;
+  uniqueWorkflows: number;
+  uniqueSteps: number;
+  stepsAboveThreshold: Array<{ workflow: string; step: string; total: number }>;
+}
+
+/** The full metric rollup response. */
+export interface MetricRollup {
+  items: MetricRow[];
+  summary: MetricSummary;
+  query: Record<string, unknown>;
+}
+
 export class ObservationStore {
   private db: Database.Database;
 
@@ -211,7 +236,7 @@ export class ObservationStore {
    * Count observations grouped by (workflow, step, reason_code).
    * Used by P4-2 metric aggregation.
    */
-  counts(query: { workflow?: string; step?: string; since?: string; until?: string } = {}): Array<{
+  counts(query: { workflow?: string; step?: string; reasonCode?: ReasonCode; since?: string; until?: string } = {}): Array<{
     workflow: string;
     step: string;
     reasonCode: string;
@@ -227,6 +252,10 @@ export class ObservationStore {
     if (query.step) {
       clauses.push("step = ?");
       params.push(query.step);
+    }
+    if (query.reasonCode) {
+      clauses.push("reason_code = ?");
+      params.push(query.reasonCode);
     }
     if (query.since) {
       clauses.push("created_at >= ?");
@@ -259,6 +288,129 @@ export class ObservationStore {
       reasonCode: r.reason_code,
       count: r.cnt,
     }));
+  }
+
+  /**
+   * Count observations grouped by (workflow, step, reason_code, from_body).
+   * The P4-2 "macro" layer — where a step everyone fails becomes visible.
+   * Optionally includes a body dimension for per-implementer breakdowns.
+   */
+  countsByBody(query: {
+    workflow?: string;
+    step?: string;
+    reasonCode?: ReasonCode;
+    since?: string;
+    until?: string;
+  } = {}): Array<{
+    workflow: string;
+    step: string;
+    reasonCode: string;
+    fromBody: string;
+    count: number;
+  }> {
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+
+    if (query.workflow) {
+      clauses.push("workflow = ?");
+      params.push(query.workflow);
+    }
+    if (query.step) {
+      clauses.push("step = ?");
+      params.push(query.step);
+    }
+    if (query.reasonCode) {
+      clauses.push("reason_code = ?");
+      params.push(query.reasonCode);
+    }
+    if (query.since) {
+      clauses.push("created_at >= ?");
+      params.push(query.since);
+    }
+    if (query.until) {
+      clauses.push("created_at <= ?");
+      params.push(query.until);
+    }
+
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+
+    const rows = this.db
+      .prepare(
+        `SELECT workflow, step, reason_code, from_body, COUNT(*) as cnt
+         FROM observations ${where}
+         GROUP BY workflow, step, reason_code, from_body
+         ORDER BY cnt DESC`,
+      )
+      .all(...params) as Array<{
+      workflow: string;
+      step: string;
+      reason_code: string;
+      from_body: string;
+      cnt: number;
+    }>;
+
+    return rows.map((r) => ({
+      workflow: r.workflow,
+      step: r.step,
+      reasonCode: r.reason_code,
+      fromBody: r.from_body,
+      count: r.cnt,
+    }));
+  }
+
+  /**
+   * Compute metrics: the ranked reason-code counts per step.
+   * This is the "missing-tests ×14 this month" view.
+   * Returns results sorted by count descending, grouped by (workflow, step, reason_code).
+   * If includeBody is true, also breaks down by from_body.
+   * Returns empty cleanly when no observations exist.
+   */
+  metrics(query: {
+    workflow?: string;
+    step?: string;
+    reasonCode?: ReasonCode;
+    since?: string;
+    until?: string;
+    includeBody?: boolean;
+    threshold?: number;
+  } = {}): MetricRollup {
+    const threshold = query.threshold;
+    const countsData = query.includeBody
+      ? this.countsByBody(query)
+      : this.counts(query);
+
+    const items: MetricRow[] = countsData.map((row) => ({
+      workflow: row.workflow,
+      step: row.step,
+      reasonCode: row.reasonCode,
+      count: row.count,
+      ...("fromBody" in row ? { fromBody: (row as { fromBody: string }).fromBody } : {}),
+      exceedsThreshold:
+        threshold !== undefined && row.count >= threshold,
+    }));
+
+    // Compute totals per workflow+step for summary
+    const stepTotals = new Map<string, number>();
+    for (const item of items) {
+      const key = `${item.workflow}|${item.step}`;
+      stepTotals.set(key, (stepTotals.get(key) ?? 0) + item.count);
+    }
+
+    const summary: MetricSummary = {
+      totalObservations: items.reduce((sum, i) => sum + i.count, 0),
+      uniqueWorkflows: new Set(items.map((i) => i.workflow)).size,
+      uniqueSteps: new Set(items.map((i) => i.step)).size,
+      stepsAboveThreshold: threshold
+        ? Array.from(stepTotals.entries())
+            .filter(([, total]) => total >= threshold)
+            .map(([key, total]) => {
+              const [workflow, step] = key.split("|");
+              return { workflow, step, total };
+            })
+        : [],
+    };
+
+    return { items, summary, query: { ...query } };
   }
 
   close(): void {
