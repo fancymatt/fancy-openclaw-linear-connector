@@ -236,7 +236,7 @@ export class ObservationStore {
    * Count observations grouped by (workflow, step, reason_code).
    * Used by P4-2 metric aggregation.
    */
-  counts(query: { workflow?: string; step?: string; since?: string; until?: string } = {}): Array<{
+  counts(query: { workflow?: string; step?: string; reasonCode?: ReasonCode; since?: string; until?: string } = {}): Array<{
     workflow: string;
     step: string;
     reasonCode: string;
@@ -252,6 +252,10 @@ export class ObservationStore {
     if (query.step) {
       clauses.push("step = ?");
       params.push(query.step);
+    }
+    if (query.reasonCode) {
+      clauses.push("reason_code = ?");
+      params.push(query.reasonCode);
     }
     if (query.since) {
       clauses.push("created_at >= ?");
@@ -364,6 +368,7 @@ export class ObservationStore {
   metrics(query: {
     workflow?: string;
     step?: string;
+    reasonCode?: ReasonCode;
     since?: string;
     until?: string;
     includeBody?: boolean;
