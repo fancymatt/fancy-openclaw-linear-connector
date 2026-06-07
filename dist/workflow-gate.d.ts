@@ -40,6 +40,11 @@ export interface WorkflowTransition {
         required?: boolean;
         category_enum?: string[];
     };
+    assign?: {
+        mode?: 'required' | 'auto' | 'none';
+        constraint?: string;
+        default?: string;
+    };
 }
 export interface WorkflowState {
     id: string;
@@ -63,6 +68,15 @@ export interface WorkflowDef {
 export declare function loadWorkflowDef(): Promise<WorkflowDef>;
 /** Invalidate the in-process workflow def cache (used in tests). */
 export declare function resetWorkflowCache(): void;
+/**
+ * Derive legal assignment targets for a transition based on destination state's owner_role.
+ * Returns mode=none for terminal states or roles with no bodies.
+ * mode=auto when singleton, mode=required when multiple bodies fill the role.
+ */
+export declare function resolveTransitionTargets(transition: WorkflowTransition, def: WorkflowDef): Promise<{
+    bodies: string[];
+    mode: 'auto' | 'required' | 'none';
+}>;
 export declare function getWorkflowId(labels: string[]): string | null;
 export declare function getCurrentState(labels: string[]): string | null;
 /**
@@ -78,7 +92,7 @@ export declare function fetchWorkflowLabels(issueId: string, authToken: string):
  * Fails open on missing issueId, missing state label, unknown workflow, or label-fetch
  * failure — enforcement only blocks with affirmative evidence of a violation.
  */
-export declare function checkWorkflowRules(intent: string, issueId: string | null, authToken: string, bodyId: string): Promise<string | null>;
+export declare function checkWorkflowRules(intent: string, issueId: string | null, authToken: string, bodyId: string, target?: string | null): Promise<string | null>;
 /**
  * Apply the state-label transition triggered by a legal command (AI-1353 / §4.2).
  *

@@ -18,6 +18,7 @@ import {
   fetchWorkflowLabels,
   getWorkflowId,
   getCurrentState,
+  resolveTransitionTargets,
   type WorkflowDef,
 } from "../workflow-gate.js";
 import { componentLogger, createLogger } from "../logger.js";
@@ -140,14 +141,29 @@ async function tryBuildWorkflowMessage(
   const breakGlassCommand = def.break_glass?.command ?? "escape";
   const transitions = stateNode.transitions ?? [];
 
-  const stepLines = transitions.map((t) => {
+  const stepLines = await Promise.all(transitions.map(async (t) => {
+    const { bodies, mode } = await resolveTransitionTargets(t, def);
+
     let cmd = `linear ${t.command} ${identifier}`;
-    if (t.feedback?.required && t.feedback.category_enum?.length) {
-      cmd += ` --category <${t.feedback.category_enum.join("|")}>`;
+    if (mode === 'required') {
+      cmd += ` <${bodies.join('|')}>`;
+    }
+    if (t.feedback?.required) {
+      cmd += ` --comment "<feedback>"`;
     }
     const arrow = ` (→ ${t.to})`;
-    return `- Run \`${cmd}\`${arrow}`;
-  });
+
+    let note = '';
+    if (mode === 'auto' && bodies.length === 1) {
+      note = ` [auto-assigns to ${bodies[0]}]`;
+    } else if (mode === 'required' && t.assign?.constraint === 'not-implementer') {
+      note = ` [reviewer required; must not be you]`;
+    } else if (t.assign?.default === 'prior-implementer') {
+      note = ` [defaults to prior implementer; overridable with --target]`;
+    }
+
+    return `- Run \`${cmd}\`${arrow}${note}`;
+  }));
 
   // Always-available break-glass escape (§4.4)
   stepLines.push(`- Run \`linear ${breakGlassCommand} ${identifier}\` to break glass and hand to steward (→ ${def.break_glass?.to ?? "escape"}, legal from any state)`);

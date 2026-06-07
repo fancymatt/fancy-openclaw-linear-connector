@@ -17,7 +17,7 @@
 #   authorizes (`deploy:execute`), not its definition.
 
 id: dev-impl
-version: 3
+version: 4
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
@@ -34,6 +34,7 @@ states:
     transitions:
       - command: accept
         to: implementation
+        assign: { mode: required }
       - command: demote
         to: __ad_hoc__          # ticket leaves the workflow entirely (design.md §4.5)
 

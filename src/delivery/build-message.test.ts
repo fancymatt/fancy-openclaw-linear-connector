@@ -167,7 +167,7 @@ describe("B3 — outbound per-step instruction injection", () => {
         state: "code-review",
         expectedCommands: [
           "linear approve AI-001",
-          "linear request-changes AI-001 --category <",
+          'linear request-changes AI-001 <felix|noah|sage|igor> --comment "<feedback>"',
         ],
         notExpected: ["linear submit AI-001", "linear deploy AI-001"],
       },
@@ -175,7 +175,7 @@ describe("B3 — outbound per-step instruction injection", () => {
         state: "deployment",
         expectedCommands: [
           "linear deploy AI-001",
-          "linear reject AI-001 --category <",
+          'linear reject AI-001 <felix|noah|sage|igor> --comment "<feedback>"',
         ],
         notExpected: ["linear approve AI-001", "linear submit AI-001"],
       },

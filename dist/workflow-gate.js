@@ -35,7 +35,7 @@
 import fs from "node:fs/promises";
 import yaml from "js-yaml";
 import { componentLogger, createLogger } from "./logger.js";
-import { bodyHasCapability } from "./escalation-gate.js";
+import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 /**
@@ -185,6 +185,24 @@ async function findOrCreateLabel(teamId, labelName, authToken) {
         return null;
     }
 }
+/**
+ * Derive legal assignment targets for a transition based on destination state's owner_role.
+ * Returns mode=none for terminal states or roles with no bodies.
+ * mode=auto when singleton, mode=required when multiple bodies fill the role.
+ */
+export async function resolveTransitionTargets(transition, def) {
+    const destState = def.states.find((s) => s.id === transition.to);
+    const ownerRole = destState?.owner_role;
+    if (!ownerRole || destState?.kind === 'terminal') {
+        return { bodies: [], mode: 'none' };
+    }
+    const bodies = await resolveBodiesForRole(ownerRole);
+    if (bodies.length === 0)
+        return { bodies: [], mode: 'none' };
+    if (bodies.length === 1)
+        return { bodies, mode: 'auto' };
+    return { bodies, mode: 'required' };
+}
 export function getWorkflowId(labels) {
     const label = labels.find((l) => /^wf:/i.test(l));
     return label ? label.slice(label.indexOf(":") + 1).toLowerCase() : null;
@@ -223,7 +241,7 @@ export async function fetchWorkflowLabels(issueId, authToken) {
  * Fails open on missing issueId, missing state label, unknown workflow, or label-fetch
  * failure — enforcement only blocks with affirmative evidence of a violation.
  */
-export async function checkWorkflowRules(intent, issueId, authToken, bodyId) {
+export async function checkWorkflowRules(intent, issueId, authToken, bodyId, target = null) {
     // TODO(AI-1347): fail-open on missing issueId is a Layer A carry-forward.
     // Harden by deriving issueId from the request body when headers are absent.
     if (!issueId)
@@ -273,6 +291,35 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId) {
             return (`[Proxy] '${intent}' requires the '${match.requires_capability}' capability; ` +
                 `handoff to the deployment body to proceed.`);
         }
+    }
+    // Assignment target validation (§4.3, §16.1)
+    const destStateNode = def.states.find((s) => s.id === match.to);
+    const ownerRole = destStateNode?.owner_role;
+    if (ownerRole && destStateNode?.kind !== 'terminal') {
+        let legalBodies;
+        try {
+            legalBodies = await resolveBodiesForRole(ownerRole);
+        }
+        catch {
+            legalBodies = []; // fail-open
+        }
+        if (legalBodies.length > 1) {
+            if (!target) {
+                return `[Proxy] '${intent}' requires an assignment target. Legal targets for role '${ownerRole}': ${legalBodies.join(', ')}.`;
+            }
+            if (!legalBodies.includes(target)) {
+                return `[Proxy] '${target}' is not a legal assignment target for '${intent}'. Legal targets for role '${ownerRole}': ${legalBodies.join(', ')}.`;
+            }
+        }
+        else if (legalBodies.length === 1) {
+            if (target && target !== legalBodies[0]) {
+                return `[Proxy] '${intent}' auto-assigns to '${legalBodies[0]}' (singleton role); target '${target}' rejected.`;
+            }
+        }
+    }
+    // not-implementer constraint (self-review prevention §4.3)
+    if (match.assign?.constraint === 'not-implementer' && target && target === bodyId) {
+        return `[Proxy] Self-review blocked: reviewer must differ from implementer ('${bodyId}').`;
     }
     return null;
 }

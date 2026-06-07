@@ -74,6 +74,7 @@ export async function handleProxyRequest(req: Request, res: Response): Promise<v
 
   const agentId = (req.headers["x-openclaw-agent"] as string | undefined) ?? "unknown";
   const intent = (req.headers["x-openclaw-linear-intent"] as string | undefined) ?? null;
+  const target = (req.headers["x-openclaw-linear-target"] as string | undefined) ?? null;
   const body = parseBody(req);
   const opName = body?.operationName ?? "(unnamed)";
   const issueId = extractIssueId(body);
@@ -90,7 +91,7 @@ export async function handleProxyRequest(req: Request, res: Response): Promise<v
       return;
     }
 
-    const p3rejection = await checkWorkflowRules(intent, issueId, authorization, agentId);
+    const p3rejection = await checkWorkflowRules(intent, issueId, authorization, agentId, target);
     if (p3rejection) {
       log.warn(`workflow-block agent=${agentId} intent=${intent}${ticketCtx}: ${p3rejection}`);
       res.status(200).json({ errors: [{ message: p3rejection }] });
