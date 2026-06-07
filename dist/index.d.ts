@@ -11,6 +11,8 @@ export interface CreateAppOptions {
     agentQueueDbPath?: string;
     /** Override OperationalEventStore database path (for testing). */
     operationalEventsDbPath?: string;
+    /** Override ObservationStore database path (for testing). */
+    observationsDbPath?: string;
     /** Override ManagingStateStore database path (for testing). */
     managingStateDbPath?: string;
 }

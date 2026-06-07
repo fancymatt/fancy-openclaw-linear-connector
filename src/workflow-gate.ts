@@ -38,6 +38,7 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger } from "./logger.js";
 import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
+import { ObservationStore, type ReasonCode } from "./store/observation-store.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
 
@@ -441,10 +442,29 @@ export async function checkWorkflowRules(
  *   __ad_hoc__ — ticket leaves the workflow; removes state:* and wf:* labels entirely.
  *   escape     — terminal break-glass state; transitions to state:escape normally.
  */
+export interface TransitionFeedback {
+  /** The body (agent) that was the implementer / from-state owner. */
+  fromBody?: string | null;
+  /** The reason code from X-Openclaw-Feedback-Category header. */
+  reasonCode: ReasonCode;
+  /** Free-text feedback from the comment body. */
+  freeText?: string | null;
+}
+
+export interface ApplyStateTransitionOptions {
+  /** Agent/body issuing the transition (the reviewer). */
+  bodyId?: string;
+  /** Optional observation store for recording feedback observations. */
+  observationStore?: ObservationStore;
+  /** Structured feedback data for transitions with feedback.required. */
+  feedback?: TransitionFeedback;
+}
+
 export async function applyStateTransition(
   intent: string,
   issueId: string | null,
   authToken: string,
+  options?: ApplyStateTransitionOptions,
 ): Promise<void> {
   // TODO(AI-1347): no-op on missing issueId carries the same fail-open posture as B1.
   if (!issueId) return;
@@ -478,20 +498,21 @@ export async function applyStateTransition(
 
   const breakGlassCommand = def.break_glass?.command ?? "escape";
   let toStateName: string;
+  let matchedTransition: WorkflowTransition | undefined;
 
   if (intent === breakGlassCommand) {
     toStateName = def.break_glass?.to ?? "escape";
   } else {
     const stateNode = def.states.find((s) => s.id === currentStateName);
-    const transition = stateNode?.transitions?.find((t) => t.command === intent);
-    if (!transition) {
+    matchedTransition = stateNode?.transitions?.find((t) => t.command === intent);
+    if (!matchedTransition) {
       // Should not happen — B1 already validated the command — but fail-open.
       log.warn(
         `workflow-gate: B2 apply: no transition for '${intent}' in state '${currentStateName}' on ${issueId} — skipping`,
       );
       return;
     }
-    toStateName = transition.to;
+    toStateName = matchedTransition.to;
   }
 
   // ── Special target: __ad_hoc__ ─────────────────────────────────────────
@@ -546,6 +567,44 @@ export async function applyStateTransition(
     log.info(
       `workflow-gate: B2 apply: ${issueId} state:${currentStateName} → state:${toStateName}`,
     );
+  }
+
+  // ── Phase 4 / P4-1: Record feedback observation ──────────────────────
+  // After a successful state transition, if the transition has a feedback
+  // block and feedback data was provided, write one append-only observation.
+  // Fail-open: observation errors are logged and never block the transition.
+  if (matchedTransition?.feedback?.required && options?.observationStore && options?.feedback) {
+    try {
+      const validatedReason = ObservationStore.validateReasonCode(options.feedback.reasonCode);
+      if (!validatedReason) {
+        log.warn(
+          `workflow-gate: P4-1: invalid reason code '${options.feedback.reasonCode}' — observation skipped for ${issueId}`,
+        );
+      } else if (!options.feedback.fromBody) {
+        // The implementer body ID must be provided (via X-Openclaw-From-Body header from
+        // the CLI). Without it, from_body == reviewer_body, which produces useless data
+        // for P4-2/3/4 aggregation. Skip the row rather than write garbage.
+        log.warn(
+          `workflow-gate: P4-1: fromBody not provided (X-Openclaw-From-Body header absent) — observation skipped for ${issueId}`,
+        );
+      } else {
+        options.observationStore.append({
+          ticket: issueId,
+          workflow: workflowId,
+          step: currentStateName,
+          fromBody: options.feedback.fromBody,
+          reviewerBody: options.bodyId ?? "unknown",
+          reasonCode: validatedReason,
+          freeText: options.feedback.freeText ?? null,
+        });
+        log.info(
+          `workflow-gate: P4-1: observation recorded for ${issueId} reason=${validatedReason}`,
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`workflow-gate: P4-1: observation write failed for ${issueId}: ${msg}`);
+    }
   }
 }
 

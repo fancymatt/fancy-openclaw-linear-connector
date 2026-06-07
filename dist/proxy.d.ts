@@ -15,5 +15,10 @@
  * Transition failures are fail-open: logged but never propagate to the response.
  */
 import type { Request, Response } from "express";
-export declare function handleProxyRequest(req: Request, res: Response): Promise<void>;
+import type { ObservationStore } from "./store/observation-store.js";
+export interface ProxyDeps {
+    /** Optional observation store for recording feedback observations (P4-1). */
+    observationStore?: ObservationStore;
+}
+export declare function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void>;
 //# sourceMappingURL=proxy.d.ts.map

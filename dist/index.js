@@ -9,6 +9,7 @@ import { handleOAuthCallback } from "./oauth-callback.js";
 import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
+import { ObservationStore } from "./store/observation-store.js";
 import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
@@ -85,6 +86,8 @@ function parseJsonBody(req) {
 export function createApp(options) {
     const app = express();
     app.set("trust proxy", true);
+    // Create stores early — needed before route registration.
+    const observationStore = new ObservationStore(options?.observationsDbPath);
     // Raw body capture for webhook signature validation.
     app.use("/", express.raw({ type: "application/json", limit: "1mb" }), (req, _res, next) => {
         if (Buffer.isBuffer(req.body)) {
@@ -96,7 +99,7 @@ export function createApp(options) {
     // Intercepts every Linear CLI call from Nakazawa agents; forwards unchanged
     // for now. Future phases add per-step instruction injection and command
     // validation. ILL fleet runs the main branch and is unaffected.
-    app.post("/proxy/graphql", handleProxyRequest);
+    app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, { observationStore }));
     // Health check
     app.get("/health", (_req, res) => {
         const agents = getAgents();
@@ -328,7 +331,7 @@ export function createApp(options) {
         res.json({ success: true, sessionId, agent: activeAgent });
     });
     // v1 admin dashboard — read-only operational UI and safe JSON API.
-    app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, deploymentName: DEPLOYMENT_NAME }));
+    app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, deploymentName: DEPLOYMENT_NAME }));
     app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle, operationalEventStore, (agentId, ticketId) => ackTracker.recordDispatch(agentId, ticketId), (agentId, ticketId) => {
         const acknowledged = ackTracker.acknowledge(agentId, ticketId);
         if (acknowledged > 0) {

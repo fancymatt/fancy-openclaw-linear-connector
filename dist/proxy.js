@@ -55,7 +55,26 @@ function extractTicketContext(body) {
     const id = extractIssueId(body);
     return id ? ` ticket=${id}` : "";
 }
-export async function handleProxyRequest(req, res) {
+/**
+ * Best-effort extraction of comment body from GraphQL mutation variables.
+ * Returns the first non-empty string found in common comment variable names, or null.
+ */
+function extractCommentBody(body) {
+    if (!body?.variables)
+        return null;
+    const vars = body.variables;
+    // commentCreate mutation sends { input: { body: "..." } } or { body: "..." }
+    const input = vars.input;
+    if (input && typeof input === "object" && input !== null) {
+        const inputObj = input;
+        if (typeof inputObj.body === "string" && inputObj.body.length > 0)
+            return inputObj.body;
+    }
+    if (typeof vars.body === "string" && vars.body.length > 0)
+        return vars.body;
+    return null;
+}
+export async function handleProxyRequest(req, res, deps) {
     const authorization = req.headers["authorization"];
     if (!authorization) {
         res.status(401).json({ errors: [{ message: "Missing Authorization header" }] });
@@ -64,6 +83,7 @@ export async function handleProxyRequest(req, res) {
     const agentId = req.headers["x-openclaw-agent"] ?? "unknown";
     const intent = req.headers["x-openclaw-linear-intent"] ?? null;
     const target = req.headers["x-openclaw-linear-target"] ?? null;
+    const feedbackCategoryHeader = req.headers["x-openclaw-feedback-category"] ?? null;
     const body = parseBody(req);
     const opName = body?.operationName ?? "(unnamed)";
     const issueId = extractIssueId(body);
@@ -106,11 +126,26 @@ export async function handleProxyRequest(req, res) {
     const responseText = await upstreamRes.text();
     log.info(`response agent=${agentId} op=${opName} status=${upstreamRes.status}`);
     // Phase 3 B2: apply state:* label transition after a successful forward.
+    // Phase 4 / P4-1: record feedback observation for feedback transitions.
     // Only runs when the command was validated (intent present, no P2/P3 block).
     // Fail-open: errors are logged and never propagate to the agent's response.
     if (intent && upstreamRes.ok) {
         try {
-            await applyStateTransition(intent, issueId, authorization);
+            // Build feedback context for observation recording.
+            let feedback;
+            if (feedbackCategoryHeader && (intent === "request-changes" || intent === "reject")) {
+                const fromBodyHeader = req.headers["x-openclaw-from-body"] ?? null;
+                feedback = {
+                    fromBody: fromBodyHeader,
+                    reasonCode: feedbackCategoryHeader,
+                    freeText: extractCommentBody(body),
+                };
+            }
+            await applyStateTransition(intent, issueId, authorization, {
+                bodyId: agentId,
+                observationStore: deps?.observationStore,
+                feedback,
+            });
         }
         catch (err) {
             const msg = err instanceof Error ? err.message : String(err);

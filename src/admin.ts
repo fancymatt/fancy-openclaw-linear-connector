@@ -7,6 +7,7 @@ import type { SessionTracker } from "./bag/index.js";
 import type { RouteResult } from "./types.js";
 import type { LinearEvent } from "./webhook/schema.js";
 import type { OperationalEventStore, OperationalEventOutcome } from "./store/operational-event-store.js";
+import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 
 interface AdminDeps {
@@ -14,6 +15,7 @@ interface AdminDeps {
   bag: PendingWorkBag;
   sessionTracker: SessionTracker;
   operationalEventStore?: OperationalEventStore;
+  observationStore?: ObservationStore;
   deploymentName: string;
 }
 
@@ -483,6 +485,34 @@ export function createAdminRouter(deps: AdminDeps): Router {
     const daysBack = typeof _req.query.days === "string" ? Number.parseInt(_req.query.days, 10) : 7;
     const summary = aggregateDigest(undefined, daysBack);
     res.type("text/plain").send(formatDigestSummary(summary));
+  });
+  // Phase 4 / P4-1: Observation query and aggregation endpoints.
+  router.get("/api/observations", (req: Request, res: Response) => {
+    if (!deps.observationStore) {
+      res.json({ observations: [] });
+      return;
+    }
+    res.json({ observations: deps.observationStore.query({
+      workflow: typeof req.query.workflow === "string" ? req.query.workflow : undefined,
+      step: typeof req.query.step === "string" ? req.query.step : undefined,
+      reasonCode: typeof req.query.reasonCode === "string" ? req.query.reasonCode as ReasonCode : undefined,
+      ticket: typeof req.query.ticket === "string" ? req.query.ticket : undefined,
+      since: typeof req.query.since === "string" ? req.query.since : undefined,
+      until: typeof req.query.until === "string" ? req.query.until : undefined,
+      limit: typeof req.query.limit === "string" ? (() => { const n = Number.parseInt(req.query.limit, 10); return Number.isFinite(n) && n > 0 ? n : undefined; })() : undefined,
+    }) });
+  });
+  router.get("/api/observations/counts", (req: Request, res: Response) => {
+    if (!deps.observationStore) {
+      res.json({ counts: [] });
+      return;
+    }
+    res.json({ counts: deps.observationStore.counts({
+      workflow: typeof req.query.workflow === "string" ? req.query.workflow : undefined,
+      step: typeof req.query.step === "string" ? req.query.step : undefined,
+      since: typeof req.query.since === "string" ? req.query.since : undefined,
+      until: typeof req.query.until === "string" ? req.query.until : undefined,
+    }) });
   });
   router.get(["/", "/agents", "/tasks", "/settings"], (req: Request, res: Response) => {
     const segment = req.path.split("/").filter(Boolean)[0];

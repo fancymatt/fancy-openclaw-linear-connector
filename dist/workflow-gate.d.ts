@@ -32,6 +32,7 @@
  *
  * Design: design.md §4.2, §4.4, §4.6, §11, §13, §16.1, §16.2.
  */
+import { ObservationStore, type ReasonCode } from "./store/observation-store.js";
 export interface WorkflowTransition {
     command: string;
     to: string;
@@ -114,5 +115,21 @@ export declare function checkWorkflowRules(intent: string, issueId: string | nul
  *   __ad_hoc__ — ticket leaves the workflow; removes state:* and wf:* labels entirely.
  *   escape     — terminal break-glass state; transitions to state:escape normally.
  */
-export declare function applyStateTransition(intent: string, issueId: string | null, authToken: string): Promise<void>;
+export interface TransitionFeedback {
+    /** The body (agent) that was the implementer / from-state owner. */
+    fromBody?: string | null;
+    /** The reason code from X-Openclaw-Feedback-Category header. */
+    reasonCode: ReasonCode;
+    /** Free-text feedback from the comment body. */
+    freeText?: string | null;
+}
+export interface ApplyStateTransitionOptions {
+    /** Agent/body issuing the transition (the reviewer). */
+    bodyId?: string;
+    /** Optional observation store for recording feedback observations. */
+    observationStore?: ObservationStore;
+    /** Structured feedback data for transitions with feedback.required. */
+    feedback?: TransitionFeedback;
+}
+export declare function applyStateTransition(intent: string, issueId: string | null, authToken: string, options?: ApplyStateTransitionOptions): Promise<void>;
 //# sourceMappingURL=workflow-gate.d.ts.map

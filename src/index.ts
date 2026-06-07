@@ -9,6 +9,7 @@ import { handleOAuthCallback } from "./oauth-callback.js";
 import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
+import { ObservationStore } from "./store/observation-store.js";
 import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
@@ -92,6 +93,8 @@ export interface CreateAppOptions {
   agentQueueDbPath?: string;
   /** Override OperationalEventStore database path (for testing). */
   operationalEventsDbPath?: string;
+  /** Override ObservationStore database path (for testing). */
+  observationsDbPath?: string;
   /** Override ManagingStateStore database path (for testing). */
   managingStateDbPath?: string;
 }
@@ -99,6 +102,9 @@ export interface CreateAppOptions {
 export function createApp(options?: CreateAppOptions) {
   const app = express();
   app.set("trust proxy", true);
+
+  // Create stores early — needed before route registration.
+  const observationStore = new ObservationStore(options?.observationsDbPath);
 
   // Raw body capture for webhook signature validation.
   app.use(
@@ -116,7 +122,7 @@ export function createApp(options?: CreateAppOptions) {
   // Intercepts every Linear CLI call from Nakazawa agents; forwards unchanged
   // for now. Future phases add per-step instruction injection and command
   // validation. ILL fleet runs the main branch and is unaffected.
-  app.post("/proxy/graphql", handleProxyRequest);
+  app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, { observationStore }));
 
   // Health check
   app.get("/health", (_req: Request, res: Response) => {
@@ -382,7 +388,7 @@ export function createApp(options?: CreateAppOptions) {
   });
 
   // v1 admin dashboard — read-only operational UI and safe JSON API.
-  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, deploymentName: DEPLOYMENT_NAME }));
+  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, deploymentName: DEPLOYMENT_NAME }));
 
   app.use("/", createWebhookRouter(
     eventStore,

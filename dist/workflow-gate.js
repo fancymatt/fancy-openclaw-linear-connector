@@ -36,6 +36,7 @@ import fs from "node:fs/promises";
 import yaml from "js-yaml";
 import { componentLogger, createLogger } from "./logger.js";
 import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
+import { ObservationStore } from "./store/observation-store.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 /**
@@ -323,29 +324,7 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
     }
     return null;
 }
-// ── B2: Atomic state-label transition application ─────────────────────────
-/**
- * Apply the state-label transition triggered by a legal command (AI-1353 / §4.2).
- *
- * Called by proxy.ts after a validated command is successfully forwarded to Linear.
- * Re-derives the ticket's current state via an independent label fetch (never trusts
- * the caller's state snapshot — §11). Applies the transition by swapping state:old →
- * state:new in a single issueUpdate mutation so the ticket never carries zero or two
- * state:* labels.
- *
- * Seam decision (documented per ticket): the proxy applies the transition, not the
- * CLI. This couples the state change to the validated forward — an agent cannot issue
- * a raw GraphQL mutation and skip the transition. The CLI only needs to send the
- * x-openclaw-linear-intent header; the connector handles the bookkeeping.
- *
- * Idempotent: if the ticket is already in the target state, no mutation is issued.
- * Fail-open: any API error is logged; the caller's response is not affected.
- *
- * Special targets:
- *   __ad_hoc__ — ticket leaves the workflow; removes state:* and wf:* labels entirely.
- *   escape     — terminal break-glass state; transitions to state:escape normally.
- */
-export async function applyStateTransition(intent, issueId, authToken) {
+export async function applyStateTransition(intent, issueId, authToken, options) {
     // TODO(AI-1347): no-op on missing issueId carries the same fail-open posture as B1.
     if (!issueId)
         return;
@@ -376,18 +355,19 @@ export async function applyStateTransition(intent, issueId, authToken) {
     }
     const breakGlassCommand = def.break_glass?.command ?? "escape";
     let toStateName;
+    let matchedTransition;
     if (intent === breakGlassCommand) {
         toStateName = def.break_glass?.to ?? "escape";
     }
     else {
         const stateNode = def.states.find((s) => s.id === currentStateName);
-        const transition = stateNode?.transitions?.find((t) => t.command === intent);
-        if (!transition) {
+        matchedTransition = stateNode?.transitions?.find((t) => t.command === intent);
+        if (!matchedTransition) {
             // Should not happen — B1 already validated the command — but fail-open.
             log.warn(`workflow-gate: B2 apply: no transition for '${intent}' in state '${currentStateName}' on ${issueId} — skipping`);
             return;
         }
-        toStateName = transition.to;
+        toStateName = matchedTransition.to;
     }
     // ── Special target: __ad_hoc__ ─────────────────────────────────────────
     // Ticket is demoted out of the workflow — remove state:* and wf:* labels.
@@ -422,6 +402,40 @@ export async function applyStateTransition(intent, issueId, authToken) {
     const applied = await issueUpdateLabels(issue.internalId, newLabelIds, authToken);
     if (applied) {
         log.info(`workflow-gate: B2 apply: ${issueId} state:${currentStateName} → state:${toStateName}`);
+    }
+    // ── Phase 4 / P4-1: Record feedback observation ──────────────────────
+    // After a successful state transition, if the transition has a feedback
+    // block and feedback data was provided, write one append-only observation.
+    // Fail-open: observation errors are logged and never block the transition.
+    if (matchedTransition?.feedback?.required && options?.observationStore && options?.feedback) {
+        try {
+            const validatedReason = ObservationStore.validateReasonCode(options.feedback.reasonCode);
+            if (!validatedReason) {
+                log.warn(`workflow-gate: P4-1: invalid reason code '${options.feedback.reasonCode}' — observation skipped for ${issueId}`);
+            }
+            else if (!options.feedback.fromBody) {
+                // The implementer body ID must be provided (via X-Openclaw-From-Body header from
+                // the CLI). Without it, from_body == reviewer_body, which produces useless data
+                // for P4-2/3/4 aggregation. Skip the row rather than write garbage.
+                log.warn(`workflow-gate: P4-1: fromBody not provided (X-Openclaw-From-Body header absent) — observation skipped for ${issueId}`);
+            }
+            else {
+                options.observationStore.append({
+                    ticket: issueId,
+                    workflow: workflowId,
+                    step: currentStateName,
+                    fromBody: options.feedback.fromBody,
+                    reviewerBody: options.bodyId ?? "unknown",
+                    reasonCode: validatedReason,
+                    freeText: options.feedback.freeText ?? null,
+                });
+                log.info(`workflow-gate: P4-1: observation recorded for ${issueId} reason=${validatedReason}`);
+            }
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.warn(`workflow-gate: P4-1: observation write failed for ${issueId}: ${msg}`);
+        }
     }
 }
 async function issueUpdateLabels(internalId, labelIds, authToken) {

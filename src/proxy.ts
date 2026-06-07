@@ -18,7 +18,8 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
-import { checkWorkflowRules, applyStateTransition } from "./workflow-gate.js";
+import { checkWorkflowRules, applyStateTransition, type TransitionFeedback } from "./workflow-gate.js";
+import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
@@ -65,7 +66,29 @@ function extractTicketContext(body: GraphQLRequestBody | null): string {
   return id ? ` ticket=${id}` : "";
 }
 
-export async function handleProxyRequest(req: Request, res: Response): Promise<void> {
+/**
+ * Best-effort extraction of comment body from GraphQL mutation variables.
+ * Returns the first non-empty string found in common comment variable names, or null.
+ */
+function extractCommentBody(body: GraphQLRequestBody | null): string | null {
+  if (!body?.variables) return null;
+  const vars = body.variables as Record<string, unknown>;
+  // commentCreate mutation sends { input: { body: "..." } } or { body: "..." }
+  const input = vars.input;
+  if (input && typeof input === "object" && input !== null) {
+    const inputObj = input as Record<string, unknown>;
+    if (typeof inputObj.body === "string" && inputObj.body.length > 0) return inputObj.body;
+  }
+  if (typeof vars.body === "string" && (vars.body as string).length > 0) return vars.body as string;
+  return null;
+}
+
+export interface ProxyDeps {
+  /** Optional observation store for recording feedback observations (P4-1). */
+  observationStore?: ObservationStore;
+}
+
+export async function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void> {
   const authorization = req.headers["authorization"];
   if (!authorization) {
     res.status(401).json({ errors: [{ message: "Missing Authorization header" }] });
@@ -75,6 +98,7 @@ export async function handleProxyRequest(req: Request, res: Response): Promise<v
   const agentId = (req.headers["x-openclaw-agent"] as string | undefined) ?? "unknown";
   const intent = (req.headers["x-openclaw-linear-intent"] as string | undefined) ?? null;
   const target = (req.headers["x-openclaw-linear-target"] as string | undefined) ?? null;
+  const feedbackCategoryHeader = (req.headers["x-openclaw-feedback-category"] as string | undefined) ?? null;
   const body = parseBody(req);
   const opName = body?.operationName ?? "(unnamed)";
   const issueId = extractIssueId(body);
@@ -122,11 +146,26 @@ export async function handleProxyRequest(req: Request, res: Response): Promise<v
   log.info(`response agent=${agentId} op=${opName} status=${upstreamRes.status}`);
 
   // Phase 3 B2: apply state:* label transition after a successful forward.
+  // Phase 4 / P4-1: record feedback observation for feedback transitions.
   // Only runs when the command was validated (intent present, no P2/P3 block).
   // Fail-open: errors are logged and never propagate to the agent's response.
   if (intent && upstreamRes.ok) {
     try {
-      await applyStateTransition(intent, issueId, authorization);
+      // Build feedback context for observation recording.
+      let feedback: TransitionFeedback | undefined;
+      if (feedbackCategoryHeader && (intent === "request-changes" || intent === "reject")) {
+        const fromBodyHeader = (req.headers["x-openclaw-from-body"] as string | undefined) ?? null;
+        feedback = {
+          fromBody: fromBodyHeader,
+          reasonCode: feedbackCategoryHeader as ReasonCode,
+          freeText: extractCommentBody(body),
+        };
+      }
+      await applyStateTransition(intent, issueId, authorization, {
+        bodyId: agentId,
+        observationStore: deps?.observationStore,
+        feedback,
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`state-transition failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
