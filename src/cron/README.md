@@ -79,7 +79,6 @@ From AI-1380:
 
 ## Future Enhancements
 
-- Deduplication: Check for existing proposals before creating new ones
 - Configurable thresholds per workflow/step
 - Learning rate adjustments based on proposal acceptance
 - Historical analysis and trend detection

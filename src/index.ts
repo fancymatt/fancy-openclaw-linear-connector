@@ -18,6 +18,7 @@ import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
+import { registerDistillationCron } from "./cron/p4-metrics-distillation.js";
 import { getAccessToken, getAgent } from "./agents.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
@@ -504,7 +505,7 @@ export function createApp(options?: CreateAppOptions) {
     });
   });
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, managingPoller, managingStateStore };
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, managingPoller, managingStateStore };
 }
 
 /**
@@ -559,7 +560,11 @@ if (isEntryPoint) {
     startTokenRefresh();
   }
 
-  const { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, resignalOptions, ackTracker, watchdog, noActivityDetector } = createApp();
+  const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, wakeConfig, resignalOptions, ackTracker, watchdog, noActivityDetector } = createApp();
+
+  // P4-3: periodic distillation of reject metrics into skill-workshop proposals
+  registerDistillationCron(observationStore);
+
   const server = app.listen(PORT, () => {
     log.info(`fancy-openclaw-linear-connector [${DEPLOYMENT_NAME}] listening on port ${PORT} (pid=${process.pid})`);
     // Recover any backlog left behind by prior process state (v1.0 queue).
