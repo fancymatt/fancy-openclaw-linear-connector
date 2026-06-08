@@ -11,10 +11,10 @@ import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
 import { deliverToAgent, DeliveryThrottle, type DeliveryConfig } from "../delivery/index.js";
 import type { RouteResult } from "../types.js";
 import { normalizeSessionKey } from "../session-key.js";
-import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName } from "../agents.js";
+import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgents } from "../agents.js";
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
-import { checkRoleGuard, checkRoleGuardAndWarn } from "../routing-guard.js";
+import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
 import { fetchWorkflowLabels } from "../workflow-gate.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
@@ -317,8 +317,10 @@ export function createWebhookRouter(
         return;
       }
 
-      // Role-guard: check if this is an implementation-state ticket being
-      // routed to a review-only agent. Advisory mode: warn but don't block.
+      // Role-guard (AI-1459 enforcement mode): check whether the target agent
+      // fills the owner_role for the ticket's current workflow state.
+      // If blocked: skip delivery — the guard has posted a comment and
+      // attempted delegate correction.
       const issueIdentifier = ticketId.replace(/^linear-/, "");
       const roleGuardToken =
         getAccessToken(route.agentId) ??
@@ -327,7 +329,35 @@ export function createWebhookRouter(
       if (roleGuardToken) {
         try {
           const guardLabels = await fetchWorkflowLabels(issueIdentifier, roleGuardToken);
-          await checkRoleGuardAndWarn(route.agentId, issueIdentifier, guardLabels);
+          // Provide a resolver so the guard can auto-correct the delegate
+          // without needing to import agents.ts directly (avoids the test
+          // compile-time dependency on fancy-openclaw-linear-skill-cli).
+          const linearUserIdResolver: LinearUserIdResolver = (bodyName: string) => {
+            const agents = getAgents();
+            const agent = agents.find(
+              (a) => a.name.toLowerCase() === bodyName.toLowerCase() ||
+                     (a as { openclawAgent?: string }).openclawAgent?.toLowerCase() === bodyName.toLowerCase()
+            );
+            return (agent as { linearUserId?: string } | undefined)?.linearUserId ?? null;
+          };
+          const guardResult = await checkRoleGuardAndBlock(route.agentId, issueIdentifier, guardLabels, linearUserIdResolver);
+          if (guardResult.blocked) {
+            log.warn(
+              `routing-guard: dispatch blocked for ${route.agentId} [${issueIdentifier}] — ${guardResult.reason ?? "role mismatch"}; ` +
+              (guardResult.correctedTo ? `corrected to ${guardResult.correctedTo}` : "delegate cleared")
+            );
+            appendOperationalEvent(operationalEventStore, {
+              outcome: "delivery-failed",
+              type: event.type,
+              agent: agentName,
+              key: ticketId,
+              sessionKey: ticketId,
+              deliveryMode: "role-guard-blocked",
+              attemptCount: 1,
+              errorSummary: `routing-guard blocked: ${guardResult.reason ?? "role mismatch"}`,
+            });
+            return;
+          }
         } catch (err) {
           log.warn(`Role-guard check failed for ${issueIdentifier}: ${err instanceof Error ? err.message : String(err)} — continuing`);
         }
