@@ -32,6 +32,7 @@ import { resetPolicyCache } from "./escalation-gate.js";
 // Resolved from the project root (jest cwd) so it works under both the
 // ESM tsc build and the CommonJS ts-jest transpile.
 const CANONICAL_FIXTURE = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
+const CANONICAL_UX_AUDIT_FIXTURE = path.resolve(process.cwd(), "src/__fixtures__/canonical-ux-audit.yaml");
 
 // ── Minimal test capability policy ────────────────────────────────────────
 // Includes deploy:execute so we can test the deployment capability gate.
@@ -68,6 +69,56 @@ bodies:
   - id: astrid
     container: steward
     fills_roles: [steward]
+`;
+
+// ── Capability policy with ux-audit roles (AI-1438 Phase 5 / B-1) ────────
+
+const UX_AUDIT_POLICY_YAML = `
+capabilities:
+  - id: linear:transition
+  - id: human:escalate
+  - id: deploy:execute
+
+containers:
+  - id: dev
+    grants: [linear:transition]
+  - id: deployment
+    grants: [linear:transition, deploy:execute]
+  - id: steward
+    grants: [linear:transition, human:escalate]
+  - id: ux-researcher
+    grants: [linear:transition]
+  - id: engine
+    grants: [linear:transition]
+
+roles:
+  - id: dev
+    requires: [linear:transition]
+  - id: deployment
+    requires: [deploy:execute]
+  - id: steward
+    requires: [human:escalate]
+  - id: ux-researcher
+    requires: [linear:transition]
+  - id: engine
+    requires: [linear:transition]
+
+bodies:
+  - id: hanzo
+    container: deployment
+    fills_roles: [deployment]
+  - id: charles
+    container: dev
+    fills_roles: [dev]
+  - id: astrid
+    container: steward
+    fills_roles: [steward]
+  - id: maya
+    container: ux-researcher
+    fills_roles: [ux-researcher]
+  - id: engine-1
+    container: engine
+    fills_roles: [engine]
 `;
 
 // ── Minimal test workflow def ──────────────────────────────────────────────
@@ -1298,5 +1349,175 @@ describe("checkRawMutationInterception — AI-1402: labelIds blocking + unknown-
     // Should still be blocked by the stateId rule, not by the unknown-caller rule
     expect(result).toContain("[Proxy]");
     expect(result).toContain("Direct status");
+  });
+});
+
+// ── Phase 5 / B-1: ux-audit workflow definition validation (AI-1438) ────────
+// Validates the canonical ux-audit YAML fixture parses correctly and
+// enforces workflow rules per design.md §14 + §16.0.
+// No engine/runtime logic — definition + validation only.
+
+describe("checkWorkflowRules — canonical ux-audit schema (src/__fixtures__/canonical-ux-audit.yaml)", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let originalWorkflowPath: string | undefined;
+  let originalPolicyPath: string | undefined;
+  let uxDir: string;
+
+  beforeAll(() => {
+    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    originalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+
+    uxDir = fs.mkdtempSync(path.join(os.tmpdir(), "ux-audit-test-"));
+    const policyFile = path.join(uxDir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, UX_AUDIT_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
+  });
+
+  afterAll(() => {
+    if (originalWorkflowPath !== undefined) {
+      process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    } else {
+      delete process.env.WORKFLOW_DEF_PATH;
+    }
+    if (originalPolicyPath !== undefined) {
+      process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
+    } else {
+      delete process.env.CAPABILITY_POLICY_PATH;
+    }
+  });
+
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetPolicyCache();
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  // §16.0 invariant: the YAML parses and produces a valid WorkflowDef
+  it("parses the canonical ux-audit YAML without error", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:auditing"]);
+    // 'complete-audit' is legal in auditing; null means pass-through
+    expect(await checkWorkflowRules("complete-audit", "issue-uuid", "Bearer tok", "maya")).toBeNull();
+  });
+
+  // §16.0 invariant: escape is legal from every state (§4.4)
+  it("escape is legal from every ux-audit state (§4.4)", async () => {
+    const allStates = [
+      "intake", "auditing", "spawning", "managing", "review", "done", "escape",
+    ];
+    for (const state of allStates) {
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:ux-audit", `state:${state}`]);
+      const result = await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "astrid");
+      expect(result).toBeNull(); // state: ${state}
+    }
+  });
+
+  // §16.0 invariant: each state has the expected legal transitions
+  it("intake state allows accept and demote only", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:intake"]);
+    // accept is legal
+    expect(await checkWorkflowRules("accept", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+    // demote is legal
+    resetWorkflowCache();
+    globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:intake"]);
+    expect(await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+    // complete-audit is illegal in intake
+    resetWorkflowCache();
+    globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:intake"]);
+    const blocked = await checkWorkflowRules("complete-audit", "issue-uuid", "Bearer tok", "astrid");
+    expect(blocked).not.toBeNull();
+    expect(blocked).toContain("accept");
+    expect(blocked).toContain("demote");
+    expect(blocked).toContain("escape");
+  });
+
+  it("auditing state allows complete-audit only", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:auditing"]);
+    expect(await checkWorkflowRules("complete-audit", "issue-uuid", "Bearer tok", "maya")).toBeNull();
+    // submit is illegal in auditing
+    resetWorkflowCache();
+    globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:auditing"]);
+    const blocked = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "maya");
+    expect(blocked).not.toBeNull();
+    expect(blocked).toContain("complete-audit");
+  });
+
+  it("spawning state allows spawn only", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:spawning"]);
+    expect(await checkWorkflowRules("spawn", "issue-uuid", "Bearer tok", "engine-1")).toBeNull();
+    // accept is illegal in spawning
+    resetWorkflowCache();
+    globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:spawning"]);
+    const blocked = await checkWorkflowRules("accept", "issue-uuid", "Bearer tok", "engine-1");
+    expect(blocked).not.toBeNull();
+    expect(blocked).toContain("spawn");
+  });
+
+  it("managing state allows complete only", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:managing"]);
+    expect(await checkWorkflowRules("complete", "issue-uuid", "Bearer tok", "maya")).toBeNull();
+    // spawn is illegal in managing
+    resetWorkflowCache();
+    globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:managing"]);
+    const blocked = await checkWorkflowRules("spawn", "issue-uuid", "Bearer tok", "maya");
+    expect(blocked).not.toBeNull();
+    expect(blocked).toContain("complete");
+  });
+
+  it("review state allows approve and request-revision", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:review"]);
+    expect(await checkWorkflowRules("approve", "issue-uuid", "Bearer tok", "maya")).toBeNull();
+    resetWorkflowCache();
+    globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:review"]);
+    expect(await checkWorkflowRules("request-revision", "issue-uuid", "Bearer tok", "maya")).toBeNull();
+    // complete is illegal in review
+    resetWorkflowCache();
+    globalThis.fetch = makeLabelFetch(["wf:ux-audit", "state:review"]);
+    const blocked = await checkWorkflowRules("complete", "issue-uuid", "Bearer tok", "maya");
+    expect(blocked).not.toBeNull();
+    expect(blocked).toContain("approve");
+    expect(blocked).toContain("request-revision");
+  });
+
+  // §16.0 invariant: all transition targets resolve to valid states
+  it("all transition targets reference valid states", async () => {
+    const { loadWorkflowDef } = await import("./workflow-gate.js");
+    const def = await loadWorkflowDef();
+    const stateIds = new Set(def.states.map((s) => s.id));
+    // Also accept __ad_hoc__ as a valid target (it's a special demotion target)
+    stateIds.add("__ad_hoc__");
+    for (const state of def.states) {
+      for (const t of state.transitions ?? []) {
+        expect(stateIds.has(t.to)).toBe(true);
+      }
+    }
+  });
+
+  // §16.0 invariant: break_glass is defined
+  it("break_glass is defined with a command", async () => {
+    const { loadWorkflowDef } = await import("./workflow-gate.js");
+    const def = await loadWorkflowDef();
+    expect(def.break_glass).toBeDefined();
+    expect(def.break_glass!.command).toBe("escape");
+    expect(def.break_glass!.to).toBe("escape");
+  });
+
+  // §16.0 invariant: entry_state references a valid state
+  it("entry_state references a valid state", async () => {
+    const { loadWorkflowDef } = await import("./workflow-gate.js");
+    const def = await loadWorkflowDef();
+    const stateIds = new Set(def.states.map((s) => s.id));
+    expect(stateIds.has(def.entry_state ?? "")).toBe(true);
+  });
+
+  // §16.0 invariant: archetype is set
+  it("archetype is 'orchestrator'", async () => {
+    const { loadWorkflowDef } = await import("./workflow-gate.js");
+    const def = await loadWorkflowDef();
+    expect(def.archetype).toBe("orchestrator");
   });
 });
