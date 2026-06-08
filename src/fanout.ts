@@ -153,10 +153,11 @@ export function extractFindings(description: string | null | undefined, fallback
 async function fetchIssueTeamAndParent(
   issueId: string,
   authToken: string,
-): Promise<{ teamId: string; parentIssueId: string | null; description: string | null; title: string | null } | null> {
+): Promise<{ internalId: string; teamId: string; parentIssueId: string | null; description: string | null; title: string | null } | null> {
   const query = `
     query IssueTeamParent($id: String!) {
       issue(id: $id) {
+        id
         title
         description
         team { id }
@@ -173,6 +174,7 @@ async function fetchIssueTeamAndParent(
     type Resp = {
       data?: {
         issue?: {
+          id: string;
           title: string | null;
           description: string | null;
           team: { id: string };
@@ -184,6 +186,7 @@ async function fetchIssueTeamAndParent(
     const issue = data.data?.issue;
     if (!issue) return null;
     return {
+      internalId: issue.id,
       teamId: issue.team.id,
       parentIssueId: issue.parent?.id ?? null,
       description: issue.description,
@@ -388,18 +391,9 @@ export async function executeFanout(
   const labelIds = [wfLabelId, stateLabelId];
 
   // 4. Create children — one per finding
-  // Resolve the parent's internal UUID for the parentId field.
-  // The parentIssueId we receive is typically the human-readable identifier (AI-1439),
-  // but Linear's parentId in issueCreate expects the internal UUID.
-  // We need to resolve the internal ID.
-  const parentInternalId = await resolveInternalId(parentIssueId, authToken);
-  if (!parentInternalId) {
-    result.errors.push({
-      findingIndex: -1,
-      message: `Failed to resolve internal UUID for parent ${parentIssueId}`,
-    });
-    return result;
-  }
+  // The parent's internal UUID was resolved by fetchIssueTeamAndParent above.
+  // No additional API call needed — we already have parentCtx.internalId.
+  const parentInternalId = parentCtx.internalId;
 
   for (let i = 0; i < findings.length; i++) {
     const finding = findings[i];
@@ -441,28 +435,7 @@ export async function executeFanout(
   return result;
 }
 
-/**
- * Resolve a human-readable issue identifier (e.g. "AI-1439") to its internal UUID.
- */
-async function resolveInternalId(
-  identifier: string,
-  authToken: string,
-): Promise<string | null> {
-  const query = `query($id: String!) { issue(id: $id) { id } }`;
-  try {
-    const res = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query, variables: { id: identifier } }),
-    });
-    type Resp = { data?: { issue?: { id: string } | null } };
-    const data = (await res.json()) as Resp;
-    return data.data?.issue?.id ?? null;
-  } catch (err) {
-    log.error(`fanout: failed to resolve internal ID for ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
-}
+// (resolveInternalId removed — internal UUID is now returned directly by fetchIssueTeamAndParent.)
 
 /**
  * Determine if the fan-out should be triggered for a given workflow + state + command.

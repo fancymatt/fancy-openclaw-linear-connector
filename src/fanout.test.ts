@@ -270,7 +270,7 @@ describe("executeFanout — mocked Linear API", () => {
 
       const query = parsed.query ?? "";
 
-      // Resolve internal UUID
+      // Resolve internal UUID + team/parent context
       if (query.includes("IssueTeamParent")) {
         const ctx = opts.parentContext ?? {
           teamId: "team-uuid",
@@ -282,6 +282,7 @@ describe("executeFanout — mocked Linear API", () => {
           JSON.stringify({
             data: {
               issue: {
+                id: parentInternalId,
                 title: ctx.title,
                 description: ctx.description,
                 team: { id: ctx.teamId },
@@ -676,12 +677,13 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
         );
       }
 
-      // Fan-out: fetch parent context (IssueTeamParent)
+      // Fan-out: fetch parent context (IssueTeamParent) — now also returns internal UUID
       if (query.includes("IssueTeamParent")) {
         return new Response(
           JSON.stringify({
             data: {
               issue: {
+                id: "parent-internal-id",
                 title: parentTitle,
                 description: parentDescription,
                 team: { id: "team-uuid" },
@@ -744,9 +746,11 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     const childCreateCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
     expect(childCreateCalls.length).toBeGreaterThanOrEqual(2); // At least 2 children from findings
 
-    // Summary comment should have been posted
+    // Summary comment should have been posted with the internal UUID (not human-readable ID)
     const commentCall = fetchCalls.find((c) => (c.body.query ?? "").includes("commentCreate"));
     expect(commentCall).toBeDefined();
+    const commentVars = commentCall!.body.variables as Record<string, unknown>;
+    expect(commentVars.issueId).toBe("parent-internal-id");
   });
 
   it("does NOT trigger fan-out for non-ux-audit workflows", async () => {
