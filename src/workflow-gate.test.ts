@@ -209,6 +209,60 @@ describe("checkWorkflowRules — break-glass escape", () => {
   }
 });
 
+// ── AI-1460: refuse-work meta-command ─────────────────────────────────────
+
+describe("checkWorkflowRules — AI-1460: refuse-work meta-command", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  const allStates = [
+    "intake", "implementation", "code-review", "deployment", "done",
+  ];
+
+  for (const state of allStates) {
+    it(`refuse-work is legal from state '${state}' for a known caller`, async () => {
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", `state:${state}`]);
+      expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+    });
+  }
+
+  it("refuse-work is blocked for unknown callers", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
+    const result = await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "ghost-agent");
+    expect(result).not.toBeNull();
+    expect(result).toContain("Unknown caller");
+    expect(result).toContain("ghost-agent");
+  });
+
+  it("refuse-work is pass-through on ad-hoc tickets (no wf:* label)", async () => {
+    globalThis.fetch = makeLabelFetch(["bug", "priority:high"]);
+    expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+  });
+
+  it("refuse-work bypasses delegate-only check (non-delegate can refuse)", async () => {
+    // Simulate a ticket where charles is NOT the delegate (someone else is)
+    // by providing callerLinearUserId that differs from delegateId.
+    // refuse-work should still pass because it bypasses delegate-only.
+    globalThis.fetch = async (_url, _init) => {
+      const body = {
+        data: {
+          issue: {
+            labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:code-review" }] },
+            delegate: { id: "other-user-id" },
+          },
+        },
+      };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+    // charles (callerLinearUserId=charles-uid) is not the delegate (other-user-id)
+    expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "charles-uid")).toBeNull();
+  });
+});
+
 // ── Per-state legal / illegal commands ────────────────────────────────────
 
 describe("checkWorkflowRules — intake state", () => {

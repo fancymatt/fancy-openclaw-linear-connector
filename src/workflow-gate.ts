@@ -386,6 +386,13 @@ export async function checkWorkflowRules(
   // §4.4: break-glass escape is legal from every state — never block it.
   if (intent === breakGlassCommand) return null;
 
+  // AI-1460: refuse-work is a meta-command (ownership/routing gesture), not a
+  // workflow transition. A wrongly-dispatched agent must always be able to
+  // decline work regardless of workflow state. Bypasses both state validation
+  // and delegate-only enforcement (the refusal itself clears the delegate).
+  // Still requires a known caller — unknown agents cannot refuse.
+  if (intent === "refuse-work") return null;
+
   // AI-1397: delegate-only enforcement at proxy (CLI-version-agnostic).
   // If both the caller's Linear user ID and the ticket's delegate ID are known,
   // block any agent that is not the current delegate. Fails open when either is
