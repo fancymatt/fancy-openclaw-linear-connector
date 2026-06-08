@@ -1,0 +1,72 @@
+# ux-audit — Archetype B (orchestrator) workflow definition
+# design.md §14, §16.1
+# owner: steward (intake), UX researcher (auditing/review), engine (spawning)
+# version history: bump `version` on any state/edge change; in-flight tickets
+#   use the version stamped at their creation time (design.md §12).
+#
+# Verbatim copy of the canonical vault file at:
+#   ai-systems/projects/fleet-orchestration-redesign/workflows/ux-audit.yaml
+# Used as a test fixture so CI can exercise the canonical schema without
+# depending on the vault being present. Keep in sync with the vault source.
+#
+# Phase 5 / B-1 (AI-1438): definition + validation only — no engine/runtime logic.
+
+id: ux-audit
+version: 1
+archetype: orchestrator
+entry_state: intake
+
+break_glass:
+  command: escape               # x-openclaw-linear-intent value that triggers break-glass (§4.4)
+  to: escape
+  owner_role: steward           # implicit escape edge from EVERY state (design.md §4.4)
+
+states:
+
+  - id: intake
+    owner_role: steward
+    kind: normal
+    transitions:
+      - command: accept
+        to: auditing
+        assign: { mode: required }
+      - command: demote
+        to: __ad_hoc__          # ticket leaves the workflow entirely (design.md §4.5)
+
+  - id: auditing
+    owner_role: ux-researcher
+    kind: normal
+    transitions:
+      - command: complete-audit
+        to: spawning
+
+  - id: spawning
+    owner_role: engine
+    kind: normal
+    transitions:
+      - command: spawn
+        to: managing
+
+  - id: managing
+    owner_role: ux-researcher   # co-owned with engine (engine fills engine role)
+    kind: normal
+    transitions:
+      - command: complete
+        to: review
+
+  - id: review
+    owner_role: ux-researcher
+    kind: normal
+    transitions:
+      - command: approve
+        to: done
+      - command: request-revision
+        to: managing
+
+  - id: done
+    kind: terminal
+    satisfies_parent_barrier: true   # uniform terminal contract (design.md §5.4)
+
+  - id: escape
+    kind: terminal
+    # break-glass terminal; steward decides if Matt escalation is warranted (design.md §11)
