@@ -133,12 +133,15 @@ export function reloadAgents() {
 export function getAgents() {
     return _agents;
 }
-/** Check whether an agent's OpenClaw workspace exists on this host.
- *  Resolves the workspace dir via the canonical helper so the writer
- *  (this connector), the reader (the Linear skill CLI), and the
- *  local-presence probe all agree on layout.
+/** Check whether an agent is managed by this connector instance.
+ *  An explicit `secretsPath` means the agent's secrets live outside the
+ *  default host workspace dir (e.g. a container mount) but this connector
+ *  is still responsible for refreshing and syncing its tokens.
+ *  Falls back to checking whether the host workspace dir exists.
  */
 export function isAgentLocal(agent) {
+    if (agent.secretsPath)
+        return true;
     const wsName = agent.openclawAgent ?? agent.name;
     return fs.existsSync(getAgentWorkspaceDir(wsName));
 }

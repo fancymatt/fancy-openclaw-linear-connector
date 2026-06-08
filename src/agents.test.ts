@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   getAccessToken,
   getAgents,
+  isAgentLocal,
   reloadAgents,
   updateTokens,
   upsertAgent,
@@ -24,6 +25,27 @@ function makeAgent(secretsPath: string): AgentConfig {
     secretsPath,
   };
 }
+
+describe("isAgentLocal", () => {
+  const baseAgent: AgentConfig = {
+    name: "felix",
+    linearUserId: "linear-user-felix",
+    clientId: "client-id",
+    clientSecret: "client-secret",
+    accessToken: "access-token",
+    refreshToken: "refresh-token",
+  };
+
+  test("returns true when secretsPath is set, regardless of host workspace dir", () => {
+    const agent: AgentConfig = { ...baseAgent, secretsPath: "/container/path/linear.env" };
+    expect(isAgentLocal(agent)).toBe(true);
+  });
+
+  test("returns false when no secretsPath and host workspace dir does not exist", () => {
+    const agent: AgentConfig = { ...baseAgent, openclawAgent: "nonexistent-agent-xyz" };
+    expect(isAgentLocal(agent)).toBe(false);
+  });
+});
 
 describe("agents credential file encryption", () => {
   let dir: string;
