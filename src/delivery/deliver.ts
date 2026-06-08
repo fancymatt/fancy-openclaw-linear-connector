@@ -26,6 +26,8 @@ export interface DeliveryResult {
   hookError?: boolean;
   /** Error summary from the gateway (if present in the response). */
   hookErrorSummary?: string;
+  /** AI-1428: True when the agent was confirmed unreachable by the pre-flight liveness check. */
+  delegateUnavailable?: boolean;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;

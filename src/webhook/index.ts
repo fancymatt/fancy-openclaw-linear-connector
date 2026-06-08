@@ -11,7 +11,11 @@ import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
 import { deliverToAgent, DeliveryThrottle, type DeliveryConfig } from "../delivery/index.js";
 import type { RouteResult } from "../types.js";
 import { normalizeSessionKey } from "../session-key.js";
-import { buildAgentMap, getAgent, getOpenclawAgentName } from "../agents.js";
+import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName } from "../agents.js";
+import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
+import { emitDelegateUnavailable } from "../escalation.js";
+import { checkRoleGuard, checkRoleGuardAndWarn } from "../routing-guard.js";
+import { fetchWorkflowLabels } from "../workflow-gate.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
@@ -275,6 +279,59 @@ export function createWebhookRouter(
       const agentName = route.agentId;
       log.info(`Routed event to ${agentName} [${route.sessionKey}]`);
       appendOperationalEvent(operationalEventStore, { outcome: "routed", type: event.type, agent: agentName, key: route.sessionKey, sessionKey: route.sessionKey, deliveryMode: bag && sessionTracker ? "pending-bag" : agentQueue ? "agent-queue" : "direct" });
+
+      // ── 9c. AI-1428: Pre-flight liveness check + role-guard ────────────
+      // Before dispatching to an agent, verify it's reachable. If not,
+      // emit DELEGATE_UNAVAILABLE instead of silently stalling.
+      // Also check role-guard for implementation-state tickets.
+      const livenessConfig: LivenessConfig = {
+        hooksUrl: process.env.OPENCLAW_HOOKS_URL,
+        hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
+      };
+      const agentLivenessCfg = getAgent(route.agentId);
+      if (agentLivenessCfg?.hooksUrl) livenessConfig.hooksUrl = agentLivenessCfg.hooksUrl;
+      if (agentLivenessCfg?.hooksToken) livenessConfig.hooksToken = agentLivenessCfg.hooksToken;
+
+      const liveness = await checkAgentLiveness(route.agentId, livenessConfig);
+      if (!liveness.available) {
+        // Agent unreachable — emit DELEGATE_UNAVAILABLE escalation.
+        log.warn(
+          `DELEGATE_UNAVAILABLE: ${route.agentId} is unreachable (${liveness.reason}: ${liveness.detail ?? "unknown"}) — skipping delivery for ${ticketId}`,
+        );
+        appendOperationalEvent(operationalEventStore, {
+          outcome: "delivery-failed",
+          type: event.type,
+          agent: agentName,
+          key: ticketId,
+          sessionKey: ticketId,
+          deliveryMode: "delegate-unavailable",
+          attemptCount: 1,
+          errorSummary: `DELEGATE_UNAVAILABLE: ${liveness.reason}: ${liveness.detail ?? "unknown"}`,
+        });
+        await emitDelegateUnavailable(
+          ticketId.replace(/^linear-/, ""),
+          route.agentId,
+          `${liveness.reason}: ${liveness.detail ?? "unknown"}`,
+        );
+        // Do NOT deliver — return immediately.
+        return;
+      }
+
+      // Role-guard: check if this is an implementation-state ticket being
+      // routed to a review-only agent. Advisory mode: warn but don't block.
+      const issueIdentifier = ticketId.replace(/^linear-/, "");
+      const roleGuardToken =
+        getAccessToken(route.agentId) ??
+        process.env.LINEAR_OAUTH_TOKEN ??
+        process.env.LINEAR_API_KEY;
+      if (roleGuardToken) {
+        try {
+          const guardLabels = await fetchWorkflowLabels(issueIdentifier, roleGuardToken);
+          await checkRoleGuardAndWarn(route.agentId, issueIdentifier, guardLabels);
+        } catch (err) {
+          log.warn(`Role-guard check failed for ${issueIdentifier}: ${err instanceof Error ? err.message : String(err)} — continuing`);
+        }
+      }
 
       // ── 10. Create agent session + emit thought ───────────────────────────
       const data = event.data as Record<string, unknown> | null;
