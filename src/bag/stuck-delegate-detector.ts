@@ -41,6 +41,7 @@ import type { OperationalEventStore } from "../store/operational-event-store.js"
 import type { SessionTracker } from "./session-tracker.js";
 import type { PendingWorkBag } from "./pending-work-bag.js";
 import { normalizeSessionKey } from "../session-key.js";
+import { deliverMessageToAgent, type DeliveryConfig } from "../delivery/index.js";
 
 const log = componentLogger(createLogger(), "stuck-delegate-detector");
 
@@ -65,6 +66,8 @@ export interface StuckDelegateDeps {
   sessionTracker: SessionTracker;
   bag: PendingWorkBag;
   operationalEventStore: OperationalEventStore;
+  /** Delivery config for sending re-prompt messages to agents. */
+  deliveryConfig: DeliveryConfig;
   /** Deliver a re-prompt wake signal to the agent. */
   sendWake?: (agentOpenclawName: string, ticketId: string, prompt: string) => Promise<boolean>;
   /** Overridable for testing. */
@@ -102,6 +105,9 @@ export interface StuckDelegateCycleResult {
 }
 
 // ── Prompt-count store (in-memory, reset on restart) ─────────────────────────
+// TODO: If ticket volume grows, persist PromptCounter to the bag DB so counts
+// survive connector restarts. In-memory is fine for v1 — maxPrompts defaults to 2
+// and a restart-only reset is acceptable.
 
 /** Tracks how many times each ticket has been re-prompted. */
 export class PromptCounter {
@@ -155,6 +161,11 @@ export function buildRePrompt(
 
   if (!stateNode || !stateNode.transitions?.length) {
     // Terminal or unknown state — shouldn't happen but be defensive
+    log.warn(
+      `Stuck-delegate: buildRePrompt reached terminal/unknown state fallback for ${ticketId} ` +
+      `(state='${currentState}', stateNode=${stateNode ? "terminal" : "unknown"}). ` +
+      `This should be unreachable — candidate filtering may be inconsistent.`,
+    );
     return (
       `[Stuck-delegate detection] Ticket ${ticketId} is in state '${currentState}' but appears stuck. ` +
       `If you believe your work is complete, run \`linear escape ${ticketId}\` to break glass.`
@@ -187,6 +198,8 @@ export class StuckDelegateDetector {
   private config: StuckDelegateConfig;
   private deps: Required<StuckDelegateDeps>;
   private promptCounter: PromptCounter;
+  /** Tracks when sessions ended per (agent, sessionKey) for idle-grace calculation. */
+  private sessionEndedAt: Map<string, number> = new Map();
 
   constructor(deps: StuckDelegateDeps, config?: Partial<StuckDelegateConfig>) {
     this.config = {
@@ -198,7 +211,8 @@ export class StuckDelegateDetector {
       sessionTracker: deps.sessionTracker,
       bag: deps.bag,
       operationalEventStore: deps.operationalEventStore,
-      sendWake: deps.sendWake ?? defaultSendWake,
+      deliveryConfig: deps.deliveryConfig,
+      sendWake: deps.sendWake ?? defaultSendWakeFactory(deps.deliveryConfig),
       listAgents: deps.listAgents ?? (() => getAgents().filter(isAgentLocal)),
       now: deps.now ?? (() => Date.now()),
       fetchStuckCandidates: deps.fetchStuckCandidates ?? defaultFetchStuckCandidates,
@@ -286,7 +300,26 @@ export class StuckDelegateDetector {
 
         // Skip if agent has an active session for this ticket — not idle yet
         if (sessionTracker.isActiveForTicket(openclawAgent, sessionKey)) {
+          // Session is active — clear any stale "ended at" tracking
+          this.sessionEndedAt.delete(`${openclawAgent}:${sessionKey}`);
           continue;
+        }
+
+        // Apply idle grace period: if the session recently ended, wait
+        // When idleGraceMs is 0 (default for tests and aggressive detection),
+        // skip the grace entirely and detect on first poll.
+        if (this.config.idleGraceMs > 0) {
+          const endedKey = `${openclawAgent}:${sessionKey}`;
+          const now = getNow();
+          const endedAt = this.sessionEndedAt.get(endedKey);
+          if (endedAt === undefined) {
+            // First poll seeing this ticket as idle — record the time and skip
+            this.sessionEndedAt.set(endedKey, now);
+            continue;
+          } else if (now - endedAt < this.config.idleGraceMs) {
+            // Still within grace period — skip
+            continue;
+          }
         }
 
         // Check the stuck pattern:
@@ -329,7 +362,7 @@ export class StuckDelegateDetector {
               `Stuck-delegate: re-prompted ${openclawAgent} for ${ticketId} (prompt ${newCount}/${this.config.maxPrompts})`,
             );
 
-            // Add to bag so the wake-up signal has something to deliver
+            // Add to bag so downstream wake-up mechanisms can see it
             const pending = bag.getPendingTickets(openclawAgent);
             if (!pending.some((e) => e.ticketId === sessionKey)) {
               bag.add(openclawAgent, sessionKey, "Issue", "stuck-delegate-reprompt");
@@ -349,6 +382,9 @@ export class StuckDelegateDetector {
                 promptNumber: newCount,
               },
             });
+
+            // Clear the idle tracker — a prompt was sent, don't re-trigger immediately
+            this.sessionEndedAt.delete(`${openclawAgent}:${sessionKey}`);
           }
         } catch (err) {
           result.errors++;
@@ -366,20 +402,37 @@ export class StuckDelegateDetector {
 // ── Default wake implementation ──────────────────────────────────────────────
 
 /**
- * Default wake implementation: adds the ticket to the pending-work bag with
- * the re-prompt as the routing reason, which triggers the standard wake-up
- * delivery path.
+ * Create a default sendWake that delivers the re-prompt to the agent via
+ * the standard delivery pipeline (HTTP hooks or CLI spawn).
  */
-async function defaultSendWake(
-  agentOpenclawName: string,
-  ticketId: string,
-  _prompt: string,
-): Promise<boolean> {
-  // The actual delivery happens through the bag + wake-up mechanism.
-  // This is a placeholder — in production, the connector's delivery pipeline
-  // will pick up the bagged ticket and send the wake signal.
-  log.info(`Stuck-delegate wake: ${agentOpenclawName} / ${ticketId}`);
-  return true;
+function defaultSendWakeFactory(
+  deliveryConfig: DeliveryConfig,
+): (agentOpenclawName: string, ticketId: string, prompt: string) => Promise<boolean> {
+  return async (
+    agentOpenclawName: string,
+    ticketId: string,
+    prompt: string,
+  ): Promise<boolean> => {
+    const sessionKey = normalizeSessionKey(ticketId);
+    log.info(`Stuck-delegate wake: delivering re-prompt to ${agentOpenclawName} / ${ticketId}`);
+    try {
+      const result = await deliverMessageToAgent(agentOpenclawName, sessionKey, prompt, deliveryConfig);
+      if (!result.dispatched) {
+        log.error(
+          `Stuck-delegate wake delivery failed for ${agentOpenclawName} / ${ticketId}: ` +
+          (result.hookErrorSummary ?? "delivery not accepted"),
+        );
+        return false;
+      }
+      log.info(`Stuck-delegate wake delivered for ${agentOpenclawName} / ${ticketId} (runId=${result.runId ?? "ok"})`);
+      return true;
+    } catch (err) {
+      log.error(
+        `Stuck-delegate wake delivery threw for ${agentOpenclawName} / ${ticketId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  };
 }
 
 // ── Default candidate fetcher ────────────────────────────────────────────────

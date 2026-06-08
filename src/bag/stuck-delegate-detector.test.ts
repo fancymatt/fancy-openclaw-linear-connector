@@ -91,7 +91,8 @@ function setupDeps(dir: string) {
   const bag = new PendingWorkBag(path.join(dir, "bag.db"), 60_000);
   const sessionTracker = new SessionTracker(30_000);
   const operationalEventStore = new OperationalEventStore(path.join(dir, "events.db"));
-  return { bag, sessionTracker, operationalEventStore };
+  const deliveryConfig = { nodeBin: "node", hooksUrl: "", hooksToken: "" };
+  return { bag, sessionTracker, operationalEventStore, deliveryConfig };
 }
 
 describe("StuckDelegateDetector", () => {
@@ -176,7 +177,7 @@ describe("StuckDelegateDetector", () => {
 
   describe("runCycle", () => {
     test("detects stuck delegate: comment posted, no transition, idle session", async () => {
-      const { bag, sessionTracker, operationalEventStore } = setupDeps(dir);
+      const { bag, sessionTracker, operationalEventStore, deliveryConfig } = setupDeps(dir);
       const wakeCalls: Array<{ agent: string; ticket: string; prompt: string }> = [];
 
       // Candidate: implementation state, delegate comment, no transition
@@ -203,6 +204,7 @@ describe("StuckDelegateDetector", () => {
           sessionTracker,
           bag,
           operationalEventStore,
+          deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
           loadDef: async () => TEST_WORKFLOW_DEF,
@@ -248,7 +250,7 @@ describe("StuckDelegateDetector", () => {
     });
 
     test("respects maxPrompts cap", async () => {
-      const { bag, sessionTracker, operationalEventStore } = setupDeps(dir);
+      const { bag, sessionTracker, operationalEventStore, deliveryConfig } = setupDeps(dir);
       const wakeCalls: Array<{ agent: string; ticket: string; prompt: string }> = [];
 
       const candidates: StuckCandidate[] = [
@@ -270,6 +272,7 @@ describe("StuckDelegateDetector", () => {
           sessionTracker,
           bag,
           operationalEventStore,
+          deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
           loadDef: async () => TEST_WORKFLOW_DEF,
@@ -304,7 +307,7 @@ describe("StuckDelegateDetector", () => {
     });
 
     test("skips when delegate has an active session", async () => {
-      const { bag, sessionTracker, operationalEventStore } = setupDeps(dir);
+      const { bag, sessionTracker, operationalEventStore, deliveryConfig } = setupDeps(dir);
 
       const candidates: StuckCandidate[] = [
         {
@@ -328,6 +331,7 @@ describe("StuckDelegateDetector", () => {
           sessionTracker,
           bag,
           operationalEventStore,
+          deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
           loadDef: async () => TEST_WORKFLOW_DEF,
@@ -349,7 +353,7 @@ describe("StuckDelegateDetector", () => {
     });
 
     test("skips when transition was fired after comment", async () => {
-      const { bag, sessionTracker, operationalEventStore } = setupDeps(dir);
+      const { bag, sessionTracker, operationalEventStore, deliveryConfig } = setupDeps(dir);
 
       // Candidate has a transition after entry — NOT stuck
       const candidates: StuckCandidate[] = [
@@ -373,6 +377,7 @@ describe("StuckDelegateDetector", () => {
           sessionTracker,
           bag,
           operationalEventStore,
+          deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
           loadDef: async () => TEST_WORKFLOW_DEF,
@@ -393,7 +398,7 @@ describe("StuckDelegateDetector", () => {
     });
 
     test("skips when no delegate comment posted", async () => {
-      const { bag, sessionTracker, operationalEventStore } = setupDeps(dir);
+      const { bag, sessionTracker, operationalEventStore, deliveryConfig } = setupDeps(dir);
 
       // No delegate comments — not the stuck pattern
       const candidates: StuckCandidate[] = [
@@ -413,6 +418,7 @@ describe("StuckDelegateDetector", () => {
           sessionTracker,
           bag,
           operationalEventStore,
+          deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
           loadDef: async () => TEST_WORKFLOW_DEF,
@@ -432,8 +438,72 @@ describe("StuckDelegateDetector", () => {
       operationalEventStore.close();
     });
 
+    test("respects idleGraceMs — waits before prompting", async () => {
+      const { bag, sessionTracker, operationalEventStore, deliveryConfig } = setupDeps(dir);
+      const wakeCalls: Array<{ agent: string; ticket: string; prompt: string }> = [];
+      let mockNow = 1000_000;
+
+      const candidates: StuckCandidate[] = [
+        {
+          identifier: "AI-1451",
+          currentState: "implementation",
+          labels: ["wf:dev-impl", "state:implementation"],
+          delegateId: "linear-user-igor",
+          stateEnteredAt: "2026-06-08T19:00:00.000Z",
+          delegateComments: [
+            { id: "c1", createdAt: "2026-06-08T20:00:00.000Z", body: "Complete" },
+          ],
+          transitionsAfterEntry: [],
+        },
+      ];
+
+      const detector = new StuckDelegateDetector(
+        {
+          sessionTracker,
+          bag,
+          operationalEventStore,
+          deliveryConfig,
+          listAgents: () => [TEST_AGENT],
+          fetchStuckCandidates: async () => candidates,
+          loadDef: async () => TEST_WORKFLOW_DEF,
+          now: () => mockNow,
+          sendWake: async (agent, ticket, prompt) => {
+            wakeCalls.push({ agent, ticket, prompt });
+            return true;
+          },
+        },
+        { pollMs: 60_000, idleGraceMs: 5000, maxPrompts: 2 }, // 5s grace
+      );
+
+      // Cycle 1: first time seeing idle — records the timestamp, no prompt
+      const r1 = await detector.runCycle();
+      expect(r1.stuckFound).toBe(0);
+      expect(r1.rePromptsSent).toBe(0);
+      expect(wakeCalls).toHaveLength(0);
+
+      // Cycle 2: only 2s elapsed — still within grace
+      mockNow += 2000;
+      const r2 = await detector.runCycle();
+      expect(r2.stuckFound).toBe(0);
+      expect(r2.rePromptsSent).toBe(0);
+      expect(wakeCalls).toHaveLength(0);
+
+      // Cycle 3: 6s total elapsed — grace expired, should prompt
+      mockNow += 4000;
+      const r3 = await detector.runCycle();
+      expect(r3.stuckFound).toBe(1);
+      expect(r3.rePromptsSent).toBe(1);
+      expect(wakeCalls).toHaveLength(1);
+      expect(wakeCalls[0].prompt).toContain("linear submit AI-1451");
+
+      detector.stop();
+      bag.close();
+      sessionTracker.close();
+      operationalEventStore.close();
+    });
+
     test("clears prompt count when transition fires", async () => {
-      const { bag, sessionTracker, operationalEventStore } = setupDeps(dir);
+      const { bag, sessionTracker, operationalEventStore, deliveryConfig } = setupDeps(dir);
 
       // Start with a stuck candidate
       let candidates: StuckCandidate[] = [
@@ -455,6 +525,7 @@ describe("StuckDelegateDetector", () => {
           sessionTracker,
           bag,
           operationalEventStore,
+          deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
           loadDef: async () => TEST_WORKFLOW_DEF,
@@ -515,7 +586,7 @@ describe("StuckDelegateDetector", () => {
     });
 
     test("works across multiple agents and tickets", async () => {
-      const { bag, sessionTracker, operationalEventStore } = setupDeps(dir);
+      const { bag, sessionTracker, operationalEventStore, deliveryConfig } = setupDeps(dir);
       const wakeCalls: Array<{ agent: string; ticket: string }> = [];
 
       const igor: AgentConfig = {
@@ -585,6 +656,7 @@ describe("StuckDelegateDetector", () => {
           sessionTracker,
           bag,
           operationalEventStore,
+          deliveryConfig,
           listAgents: () => [igor, noah],
           fetchStuckCandidates: async (agent) => candidateMap.get(agent) ?? [],
           loadDef: async () => TEST_WORKFLOW_DEF,
@@ -615,13 +687,14 @@ describe("StuckDelegateDetector", () => {
     });
 
     test("handles workflow def load failure gracefully", async () => {
-      const { bag, sessionTracker, operationalEventStore } = setupDeps(dir);
+      const { bag, sessionTracker, operationalEventStore, deliveryConfig } = setupDeps(dir);
 
       const detector = new StuckDelegateDetector(
         {
           sessionTracker,
           bag,
           operationalEventStore,
+          deliveryConfig,
           listAgents: () => [TEST_AGENT],
           loadDef: async () => { throw new Error("YAML parse error"); },
           sendWake: async () => true,
@@ -641,13 +714,14 @@ describe("StuckDelegateDetector", () => {
     });
 
     test("handles candidate fetch failure gracefully", async () => {
-      const { bag, sessionTracker, operationalEventStore } = setupDeps(dir);
+      const { bag, sessionTracker, operationalEventStore, deliveryConfig } = setupDeps(dir);
 
       const detector = new StuckDelegateDetector(
         {
           sessionTracker,
           bag,
           operationalEventStore,
+          deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => { throw new Error("API error"); },
           loadDef: async () => TEST_WORKFLOW_DEF,
@@ -668,13 +742,14 @@ describe("StuckDelegateDetector", () => {
     });
 
     test("no agents configured — no-op", async () => {
-      const { bag, sessionTracker, operationalEventStore } = setupDeps(dir);
+      const { bag, sessionTracker, operationalEventStore, deliveryConfig } = setupDeps(dir);
 
       const detector = new StuckDelegateDetector(
         {
           sessionTracker,
           bag,
           operationalEventStore,
+          deliveryConfig,
           listAgents: () => [],
           loadDef: async () => TEST_WORKFLOW_DEF,
           sendWake: async () => true,
