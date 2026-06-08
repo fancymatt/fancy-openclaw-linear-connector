@@ -112,7 +112,7 @@ function writeAgents(dir: string): string {
   const file = path.join(dir, "agents.json");
   fs.writeFileSync(
     file,
-    JSON.stringify({ agents: [{ name: "charles", linearUserId: "u1", openclawAgent: "charles", accessToken: "tok", host: "local" }] }),
+    JSON.stringify({ agents: [{ name: "charles", linearUserId: "u1", openclawAgent: "charles", accessToken: "tok", host: "local" }, { name: "hanzo", linearUserId: "u2", openclawAgent: "hanzo", accessToken: "tok2", host: "local" }] }),
     "utf8"
   );
   return file;
@@ -381,6 +381,10 @@ const DEV_IMPL_IMPLEMENTATION_RESPONSE = {
 const DEV_IMPL_DEPLOYMENT_RESPONSE = {
   data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] }, delegate: { id: "u1" } } },
 };
+// AI-1400: hanzo (u2) is the delegate in deployment state for tests that verify hanzo can deploy.
+const DEV_IMPL_DEPLOYMENT_RESPONSE_HANZO_DELEGATE = {
+  data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] }, delegate: { id: "u2" } } },
+};
 
 describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
   let dir: string;
@@ -497,7 +501,7 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
   });
 
   it("allows deploy from hanzo (deployment body) in deployment state", async () => {
-    globalThis.fetch = makeFetch(DEV_IMPL_DEPLOYMENT_RESPONSE);
+    globalThis.fetch = makeFetch(DEV_IMPL_DEPLOYMENT_RESPONSE_HANZO_DELEGATE);
 
     const res = await request(appState.app)
       .post("/proxy/graphql")
@@ -614,6 +618,59 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
       // no X-Openclaw-Linear-Cli-Version header
       .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
 
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+  });
+
+  it("escape (break-glass) bypasses the delegate-only check even for a non-delegate agent", async () => {
+    const nonDelegateResponse = {
+      data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] }, delegate: { id: "u99" } } },
+    };
+    globalThis.fetch = makeFetch(nonDelegateResponse);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "escape")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+  });
+
+  it("blocks an agent not registered in agents.json when ticket has a known delegate (AI-1400 B2 fail-closed)", async () => {
+    const knownDelegateResponse = {
+      data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] }, delegate: { id: "u99" } } },
+    };
+    globalThis.fetch = makeFetch(knownDelegateResponse);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "unknown-unregistered-agent")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("[Proxy]");
+    expect(res.body.errors[0].message).toContain("cannot be verified");
+  });
+
+  it("accepts a v-prefixed CLI version string (parseSemver fix)", async () => {
+    process.env.PROXY_MIN_CLI_VERSION = "0.3.0";
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .set("X-Openclaw-Linear-Cli-Version", "v0.4.0")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    delete process.env.PROXY_MIN_CLI_VERSION;
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeUndefined();
   });

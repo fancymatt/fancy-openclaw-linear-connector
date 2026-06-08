@@ -378,6 +378,16 @@ export async function checkWorkflowRules(
   // If both the caller's Linear user ID and the ticket's delegate ID are known,
   // block any agent that is not the current delegate. Fails open when either is
   // unknown (delegate not set, agent config missing linearUserId, fetch error).
+  // AI-1400 B2: additionally fail-closed when the caller identity is unknown
+  // (no linearUserId in agents.json) but the ticket has a known delegate — an
+  // unverifiable caller must not be allowed to mutate a delegated ticket.
+  if (!callerLinearUserId && delegateId) {
+    log.warn(`workflow-gate: unknown-caller block agent=${bodyId} intent=${intent} ticket=${issueId}`);
+    return (
+      `[Proxy] '${intent}' blocked: caller '${bodyId}' cannot be verified and the ticket has a known delegate. ` +
+      `Register the agent in agents.json with a linearUserId to proceed.`
+    );
+  }
   if (callerLinearUserId && delegateId && callerLinearUserId !== delegateId) {
     log.warn(`workflow-gate: delegate-only block agent=${bodyId} intent=${intent} ticket=${issueId}`);
     return (

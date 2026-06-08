@@ -45,7 +45,7 @@ function minWorkflowCliVersion(): string {
 
 /** Parse a semver string into [major, minor, patch] tuple, or null on failure. */
 function parseSemver(v: string): [number, number, number] | null {
-  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(v.trim());
+  const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(v.trim());
   if (!m) return null;
   return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
 }
