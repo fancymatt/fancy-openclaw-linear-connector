@@ -41,6 +41,7 @@ import { componentLogger, createLogger } from "./logger.js";
 import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
 import { ObservationStore, type ReasonCode } from "./store/observation-store.js";
 import { isBodyKnown } from "./escalation-gate.js";
+import { getAgent } from "./agents.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
 
@@ -832,6 +833,42 @@ export async function applyStateTransition(
     );
   }
 
+  // ── Auto-delegate assignment (AI-1463) ─────────────────────────────────
+  // After a successful state transition, if the destination state has a
+  // singleton owner_role (exactly one body fills it), automatically update
+  // the ticket delegate to that body's linearUserId. This prevents the
+  // reviewer from being stuck as delegate in a state they cannot act on.
+  // Fail-open: errors are logged and never block the already-succeeded label transition.
+  const destStateNode = def.states.find((s) => s.id === toStateName);
+  const destOwnerRole = destStateNode?.owner_role;
+  if (destOwnerRole && destStateNode?.kind !== 'terminal') {
+    try {
+      const roleBodies = await resolveBodiesForRole(destOwnerRole);
+      if (roleBodies.length === 1) {
+        const agent = getAgent(roleBodies[0]);
+        if (agent?.linearUserId) {
+          const delegateUpdated = await issueUpdateDelegate(
+            issue.internalId,
+            agent.linearUserId,
+            authToken,
+          );
+          if (delegateUpdated) {
+            log.info(
+              `workflow-gate: B2 apply: ${issueId} auto-delegate → ${roleBodies[0]} (linearUserId=${agent.linearUserId})`,
+            );
+          }
+        } else {
+          log.warn(
+            `workflow-gate: B2 apply: singleton body '${roleBodies[0]}' for role '${destOwnerRole}' has no linearUserId — skipping auto-delegate`,
+          );
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`workflow-gate: B2 apply: auto-delegate failed for ${issueId}: ${msg}`);
+    }
+  }
+
   // ── Phase 4 / P4-1: Record feedback observation ──────────────────────
   // After a successful state transition, if the transition has a feedback
   // block and feedback data was provided, write one append-only observation.
@@ -899,6 +936,44 @@ async function issueUpdateLabels(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: B2 apply: issueUpdate failed for ${internalId}: ${msg}`);
+    return false;
+  }
+}
+
+/**
+ * Update the delegate (assignee) of a Linear issue via a delegateId mutation.
+ * Used by the auto-delegate assignment logic (AI-1463) after a state transition
+ * to ensure the new state's owner body becomes the delegate.
+ * Fail-open: returns false on any error, never throws.
+ */
+async function issueUpdateDelegate(
+  internalId: string,
+  delegateLinearUserId: string,
+  authToken: string,
+): Promise<boolean> {
+  const mutation = `
+    mutation UpdateDelegate($issueId: String!, $delegateId: String!) {
+      issueUpdate(id: $issueId, input: { delegateId: $delegateId }) {
+        success
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId: internalId, delegateId: delegateLinearUserId } }),
+    });
+    type Resp = { data?: { issueUpdate?: { success: boolean } } };
+    const data = (await res.json()) as Resp;
+    if (!data.data?.issueUpdate?.success) {
+      log.warn(`workflow-gate: auto-delegate: issueUpdate returned non-success for ${internalId}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: auto-delegate: issueUpdate failed for ${internalId}: ${msg}`);
     return false;
   }
 }

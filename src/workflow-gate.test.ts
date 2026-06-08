@@ -28,6 +28,7 @@ import {
   resetWorkflowCache,
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
+import { reloadAgents } from "./agents.js";
 
 // Resolved from the project root (jest cwd) so it works under both the
 // ESM tsc build and the CommonJS ts-jest transpile.
@@ -634,6 +635,14 @@ function makeTransitionFetch(opts: {
       if (opts.updateError) throw new Error("simulated update error");
       return new Response(
         JSON.stringify({ data: { issueUpdate: { success: issueUpdateSuccess } } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // AI-1463: UpdateDelegate mutation for auto-delegate assignment.
+    if (query.includes("UpdateDelegate")) {
+      return new Response(
+        JSON.stringify({ data: { issueUpdate: { success: true } } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -1352,6 +1361,7 @@ describe("checkRawMutationInterception — AI-1402: labelIds blocking + unknown-
   });
 });
 
+
 // ── Phase 5 / B-1: ux-audit workflow definition validation (AI-1438) ────────
 // Validates the canonical ux-audit YAML fixture parses correctly and
 // enforces workflow rules per design.md §14 + §16.0.
@@ -1519,5 +1529,168 @@ describe("checkWorkflowRules — canonical ux-audit schema (src/__fixtures__/can
     const { loadWorkflowDef } = await import("./workflow-gate.js");
     const def = await loadWorkflowDef();
     expect(def.archetype).toBe("orchestrator");
+  });
+});
+
+// ── AI-1463: Auto-delegate assignment on approve transition ──────────────────
+
+describe("applyStateTransition — auto-delegate assignment (AI-1463)", () => {
+  let autoDelegateDir: string;
+  let autoDelegateOriginalFetch: typeof globalThis.fetch;
+  let originalAgentsFile: string | undefined;
+
+  beforeEach(() => {
+    autoDelegateDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1463-test-"));
+    const policyFile = path.join(autoDelegateDir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(autoDelegateDir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    // Set up agents.json with hanzo (deployment body) having a linearUserId
+    const agentsFile = path.join(autoDelegateDir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [{
+        name: "hanzo",
+        linearUserId: "hanzo-linear-uuid",
+        clientId: "hanzo-client",
+        clientSecret: "hanzo-secret",
+        accessToken: "hanzo-token",
+        refreshToken: "hanzo-refresh",
+      }, {
+        name: "charles",
+        linearUserId: "charles-linear-uuid",
+        clientId: "charles-client",
+        clientSecret: "charles-secret",
+        accessToken: "charles-token",
+        refreshToken: "charles-refresh",
+      }],
+    }, null, 2), "utf8");
+    originalAgentsFile = process.env.AGENTS_FILE;
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    autoDelegateOriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = autoDelegateOriginalFetch;
+    if (originalAgentsFile) {
+      process.env.AGENTS_FILE = originalAgentsFile;
+    } else {
+      delete process.env.AGENTS_FILE;
+    }
+    reloadAgents();
+    fs.rmSync(autoDelegateDir, { recursive: true, force: true });
+  });
+
+  it("auto-assigns delegate to hanzo when approve transitions code-review → deployment", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:code-review" },
+      ],
+      teamLabels: [{ id: "deploy-lbl", name: "state:deployment" }],
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("approve", "issue-uuid", "Bearer tok");
+
+    // Verify the label swap happened
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    expect(updateCall).toBeDefined();
+
+    // Verify the delegate update mutation was issued
+    const delegateCall = calls.find((c) => (c.body.query ?? "").includes("UpdateDelegate"));
+    expect(delegateCall).toBeDefined();
+    const vars = delegateCall!.body.variables as { issueId: string; delegateId: string };
+    expect(vars.issueId).toBe("internal-uuid");
+    expect(vars.delegateId).toBe("hanzo-linear-uuid");
+  });
+
+  it("does not auto-assign delegate when destination state has no owner_role", async () => {
+    // submit transitions implementation → code-review. code-review has owner_role: code-review
+    // but there is no body filling the code-review role in the test policy, so resolveBodiesForRole
+    // returns [] and auto-delegate should be skipped.
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:implementation" },
+      ],
+      teamLabels: [{ id: "cr-lbl", name: "state:code-review" }],
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("submit", "issue-uuid", "Bearer tok");
+
+    // Label swap should happen
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    expect(updateCall).toBeDefined();
+
+    // But no delegate update (code-review role has no bodies in test policy)
+    const delegateCall = calls.find((c) => (c.body.query ?? "").includes("UpdateDelegate"));
+    expect(delegateCall).toBeUndefined();
+  });
+
+  it("does not auto-assign delegate when destination is terminal (done)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
+
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    expect(updateCall).toBeDefined();
+
+    // Terminal state — no auto-delegate
+    const delegateCall = calls.find((c) => (c.body.query ?? "").includes("UpdateDelegate"));
+    expect(delegateCall).toBeUndefined();
+  });
+
+  it("fail-open: auto-delegate errors do not block the label transition", async () => {
+    // Simulate a scenario where getAgent returns undefined (body not in agents.json)
+    // by using a body name that doesn't exist. The label swap should still succeed.
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:code-review" },
+      ],
+      teamLabels: [{ id: "deploy-lbl", name: "state:deployment" }],
+    });
+    globalThis.fetch = mock;
+
+    // Temporarily remove hanzo from agents
+    const agentsFile = path.join(autoDelegateDir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [{
+        name: "charles",
+        linearUserId: "charles-linear-uuid",
+        clientId: "charles-client",
+        clientSecret: "charles-secret",
+        accessToken: "charles-token",
+        refreshToken: "charles-refresh",
+      }],
+    }, null, 2), "utf8");
+    reloadAgents();
+
+    await applyStateTransition("approve", "issue-uuid", "Bearer tok");
+
+    // Label swap should still have happened despite missing hanzo agent
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    expect(updateCall).toBeDefined();
+
+    // No delegate update (hanzo not in agents)
+    const delegateCall = calls.find((c) => (c.body.query ?? "").includes("UpdateDelegate"));
+    expect(delegateCall).toBeUndefined();
+
   });
 });
