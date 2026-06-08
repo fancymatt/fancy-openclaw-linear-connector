@@ -2,9 +2,9 @@
  * Phase 4 / P4-3 — Periodic distillation of reject metrics into skill-workshop proposals.
  *
  * Scheduled job that:
- * 1. Reads P4-2 metric aggregation from /api/observations/metrics
+ * 1. Reads P4-2 metric aggregation from ObservationStore
  * 2. Detects (workflow, step, reason_code) patterns exceeding threshold
- * 3. Emits a skill-workshop proposal for each crossing pattern
+ * 3. Emits a pending skill-workshop proposal for each crossing pattern (deduplicated)
  * 4. Follows existing propose → review → apply flow (pending by default)
  *
  * Design: design.md §8 (learning loop), §8.2 (system-level fix), §8.3 (propose → review → apply)
@@ -15,11 +15,9 @@ import { createLogger, componentLogger } from "../logger.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "p4-metrics-distillation");
 
-/** Default threshold for triggering a proposal (configurable via env) */
 const DEFAULT_THRESHOLD = parseInt(process.env.P4_DISTILL_THRESHOLD ?? "3", 10);
-
-/** Max proposals to generate per run (prevent storming) */
-const MAX_PROPOSALS_PER_RUN = 10;
+const MAX_PROPOSALS_PER_RUN = parseInt(process.env.MAX_PROPOSALS_PER_RUN ?? "10", 10);
+const DEFAULT_INTERVAL_MS = parseIntervalMs(process.env.P4_DISTILL_INTERVAL ?? "1h");
 
 export interface DistillationResult {
   proposalsCreated: number;
@@ -28,28 +26,96 @@ export interface DistillationResult {
   error?: string;
 }
 
-/**
- * Build a skill-workshop proposal description for a crossed pattern.
- */
-function buildProposalDescription(workflow: string, step: string, reasonCode: string, count: number): string {
-  const reasonDescriptions: Record<string, string> = {
-    "missing-tests": "Missing tests detected during review",
-    "style": "Code style issues found during review",
-    "scope-creep": "Scope creep detected in implementation",
-    "correctness": "Correctness issues found during review",
-    "ac-mismatch": "Acceptance criteria mismatch detected",
-  };
+/** Parse a duration string like "1h", "30m", "3600s" or raw milliseconds. */
+function parseIntervalMs(value: string): number {
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return parseInt(trimmed, 10);
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)(ms|s|m|h|d)$/);
+  if (!match) return 60 * 60 * 1000; // default 1h
+  const n = parseFloat(match[1]);
+  switch (match[2]) {
+    case "ms": return n;
+    case "s":  return n * 1_000;
+    case "m":  return n * 60_000;
+    case "h":  return n * 3_600_000;
+    case "d":  return n * 86_400_000;
+    default:   return 3_600_000;
+  }
+}
 
-  const reasonDesc = reasonDescriptions[reasonCode] || `Rejects for reason "${reasonCode}"`;
-  return `At the "${step}" step of the "${workflow}" workflow, reviewers rejected for "${reasonCode}" ${count}× — proposed guidance: Add ${reasonDesc} checklist items and update step documentation.`;
+/** Call a tool via the OpenClaw gateway /tools/invoke HTTP API. */
+async function invokeGatewayTool(tool: string, args: Record<string, unknown>): Promise<unknown> {
+  const gatewayUrl = (process.env.OPENCLAW_GATEWAY_URL ?? "http://localhost:18789").replace(/\/$/, "");
+  const token = process.env.OPENCLAW_GATEWAY_TOKEN ?? process.env.OPENCLAW_GATEWAY_PASSWORD;
+
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  const response = await fetch(`${gatewayUrl}/tools/invoke`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ tool, args }),
+  });
+
+  const data = await response.json() as { ok: boolean; result?: unknown; error?: { message?: string } };
+  if (!data.ok) {
+    throw new Error(data.error?.message ?? `Gateway tool invoke failed (status ${response.status})`);
+  }
+  return data.result;
+}
+
+/** Check if a pending skill-workshop proposal already exists for the given name. */
+async function proposalExists(name: string): Promise<boolean> {
+  try {
+    const result = await invokeGatewayTool("skill_workshop", { action: "list" }) as { proposals?: Array<{ name: string; status?: string }> } | null;
+    if (!result || !Array.isArray((result as { proposals?: unknown[] }).proposals)) return false;
+    const proposals = (result as { proposals: Array<{ name: string; status?: string }> }).proposals;
+    return proposals.some(
+      (p) => p.name === name && (!p.status || p.status === "pending")
+    );
+  } catch (err) {
+    log.warn(`[P4-3] Could not check for existing proposals: ${err instanceof Error ? err.message : String(err)} — skipping dedup check`);
+    return false;
+  }
+}
+
+function buildProposalContent(workflow: string, step: string, reasonCode: string, count: number, description: string): string {
+  return [
+    `# Skill: ${workflow}-${step}-${reasonCode}`,
+    "",
+    description,
+    "",
+    "## Steps",
+    "",
+    `1. Add ${reasonCode} checklist items to the ${step} step`,
+    "2. Update step documentation",
+    "3. Train on common pitfalls",
+    "",
+    "## Acceptance Criteria",
+    "",
+    `- [ ] ${reasonCode} checklist added to ${step}`,
+    "- [ ] Step documentation updated",
+    "- [ ] Reviewer guidelines updated",
+    "",
+    `_Auto-generated by P4-3 distillation. Pattern: ${workflow}/${step}/${reasonCode} crossed threshold (count=${count})._`,
+  ].join("\n");
+}
+
+function buildDescription(workflow: string, step: string, reasonCode: string, count: number): string {
+  const reasonLabels: Record<string, string> = {
+    "missing-tests": "missing tests",
+    "style": "code style issues",
+    "scope-creep": "scope creep",
+    "correctness": "correctness issues",
+    "ac-mismatch": "AC mismatch",
+  };
+  const label = reasonLabels[reasonCode] ?? `"${reasonCode}"`;
+  const desc = `${workflow}/${step}: ${label} rejected ${count}× — add checklist + update docs`;
+  return desc.length <= 160 ? desc : desc.slice(0, 157) + "...";
 }
 
 /**
  * Run P4-3 distillation: scan metrics and create proposals for threshold-crossing patterns.
- *
- * @param observationStore - P4-2 metrics store
- * @param threshold - Optional threshold override (default from env or DEFAULT_THRESHOLD)
- * @returns DistillationResult with summary
  */
 export async function runDistillation(observationStore: ObservationStore, threshold?: number): Promise<DistillationResult> {
   const actualThreshold = threshold ?? DEFAULT_THRESHOLD;
@@ -57,96 +123,73 @@ export async function runDistillation(observationStore: ObservationStore, thresh
   try {
     log.info(`[P4-3] Running distillation with threshold=${actualThreshold}`);
 
-    // Step 1: Fetch metrics from ObservationStore
     const metrics = observationStore.metrics({ threshold: actualThreshold });
-
-    // Step 2: Group crossed patterns
     const crossedPatterns = metrics.items.filter((item) => item.exceedsThreshold);
-    const patternCounts = new Map<string, number>();
-    for (const item of crossedPatterns) {
-      const key = `${item.workflow}|${item.step}|${item.reasonCode}`;
-      patternCounts.set(key, (patternCounts.get(key) ?? 0) + item.count);
-    }
 
-    log.info(`[P4-3] Found ${patternCounts.size} crossed patterns out of ${crossedPatterns.length} items`);
+    log.info(`[P4-3] Found ${crossedPatterns.length} crossed pattern(s)`);
 
-    // Step 3: Create proposals (limit per run)
-    const proposalsToCreate = Array.from(patternCounts.entries())
-      .slice(0, MAX_PROPOSALS_PER_RUN)
-      .map(([key, count]) => {
-        const [workflow, step, reasonCode] = key.split("|");
-        return {
-          workflow,
-          step,
-          reasonCode,
-          count,
-          description: buildProposalDescription(workflow, step, reasonCode, count),
-        };
-      });
+    const candidates = crossedPatterns.slice(0, MAX_PROPOSALS_PER_RUN).map((item) => ({
+      workflow: item.workflow,
+      step: item.step,
+      reasonCode: item.reasonCode,
+      count: item.count,
+      name: `${item.workflow}-${item.step}-${item.reasonCode}`,
+    }));
 
-    // Step 4: Emit proposals via skill_workshop (mock implementation)
-    // In production, this would call the skill_workshop API with action="create"
-    const proposalsCreated = proposalsToCreate.length;
-    const skipped = [];
+    let proposalsCreated = 0;
+    const skipped: { pattern: string; reason: string }[] = [];
 
-    for (const proposal of proposalsToCreate) {
+    for (const candidate of candidates) {
+      const patternLabel = `${candidate.workflow}/${candidate.step}/${candidate.reasonCode}`;
       try {
-        // Simulate proposal creation
-        log.info(
-          `[P4-3] Creating proposal: workflow=${proposal.workflow} step=${proposal.step} reason=${proposal.reasonCode} count=${proposal.count}`
-        );
-        // TODO: Replace with actual skill_workshop API call
-        // await skillWorkshopCreate({
-        //   name: `${proposal.workflow}-${proposal.step}-${proposal.reasonCode}`,
-        //   description: proposal.description,
-        //   proposalContent: `# Skill: ${proposal.workflow}-${proposal.step}\n\n${proposal.description}\n\n## Steps\n\n1. Add ${proposal.reasonCode} checklist items\n2. Update step documentation\n3. Train on common pitfalls\n\n## Acceptance Criteria\n\n- [ ] ${proposal.reasonCode} checklist added\n- [ ] Step documentation updated\n- [ ] Reviewer guidelines updated\n`,
-        // });
-      } catch (err) {
-        log.error(`[P4-3] Failed to create proposal for ${proposal.workflow}/${proposal.step}/${proposal.reasonCode}: ${err instanceof Error ? err.message : String(err)}`);
-        skipped.push({
-          pattern: `${proposal.workflow}/${proposal.step}/${proposal.reasonCode}`,
-          reason: "Proposal creation failed",
+        const exists = await proposalExists(candidate.name);
+        if (exists) {
+          log.info(`[P4-3] Skipping ${patternLabel} — pending proposal already exists`);
+          skipped.push({ pattern: patternLabel, reason: "existing-pending-proposal" });
+          continue;
+        }
+
+        const description = buildDescription(candidate.workflow, candidate.step, candidate.reasonCode, candidate.count);
+        const proposalContent = buildProposalContent(candidate.workflow, candidate.step, candidate.reasonCode, candidate.count, description);
+
+        await invokeGatewayTool("skill_workshop", {
+          action: "create",
+          name: candidate.name,
+          description,
+          proposal_content: proposalContent,
         });
+
+        log.info(`[P4-3] Created proposal: ${candidate.name} (count=${candidate.count})`);
+        proposalsCreated++;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.error(`[P4-3] Failed to create proposal for ${patternLabel}: ${msg}`);
+        skipped.push({ pattern: patternLabel, reason: "proposal-creation-failed" });
       }
     }
 
-    log.info(`[P4-3] Distillation complete: ${proposalsCreated} proposals created, ${skipped.length} skipped`);
+    log.info(`[P4-3] Distillation complete: ${proposalsCreated} created, ${skipped.length} skipped`);
 
-    return {
-      proposalsCreated,
-      patternsCrossed: crossedPatterns.length,
-      skipped,
-    };
+    return { proposalsCreated, patternsCrossed: crossedPatterns.length, skipped };
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log.error(`[P4-3] Distillation failed: ${errorMessage}`);
-    return {
-      proposalsCreated: 0,
-      patternsCrossed: 0,
-      skipped: [],
-      error: errorMessage,
-    };
+    return { proposalsCreated: 0, patternsCrossed: 0, skipped: [], error: errorMessage };
   }
 }
 
 /**
- * Register P4-3 cron job with Gateway cron manager.
- *
- * This is a placeholder for the cron registration. In production,
- * this would be called during connector initialization.
+ * Register the P4-3 distillation as an in-process recurring job.
+ * Interval is controlled by P4_DISTILL_INTERVAL env var (default: 1h).
+ * The timer is unref'd so it won't prevent graceful shutdown.
  */
-export function registerDistillationCron(jobId: string, sessionKey?: string): void {
-  log.info(`[P4-3] Cron job registration placeholder: jobId=${jobId}, sessionKey=${sessionKey ?? "current"}`);
-
-  // TODO: Replace with actual cron.add call using Gateway cron tool
-  // Example:
-  // cron.add({
-  //   name: "p4-metrics-distillation",
-  //   schedule: { kind: "every", everyMs: 60 * 60 * 1000 }, // hourly
-  //   sessionTarget: sessionKey ?? "current",
-  //   payload: {
-  //     kind: "agentTurn",
-  //     message: "Run P4-3 distillation: /api/observations/metrics",
-  //   },
-  // });
+export function registerDistillationCron(observationStore: ObservationStore): void {
+  const intervalMs = DEFAULT_INTERVAL_MS;
+  const timer = setInterval(() => {
+    runDistillation(observationStore).catch((err) => {
+      log.error(`[P4-3] Scheduled distillation failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }, intervalMs);
+  timer.unref();
+  log.info(`[P4-3] Distillation scheduled every ${intervalMs}ms (P4_DISTILL_INTERVAL=${process.env.P4_DISTILL_INTERVAL ?? "1h"})`);
 }
