@@ -811,7 +811,7 @@ describe("checkRawMutationInterception — Layer 2 (AI-1387)", () => {
     return async (url: any, init?: RequestInit) => {
       if (typeof url === "string" && url.includes("api.linear.app")) {
         const bodyText = typeof init?.body === "string" ? init.body : "";
-        if (bodyText.includes("IssueLabels")) {
+        if (bodyText.includes("IssueContext") || bodyText.includes("IssueLabels")) {
           return new Response(JSON.stringify(labelResponse), {
             status: 200, headers: { "Content-Type": "application/json" },
           });

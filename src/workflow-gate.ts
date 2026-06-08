@@ -116,14 +116,20 @@ interface LabelNode {
   name: string;
 }
 
+interface TicketContext {
+  labels: string[];
+  /** Linear user ID of the current delegate, or null if unset. */
+  delegateId: string | null;
+}
+
 /**
- * Fetch label names for a Linear issue using the caller's auth token.
+ * Fetch label names and delegate for a Linear issue using the caller's auth token.
  * Independent of escalation-gate's label fetch — the proxy resolves state
  * from its own query and never trusts agent-supplied values (§11).
- * Returns an empty array on any error — enforcement fails open.
+ * Returns empty labels and null delegate on any error — enforcement fails open.
  */
-async function fetchTicketLabels(issueId: string, authToken: string): Promise<string[]> {
-  const query = `query IssueLabels($id: String!) { issue(id: $id) { labels { nodes { name } } } }`;
+async function fetchTicketContext(issueId: string, authToken: string): Promise<TicketContext> {
+  const query = `query IssueContext($id: String!) { issue(id: $id) { labels { nodes { name } } delegate { id } } }`;
   try {
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",
@@ -133,13 +139,24 @@ async function fetchTicketLabels(issueId: string, authToken: string): Promise<st
       },
       body: JSON.stringify({ query, variables: { id: issueId } }),
     });
-    type LabelResp = { data?: { issue?: { labels?: { nodes: Array<{ name: string }> } } } };
-    const data = (await res.json()) as LabelResp;
-    return (data.data?.issue?.labels?.nodes ?? []).map((n) => n.name);
+    type ContextResp = {
+      data?: {
+        issue?: {
+          labels?: { nodes: Array<{ name: string }> };
+          delegate?: { id: string } | null;
+        };
+      };
+    };
+    const data = (await res.json()) as ContextResp;
+    const issue = data.data?.issue;
+    return {
+      labels: (issue?.labels?.nodes ?? []).map((n) => n.name),
+      delegateId: issue?.delegate?.id ?? null,
+    };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    log.warn(`workflow-gate: label fetch failed for ${issueId}: ${msg} — failing open`);
-    return [];
+    log.warn(`workflow-gate: context fetch failed for ${issueId}: ${msg} — failing open`);
+    return { labels: [], delegateId: null };
   }
 }
 
@@ -318,19 +335,23 @@ export async function fetchWorkflowLabels(issueId: string, authToken: string): P
  * Returns a rejection message when the command should be blocked, or null to forward.
  * Fails open on missing issueId, missing state label, unknown workflow, or label-fetch
  * failure — enforcement only blocks with affirmative evidence of a violation.
+ *
+ * @param callerLinearUserId - Linear user ID of the requesting agent (from agents.ts);
+ *   used for delegate-only enforcement (AI-1397). Null/undefined → fail-open.
  */
 export async function checkWorkflowRules(
   intent: string,
   issueId: string | null,
   authToken: string,
   bodyId: string,
-  target: string | null = null
+  target: string | null = null,
+  callerLinearUserId?: string | null
 ): Promise<string | null> {
   // TODO(AI-1347): fail-open on missing issueId is a Layer A carry-forward.
   // Harden by deriving issueId from the request body when headers are absent.
   if (!issueId) return null;
 
-  const labels = await fetchTicketLabels(issueId, authToken);
+  const { labels, delegateId } = await fetchTicketContext(issueId, authToken);
 
   // §4.6 mode switch: ad-hoc tickets (no wf:* label) are full pass-through.
   const workflowId = getWorkflowId(labels);
@@ -352,6 +373,18 @@ export async function checkWorkflowRules(
 
   // §4.4: break-glass escape is legal from every state — never block it.
   if (intent === breakGlassCommand) return null;
+
+  // AI-1397: delegate-only enforcement at proxy (CLI-version-agnostic).
+  // If both the caller's Linear user ID and the ticket's delegate ID are known,
+  // block any agent that is not the current delegate. Fails open when either is
+  // unknown (delegate not set, agent config missing linearUserId, fetch error).
+  if (callerLinearUserId && delegateId && callerLinearUserId !== delegateId) {
+    log.warn(`workflow-gate: delegate-only block agent=${bodyId} intent=${intent} ticket=${issueId}`);
+    return (
+      `[Proxy] '${intent}' blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
+      `Only the ticket delegate may mutate its state.`
+    );
+  }
 
   const currentState = getCurrentState(labels);
   if (!currentState) {
@@ -459,7 +492,7 @@ export async function checkRawMutationInterception(
   if (!hasStateChange && !hasAssigneeChange) return null;
 
   // This is a raw status/assignee mutation — check if the ticket is on a workflow.
-  const labels = await fetchTicketLabels(issueId, authToken);
+  const { labels } = await fetchTicketContext(issueId, authToken);
   const workflowId = getWorkflowId(labels);
   if (!workflowId) return null; // ad-hoc ticket — pass-through
 

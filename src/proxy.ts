@@ -7,7 +7,8 @@
  *
  * Enforcement order (defense in depth):
  *   1. Phase 2 escalation-gate — capability rule table (needs-human steward-only).
- *   2. Phase 3 B1 workflow-gate — full legal-move validation against dev-impl.yaml.
+ *   2. Phase 3 B1 workflow-gate — full legal-move validation against dev-impl.yaml,
+ *      including delegate-only enforcement (AI-1397).
  *   3. Layer 2 raw mutation interception (AI-1387) — blocks direct status/assignee
  *      changes on workflow tickets that bypass the intent-header path.
  * All must pass for the request to be forwarded.
@@ -16,6 +17,9 @@
  * atomically (single issueUpdate mutation). Seam: proxy-side, not CLI-side — the
  * state change is coupled to the validated forward so an agent cannot skip it.
  * Transition failures are fail-open: logged but never propagate to the response.
+ *
+ * AI-1397 version floor: workflow mutations from CLIs below MIN_WORKFLOW_CLI_VERSION
+ * are rejected. Missing version header is warned but allowed (backward compat).
  */
 
 import type { Request, Response } from "express";
@@ -23,9 +27,35 @@ import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, type TransitionFeedback } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
+import { getAgent } from "./agents.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
+
+/**
+ * Minimum CLI version required to issue workflow mutations (AI-1397).
+ * CLIs below this version lack proxy-side delegate guards and advancement
+ * guards, so they must be rejected before any enforcement can be bypassed.
+ * Override via PROXY_MIN_CLI_VERSION env for testing. Evaluated at request
+ * time so tests can override the env var after module load.
+ */
+function minWorkflowCliVersion(): string {
+  return process.env.PROXY_MIN_CLI_VERSION ?? "0.3.0";
+}
+
+/** Parse a semver string into [major, minor, patch] tuple, or null on failure. */
+function parseSemver(v: string): [number, number, number] | null {
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(v.trim());
+  if (!m) return null;
+  return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
+}
+
+/** Returns true when `a` is strictly less than `b`. */
+function semverLt(a: [number, number, number], b: [number, number, number]): boolean {
+  if (a[0] !== b[0]) return a[0] < b[0];
+  if (a[1] !== b[1]) return a[1] < b[1];
+  return a[2] < b[2];
+}
 
 interface GraphQLRequestBody {
   query?: string;
@@ -102,15 +132,34 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   const intent = (req.headers["x-openclaw-linear-intent"] as string | undefined) ?? null;
   const target = (req.headers["x-openclaw-linear-target"] as string | undefined) ?? null;
   const feedbackCategoryHeader = (req.headers["x-openclaw-feedback-category"] as string | undefined) ?? null;
+  const cliVersion = (req.headers["x-openclaw-linear-cli-version"] as string | undefined) ?? null;
   const body = parseBody(req);
   const opName = body?.operationName ?? "(unnamed)";
   const issueId = extractIssueId(body);
   const ticketCtx = issueId ? ` ticket=${issueId}` : "";
 
-  log.info(`forward agent=${agentId} op=${opName}${ticketCtx}${intent ? ` intent=${intent}` : ""}`);
+  // AI-1397: resolve caller's Linear user ID from agent config for delegate enforcement.
+  const callerLinearUserId = getAgent(agentId)?.linearUserId ?? null;
+
+  log.info(`forward agent=${agentId} op=${opName}${ticketCtx}${intent ? ` intent=${intent}` : ""}${cliVersion ? ` cli=${cliVersion}` : ""}`);
 
   // Phase 2 / slice 1 + Phase 3 B1: evaluate enforcement rules before forwarding.
   if (intent) {
+    // AI-1397: version floor — reject workflow mutations from stale CLIs.
+    if (cliVersion) {
+      const minVer = minWorkflowCliVersion();
+      const parsed = parseSemver(cliVersion);
+      const floor = parseSemver(minVer);
+      if (parsed && floor && semverLt(parsed, floor)) {
+        const msg = `[Proxy] CLI version ${cliVersion} is below the minimum required ${minVer}. Update fancy-openclaw-linear-skill-cli to proceed.`;
+        log.warn(`version-floor-block agent=${agentId} cli=${cliVersion}${ticketCtx}: below ${minVer}`);
+        res.status(200).json({ errors: [{ message: msg }] });
+        return;
+      }
+    } else {
+      log.warn(`version-header-missing agent=${agentId} intent=${intent}${ticketCtx} — update CLI to emit X-Openclaw-Linear-Cli-Version`);
+    }
+
     const p2rejection = await checkEnforcementRules(intent, issueId, authorization, agentId);
     if (p2rejection) {
       log.warn(`enforcement-block agent=${agentId} intent=${intent}${ticketCtx}: ${p2rejection}`);
@@ -118,7 +167,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       return;
     }
 
-    const p3rejection = await checkWorkflowRules(intent, issueId, authorization, agentId, target);
+    const p3rejection = await checkWorkflowRules(intent, issueId, authorization, agentId, target, callerLinearUserId);
     if (p3rejection) {
       log.warn(`workflow-block agent=${agentId} intent=${intent}${ticketCtx}: ${p3rejection}`);
       res.status(200).json({ errors: [{ message: p3rejection }] });

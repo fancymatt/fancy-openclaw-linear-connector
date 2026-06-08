@@ -281,10 +281,10 @@ describe("proxy enforcement — needs-human (Phase 2 slice 1)", () => {
       if (typeof url !== "string" || !url.includes("api.linear.app")) {
         return originalFetch(url, init);
       }
-      // Distinguish label fetch (IssueLabels query) from the main mutation.
+      // Distinguish label/context fetch from the main mutation.
       const bodyText = typeof init?.body === "string" ? init.body : "";
       const parsed = bodyText ? JSON.parse(bodyText) as { query?: string } : {};
-      if (parsed.query?.includes("IssueLabels")) {
+      if (parsed.query?.includes("IssueContext") || parsed.query?.includes("IssueLabels")) {
         return new Response(JSON.stringify(labelResponse), {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -374,11 +374,12 @@ describe("proxy enforcement — needs-human (Phase 2 slice 1)", () => {
 
 // ── Phase 3 / B1: workflow-def-driven command validation ──────────────────
 
+// AI-1397: include delegate so charles (linearUserId "u1") passes the proxy delegate check.
 const DEV_IMPL_IMPLEMENTATION_RESPONSE = {
-  data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] } } },
+  data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] }, delegate: { id: "u1" } } },
 };
 const DEV_IMPL_DEPLOYMENT_RESPONSE = {
-  data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] } } },
+  data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] }, delegate: { id: "u1" } } },
 };
 
 describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
@@ -422,7 +423,7 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
       }
       const bodyText = typeof init?.body === "string" ? init.body : "";
       const parsed = bodyText ? JSON.parse(bodyText) as { query?: string } : {};
-      if (parsed.query?.includes("IssueLabels")) {
+      if (parsed.query?.includes("IssueContext") || parsed.query?.includes("IssueLabels")) {
         return new Response(JSON.stringify(labelResponse), {
           status: 200, headers: { "Content-Type": "application/json" },
         });
@@ -524,6 +525,98 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
     expect(res.body.errors).toBeUndefined();
     expect(res.body.data).toBeDefined();
   });
+
+  // ── AI-1397: delegate-only enforcement ───────────────────────────────────
+
+  it("blocks a non-delegate agent (different linearUserId) from mutating a workflow ticket", async () => {
+    // Ticket delegate is "u99" (not charles's "u1") → reject regardless of command legality.
+    const nonDelegateResponse = {
+      data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] }, delegate: { id: "u99" } } },
+    };
+    globalThis.fetch = makeFetch(nonDelegateResponse);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit") // would be legal if delegate matched
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("[Proxy]");
+    expect(res.body.errors[0].message).toContain("not the current delegate");
+  });
+
+  it("fails open (allows) when ticket has no delegate set", async () => {
+    const noDelegateResponse = {
+      data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] }, delegate: null } },
+    };
+    globalThis.fetch = makeFetch(noDelegateResponse);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+  });
+
+  // ── AI-1397: version floor ────────────────────────────────────────────────
+
+  it("blocks a CLI below the minimum version on a workflow mutation", async () => {
+    process.env.PROXY_MIN_CLI_VERSION = "1.0.0";
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .set("X-Openclaw-Linear-Cli-Version", "0.3.0")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    delete process.env.PROXY_MIN_CLI_VERSION;
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("minimum required");
+    expect(res.body.errors[0].message).toContain("1.0.0");
+  });
+
+  it("allows a CLI at or above the minimum version", async () => {
+    process.env.PROXY_MIN_CLI_VERSION = "0.3.0";
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .set("X-Openclaw-Linear-Cli-Version", "0.3.0")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    delete process.env.PROXY_MIN_CLI_VERSION;
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+  });
+
+  it("fails open (allows) when version header is absent", async () => {
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      // no X-Openclaw-Linear-Cli-Version header
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+  });
 });
 
 // ── Phase 3 / B2: state-label transition application ─────────────────────
@@ -615,7 +708,7 @@ describe("proxy enforcement — B2 state-label transition application", () => {
 
       const q = parsed.query ?? "";
 
-      if (q.includes("IssueLabels") && !q.includes("IssueWithLabels")) {
+      if ((q.includes("IssueContext") || q.includes("IssueLabels")) && !q.includes("IssueWithLabels")) {
         return new Response(JSON.stringify(opts.b1LabelResponse), {
           status: 200, headers: { "Content-Type": "application/json" },
         });
@@ -774,7 +867,7 @@ describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
       }
       const bodyText = typeof init?.body === "string" ? init.body : "";
       const parsed = bodyText ? JSON.parse(bodyText) as { query?: string } : {};
-      if (parsed.query?.includes("IssueLabels")) {
+      if (parsed.query?.includes("IssueContext") || parsed.query?.includes("IssueLabels")) {
         return new Response(JSON.stringify(labelResponse), {
           status: 200, headers: { "Content-Type": "application/json" },
         });
