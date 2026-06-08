@@ -55,6 +55,18 @@ function acknowledgeAgentAuthoredActivity(event, onAgentActivity) {
     onAgentActivity(agentId, ticketId);
     log.info(`Agent-authored Linear activity acknowledged: ${agentId} [${ticketId}]`);
 }
+/** Wrap deliverToAgent with the global concurrent-dispatch semaphore. */
+async function deliverWithSlot(route, config, throttle) {
+    if (throttle)
+        await throttle.acquireSlot();
+    try {
+        return await deliverToAgent(route, config);
+    }
+    finally {
+        if (throttle)
+            throttle.releaseSlot();
+    }
+}
 export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle, operationalEventStore, onDispatched, onAgentActivity) {
     const router = Router();
     if (NUDGE_DEDUP_WINDOW_MS > 0) {
@@ -241,6 +253,13 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
         if (bag && sessionTracker) {
             const normalizedTicketId = normalizeSessionKey(ticketId);
             bag.add(agentName, normalizedTicketId, event.type, route.routingReason);
+            // Purge stale bag entries for this ticket from all other agents. When a
+            // delegate changes, the previous holder's bag entry must be removed so it
+            // doesn't receive a spurious consider-work wake for a ticket it no longer owns.
+            const purgedStale = bag.removeTicketForOtherAgents(agentName, normalizedTicketId);
+            if (purgedStale > 0) {
+                log.info(`Bag: purged stale entries for ${normalizedTicketId} from ${purgedStale} other agent(s)`);
+            }
             appendOperationalEvent(operationalEventStore, { outcome: "bag-added", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "pending-bag" });
             const wakeConfig = {
                 nodeBin: process.execPath,
@@ -281,7 +300,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
                         await throttle.wait(route.agentId);
                         throttle.record(route.agentId);
                     }
-                    const sameTicketResult = await deliverToAgent(route, wakeConfigForAgent(route.agentId));
+                    const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle);
                     bag.removeTicket(agentName, normalizedTicketId);
                     appendOperationalEvent(operationalEventStore, {
                         outcome: sameTicketResult.runId ? "dispatch-accepted" : "delivered",
@@ -348,7 +367,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
                 await throttle.wait(route.agentId);
                 throttle.record(route.agentId);
             }
-            const directResult = await deliverToAgent(route, deliveryConfig);
+            const directResult = await deliverWithSlot(route, deliveryConfig, throttle);
             appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null });
         }
         catch (err) {
@@ -366,7 +385,7 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
                             await throttle.wait(route.agentId);
                             throttle.record(route.agentId);
                         }
-                        const drainResult = await deliverToAgent(next, deliveryConfig);
+                        const drainResult = await deliverWithSlot(next, deliveryConfig, throttle);
                         appendOperationalEvent(operationalEventStore, { outcome: drainResult.runId ? "dispatch-accepted" : "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, runId: drainResult.runId ?? null });
                     }
                     catch (err) {

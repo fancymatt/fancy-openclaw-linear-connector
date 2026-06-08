@@ -1,18 +1,26 @@
 /**
- * Per-agent delivery throttle.
+ * Per-agent delivery throttle + global concurrent-dispatch semaphore.
  *
- * Prevents burst-spawned sessions by enforcing a minimum interval between
- * consecutive deliveries to the same agent. Each agent gets its own cooldown
- * tracked independently.
- *
- * Default interval: 2 seconds (configurable via DISPATCH_THROTTLE_MS env).
+ * Prevents burst-spawned sessions by:
+ * 1. Per-agent: enforcing a minimum interval between consecutive deliveries
+ *    to the same agent (DISPATCH_THROTTLE_MS, default 2s).
+ * 2. Global: capping the number of in-flight deliveries across all agents
+ *    (MAX_CONCURRENT_DISPATCHES, default 3).  This prevents a Linear webhook
+ *    burst from queuing 20+ sessions on the OpenClaw gateway's lane=main
+ *    simultaneously, which caused runtime-plugins bootstrap stalls fleet-wide
+ *    when the main lane was saturated (AI-1216).
  */
 const DEFAULT_THROTTLE_MS = 2000;
+const DEFAULT_MAX_CONCURRENT = 3;
 export class DeliveryThrottle {
-    constructor(intervalMs) {
+    constructor(intervalMs, maxConcurrent) {
         this.lastDelivery = new Map();
+        this.active = 0;
+        this.waitQueue = [];
         this.intervalMs =
             intervalMs ?? parseInt(process.env.DISPATCH_THROTTLE_MS ?? `${DEFAULT_THROTTLE_MS}`, 10);
+        this.maxConcurrent =
+            maxConcurrent ?? parseInt(process.env.MAX_CONCURRENT_DISPATCHES ?? `${DEFAULT_MAX_CONCURRENT}`, 10);
     }
     /**
      * If the agent was delivered to within the throttle window, wait the
@@ -35,9 +43,39 @@ export class DeliveryThrottle {
     record(agentId) {
         this.lastDelivery.set(agentId, Date.now());
     }
-    /** Return the configured interval in ms. */
+    /**
+     * Acquire a global dispatch slot. Waits if MAX_CONCURRENT_DISPATCHES
+     * deliveries are already in flight. Call releaseSlot() when done.
+     */
+    async acquireSlot() {
+        if (this.active < this.maxConcurrent) {
+            this.active++;
+            return;
+        }
+        return new Promise((resolve) => {
+            this.waitQueue.push(() => {
+                this.active++;
+                resolve();
+            });
+        });
+    }
+    /** Release a global dispatch slot, unblocking the next waiter if any. */
+    releaseSlot() {
+        const next = this.waitQueue.shift();
+        if (next) {
+            next();
+        }
+        else {
+            this.active--;
+        }
+    }
+    /** Return the configured per-agent interval in ms. */
     getInterval() {
         return this.intervalMs;
+    }
+    /** Return the configured global concurrent dispatch limit. */
+    getMaxConcurrent() {
+        return this.maxConcurrent;
     }
 }
 //# sourceMappingURL=throttle.js.map

@@ -8,7 +8,8 @@ import { NudgeStore } from "../store/nudge-store.js";
 import type { OperationalEventInput, OperationalEventStore } from "../store/operational-event-store.js";
 import { routeEvent } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
-import { deliverToAgent, DeliveryThrottle } from "../delivery/index.js";
+import { deliverToAgent, DeliveryThrottle, type DeliveryConfig } from "../delivery/index.js";
+import type { RouteResult } from "../types.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { buildAgentMap, getAgent, getOpenclawAgentName } from "../agents.js";
 import { AgentQueue } from "../queue/index.js";
@@ -63,6 +64,20 @@ function acknowledgeAgentAuthoredActivity(
   const ticketId = normalizeSessionKey(identifier);
   onAgentActivity(agentId, ticketId);
   log.info(`Agent-authored Linear activity acknowledged: ${agentId} [${ticketId}]`);
+}
+
+/** Wrap deliverToAgent with the global concurrent-dispatch semaphore. */
+async function deliverWithSlot(
+  route: RouteResult,
+  config: DeliveryConfig,
+  throttle?: DeliveryThrottle,
+): Promise<Awaited<ReturnType<typeof deliverToAgent>>> {
+  if (throttle) await throttle.acquireSlot();
+  try {
+    return await deliverToAgent(route, config);
+  } finally {
+    if (throttle) throttle.releaseSlot();
+  }
 }
 
 export function createWebhookRouter(
@@ -336,7 +351,7 @@ export function createWebhookRouter(
               await throttle.wait(route.agentId);
               throttle.record(route.agentId);
             }
-            const sameTicketResult = await deliverToAgent(route, wakeConfigForAgent(route.agentId));
+            const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle);
             bag.removeTicket(agentName, normalizedTicketId);
             appendOperationalEvent(operationalEventStore, {
               outcome: sameTicketResult.runId ? "dispatch-accepted" : "delivered",
@@ -405,7 +420,7 @@ export function createWebhookRouter(
           await throttle.wait(route.agentId);
           throttle.record(route.agentId);
         }
-        const directResult = await deliverToAgent(route, deliveryConfig);
+        const directResult = await deliverWithSlot(route, deliveryConfig, throttle);
         appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null });
       } catch (err) {
         log.error(`OpenClaw delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
@@ -421,7 +436,7 @@ export function createWebhookRouter(
                 await throttle.wait(route.agentId);
                 throttle.record(route.agentId);
               }
-              const drainResult = await deliverToAgent(next, deliveryConfig);
+              const drainResult = await deliverWithSlot(next, deliveryConfig, throttle);
               appendOperationalEvent(operationalEventStore, { outcome: drainResult.runId ? "dispatch-accepted" : "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, runId: drainResult.runId ?? null });
             } catch (err) {
               log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);
