@@ -27,6 +27,7 @@
 
 import { componentLogger, createLogger } from "./logger.js";
 import { isHealthy as isConfigHealthy, getStatus as getConfigStatus, onAlert, type ConfigHealthStatus } from "./config-health.js";
+import { loadWorkflowDef, type WorkflowDef } from "./workflow-gate.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "canary");
 
@@ -286,4 +287,104 @@ function fireCanaryAlerts(result: CanaryResult): void {
       log.error(`canary: alert callback threw: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+}
+
+// ── AI-1493: Transition-walk canary ────────────────────────────────────────
+
+export interface TransitionWalkResult {
+  passed: boolean;
+  transitionsChecked: number;
+  violations: TransitionWalkViolation[];
+  timestamp: string;
+}
+
+export interface TransitionWalkViolation {
+  from: string;
+  command: string;
+  to: string;
+  issue: string;
+}
+
+/**
+ * Walk the workflow transition graph and verify every hop produces a valid state.
+ * Design: AI-1493 item 4.
+ */
+export async function runTransitionWalk(): Promise<TransitionWalkResult> {
+  const timestamp = new Date().toISOString();
+  const violations: TransitionWalkViolation[] = [];
+  let transitionsChecked = 0;
+
+  let def: WorkflowDef;
+  try {
+    def = await loadWorkflowDef();
+  } catch (err) {
+    return {
+      passed: false,
+      transitionsChecked: 0,
+      violations: [{
+        from: "(root)",
+        command: "loadWorkflowDef",
+        to: "(n/a)",
+        issue: "Failed to load workflow definition: " + (err instanceof Error ? err.message : String(err)),
+      }],
+      timestamp,
+    };
+  }
+
+  const stateIds = new Set(def.states.map((s) => s.id));
+
+  for (const state of def.states) {
+    if (state.kind !== "terminal") {
+      if (!state.owner_role) {
+        violations.push({
+          from: state.id,
+          command: "(schema)",
+          to: "(n/a)",
+          issue: "Non-terminal state '" + state.id + "' has no owner_role.",
+        });
+      }
+    }
+
+    for (const transition of state.transitions ?? []) {
+      transitionsChecked++;
+
+      if (!stateIds.has(transition.to) && transition.to !== "__ad_hoc__") {
+        violations.push({
+          from: state.id,
+          command: transition.command,
+          to: transition.to,
+          issue: "Transition leads to undefined state '" + transition.to + "'.",
+        });
+        continue;
+      }
+
+      if (transition.to === "__ad_hoc__") continue;
+
+      const destState = def.states.find((s) => s.id === transition.to);
+      if (!destState) continue;
+
+      if (destState.kind === "terminal") continue;
+
+      if (!destState.owner_role) {
+        violations.push({
+          from: state.id,
+          command: transition.command,
+          to: transition.to,
+          issue: "Transition to non-terminal state '" + transition.to + "' which has no owner_role.",
+        });
+      }
+    }
+  }
+
+  if (def.entry_state && !stateIds.has(def.entry_state)) {
+    violations.push({
+      from: "(schema)",
+      command: "entry_state",
+      to: def.entry_state,
+      issue: "entry_state '" + def.entry_state + "' does not reference a defined state.",
+    });
+  }
+
+  const passed = violations.length === 0;
+  return { passed, transitionsChecked, violations, timestamp };
 }

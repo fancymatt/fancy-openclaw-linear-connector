@@ -32,6 +32,7 @@ import {
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
 import { clearArtifactStore, getBoundArtifact, hasBoundArtifact } from "./artifact-store.js";
+import { runTransitionWalk } from "./canary.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
 
 // Resolved from the project root (jest cwd) so it works under both the
@@ -2010,10 +2011,8 @@ describe("applyStateTransition — auto-delegate assignment (AI-1463)", () => {
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
 
-    // Verify the delegate update mutation was issued
-    const delegateCall = calls.find((c) => (c.body.query ?? "").includes("UpdateDelegate"));
-    expect(delegateCall).toBeDefined();
-    const vars = delegateCall!.body.variables as { issueId: string; delegateId: string };
+    // AI-1493: delegate is bundled in the atomic mutation (not separate UpdateDelegate).
+    const vars = updateCall!.body.variables as { issueId: string; delegateId?: string };
     expect(vars.issueId).toBe("internal-uuid");
     expect(vars.delegateId).toBe("hanzo-linear-uuid");
   });
@@ -3739,4 +3738,197 @@ describe("AI-1482: Verbatim AC + Stakes-threshold sign-off", () => {
       expect(resolveStakesLevel(["stakes:unknown"], stakesConfig)).toBe(2);
     });
   });
+
+// ── AI-1493: Atomic transitions + deterministic owner-routing ──────────────
+
+describe("applyStateTransition — AI-1493 atomic transitions", () => {
+  let ai1493Dir: string;
+  let ai1493OriginalFetch: typeof globalThis.fetch;
+  let ai1493OriginalAgentsFile: string | undefined;
+
+  beforeEach(() => {
+    ai1493Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1493-test-"));
+    const policyFile = path.join(ai1493Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai1493Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    const agentsFile = path.join(ai1493Dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [{
+        name: "hanzo",
+        linearUserId: "hanzo-linear-uuid",
+        clientId: "hanzo-client",
+        clientSecret: "hanzo-secret",
+        accessToken: "hanzo-token",
+        refreshToken: "hanzo-refresh",
+      }, {
+        name: "charles",
+        linearUserId: "charles-linear-uuid",
+        clientId: "charles-client",
+        clientSecret: "charles-secret",
+        accessToken: "charles-token",
+        refreshToken: "charles-refresh",
+      }],
+    }, null, 2), "utf8");
+    ai1493OriginalAgentsFile = process.env.AGENTS_FILE;
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    ai1493OriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(async () => {
+    globalThis.fetch = ai1493OriginalFetch;
+    if (ai1493OriginalAgentsFile) {
+      process.env.AGENTS_FILE = ai1493OriginalAgentsFile;
+    } else {
+      delete process.env.AGENTS_FILE;
+    }
+    reloadAgents();
+    fs.rmSync(ai1493Dir, { recursive: true, force: true });
+
+    const { removeImplementer: doRemove } = await import("./implementer-store.js");
+    doRemove("issue-reject-ai1493");
+    doRemove("issue-rc-ai1493");
+    doRemove("issue-atomic-ai1493");
+    doRemove("issue-done-ai1493");
+  });
+
+  it("routes reject back to prior implementer from implementer store", async () => {
+    const { recordImplementer: doRecord } = await import("./implementer-store.js");
+    doRecord("issue-reject-ai1493", "hanzo", "dev-impl");
+
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("reject", "issue-reject-ai1493", "Bearer tok");
+
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.body.variables as { delegateId?: string };
+    expect(vars.delegateId).toBe("hanzo-linear-uuid");
+  });
+
+  it("routes request-changes back to prior implementer", async () => {
+    const { recordImplementer: doRecord } = await import("./implementer-store.js");
+    doRecord("issue-rc-ai1493", "charles", "dev-impl");
+
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:code-review" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("request-changes", "issue-rc-ai1493", "Bearer tok");
+
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.body.variables as { delegateId?: string };
+    expect(vars.delegateId).toBe("charles-linear-uuid");
+  });
+
+  it("atomic mutation includes both labels and delegate in single call", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:code-review" },
+      ],
+      teamLabels: [{ id: "deploy-lbl", name: "state:deployment" }],
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("approve", "issue-atomic-ai1493", "Bearer tok");
+
+    const atomicCalls = calls.filter((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(atomicCalls.length).toBe(1);
+
+    const vars = atomicCalls[0].body.variables as { labelIds: string[]; delegateId?: string };
+    expect(vars.labelIds).toBeDefined();
+    expect(vars.delegateId).toBe("hanzo-linear-uuid");
+
+    const delegateCalls = calls.filter((c) => (c.body.query ?? "").includes("UpdateDelegate"));
+    expect(delegateCalls.length).toBe(0);
+  });
+
+  it("clears delegate on terminal transition (deploy to done)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("deploy", "issue-done-ai1493", "Bearer tok");
+
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.body.variables as { delegateId?: string };
+    expect(vars.delegateId).toBeNull();
+  });
+});
+
+// ── AI-1493: Transition-walk canary ──────────────────────────────────────────
+
+describe("AI-1493: transition-walk canary", () => {
+  let canaryDir: string;
+
+  beforeEach(() => {
+    canaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1493-canary-"));
+    const workflowFile = path.join(canaryDir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+    resetWorkflowCache();
+  });
+
+  afterEach(() => {
+    fs.rmSync(canaryDir, { recursive: true, force: true });
+  });
+
+  it("passes on valid dev-impl workflow definition", async () => {
+    const result = await runTransitionWalk();
+    expect(result.passed).toBe(true);
+    expect(result.transitionsChecked).toBeGreaterThan(0);
+    expect(result.violations).toHaveLength(0);
+  });
+
+  it("detects missing owner_role on non-terminal state", async () => {
+    const badYaml = TEST_WORKFLOW_YAML.replace("owner_role: dev", "");
+    const workflowFile = path.join(canaryDir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, badYaml, "utf8");
+    resetWorkflowCache();
+
+    const result = await runTransitionWalk();
+    expect(result.passed).toBe(false);
+    expect(result.violations.some(v => v.issue.includes("no owner_role"))).toBe(true);
+  });
+
+  it("detects undefined destination state", async () => {
+    const badYaml = TEST_WORKFLOW_YAML.replace("to: deployment", "to: nonexistent");
+    const workflowFile = path.join(canaryDir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, badYaml, "utf8");
+    resetWorkflowCache();
+
+    const result = await runTransitionWalk();
+    expect(result.passed).toBe(false);
+    expect(result.violations.some(v => v.issue.includes("undefined state"))).toBe(true);
+  });
+});
+
 });
