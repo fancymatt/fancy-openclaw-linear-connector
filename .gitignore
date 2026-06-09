@@ -16,3 +16,4 @@ agents.json
 agents.json.bak-*
 tmp/
 scripts/validate-story-defs.ts
+typescript-*.tgz

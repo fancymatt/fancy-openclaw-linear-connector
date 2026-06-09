@@ -66,6 +66,9 @@ export interface DepartmentRoster {
 
 // ── Roster loading ─────────────────────────────────────────────────────────
 
+// NOTE: DEFAULT_ROSTER_PATH points to the vault copy (canonical source of truth).
+// The repo copy at config/department-roster.yaml is a convenience for local dev.
+// In production, DEPARTMENT_ROSTER_PATH should be set explicitly.
 const DEFAULT_ROSTER_PATH = path.resolve(
   process.env.HOME ?? "/home/fancymatt",
   "obsidian-vault/ai-systems/projects/fleet-orchestration-redesign/config/department-roster.yaml",
