@@ -253,7 +253,7 @@ describe("attemptBarrierTransition — mocked Linear API", () => {
       }
 
       // Fetch parent state with label IDs
-      if (query.includes("ParentLabels") || query.includes("ParentState")) {
+      if (query.includes("ParentLabels") || query.includes("ParentState") || query.includes("IssueLabels")) {
         return new Response(
           JSON.stringify({
             data: {
@@ -290,7 +290,7 @@ describe("attemptBarrierTransition — mocked Linear API", () => {
       }
 
       // Label swap (barrier transition)
-      if (query.includes("BarrierTransition")) {
+      if (query.includes("BarrierTransition") || query.includes("UpdateLabels")) {
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success: true } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
@@ -319,7 +319,7 @@ describe("attemptBarrierTransition — mocked Linear API", () => {
     expect(result.totalChildren).toBe(2);
 
     // Should have done a label swap
-    const swapCall = fetchCalls.find((c) => (c.body.query ?? "").includes("BarrierTransition"));
+    const swapCall = fetchCalls.find((c) => (c.body.query ?? "").includes("UpdateLabels"));
     expect(swapCall).toBeDefined();
 
     // Should have posted a barrier comment
@@ -342,7 +342,7 @@ describe("attemptBarrierTransition — mocked Linear API", () => {
     expect(result.totalChildren).toBe(2);
 
     // No label swap should have happened
-    const swapCall = fetchCalls.find((c) => (c.body.query ?? "").includes("BarrierTransition"));
+    const swapCall = fetchCalls.find((c) => (c.body.query ?? "").includes("UpdateLabels"));
     expect(swapCall).toBeUndefined();
   });
 
@@ -506,7 +506,7 @@ describe("onChildTerminal — webhook entry point", () => {
         );
       }
 
-      if (q.includes("ParentState") || q.includes("ParentLabels")) {
+      if (q.includes("ParentState") || q.includes("ParentLabels") || q.includes("IssueLabels")) {
         return new Response(
           JSON.stringify({
             data: {
@@ -529,7 +529,7 @@ describe("onChildTerminal — webhook entry point", () => {
         );
       }
 
-      if (q.includes("BarrierTransition")) {
+      if (q.includes("BarrierTransition") || q.includes("UpdateLabels")) {
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success: true } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },

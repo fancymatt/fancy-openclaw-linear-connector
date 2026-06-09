@@ -29,10 +29,18 @@
 
 import { componentLogger, createLogger } from "./logger.js";
 import { loadWorkflowDef, getWorkflowId, getCurrentState, type WorkflowDef } from "./workflow-gate.js";
+import {
+  LINEAR_API_URL,
+  findOrCreateLabel,
+  postComment,
+  resolveInternalId,
+  issueUpdateLabels,
+  fetchIssueWithLabels,
+  type LabelNode,
+  type IssueWithLabels,
+} from "./linear-helpers.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "barrier");
-
-const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -251,124 +259,6 @@ async function fetchParentState(
   }
 }
 
-/**
- * Find or create a state label in the team.
- */
-async function findOrCreateLabel(
-  teamId: string,
-  labelName: string,
-  authToken: string,
-): Promise<string | null> {
-  // Look up existing
-  const lookupQuery = `
-    query TeamLabels($teamId: String!) {
-      team(id: $teamId) {
-        labels { nodes { id name } }
-      }
-    }
-  `;
-  try {
-    const lookupRes = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query: lookupQuery, variables: { teamId } }),
-    });
-    type LookupResp = { data?: { team?: { labels: { nodes: Array<{ id: string; name: string }> } } } };
-    const lookupData = (await lookupRes.json()) as LookupResp;
-    const existing = (lookupData.data?.team?.labels?.nodes ?? []).find(
-      (n) => n.name === labelName,
-    );
-    if (existing) return existing.id;
-  } catch (err) {
-    log.error(`barrier: label lookup failed for ${labelName}: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
-
-  // Create
-  const createMutation = `
-    mutation CreateLabel($teamId: String!, $name: String!, $color: String!) {
-      issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color }) {
-        success
-        issueLabel { id }
-      }
-    }
-  `;
-  try {
-    const createRes = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({
-        query: createMutation,
-        variables: { teamId, name: labelName, color: "#94a3b8" },
-      }),
-    });
-    type CreateResp = {
-      data?: { issueLabelCreate?: { success: boolean; issueLabel?: { id: string } } };
-    };
-    const createData = (await createRes.json()) as CreateResp;
-    const result = createData.data?.issueLabelCreate;
-    if (result?.success && result.issueLabel) {
-      log.info(`barrier: created label '${labelName}' in team ${teamId}`);
-      return result.issueLabel.id;
-    }
-    return null;
-  } catch (err) {
-    log.error(`barrier: label creation failed for ${labelName}: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
-}
-
-/**
- * Post a comment on an issue.
- */
-async function postComment(
-  issueInternalId: string,
-  body: string,
-  authToken: string,
-): Promise<boolean> {
-  const mutation = `
-    mutation($issueId: ID!, $body: String!) {
-      commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
-    }
-  `;
-  try {
-    const res = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query: mutation, variables: { issueId: issueInternalId, body } }),
-    });
-    type Resp = { data?: { commentCreate?: { success: boolean } } };
-    const data = (await res.json()) as Resp;
-    return data.data?.commentCreate?.success ?? false;
-  } catch (err) {
-    log.error(`barrier: comment post failed: ${err instanceof Error ? err.message : String(err)}`);
-    return false;
-  }
-}
-
-/**
- * Resolve a human-readable identifier to an internal UUID.
- */
-async function resolveInternalId(
-  identifier: string,
-  authToken: string,
-): Promise<string | null> {
-  const query = `query($id: String!) { issue(id: $id) { id } }`;
-  try {
-    const res = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query, variables: { id: identifier } }),
-    });
-    type Resp = { data?: { issue?: { id: string } | null } };
-    const data = (await res.json()) as Resp;
-    return data.data?.issue?.id ?? null;
-  } catch (err) {
-    log.error(`barrier: failed to resolve internal ID for ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
-}
-
 // ── Public API: Barrier ───────────────────────────────────────────────────
 
 /**
@@ -563,78 +453,18 @@ export async function onChildTerminal(
 
 // ── Label fetch with IDs ──────────────────────────────────────────────────
 
-interface LabelNode {
-  id: string;
-  name: string;
-}
+// Re-export LabelNode for barrier-specific usage
+export type { LabelNode } from "./linear-helpers.js";
 
+/**
+ * Fetch parent issue with label IDs.
+ * Delegates to the shared fetchIssueWithLabels from linear-helpers.
+ */
 async function fetchParentWithLabelIds(
   parentIdentifier: string,
   authToken: string,
-): Promise<{ internalId: string; teamId: string; labels: LabelNode[] } | null> {
-  const query = `
-    query ParentLabels($id: String!) {
-      issue(id: $id) {
-        id
-        team { id }
-        labels { nodes { id name } }
-      }
-    }
-  `;
-  try {
-    const res = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query, variables: { id: parentIdentifier } }),
-    });
-    type Resp = {
-      data?: {
-        issue?: {
-          id: string;
-          team: { id: string };
-          labels: { nodes: LabelNode[] };
-        };
-      };
-    };
-    const data = (await res.json()) as Resp;
-    const issue = data.data?.issue;
-    if (!issue) return null;
-    return { internalId: issue.id, teamId: issue.team.id, labels: issue.labels.nodes };
-  } catch (err) {
-    log.error(`barrier: failed to fetch parent labels for ${parentIdentifier}: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
-}
-
-async function issueUpdateLabels(
-  internalId: string,
-  labelIds: string[],
-  authToken: string,
-): Promise<boolean> {
-  const mutation = `
-    mutation BarrierTransition($issueId: String!, $labelIds: [String!]!) {
-      issueUpdate(id: $issueId, input: { labelIds: $labelIds }) {
-        success
-      }
-    }
-  `;
-  try {
-    const res = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query: mutation, variables: { issueId: internalId, labelIds } }),
-    });
-    type Resp = { data?: { issueUpdate?: { success: boolean } } };
-    const data = (await res.json()) as Resp;
-    if (!data.data?.issueUpdate?.success) {
-      log.warn(`barrier: issueUpdate returned non-success for ${internalId}`);
-      return false;
-    }
-    return true;
-  } catch (err) {
-    log.error(`barrier: issueUpdate failed for ${internalId}: ${err instanceof Error ? err.message : String(err)}`);
-    return false;
-  }
+): Promise<IssueWithLabels | null> {
+  return fetchIssueWithLabels(parentIdentifier, authToken);
 }
 
 // ── Public API: Asymmetric shepherding ────────────────────────────────────
