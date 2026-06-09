@@ -124,9 +124,14 @@ export interface RoutingCheckResult {
 export async function checkLinearIssueRouting(
   ticketId: string,
   agentId: string,
-  routingReason: "delegate" | "assignee" | "mention" | "body-mention" | undefined,
+  routingReason: "delegate" | "assignee" | "mention" | "body-mention" | "department-prefix" | "department-override" | "steward-escalation" | undefined,
 ): Promise<RoutingCheckResult> {
   if (routingReason === "mention" || routingReason === "body-mention") {
+    return { actionable: true, failOpen: false };
+  }
+  // Department-roster and steward-escalation routes are always actionable —
+  // they come from the deterministic functionary, not from stale webhook data.
+  if (routingReason === "department-prefix" || routingReason === "department-override" || routingReason === "steward-escalation") {
     return { actionable: true, failOpen: false };
   }
 
@@ -227,7 +232,7 @@ export async function checkLinearIssueRouting(
 export async function isLinearIssueStillRoutedToAgent(
   ticketId: string,
   agentId: string,
-  routingReason: "delegate" | "assignee" | "mention" | "body-mention" | undefined,
+  routingReason: "delegate" | "assignee" | "mention" | "body-mention" | "department-prefix" | "department-override" | "steward-escalation" | undefined,
 ): Promise<boolean> {
   return (await checkLinearIssueRouting(ticketId, agentId, routingReason)).actionable;
 }

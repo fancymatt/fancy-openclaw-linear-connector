@@ -373,7 +373,7 @@ export function createWebhookRouter(
         }
       }
 
-      const route = routeEvent(event);
+      const route = await routeEvent(event);
       if (!route) {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
         appendOperationalEvent(operationalEventStore, { outcome: "no-route", type: event.type, errorSummary: `No agent target for ${event.type}` });
