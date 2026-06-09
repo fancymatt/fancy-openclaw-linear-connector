@@ -1694,3 +1694,293 @@ describe("applyStateTransition — auto-delegate assignment (AI-1463)", () => {
 
   });
 });
+
+// ── Phase 5 / B-3: Barrier integration with applyStateTransition ──────────
+
+describe("applyStateTransition — B-3 barrier integration", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let calls: Array<{ query: string; variables?: Record<string, unknown> }>;
+  let uxDir: string;
+  let originalWorkflowPath: string | undefined;
+  let originalPolicyPath: string | undefined;
+
+  const BARRIER_POLICY_YAML = `
+capabilities:
+  - id: linear:transition
+  - id: deploy:execute
+
+containers:
+  - id: dev
+    grants: [linear:transition]
+  - id: deployment
+    grants: [linear:transition, deploy:execute]
+  - id: engine
+    grants: [linear:transition]
+
+roles:
+  - id: dev
+    requires: [linear:transition]
+  - id: deployment
+    requires: [deploy:execute]
+  - id: engine
+    requires: [linear:transition]
+
+bodies:
+  - id: charles
+    container: dev
+    fills_roles: [dev]
+  - id: engine-1
+    container: engine
+    fills_roles: [engine]
+`;
+
+  beforeAll(() => {
+    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    originalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    uxDir = fs.mkdtempSync(path.join(os.tmpdir(), "barrier-integration-"));
+    fs.writeFileSync(path.join(uxDir, "capability-policy.yaml"), BARRIER_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = path.join(uxDir, "capability-policy.yaml");
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
+  });
+
+  afterAll(() => {
+    if (originalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    if (originalPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+  });
+
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetPolicyCache();
+    originalFetch = globalThis.fetch;
+    calls = [];
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  /**
+   * Mock fetch that handles both state transition and barrier calls.
+   * The child transitions to done, which triggers the barrier check.
+   * Parent is ux-audit in managing with all children done.
+   */
+  function makeBarrierIntegrationFetch(opts: {
+    childLabels?: Array<{ id: string; name: string }>;
+    hasParent?: boolean;
+    parentLabels?: Array<{ id: string; name: string }>;
+    siblings?: Array<{ identifier: string; labels: string[] }>;
+  }): typeof globalThis.fetch {
+    const childLabels = opts.childLabels ?? [
+      { id: "wf-lbl", name: "wf:dev-impl" },
+      { id: "state-lbl", name: "state:code-review" },
+    ];
+    const hasParent = opts.hasParent ?? true;
+    const parentLabels = opts.parentLabels ?? [
+      { id: "wf-lbl", name: "wf:ux-audit" },
+      { id: "state-lbl", name: "state:managing" },
+    ];
+    const siblings = opts.siblings ?? [
+      { identifier: "AI-2001", labels: ["wf:dev-impl", "state:done"] },
+      { identifier: "AI-2002", labels: ["wf:dev-impl", "state:done"] },
+    ];
+
+    return async (url, init) => {
+      if (typeof url !== "string" || !url.includes("api.linear.app")) {
+        throw new Error("unexpected fetch call");
+      }
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
+      calls.push({ query: parsed.query ?? "", variables: parsed.variables as Record<string, unknown> | undefined });
+
+      const q = parsed.query ?? "";
+
+      // State transition: fetch issue with labels
+      if (q.includes("IssueWithLabels")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { id: "child-internal-id", team: { id: "team-uuid" }, labels: { nodes: childLabels } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // State transition: team label lookup
+      if (q.includes("TeamLabels")) {
+        return new Response(
+          JSON.stringify({ data: { team: { labels: { nodes: [] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // State transition: label create
+      if (q.includes("issueLabelCreate")) {
+        const name = (parsed.variables as Record<string, unknown>).name as string;
+        return new Response(
+          JSON.stringify({ data: { issueLabelCreate: { success: true, issueLabel: { id: `label-${name}` } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // State transition: issueUpdate
+      if (q.includes("ApplyStateTransition")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Barrier: fetch parent identifier
+      if (q.includes("ChildParent")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { parent: hasParent ? { identifier: "AI-1439" } : null } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Barrier: fetch parent state
+      if (q.includes("ParentState") || q.includes("ParentLabels")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { id: "parent-internal-id", team: { id: "team-uuid" }, labels: { nodes: parentLabels } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Barrier: fetch children
+      if (q.includes("ParentChildren")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                children: {
+                  nodes: siblings.map((s) => ({
+                    identifier: s.identifier,
+                    labels: { nodes: s.labels.map((l) => ({ name: l })) },
+                  })),
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Barrier: label swap
+      if (q.includes("BarrierTransition")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Barrier: comment
+      if (q.includes("commentCreate")) {
+        return new Response(
+          JSON.stringify({ data: { commentCreate: { success: true, comment: { id: "comment-id" } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Barrier: resolve internal ID
+      if (q.includes("issue(id: $id) { id }") && !q.includes("team") && !q.includes("parent") && !q.includes("labels")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { id: "parent-internal-id" } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      throw new Error(`unexpected query: ${q.slice(0, 100)}`);
+    };
+  }
+
+  it("triggers barrier check when child transitions to done via matching workflow", async () => {
+    // Use dev-impl workflow def for this test since the child is wf:dev-impl
+    const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
+    process.env.WORKFLOW_DEF_PATH = devImplFixture;
+    resetWorkflowCache();
+
+    globalThis.fetch = makeBarrierIntegrationFetch({
+      childLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+    });
+
+    // deploy from deployment → done (terminal)
+    await applyStateTransition("deploy", "AI-2001", "Bearer tok");
+
+    // Restore ux-audit workflow def
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
+
+    // Should have done state transition
+    const stateTransition = calls.find((c) => c.query.includes("ApplyStateTransition"));
+    expect(stateTransition).toBeDefined();
+
+    // Should have triggered barrier check (fetching parent)
+    const parentFetch = calls.find((c) => c.query.includes("ChildParent"));
+    expect(parentFetch).toBeDefined();
+
+    // Should have fetched children for barrier evaluation
+    const childrenFetch = calls.find((c) => c.query.includes("ParentChildren"));
+    expect(childrenFetch).toBeDefined();
+
+    // Should have transitioned parent managing → review
+    const barrierTransition = calls.find((c) => c.query.includes("BarrierTransition"));
+    expect(barrierTransition).toBeDefined();
+
+    // Should have posted a barrier comment
+    const commentCall = calls.find((c) => c.query.includes("commentCreate"));
+    expect(commentCall).toBeDefined();
+  });
+
+  it("does not trigger barrier for non-terminal transition", async () => {
+    const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
+    process.env.WORKFLOW_DEF_PATH = devImplFixture;
+    resetWorkflowCache();
+
+    globalThis.fetch = makeBarrierIntegrationFetch({
+      childLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:implementation" },
+      ],
+    });
+
+    // submit from implementation → code-review (not terminal)
+    await applyStateTransition("submit", "AI-2001", "Bearer tok");
+
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
+
+    // Should have done state transition
+    const stateTransition = calls.find((c) => c.query.includes("ApplyStateTransition"));
+    expect(stateTransition).toBeDefined();
+
+    // Should NOT have triggered barrier check (code-review is not terminal)
+    const parentFetch = calls.find((c) => c.query.includes("ChildParent"));
+    expect(parentFetch).toBeUndefined();
+  });
+
+  it("does not trigger barrier when child has no parent", async () => {
+    const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
+    process.env.WORKFLOW_DEF_PATH = devImplFixture;
+    resetWorkflowCache();
+
+    globalThis.fetch = makeBarrierIntegrationFetch({
+      hasParent: false,
+      childLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+    });
+
+    await applyStateTransition("deploy", "AI-2001", "Bearer tok");
+
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
+
+    // State transition should happen
+    const stateTransition = calls.find((c) => c.query.includes("ApplyStateTransition"));
+    expect(stateTransition).toBeDefined();
+
+    // Barrier check should return early (no parent)
+    const childrenFetch = calls.find((c) => c.query.includes("ParentChildren"));
+    expect(childrenFetch).toBeUndefined();
+  });
+});

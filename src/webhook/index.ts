@@ -21,6 +21,7 @@ import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/i
 import { type WakeUpConfig } from "../bag/wake-up.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { isLinearIssueStillRoutedToAgent, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
+import { onChildTerminal } from "../barrier.js";
 
 const log = componentLogger(createLogger(), "webhook");
 
@@ -204,6 +205,21 @@ export function createWebhookRouter(
             ` and ${removedQueued} queued signal${removedQueued === 1 ? "" : "s"}; skipping agent dispatch`,
           );
           appendOperationalEvent(operationalEventStore, { outcome: "terminal-pruned", type: event.type, key: sessionKey, sessionKey, detail: { removedBag, removedQueued } });
+
+          // Phase 5 / B-3: Barrier (N→1) — event-driven parent auto-advance.
+          // When a child reaches a terminal state, check if all siblings are
+          // terminal and auto-advance the parent managing → review.
+          // Fail-open: barrier errors are logged and never block the terminal prune.
+          const barrierToken = process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+          if (barrierToken) {
+            onChildTerminal(identifier, barrierToken).then((result) => {
+              if (result?.transitioned) {
+                log.info(`Barrier: auto-advanced parent of ${identifier} managing → review`);
+              }
+            }).catch((err) => {
+              log.warn(`Barrier check failed for terminal child ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
+            });
+          }
         } else {
           log.info("Terminal issue event without identifier; skipping agent dispatch");
         }

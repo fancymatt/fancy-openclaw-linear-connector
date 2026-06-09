@@ -43,6 +43,7 @@ import { ObservationStore, type ReasonCode } from "./store/observation-store.js"
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent } from "./agents.js";
 import { executeFanout, shouldTriggerFanout } from "./fanout.js";
+import { onChildTerminal, isTerminalState } from "./barrier.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
 
@@ -371,6 +372,14 @@ export async function checkWorkflowRules(
 
   // Only enforce for the workflow whose def is loaded; others fail open.
   if (workflowId !== def.id) return null;
+
+  // §5.3 Asymmetry enforcement: children running wf:dev-impl have no legal
+  // command to address the parent's ux-audit workflow. This is structural:
+  //   - The dev-impl workflow def has no 'address-parent' or 'barrier-signal' command.
+  //   - Layer 2 (checkRawMutationInterception) blocks raw label/state mutations.
+  //   - The proxy only validates against the loaded workflow def.
+  // AC3 (B-3): Children cannot address the parent — enforced by the absence of
+  // any upward-directed command in the dev-impl state machine.
 
   // AI-1402: Fail-closed on unknown caller. When the caller's body is not in the
   // capability policy and the ticket is a governed workflow ticket, block the mutation.
@@ -933,6 +942,27 @@ export async function applyStateTransition(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`workflow-gate: P4-1: observation write failed for ${issueId}: ${msg}`);
+    }
+  }
+
+  // ── Phase 5 / B-3: Barrier (N→1) — event-driven parent auto-advance ─
+  // After a successful state transition to a terminal state (done, escape),
+  // fire the barrier check to see if the parent should auto-advance from
+  // managing → review. The barrier module handles the full evaluation:
+  // fetch parent, check all children, transition if ready.
+  // Fail-open: barrier errors are logged and never block the transition.
+  if (applied && isTerminalState(toStateName)) {
+    try {
+      log.info(`workflow-gate: B-3 barrier: child ${issueId} reached terminal state '${toStateName}' — checking parent barrier`);
+      const barrierResult = await onChildTerminal(issueId, authToken);
+      if (barrierResult?.transitioned) {
+        log.info(
+          `workflow-gate: B-3 barrier: parent auto-advanced managing → review via ${issueId}`,
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`workflow-gate: B-3 barrier check failed for ${issueId}: ${msg}`);
     }
   }
 }
