@@ -244,10 +244,26 @@ export async function routeEvent(event: LinearEvent): Promise<RouteResult | null
     log.info(`Skipping self-triggered event from ${actorId}`);
     return null;
   }
-  // Also suppress when actor is an agent and there's no mechanical target
-  // (no delegate/assignee/mention pointing to any agent).
+  // When actor is an agent and there's no mechanical target, check the
+  // department roster before suppressing. If the functionary would route to
+  // a department target (which is NOT the actor), dispatch to that target.
+  // Only suppress if the functionary also can't find a department match
+  // (in which case it would escalate to the steward — and if the steward
+  // IS the actor, suppress to prevent loop).
   if (isActorOurAgent && !mechanicalTarget) {
-    log.info(`Skipping self-triggered event from ${actorId} (no mechanical target)`);
+    const functionaryResult = resolveRoute(identifier, event.type, roster, null);
+    const actorName = agentMap[actorId!];
+    if (
+      (functionaryResult.reason === "department-prefix" ||
+        functionaryResult.reason === "department-override") &&
+      functionaryResult.target !== actorName
+    ) {
+      // Department routing found a target that isn't the actor — dispatch.
+      return buildRouteResult(event, functionaryResult.target, identifier, functionaryResult.reason);
+    }
+    // No department match that differs from the actor, or steward escalation
+    // that would loop — suppress.
+    log.info(`Skipping self-triggered event from ${actorId} (no mechanical target, no department match to other target)`);
     return null;
   }
 
@@ -255,6 +271,20 @@ export async function routeEvent(event: LinearEvent): Promise<RouteResult | null
   const functionaryResult = resolveRoute(identifier, event.type, roster, mechanicalTarget);
 
   return buildRouteResult(event, functionaryResult.target, identifier, functionaryResult.reason);
+}
+
+const VALID_ROUTING_REASONS = new Set<string>([
+  "delegate",
+  "assignee",
+  "mention",
+  "body-mention",
+  "department-prefix",
+  "department-override",
+  "steward-escalation",
+] as const);
+
+function toRoutingReason(reason: string): RouteResult["routingReason"] {
+  return VALID_ROUTING_REASONS.has(reason) ? reason as RouteResult["routingReason"] : undefined;
 }
 
 /**
@@ -290,6 +320,6 @@ function buildRouteResult(
     sessionKey,
     priority: 0,
     event,
-    routingReason: reason as RouteResult["routingReason"],
+    routingReason: toRoutingReason(reason),
   };
 }

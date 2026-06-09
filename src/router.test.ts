@@ -328,3 +328,98 @@ describe("routeEvent", () => {
     expect(result?.agentId).toBe("charles");
   });
 });
+
+// ── routeEvent + department roster integration ───────────────────────────────
+
+describe("routeEvent with department roster — self-trigger suppression", () => {
+  let agentsFile: string;
+  let rosterFile: string;
+
+  // Roster: AI → charles, ILL → astrid, steward → astrid
+  const ROSTER_YAML = `
+version: 1
+steward: astrid
+departments:
+  AI:
+    name: AI Team
+    defaultTarget: charles
+  ILL:
+    name: ILL Team
+    defaultTarget: astrid
+`;
+
+  beforeEach(() => {
+    agentsFile = makeTempAgentsFile(BASE_AGENTS);
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+
+    const dir = path.dirname(agentsFile);
+    rosterFile = path.join(dir, "department-roster.yaml");
+    fs.writeFileSync(rosterFile, ROSTER_YAML);
+    process.env.DEPARTMENT_ROSTER_PATH = rosterFile;
+    resetRosterCache();
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTS_FILE;
+    delete process.env.DEPARTMENT_ROSTER_PATH;
+    fs.rmSync(path.dirname(agentsFile), { recursive: true, force: true });
+    resetRosterCache();
+  });
+
+  it("agent actor with no mechanical target routes via department prefix (not suppressed)", async () => {
+    // Igor (not in BASE_AGENTS, so use charles as the actor) comments on ILL-42.
+    // No delegate/assignee/mention. Roster routes ILL → astrid.
+    // This should NOT be suppressed — astrid != charles (the actor).
+    const event = makeIssueEvent({
+      actorId: CHARLES_ID,
+      identifier: "ILL-42",
+      commentBody: "some comment",
+    });
+    const result = await routeEvent(event);
+    expect(result).not.toBeNull();
+    expect(result?.agentId).toBe("astrid");
+    expect(result?.routingReason).toBe("department-prefix");
+  });
+
+  it("agent actor with no mechanical target still suppressed when no department match", async () => {
+    // Charles comments on XYZ-99. No department for XYZ, no mechanical target.
+    // Should suppress (self-trigger, nowhere to route that isn't the actor).
+    const event = makeIssueEvent({
+      actorId: CHARLES_ID,
+      identifier: "XYZ-99",
+      commentBody: "some comment",
+    });
+    const result = await routeEvent(event);
+    expect(result).toBeNull();
+  });
+
+  it("agent actor on own-department issue with no mechanical target is suppressed", async () => {
+    // Charles comments on AI-100. Roster routes AI → charles. Charles IS the actor.
+    // This should suppress — department target is the actor itself.
+    const event = makeIssueEvent({
+      actorId: CHARLES_ID,
+      identifier: "AI-100",
+      commentBody: "some comment",
+    });
+    const result = await routeEvent(event);
+    // The !mechanicalTarget branch checks roster. AI → charles, actor is charles.
+    // department match but target == actor → still suppressed.
+    expect(result).toBeNull();
+  });
+
+  it("mechanical target self-trigger still routes via department when target differs", async () => {
+    // Charles is both actor and delegate on ILL-42.
+    // The mechanicalTarget branch runs first, finds self-trigger,
+    // but the roster routes ILL → astrid (not charles) → dispatch.
+    const event = makeIssueEvent({
+      actorId: CHARLES_ID,
+      delegateId: CHARLES_ID,
+      identifier: "ILL-42",
+    });
+    const result = await routeEvent(event);
+    expect(result).not.toBeNull();
+    expect(result?.agentId).toBe("astrid");
+    expect(result?.routingReason).toBe("department-prefix");
+  });
+});
