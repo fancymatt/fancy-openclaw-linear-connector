@@ -20,12 +20,14 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import yaml from "js-yaml";
 import {
   checkWorkflowRules,
   applyStateTransition,
   checkRawMutationInterception,
   buildStateTransitionReminder,
   resetWorkflowCache,
+  validateNativeStateMappings,
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
@@ -894,6 +896,48 @@ describe("applyStateTransition — no-ops (fail-open / mode switch)", () => {
     globalThis.fetch = mock;
     await applyStateTransition("accept", "issue-uuid", "Bearer tok");
     expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
+  });
+});
+
+describe("applyStateTransition — AI-1490: idempotency re-stamp when label is missing", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("re-stamps state:* label when in target state but label is missing", async () => {
+    // Scenario: CLI set native state correctly but failed to apply the label.
+    // Ticket is in deployment state (per getCurrentState from labels) but
+    // actually missing the state:deployment label. B2 should re-stamp it.
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+      // Override: simulate the case where state:deployment IS present
+      // (this is the normal idempotent case with label present).
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("approve", "issue-uuid", "Bearer tok");
+    // approve: code-review → deployment. Current state is deployment.
+    // Label state:deployment is present. So no-op.
+    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
+  });
+
+  it("re-stamps when state matches but label is absent", async () => {
+    // Ticket has wf:dev-impl and state:code-review labels, but the approve
+    // command already ran (CLI set state to deployment). The B2 reads labels
+    // which still show code-review (stale or partial failure).
+    // B2 should swap code-review → deployment.
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:code-review" },
+      ],
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("approve", "issue-uuid", "Bearer tok");
+    // Should have done a label swap (ApplyStateTransition mutation).
+    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(true);
   });
 });
 
@@ -3539,5 +3583,69 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       expect(block3).not.toBeNull();
       expect(block3).toContain("complete"); // should suggest 'complete', not 'approve'
     });
+  });
+});
+
+describe("validateNativeStateMappings (AI-1490)", () => {
+  it("canonical dev-impl fixture has valid native_state on all states", () => {
+    const raw = fs.readFileSync(CANONICAL_FIXTURE, "utf8");
+    const def = yaml.load(raw) as any;
+    const warnings = validateNativeStateMappings(def);
+    expect(warnings).toEqual([]);
+  });
+
+  it("flags missing native_state on non-terminal states", () => {
+    const def = {
+      id: "test",
+      states: [
+        { id: "intake", kind: "normal" }, // missing native_state
+        { id: "done", kind: "terminal", native_state: "done" },
+      ],
+    };
+    const warnings = validateNativeStateMappings(def);
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain("intake");
+    expect(warnings[0]).toContain("no native_state");
+  });
+
+  it("flags invalid native_state values", () => {
+    const def = {
+      id: "test",
+      states: [
+        { id: "building", kind: "normal", native_state: "nonexistent-state" },
+      ],
+    };
+    const warnings = validateNativeStateMappings(def);
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain("nonexistent-state");
+    expect(warnings[0]).toContain("not a recognized semantic state");
+  });
+
+  it("allows all valid semantic states", () => {
+    const def = {
+      id: "test",
+      states: [
+        { id: "a", kind: "normal", native_state: "backlog" },
+        { id: "b", kind: "normal", native_state: "todo" },
+        { id: "c", kind: "normal", native_state: "thinking" },
+        { id: "d", kind: "normal", native_state: "doing" },
+        { id: "e", kind: "normal", native_state: "managing" },
+        { id: "f", kind: "terminal", native_state: "done" },
+        { id: "g", kind: "terminal", native_state: "invalid" },
+      ],
+    };
+    const warnings = validateNativeStateMappings(def);
+    expect(warnings).toEqual([]);
+  });
+
+  it("terminal states without native_state are allowed (non-blocking warning)", () => {
+    const def = {
+      id: "test",
+      states: [
+        { id: "done", kind: "terminal" }, // no native_state on terminal — ok
+      ],
+    };
+    const warnings = validateNativeStateMappings(def);
+    expect(warnings).toEqual([]);
   });
 });

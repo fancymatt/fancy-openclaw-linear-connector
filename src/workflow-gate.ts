@@ -85,6 +85,10 @@ export interface WorkflowState {
   id: string;
   owner_role?: string;
   kind?: string;
+  /** AI-1490: semantic native Linear state this workflow state projects to.
+   *  Must be a key in the CLI's SEMANTIC_STATE_MAP (doing, thinking, done, invalid, etc.)
+   *  or a literal Linear state name. Validated at connector startup. */
+  native_state?: string;
   transitions?: WorkflowTransition[];
 }
 
@@ -112,6 +116,11 @@ export async function loadWorkflowDef(): Promise<WorkflowDef> {
     }
     _workflowCache = def;
     recordSuccess("workflow-def");
+    // AI-1490: validate native_state mappings on load.
+    const warnings = validateNativeStateMappings(def);
+    for (const w of warnings) {
+      log.warn(`workflow-gate: native_state validation: ${w}`);
+    }
     return _workflowCache;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -123,6 +132,46 @@ export async function loadWorkflowDef(): Promise<WorkflowDef> {
 /** Invalidate the in-process workflow def cache (used in tests). */
 export function resetWorkflowCache(): void {
   _workflowCache = null;
+}
+
+/**
+ * Valid semantic state names that the CLI's SEMANTIC_STATE_MAP recognizes.
+ * AI-1490: used to validate that every workflow state's native_state field
+ * maps to a real CLI semantic state (which in turn resolves to an actual
+ * Linear workflow state per team).
+ */
+const VALID_SEMANTIC_STATES = new Set([
+  "backlog", "todo", "thinking", "doing", "managing", "done", "invalid",
+]);
+
+/**
+ * AI-1490: Validate that every workflow state with a native_state field
+ * references a valid semantic state name. Returns an array of diagnostic
+ * warnings (empty if all valid). Does not throw — used for startup checks
+ * and config-health reporting.
+ */
+export function validateNativeStateMappings(def: WorkflowDef): string[] {
+  const warnings: string[] = [];
+  for (const state of def.states) {
+    if (!state.native_state) {
+      // Missing native_state is a problem for non-terminal states
+      // (terminals like done/escape should have them for completeness).
+      if (state.kind !== "terminal") {
+        warnings.push(
+          `Workflow state '${state.id}' has no native_state field — its native Linear state projection is undefined. ` +
+          `Add a native_state field (e.g. 'doing', 'thinking', 'todo', 'done', 'invalid').`,
+        );
+      }
+      continue;
+    }
+    if (!VALID_SEMANTIC_STATES.has(state.native_state)) {
+      warnings.push(
+        `Workflow state '${state.id}' has native_state '${state.native_state}' which is not a recognized semantic state. ` +
+        `Valid options: ${[...VALID_SEMANTIC_STATES].join(", ")}.`,
+      );
+    }
+  }
+  return warnings;
 }
 
 // ── Label fetch ────────────────────────────────────────────────────────────
@@ -1006,11 +1055,42 @@ export async function applyStateTransition(
     return;
   }
 
-  // ── Idempotency check ──────────────────────────────────────────────────
+  // ── Idempotency check (AI-1490 hardened) ────────────────────────────────
+  // If the ticket is already in the target state, verify the state:* label
+  // is actually present. If it's missing (CLI partial failure, race condition),
+  // re-stamp it. Previously this was a blind no-op, which meant a lost label
+  // would never be recovered.
   if (currentStateName === toStateName) {
-    log.info(
-      `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' — no-op`,
+    const targetLabelName = `state:${toStateName}`;
+    const hasTargetLabel = issue.labels.some((l) => l.name === targetLabelName);
+    if (hasTargetLabel) {
+      log.info(
+        `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' with label present — no-op`,
+      );
+      return;
+    }
+    // Label is missing despite being in the correct state — re-stamp.
+    log.warn(
+      `workflow-gate: B2 apply: ${issueId} is in state '${toStateName}' but label '${targetLabelName}' is missing — re-stamping`,
     );
+    const newLabelId = await findOrCreateLabel(
+      issue.teamId,
+      targetLabelName,
+      authToken,
+    );
+    if (!newLabelId) {
+      log.warn(`workflow-gate: B2 apply: could not create label '${targetLabelName}' for re-stamp on ${issueId} — skipping`);
+      return;
+    }
+    // Remove any stale state:* labels and add the correct one.
+    const cleanedLabelIds = issue.labels
+      .filter((l) => !l.name.startsWith("state:"))
+      .map((l) => l.id);
+    cleanedLabelIds.push(newLabelId);
+    const applied = await issueUpdateLabels(issue.internalId, cleanedLabelIds, authToken);
+    if (applied) {
+      log.info(`workflow-gate: B2 apply: ${issueId} re-stamped label '${targetLabelName}'`);
+    }
     return;
   }
 
