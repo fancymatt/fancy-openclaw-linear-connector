@@ -23,5 +23,10 @@ export interface StartupReplayResult {
  * - Sends one wake-up per pending ticket, rate-limited by interAgentDelayMs.
  * - Emits startup-replayed / startup-pruned operational events.
  */
-export declare function replayPendingBag(bag: PendingWorkBag, sessionTracker: SessionTracker, wakeConfig: WakeUpConfig, operationalEventStore?: OperationalEventStore, options?: StartupReplayOptions): Promise<StartupReplayResult>;
+export declare function replayPendingBag(bag: PendingWorkBag, sessionTracker: SessionTracker, wakeConfig: WakeUpConfig, operationalEventStore?: OperationalEventStore, options?: StartupReplayOptions & {
+    /** Resolve per-agent WakeUpConfig (hooksUrl/hooksToken from agents.json).
+     *  When provided, used instead of the static wakeConfig so container-retired
+     *  agents receive replay signals on their own gateway, not the host. */
+    wakeConfigForAgent?: (agentId: string) => WakeUpConfig;
+}): Promise<StartupReplayResult>;
 //# sourceMappingURL=startup-replay.d.ts.map

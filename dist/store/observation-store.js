@@ -143,6 +143,10 @@ export class ObservationStore {
             clauses.push("step = ?");
             params.push(query.step);
         }
+        if (query.reasonCode) {
+            clauses.push("reason_code = ?");
+            params.push(query.reasonCode);
+        }
         if (query.since) {
             clauses.push("created_at >= ?");
             params.push(query.since);

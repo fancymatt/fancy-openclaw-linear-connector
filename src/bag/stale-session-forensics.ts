@@ -761,21 +761,44 @@ export async function recoverTicket(
   const targetStateName = getRecoveryTargetStateName(snapshot.classification);
 
   try {
-    // Fetch the issue to get its ID and team
+    // Fetch the issue to get its ID, team, and current state. We need the live
+    // state to guard against clobbering a ticket that already reached a terminal
+    // state between stale-detection and recovery-execution (see terminal guard below).
     const issueRes = await fetch("https://api.linear.app/graphql", {
       method: "POST",
       headers: { "content-type": "application/json", authorization: authHeader },
       body: JSON.stringify({
-        query: `query IssueWithTeam($id: String!) { issue(id: $id) { id team { id } } }`,
+        query: `query IssueWithTeam($id: String!) { issue(id: $id) { id team { id } state { name type } } }`,
         variables: { id: identifier },
       }),
     });
 
-    const issueBody = (await issueRes.json()) as { data?: { issue?: { id: string; team: { id: string } } | null } };
+    const issueBody = (await issueRes.json()) as {
+      data?: { issue?: { id: string; team: { id: string }; state?: { name?: string; type?: string } | null } | null };
+    };
     const issueId = issueBody.data?.issue?.id;
     const teamId = issueBody.data?.issue?.team?.id;
     if (!issueId) {
       return { success: false, action: "none", detail: `Issue ${identifier} not found` };
+    }
+
+    // Terminal guard: a stale session can be reaped after its ticket already
+    // advanced to a terminal state (e.g. the agent finished, the work merged, and
+    // Done was set in the window between stale-detection and this recovery). Running
+    // recovery here would clobber a completed ticket — post a contradictory comment,
+    // clear the delegate, and try to drag it back to "To Do". Skip entirely if the
+    // ticket is already terminal. (Linear state.type: completed | canceled.)
+    const liveStateType = issueBody.data?.issue?.state?.type;
+    const liveStateName = issueBody.data?.issue?.state?.name ?? "(unknown)";
+    if (liveStateType === "completed" || liveStateType === "canceled") {
+      log.info(
+        `Recovery for ${identifier}: ticket already terminal (state="${liveStateName}", type=${liveStateType}) — skipping recovery to avoid clobbering completed work`,
+      );
+      return {
+        success: true,
+        action: "skipped-terminal",
+        detail: `Ticket already in terminal state "${liveStateName}" — no recovery needed`,
+      };
     }
 
     // Post comment
@@ -813,11 +836,23 @@ export async function recoverTicket(
     let stateTransitioned = false;
     if (targetStateName && teamId) {
       const states = await fetchWorkflowStates(teamId, agentId);
-      const targetState = states.find((s) => s.name === targetStateName);
+      // Resolve by exact name first; teams differ on the precise label ("To Do"
+      // vs "Todo" vs "Backlog"), so fall back to the canonical re-dispatch target
+      // by state TYPE (unstarted, then backlog) when the name doesn't match. This
+      // keeps recovery working across teams instead of silently no-op'ing when the
+      // hardcoded name is wrong (the "Todo" vs "To Do" bug).
+      const targetState =
+        states.find((s) => s.name === targetStateName) ??
+        states.find((s) => s.name.toLowerCase() === targetStateName.toLowerCase()) ??
+        states.find((s) => s.type === "unstarted") ??
+        states.find((s) => s.type === "backlog");
       if (targetState) {
         updateInput.stateId = targetState.id;
+        if (targetState.name !== targetStateName) {
+          log.info(`Recovery for ${identifier}: target "${targetStateName}" resolved to "${targetState.name}" (type=${targetState.type})`);
+        }
       } else {
-        log.warn(`Target state "${targetStateName}" not found in team ${teamId} workflow`);
+        log.warn(`Target state "${targetStateName}" not found in team ${teamId} workflow (no name or unstarted/backlog type match)`);
       }
     }
 
@@ -961,7 +996,9 @@ function getRecoveryTargetStateName(cls: StaleClass): string | null {
    case "C6": // Errored → manual intervention
    case "C-UNK": // Unknown → manual intervention
    default:
-     return process.env.STALE_RECOVERY_STATE_DEFAULT ?? "Todo";
+     // "To Do" is the canonical unstarted-state name in our teams; recoverTicket
+     // also falls back to resolving by state type if a team labels it differently.
+     return process.env.STALE_RECOVERY_STATE_DEFAULT ?? "To Do";
  }
 }
 

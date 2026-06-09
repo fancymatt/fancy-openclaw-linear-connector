@@ -18,6 +18,8 @@ export interface DeliveryResult {
     hookError?: boolean;
     /** Error summary from the gateway (if present in the response). */
     hookErrorSummary?: string;
+    /** AI-1428: True when the agent was confirmed unreachable by the pre-flight liveness check. */
+    delegateUnavailable?: boolean;
 }
 /**
  * Deliver a routed event to an OpenClaw agent.

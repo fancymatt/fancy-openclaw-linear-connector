@@ -2,6 +2,7 @@
  * Unit tests for liveness check module (AI-1428).
  */
 
+import { jest } from "@jest/globals";
 import { checkAgentLiveness, type LivenessConfig } from "./liveness.js";
 
 // Minimal fetch mock — global fetch is available in Node 18+.
@@ -52,6 +53,23 @@ describe("checkAgentLiveness", () => {
     expect(result.available).toBe(false);
     if (!result.available) {
       expect(result.reason).toBe("unreachable");
+    }
+  });
+
+  it("returns available=true when hooks returns a non-auth 4xx (gateway responded)", async () => {
+    mockFetch({ ok: false, status: 400, text: () => Promise.resolve('{"ok":false,"error":"message required"}') });
+    const config: LivenessConfig = { hooksUrl: "http://localhost:3100/test", hooksToken: "test-token" };
+    const result = await checkAgentLiveness("igor", config);
+    expect(result.available).toBe(true);
+  });
+
+  it("returns available=false with reason=error when hooks returns 403 (auth failure)", async () => {
+    mockFetch({ ok: false, status: 403, text: () => Promise.resolve("Forbidden") });
+    const config: LivenessConfig = { hooksUrl: "http://localhost:3100/test", hooksToken: "test-token" };
+    const result = await checkAgentLiveness("igor", config);
+    expect(result.available).toBe(false);
+    if (!result.available) {
+      expect(result.reason).toBe("error");
     }
   });
 

@@ -507,8 +507,20 @@ export async function checkWorkflowRules(
         `Use '${breakGlassCommand}' to exit the workflow. Legal moves: ${legalMoves}.`
       );
     }
-    log.warn(`workflow-gate: no state:* label on ${issueId} — failing open`);
-    return null;
+    // A governed wf:dev-impl ticket enters at entry_state with a state:* label applied
+    // atomically; a missing label means the projection was corrupted (e.g. a label-stripping
+    // CLI verb ran). Previously this failed OPEN — allowing ANY intent, including a deploy
+    // that bypasses the Done gate (§5.6). That is exactly how a ticket reached terminal without
+    // a pushed branch/PR. Fail CLOSED for all state-advancing intents: the only legal moves on a
+    // state-corrupted ticket are the recovery hatches already handled above — 'escape'
+    // (break-glass, line ~467), 'refuse-work' (line ~474), and 'needs-human'. The steward must
+    // re-establish state (re-accept) to resume the workflow.
+    log.warn(`workflow-gate: no state:* label on ${issueId} — blocking '${intent}' (state corrupted; use escape/needs-human or re-accept)`);
+    return (
+      `[Proxy] '${intent}' blocked: ${issueId} has no 'state:*' workflow label — its workflow state cannot be determined ` +
+      `(the projection was likely stripped by a raw mutation or a label-stripping command). ` +
+      `Re-establish state via the steward ('accept'), or use '${breakGlassCommand}' to exit the workflow.`
+    );
   }
 
   const stateNode = def.states.find((s) => s.id === currentState);

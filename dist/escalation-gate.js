@@ -80,6 +80,15 @@ export async function bodyHasCapability(bodyId, capability) {
     return caps.has(capability);
 }
 /**
+ * Returns true when the body ID resolves to a known entry in the capability policy.
+ * Unknown bodies (not in policy) are treated as untrusted callers.
+ * Used by the workflow gate for fail-closed enforcement on wf:dev-impl tickets (AI-1402).
+ */
+export async function isBodyKnown(bodyId) {
+    const policy = await loadPolicy();
+    return policy.bodies.some((b) => b.id === bodyId || b.openclaw_agent === bodyId);
+}
+/**
  * Returns body IDs that fill the given role (§16.2).
  * Used by the workflow gate to derive legal assignment targets.
  */

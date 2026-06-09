@@ -337,9 +337,16 @@ describe("checkWorkflowRules — mode switch", () => {
     expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles")).toBeNull();
   });
 
-  it("returns null when no state:* label — fail open", async () => {
+  it("blocks state-advancing intents when no state:* label — fail closed (corrupt projection)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "bug"]);
-    expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("no 'state:*' workflow label");
+  });
+
+  it("still allows escape (break-glass) when no state:* label", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "bug"]);
+    expect(await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "charles")).toBeNull();
   });
 });
 

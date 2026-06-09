@@ -471,6 +471,7 @@ export function createAdminRouter(deps) {
         res.json(deps.observationStore.metrics({
             workflow: typeof req.query.workflow === "string" ? req.query.workflow : undefined,
             step: typeof req.query.step === "string" ? req.query.step : undefined,
+            reasonCode: typeof req.query.reasonCode === "string" ? req.query.reasonCode : undefined,
             since: typeof req.query.since === "string" ? req.query.since : undefined,
             until: typeof req.query.until === "string" ? req.query.until : undefined,
             includeBody: req.query.includeBody === "true",

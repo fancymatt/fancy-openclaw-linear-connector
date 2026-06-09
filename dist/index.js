@@ -18,6 +18,7 @@ import { sendWakeUpSignal } from "./bag/wake-up.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES } from "./bag/stale-session-forensics.js";
+import { registerDistillationCron } from "./cron/p4-metrics-distillation.js";
 import { getAccessToken, getAgent } from "./agents.js";
 import crypto from "crypto";
 import path from "path";
@@ -258,9 +259,9 @@ export function createApp(options) {
             return false;
         }
     }
-    const watchdog = new DispatchWatchdog({ bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, resignalOptions });
+    const watchdog = new DispatchWatchdog({ bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions });
     watchdog.start();
-    const noActivityDetector = new NoActivityDetector({ sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, resignalOptions, postLinearComment });
+    const noActivityDetector = new NoActivityDetector({ sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions, postLinearComment });
     noActivityDetector.start();
     // ── Managing-state stewardship poller ────────────────────────────────
     // Wakes agents on a cadence to review Managing-state tickets (parent /
@@ -405,7 +406,7 @@ export function createApp(options) {
             // Re-signal: agent has work waiting. Send one signal per ticket so each
             // issue is delivered into its own canonical per-ticket session key.
             try {
-                await resignalPendingTickets(agentId, allPending, bag, sessionTracker, wakeConfig, { markActive: true });
+                await resignalPendingTickets(agentId, allPending, bag, sessionTracker, wakeConfigForAgent(agentId), { markActive: true });
             }
             catch (err) {
                 log.error(`Session-end re-signal failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
@@ -439,7 +440,7 @@ export function createApp(options) {
             activeSessionDetails: activeSessions.map((agentId) => sessionTracker.getActiveSessionInfo(agentId)),
         });
     });
-    return { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, managingPoller, managingStateStore };
+    return { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, managingPoller, managingStateStore };
 }
 /**
  * Recover queue backlog left behind by prior process state. For each agent
@@ -490,7 +491,9 @@ if (isEntryPoint) {
     if (agents.length > 0) {
         startTokenRefresh();
     }
-    const { app, agentQueue, bag, sessionTracker, operationalEventStore, wakeConfig, resignalOptions, ackTracker, watchdog, noActivityDetector } = createApp();
+    const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector } = createApp();
+    // P4-3: periodic distillation of reject metrics into skill-workshop proposals
+    registerDistillationCron(observationStore);
     const server = app.listen(PORT, () => {
         log.info(`fancy-openclaw-linear-connector [${DEPLOYMENT_NAME}] listening on port ${PORT} (pid=${process.pid})`);
         // Recover any backlog left behind by prior process state (v1.0 queue).
@@ -500,6 +503,7 @@ if (isEntryPoint) {
         // Replay persisted pending-bag work left behind by a prior process restart.
         replayPendingBag(bag, sessionTracker, wakeConfig, operationalEventStore, {
             ...resignalOptions,
+            wakeConfigForAgent,
             onDispatched: (agentId, ticketId) => ackTracker.recordDispatch(agentId, ticketId),
         }).catch((err) => {
             log.error(`Startup replay failed: ${err instanceof Error ? err.message : String(err)}`);

@@ -130,7 +130,7 @@ export class NoActivityDetector {
      * Call this after sessionTracker.endSession() for an agent.
      */
     async checkDeferredOnSessionEnd(agentId) {
-        const { sessionTracker, bag, operationalEventStore, wakeConfig } = this.deps;
+        const { sessionTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent } = this.deps;
         const set = this.deferredAtCapacity.get(agentId);
         if (!set || set.size === 0)
             return;
@@ -152,7 +152,8 @@ export class NoActivityDetector {
             if (!pendingIds.includes(ticketId)) {
                 bag.add(agentId, ticketId, "Issue");
             }
-            const results = await resignalPendingTickets(agentId, [ticketId], bag, sessionTracker, wakeConfig, { markActive: true, ...this.deps.resignalOptions });
+            const agentWakeConfig = wakeConfigForAgent ? wakeConfigForAgent(agentId) : wakeConfig;
+            const results = await resignalPendingTickets(agentId, [ticketId], bag, sessionTracker, agentWakeConfig, { markActive: true, ...this.deps.resignalOptions });
             if (results.some((r) => r.dispatched)) {
                 operationalEventStore.append({
                     outcome: "deferred-capacity-rearm",
@@ -173,7 +174,7 @@ export class NoActivityDetector {
      * Run one detection cycle. Returns a summary of actions taken.
      */
     async runCycle() {
-        const { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig } = this.deps;
+        const { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent } = this.deps;
         const result = { warned: 0, failed: 0, alreadyEnded: 0, deferredAtCapacity: 0 };
         // Get all currently tracked dispatches that are still pending/unconfirmed
         const pending = ackTracker.getPendingTimedOut(0); // 0ms → all pending
@@ -253,7 +254,8 @@ export class NoActivityDetector {
                 log.info(`No-activity: stale-deferred ticket ${ticketId} no longer actionable — pruning`);
                 continue;
             }
-            const rescueResults = await resignalPendingTickets(agentId, [ticketId], bag, sessionTracker, wakeConfig, { markActive: true, ...this.deps.resignalOptions });
+            const agentWakeConfig = wakeConfigForAgent ? wakeConfigForAgent(agentId) : wakeConfig;
+            const rescueResults = await resignalPendingTickets(agentId, [ticketId], bag, sessionTracker, agentWakeConfig, { markActive: true, ...this.deps.resignalOptions });
             if (rescueResults.some((r) => r.dispatched)) {
                 ackTracker.markResignaled(agentId, ticketId);
                 log.info(`No-activity: rescued stale-deferred ${agentId} [${deferredSessionKey}]`);
@@ -270,7 +272,7 @@ export class NoActivityDetector {
      */
     async handleFailure(entry, sessionKey) {
         const { agentId, ticketId, attemptCount } = entry;
-        const { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig } = this.deps;
+        const { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent } = this.deps;
         const ageMs = Date.now() - new Date(entry.dispatchedAt.replace(' ', 'T') + 'Z').getTime();
         log.error(`No-activity failure for ${agentId} [${sessionKey}] ` +
             `(${Math.round(ageMs / 1000)}s since dispatch, no evidence of agent starting)`);
@@ -365,7 +367,8 @@ export class NoActivityDetector {
             ackTracker.acknowledge(agentId, ticketId);
             return false;
         }
-        const results = await resignalPendingTickets(agentId, [ticketId], bag, sessionTracker, wakeConfig, { markActive: true, ...this.deps.resignalOptions });
+        const agentWakeConfig = wakeConfigForAgent ? wakeConfigForAgent(agentId) : wakeConfig;
+        const results = await resignalPendingTickets(agentId, [ticketId], bag, sessionTracker, agentWakeConfig, { markActive: true, ...this.deps.resignalOptions });
         const dispatched = results.some((r) => r.dispatched);
         const pruned = results.some((r) => r.pruned);
         if (dispatched) {

@@ -22,6 +22,7 @@
 import { createLogger, componentLogger } from "../logger.js";
 import { getAccessToken, getAgents, isAgentLocal } from "../agents.js";
 import { sendManagingWakeSignal } from "./managing-wake.js";
+import { surfaceStalledChildren } from "../barrier.js";
 const log = componentLogger(createLogger(), "managing-poller");
 const DEFAULT_CYCLE_MS = 60 * 1000;
 const DEFAULT_INTERVAL_MS = 30 * 60 * 1000;
@@ -191,6 +192,23 @@ export class ManagingPoller {
             if (dueTickets.length === 0)
                 continue;
             const openclawAgent = agent.openclawAgent ?? agent.name;
+            // §5.5 stall detection: surface stalled children via tripwire comments
+            // before sending the stewardship wake. This wires the stall detection
+            // to a real production trigger (the managing-wake cycle).
+            const stallToken = getAccessToken(agent.name);
+            if (stallToken) {
+                for (const ticket of dueTickets) {
+                    try {
+                        const stalledCount = await surfaceStalledChildren(ticket.identifier, /^Bearer\s+/i.test(stallToken) ? stallToken : `Bearer ${stallToken}`);
+                        if (stalledCount > 0) {
+                            log.info(`§5.5 tripwire: ${stalledCount} stalled child(ren) surfaced on ${ticket.identifier}`);
+                        }
+                    }
+                    catch (err) {
+                        log.warn(`Stall detection failed for ${ticket.identifier}: ${err instanceof Error ? err.message : String(err)}`);
+                    }
+                }
+            }
             try {
                 await sendWake(openclawAgent, dueTickets, deliveryConfig);
                 result.ticketsDispatched += dueTickets.length;

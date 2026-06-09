@@ -62,6 +62,12 @@ export declare class PendingWorkBag {
      */
     removeTicketForAllAgents(ticketId: string): number;
     /**
+     * Remove a ticket from every agent bag EXCEPT the specified agent. Used when
+     * a ticket is re-delegated: the new delegate keeps their entry, all previous
+     * holders are cleared so they don't receive spurious wake-up signals.
+     */
+    removeTicketForOtherAgents(agentId: string, ticketId: string): number;
+    /**
      * Check if any agent has pending work. Returns array of agent IDs.
      */
     agentsWithPendingWork(): string[];
