@@ -2156,6 +2156,14 @@ bodies:
         );
       }
 
+      // Barrier: fetch parent with label IDs (via fetchIssueWithLabels → IssueLabels query)
+      if (q.includes("IssueLabels") && !q.includes("IssueWithLabels")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { id: "parent-internal-id", team: { id: "team-uuid" }, labels: { nodes: parentLabels } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
       // Barrier: fetch children
       if (q.includes("ParentChildren")) {
         return new Response(
@@ -2175,8 +2183,8 @@ bodies:
         );
       }
 
-      // Barrier: label swap
-      if (q.includes("BarrierTransition")) {
+      // Barrier: label swap (via issueUpdateLabels → UpdateLabels mutation)
+      if (q.includes("UpdateLabels")) {
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success: true } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
@@ -2250,7 +2258,7 @@ bodies:
     expect(childrenFetch).toBeDefined();
 
     // Should have transitioned parent managing → review
-    const barrierTransition = calls.find((c) => c.query.includes("BarrierTransition"));
+    const barrierTransition = calls.find((c) => c.query.includes("UpdateLabels"));
     expect(barrierTransition).toBeDefined();
 
     // Should have posted a barrier comment
