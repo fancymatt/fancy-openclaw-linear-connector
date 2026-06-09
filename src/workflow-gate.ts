@@ -332,6 +332,70 @@ export async function fetchWorkflowLabels(issueId: string, authToken: string): P
   }
 }
 
+// ── Done gate: branch/PR verification (AI-1475 Defect 1) ─────────────────
+
+interface BranchAndPRStatus {
+  /** True when the issue has a branch that has been pushed to origin. */
+  hasBranch: boolean;
+  /** True when the issue has at least one associated pull request. */
+  hasPR: boolean;
+}
+
+/**
+ * Query Linear for the issue's branch and pull request status.
+ * Used by the done gate (§5.6) to verify that implementation was actually
+ * pushed and reviewed before allowing the terminal done transition.
+ * Returns null on any error — caller decides fail-open vs fail-closed.
+ */
+async function fetchBranchAndPRStatus(
+  issueId: string,
+  authToken: string,
+): Promise<BranchAndPRStatus | null> {
+  const query = `
+    query IssueBranchAndPR($id: String!) {
+      issue(id: $id) {
+        branch {
+          id
+          name
+          updatedAt
+        }
+        pullRequests {
+          nodes {
+            id
+            state
+          }
+        }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    type PRResp = {
+      data?: {
+        issue?: {
+          branch?: { id: string; name: string; updatedAt: string } | null;
+          pullRequests?: { nodes: Array<{ id: string; state: string }> };
+        };
+      };
+    };
+    const data = (await res.json()) as PRResp;
+    const issue = data.data?.issue;
+    if (!issue) return null;
+    return {
+      hasBranch: !!issue.branch?.id,
+      hasPR: (issue.pullRequests?.nodes?.length ?? 0) > 0,
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: branch/PR fetch failed for ${issueId}: ${msg}`);
+    return null;
+  }
+}
+
 // ── Public enforcement API ─────────────────────────────────────────────────
 
 /**
@@ -471,8 +535,38 @@ export async function checkWorkflowRules(
     }
   }
 
-  // Assignment target validation (§4.3, §16.1)
+  // Resolve destination state for subsequent gates.
   const destStateNode = def.states.find((s) => s.id === match.to);
+
+  // AI-1475 Defect 1: Done gate (§5.6) — terminal 'done' requires pushed branch + PR.
+  // A wf:dev-impl ticket must not reach terminal done without evidence that the
+  // implementation was pushed and reviewed. Fail-closed: if we cannot determine
+  // branch/PR status, block the transition.
+  // Only applies to the deploy command (dev-impl workflow: deployment → done).
+  // Other workflows (ux-audit) have their own gate paths (parent-AC gate).
+  if (intent === 'deploy' && destStateNode?.kind === 'terminal' && match.to === 'done') {
+    const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+    if (!branchStatus) {
+      log.warn(`workflow-gate: done gate: could not verify branch/PR status for ${issueId} — blocking`);
+      return (
+        `[Proxy] 'deploy' blocked: unable to verify branch/pull-request status for ${issueId}. ` +
+        `Ensure the branch has been pushed to origin and a pull request exists.`
+      );
+    }
+    const missing: string[] = [];
+    if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
+    if (!branchStatus.hasPR) missing.push('no pull request associated');
+    if (missing.length > 0) {
+      log.warn(`workflow-gate: done gate: ${issueId} blocked — ${missing.join('; ')}`);
+      return (
+        `[Proxy] 'deploy' blocked: cannot reach terminal done. Missing: ${missing.join('; ')}. ` +
+        `Push the branch and open a pull request before deploying.`
+      );
+    }
+    log.info(`workflow-gate: done gate: ${issueId} passed (has branch + PR)`);
+  }
+
+  // Assignment target validation (§4.3, §16.1)
   const ownerRole = destStateNode?.owner_role;
   if (ownerRole && destStateNode?.kind !== 'terminal') {
     let legalBodies: string[];
@@ -809,6 +903,25 @@ export async function applyStateTransition(
       `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' — no-op`,
     );
     return;
+  }
+
+  // ── AI-1475 Defect 1: Done gate defense-in-depth (§5.6) ────────────────
+  // Block the label swap to done if the branch/PR gate is not satisfied.
+  // This is defense-in-depth: checkWorkflowRules is the primary gate, but
+  // applyStateTransition also blocks to prevent any bypass path.
+  // Only applies when intent is 'deploy' (dev-impl workflow: deployment → done).
+  if (intent === 'deploy' && toStateName === 'done') {
+    const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+    if (!branchStatus || !branchStatus.hasBranch || !branchStatus.hasPR) {
+      const missing: string[] = [];
+      if (!branchStatus) missing.push('could not verify branch/PR status');
+      else {
+        if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
+        if (!branchStatus.hasPR) missing.push('no pull request associated');
+      }
+      log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
+      return; // Block the transition
+    }
   }
 
   // ── Phase 5 / B-4: Parent-AC gate for review → done (F2b, §5.6) ─────
