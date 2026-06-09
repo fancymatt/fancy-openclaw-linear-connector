@@ -46,6 +46,7 @@ import { executeFanout, shouldTriggerFanout } from "./fanout.js";
 import { onChildTerminal, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
+import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
 
@@ -103,13 +104,20 @@ let _workflowCache: WorkflowDef | null = null;
 
 export async function loadWorkflowDef(): Promise<WorkflowDef> {
   if (_workflowCache) return _workflowCache;
-  const raw = await fs.readFile(workflowDefPath(), "utf8");
-  const def = yaml.load(raw) as WorkflowDef;
-  if (def.break_glass && !def.break_glass.command) {
-    log.warn(`workflow-gate: break_glass block in ${workflowDefPath()} has no 'command' field — falling back to hardcoded "escape". Canonicalize the YAML to add command: escape.`);
+  try {
+    const raw = await fs.readFile(workflowDefPath(), "utf8");
+    const def = yaml.load(raw) as WorkflowDef;
+    if (def.break_glass && !def.break_glass.command) {
+      log.warn(`workflow-gate: break_glass block in ${workflowDefPath()} has no 'command' field — falling back to hardcoded "escape". Canonicalize the YAML to add command: escape.`);
+    }
+    _workflowCache = def;
+    recordSuccess("workflow-def");
+    return _workflowCache;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    recordFailure("workflow-def", msg);
+    throw err;
   }
-  _workflowCache = def;
-  return _workflowCache;
 }
 
 /** Invalidate the in-process workflow def cache (used in tests). */
@@ -128,13 +136,19 @@ interface TicketContext {
   labels: string[];
   /** Linear user ID of the current delegate, or null if unset. */
   delegateId: string | null;
+  /** True when the context fetch itself failed (network error, API error, etc.). */
+  fetchFailed: boolean;
 }
 
 /**
  * Fetch label names and delegate for a Linear issue using the caller's auth token.
  * Independent of escalation-gate's label fetch — the proxy resolves state
  * from its own query and never trusts agent-supplied values (§11).
- * Returns empty labels and null delegate on any error — enforcement fails open.
+ *
+ * Phase 6.5 / H-1: Returns fetchFailed=true on error so callers can
+ * decide fail-open vs fail-closed. When the fetch fails, we cannot determine
+ * whether the ticket is a workflow ticket, so the caller must apply the
+ * configured posture.
  */
 async function fetchTicketContext(issueId: string, authToken: string): Promise<TicketContext> {
   const query = `query IssueContext($id: String!) { issue(id: $id) { labels { nodes { name } } delegate { id } } }`;
@@ -157,14 +171,19 @@ async function fetchTicketContext(issueId: string, authToken: string): Promise<T
     };
     const data = (await res.json()) as ContextResp;
     const issue = data.data?.issue;
+    if (!issue) {
+      log.warn(`workflow-gate: issue ${issueId} not found in context fetch — returning fetchFailed`);
+      return { labels: [], delegateId: null, fetchFailed: true };
+    }
     return {
       labels: (issue?.labels?.nodes ?? []).map((n) => n.name),
       delegateId: issue?.delegate?.id ?? null,
+      fetchFailed: false,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    log.warn(`workflow-gate: context fetch failed for ${issueId}: ${msg} — failing open`);
-    return { labels: [], delegateId: null };
+    log.warn(`workflow-gate: context fetch failed for ${issueId}: ${msg}`);
+    return { labels: [], delegateId: null, fetchFailed: true };
   }
 }
 
@@ -418,25 +437,68 @@ export async function checkWorkflowRules(
   bodyId: string,
   target: string | null = null,
   callerLinearUserId?: string | null,
-  artifactRef?: string | null
+  artifactRef?: string | null,
+  breakGlassOverride: boolean = false,
 ): Promise<string | null> {
   // TODO(AI-1347): fail-open on missing issueId is a Layer A carry-forward.
   // Harden by deriving issueId from the request body when headers are absent.
   if (!issueId) return null;
 
-  const { labels, delegateId } = await fetchTicketContext(issueId, authToken);
+  const { labels, delegateId, fetchFailed } = await fetchTicketContext(issueId, authToken);
+
+  // Phase 6.5 / H-1: Fail-closed on context-fetch failure.
+  // When we can't fetch the ticket's labels, we cannot determine whether
+  // it's a workflow ticket. If the caller explicitly set an intent header
+  // (signaling they believe this is a workflow command), fail closed.
+  // Break-glass override bypasses this check.
+  if (fetchFailed && !breakGlassOverride) {
+    // Safety: begin-work and note pass through even on fetch failure because:
+    //   - begin-work on an ad-hoc ticket is harmless (labels are empty → getWorkflowId
+    //     returns null → pass-through below), and it's the only way to add a wf:*
+    //     label to start workflowing a ticket.
+    //   - note is informational-only and never mutates state, so allowing it through
+    //     is safe even if we can't verify workflow membership.
+    // All other intents are rejected because they would mutate workflow state without
+    //     being able to validate the move.
+    const looksLikeWorkflowCommand = intent !== "begin-work" && intent !== "note";
+    if (looksLikeWorkflowCommand) {
+      log.error(`workflow-gate: FAIL-CLOSED — context fetch failed for ${issueId}, cannot determine if workflow ticket — rejecting '${intent}'`);
+      return (
+        `[Proxy] '${intent}' blocked: unable to fetch ticket context for ${issueId}. ` +
+        `Cannot determine workflow state — failing closed for safety. ` +
+        `A steward can use break-glass to bypass this check.`
+      );
+    }
+  }
 
   // §4.6 mode switch: ad-hoc tickets (no wf:* label) are full pass-through.
   const workflowId = getWorkflowId(labels);
   if (!workflowId) return null;
+
+  // ── Phase 6.5 / H-1: Fail-closed on config-load failure (§16.0) ──────
+  if (!breakGlassOverride && !isConfigHealthy()) {
+    log.error(`workflow-gate: config-health FAIL-CLOSED — rejecting '${intent}' on wf:${workflowId} ticket ${issueId} because config is degraded`);
+    return (
+      `[Proxy] '${intent}' blocked: config artifacts are degraded and enforcement cannot be trusted. ` +
+      `A steward can use break-glass (--break-glass flag or X-Openclaw-Break-Glass header) to bypass this check.`
+    );
+  }
 
   let def: WorkflowDef;
   try {
     def = await loadWorkflowDef();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    log.warn(`workflow-gate: failed to load workflow def: ${msg} — failing open`);
-    return null;
+    // Phase 6.5 / H-1: FAIL CLOSED on workflow def load failure (§16.0).
+    if (breakGlassOverride) {
+      log.warn(`workflow-gate: workflow def load failed but break-glass override active — allowing through: ${msg}`);
+      return null;
+    }
+    log.error(`workflow-gate: FAIL-CLOSED — workflow def load failed, rejecting '${intent}' on wf:${workflowId} ticket ${issueId}: ${msg}`);
+    return (
+      `[Proxy] '${intent}' blocked: workflow definition could not be loaded (${msg}). ` +
+      `A steward can use break-glass to bypass this check.`
+    );
   }
 
   // Only enforce for the workflow whose def is loaded; others fail open.
