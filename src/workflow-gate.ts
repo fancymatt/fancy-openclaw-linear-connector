@@ -41,12 +41,14 @@ import { componentLogger, createLogger } from "./logger.js";
 import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
 import { ObservationStore, type ReasonCode } from "./store/observation-store.js";
 import { isBodyKnown } from "./escalation-gate.js";
-import { getAgent } from "./agents.js";
+import { getAgent, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout } from "./fanout.js";
 import { onChildTerminal, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
+import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
+import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
 
@@ -79,6 +81,10 @@ export interface WorkflowTransition {
     constraint?: string;
     default?: string;
   };
+  /** Phase 6.5 / H-7 (AI-1482): if true, capture verbatim AC from issue description at accept time. */
+  capture_ac?: boolean;
+  /** Phase 6.5 / H-7 (AI-1482): if true, requires human sign-off when stakes >= threshold. */
+  requires_human_signoff_above_stakes?: boolean;
 }
 
 export interface WorkflowState {
@@ -88,6 +94,13 @@ export interface WorkflowState {
   transitions?: WorkflowTransition[];
 }
 
+export interface StakesLevel {
+  /** Map of stakes:* label names to numeric levels (e.g. stakes:low → 0, stakes:high → 2). */
+  levels: Record<string, number>;
+  /** Tickets at or above this level require human sign-off. */
+  threshold: number;
+}
+
 export interface WorkflowDef {
   id: string;
   version?: number;
@@ -95,6 +108,8 @@ export interface WorkflowDef {
   entry_state?: string;
   /** §4.4: break_glass.command is the x-openclaw-linear-intent value for escape. */
   break_glass?: { command: string; to?: string; owner_role?: string };
+  /** Phase 6.5 / H-7 (AI-1482): stakes-threshold configuration for human sign-off gate. */
+  stakes?: StakesLevel;
   states: WorkflowState[];
 }
 
@@ -422,6 +437,63 @@ async function fetchBranchAndPRStatus(
   }
 }
 
+// ── Issue description fetch (AI-1482) ─────────────────────────────────────
+
+/**
+ * Fetch the description of a Linear issue.
+ * Used by the verbatim AC capture to extract the AC from the description at accept time.
+ * Returns an empty string on any error.
+ */
+async function fetchIssueDescription(issueId: string, authToken: string): Promise<{ description: string; fetchFailed: boolean }> {
+  const query = `query IssueDescription($id: String!) { issue(id: $id) { description } }`;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    type DescResp = { data?: { issue?: { description?: string | null } } };
+    const data = (await res.json()) as DescResp;
+    const desc = data.data?.issue?.description;
+    if (desc === undefined || desc === null) {
+      log.warn(`workflow-gate: description fetch returned no description for ${issueId} — AC capture may be incomplete`);
+      return { description: "", fetchFailed: true };
+    }
+    return { description: desc, fetchFailed: false };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: description fetch failed for ${issueId}: ${msg} — AC capture will be incomplete`);
+    return { description: "", fetchFailed: true };
+  }
+}
+
+// ── Stakes-level resolution (AI-1482) ───────────────────────────────────────
+
+/**
+ * Resolve a ticket's numeric stakes level from its labels.
+ * Checks for stakes:* labels (e.g. stakes:low, stakes:medium, stakes:high)
+ * and maps them to numeric values via the workflow's stakes configuration.
+ *
+ * Fails closed: when no stakes label is present, returns the threshold
+ * value itself — unlabeled tickets are treated as high-stakes to prevent
+ * a missing label from silently bypassing the human sign-off gate.
+ * When the label is present but maps to an unknown level, also returns
+ * the threshold (fail-closed on unknown metadata).
+ */
+export function resolveStakesLevel(labels: string[], stakesConfig: StakesLevel): number {
+  const stakesLabel = labels.find((l) => /^stakes:/i.test(l));
+  if (!stakesLabel) {
+    log.warn(`workflow-gate: resolveStakesLevel: no stakes:* label found — failing closed (defaulting to threshold ${stakesConfig.threshold})`);
+    return stakesConfig.threshold; // fail closed: unlabeled = high stakes
+  }
+  const level = stakesConfig.levels[stakesLabel];
+  if (level === undefined) {
+    log.warn(`workflow-gate: resolveStakesLevel: unknown stakes label '${stakesLabel}' — failing closed (defaulting to threshold ${stakesConfig.threshold})`);
+    return stakesConfig.threshold; // fail closed: unknown level = high stakes
+  }
+  return level;
+}
+
 // ── Public enforcement API ─────────────────────────────────────────────────
 
 /**
@@ -629,6 +701,30 @@ export async function checkWorkflowRules(
       `Provide a sprint-plan doc reference via the --artifact-ref flag (or X-Openclaw-Artifact-Ref header). ` +
       `Example: ai-systems/projects/<project>/sprints/<sprint-plan>.md`
     );
+  }
+
+  // Phase 6.5 / H-7 (AI-1482): Stakes-threshold sign-off gate.
+  // If the transition has requires_human_signoff_above_stakes: true and the
+  // ticket's stakes level meets or exceeds the workflow's threshold, the deploy
+  // must come from a human (Matt), not an AI agent. An AI agent cannot both
+  // author the spec and bless its fulfillment on consequential work.
+  // A body is considered an AI agent if it is registered in the capability
+  // policy (known body = AI agent). Unknown bodies are assumed human.
+  if (match.requires_human_signoff_above_stakes && def.stakes) {
+    const ticketStakesLevel = resolveStakesLevel(labels, def.stakes);
+    if (ticketStakesLevel >= def.stakes.threshold) {
+      // A body known in the capability policy is an AI agent; unknown = human
+      const isAgent = await isBodyKnown(bodyId);
+      if (isAgent) {
+        log.warn(`workflow-gate: stakes-threshold gate: ${intent} on ${issueId} blocked — stakes level ${ticketStakesLevel} >= threshold ${def.stakes.threshold}, caller '${bodyId}' is a known AI agent`);
+        return (
+          `[Proxy] '${intent}' blocked: this ticket has elevated stakes (level ${ticketStakesLevel}) ` +
+          `and requires human sign-off. AI agent '${bodyId}' cannot self-sign-off on high-stakes work. ` +
+          `Use 'escape' to exit the workflow and escalate to a human, or 'reject' to send back for changes.`
+        );
+      }
+      log.info(`workflow-gate: stakes-threshold gate: ${intent} on ${issueId} — stakes level ${ticketStakesLevel} >= threshold ${def.stakes.threshold}, but caller '${bodyId}' is human/unknown — allowing`);
+    }
   }
 
   // Resolve destination state for subsequent gates.
@@ -1116,11 +1212,45 @@ export async function applyStateTransition(
     log.info(`workflow-gate: C-2: sprint artifact gate: ${issueId} artifact '${artifact.ref}' present — allowing validating → done`);
   }
 
-  // ── Atomic label swap ──────────────────────────────────────────────────
+  // ── Phase 6.5 / H-7 (AI-1482): Verbatim AC capture at accept ──────────
+  // When the accept transition has capture_ac: true, extract the verbatim AC
+  // from the issue description and store it as the immutable AC of record.
+  // This closes the gap where Ai's paraphrase silently becomes the de-facto spec.
+  if (matchedTransition?.capture_ac && intent === 'accept') {
+    try {
+      const { description, fetchFailed } = await fetchIssueDescription(issueId, authToken);
+      if (fetchFailed) {
+        log.warn(`workflow-gate: H-7: description fetch failed for ${issueId} — AC capture skipped, delivery message will note incomplete capture`);
+        // Continue with the transition but note that AC capture was incomplete
+      } else {
+        const verbatimAc = extractAcFromDescription(description);
+        if (verbatimAc) {
+          await captureAc(issueId, {
+            verbatimAc,
+            capturedAt: new Date().toISOString(),
+            capturedBy: options?.bodyId ?? 'unknown',
+            source: 'description',
+          });
+          log.info(`workflow-gate: H-7: captured verbatim AC for ${issueId} (${verbatimAc.length} chars)`);
+        } else {
+          log.warn(`workflow-gate: H-7: no AC section header found in description for ${issueId} — AC capture skipped (description has no '### Acceptance' or '### AC' section)`);
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`workflow-gate: H-7: AC capture failed for ${issueId}: ${msg}`);
+    }
+  }
+
+  // ── AI-1493: Pre-compute full transition tuple (atomic + fail-closed) ──
+  // Before any mutation, resolve ALL facets: {label swap, delegate}.
+  // If any facet cannot be resolved for deterministic transitions, fail CLOSED.
+
+  // Step 1: Resolve label IDs for the state swap.
   const oldLabel = issue.labels.find((l) => l.name === `state:${currentStateName}`);
   if (!oldLabel) {
-    log.warn(
-      `workflow-gate: B2 apply: could not find label id for state:${currentStateName} on ${issueId} — skipping`,
+    log.error(
+      `workflow-gate: B2 apply: FAIL-CLOSED — could not find label id for state:${currentStateName} on ${issueId}. Transition aborted.`,
     );
     return;
   }
@@ -1131,8 +1261,8 @@ export async function applyStateTransition(
     authToken,
   );
   if (!newLabelId) {
-    log.warn(
-      `workflow-gate: B2 apply: could not resolve label id for state:${toStateName} — skipping`,
+    log.error(
+      `workflow-gate: B2 apply: FAIL-CLOSED — could not resolve label id for state:${toStateName}. Transition aborted.`,
     );
     return;
   }
@@ -1142,18 +1272,116 @@ export async function applyStateTransition(
     newLabelId,
   ];
 
-  const applied = await issueUpdateLabels(issue.internalId, newLabelIds, authToken);
+  // Step 2: Resolve the next delegate.
+  // AI-1493: Deterministic owner-routing for ALL transitions.
+  const destStateNode = def.states.find((s) => s.id === toStateName);
+  const destOwnerRole = destStateNode?.owner_role;
+  const isTerminal = destStateNode?.kind === 'terminal' || !destOwnerRole;
+  let resolvedDelegateId: string | null | undefined = undefined;
+
+  if (isTerminal) {
+    resolvedDelegateId = null;
+  } else {
+    // Deterministic routing for reject / request-changes (back to implementation).
+    if ((intent === 'reject' || intent === 'request-changes') && toStateName === 'implementation') {
+      const priorImplementer = getImplementer(issueId);
+      if (priorImplementer) {
+        const agent = getAgent(priorImplementer);
+        if (agent?.linearUserId) {
+          resolvedDelegateId = agent.linearUserId;
+          log.info(
+            `workflow-gate: B2 apply: ${issueId} ${intent} → implementation, routing to prior implementer '${priorImplementer}'`,
+          );
+        } else {
+          log.error(
+            `workflow-gate: B2 apply: FAIL-CLOSED — prior implementer '${priorImplementer}' has no linearUserId. Cannot route ${intent} on ${issueId}.`,
+          );
+          return;
+        }
+      } else {
+        log.warn(
+          `workflow-gate: B2 apply: no prior implementer recorded for ${issueId} on ${intent} — falling back to role resolution`,
+        );
+      }
+    }
+
+    // Role-based resolution (singleton auto-assign, multi-body skip).
+    if (resolvedDelegateId === undefined) {
+      try {
+        const roleBodies = await resolveBodiesForRole(destOwnerRole!);
+        if (roleBodies.length === 1) {
+          const agent = getAgent(roleBodies[0]);
+          if (agent?.linearUserId) {
+            resolvedDelegateId = agent.linearUserId;
+          } else {
+            log.warn(
+              `workflow-gate: B2 apply: singleton body '${roleBodies[0]}' for role '${destOwnerRole}' has no linearUserId — skipping auto-delegate`,
+            );
+          }
+        } else if (roleBodies.length > 1) {
+          log.info(
+            `workflow-gate: B2 apply: ${issueId} multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) — delegate set by CLI target, skipping proxy auto-assign`,
+          );
+        } else {
+          if (intent === 'approve' || intent === 'reject') {
+            log.error(
+              `workflow-gate: B2 apply: FAIL-CLOSED — no bodies found for role '${destOwnerRole}' on '${intent}'. Transition aborted per AI-1493.`,
+            );
+            return;
+          }
+          log.warn(
+            `workflow-gate: B2 apply: no bodies found for role '${destOwnerRole}' on '${intent}' — skipping auto-delegate`,
+          );
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.error(
+          `workflow-gate: B2 apply: FAIL-CLOSED — role resolution failed for '${destOwnerRole}': ${msg}. Transition aborted.`,
+        );
+        return;
+      }
+    }
+  }
+
+  // Step 3: Record implementer BEFORE the mutation.
+  if (toStateName === 'implementation' && resolvedDelegateId) {
+    const agents = getAgents();
+    const implementerAgent = agents.find(a => a.linearUserId === resolvedDelegateId);
+    if (implementerAgent) {
+      recordImplementer(issueId, implementerAgent.name, workflowId);
+      log.info(
+        `workflow-gate: B2 apply: recorded implementer '${implementerAgent.name}' for ${issueId}`,
+      );
+    } else if (options?.bodyId) {
+      recordImplementer(issueId, options.bodyId, workflowId);
+      log.info(
+        `workflow-gate: B2 apply: recorded implementer from bodyId '${options.bodyId}' for ${issueId}`,
+      );
+    }
+  }
+
+  // Step 4: Apply the FULL transition atomically (labels + delegate in one mutation).
+  const applied = await issueUpdateAtomic(
+    issue.internalId,
+    newLabelIds,
+    authToken,
+    resolvedDelegateId,
+  );
+
   if (applied) {
     log.info(
-      `workflow-gate: B2 apply: ${issueId} state:${currentStateName} → state:${toStateName}`,
+      `workflow-gate: B2 apply: ${issueId} state:${currentStateName} → state:${toStateName}` +
+      (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``),
     );
+  } else {
+    log.error(
+      `workflow-gate: B2 apply: atomic mutation FAILED for ${issueId} — all facets rolled back (no partial state)`,
+    );
+    return;
   }
 
   // ── §5.7 item 1 / C-2: Artifact-binding recording ────────────────────
-  // After a successful state transition, if the matched transition requires
-  // an artifact and one was provided, record it connector-side.
-  // Also clean up artifacts on escape/demote (ticket leaves the workflow).
-  if (applied && matchedTransition?.requires_artifact && options?.artifactRef) {
+  if (matchedTransition?.requires_artifact && options?.artifactRef) {
     try {
       bindArtifact(issueId, {
         ref: options.artifactRef,
@@ -1169,48 +1397,17 @@ export async function applyStateTransition(
     }
   }
 
-  // Clean up artifact binding on escape/demote (ticket leaves workflow)
-  if (applied && (toStateName === "escape" || toStateName === "__ad_hoc__")) {
+  // Clean up artifact binding and implementer record on escape/demote
+  if (toStateName === "escape" || toStateName === "__ad_hoc__") {
     removeArtifact(issueId);
+    await removeAcRecord(issueId);
+  }
+  // Clean up implementer record on terminal states
+  if (isTerminal) {
+    removeImplementer(issueId);
   }
 
-  // ── Auto-delegate assignment (AI-1463) ─────────────────────────────────
-  // After a successful state transition, if the destination state has a
-  // singleton owner_role (exactly one body fills it), automatically update
-  // the ticket delegate to that body's linearUserId. This prevents the
-  // reviewer from being stuck as delegate in a state they cannot act on.
-  // Fail-open: errors are logged and never block the already-succeeded label transition.
-  const destStateNode = def.states.find((s) => s.id === toStateName);
-  const destOwnerRole = destStateNode?.owner_role;
-  if (destOwnerRole && destStateNode?.kind !== 'terminal') {
-    try {
-      const roleBodies = await resolveBodiesForRole(destOwnerRole);
-      if (roleBodies.length === 1) {
-        const agent = getAgent(roleBodies[0]);
-        if (agent?.linearUserId) {
-          const delegateUpdated = await issueUpdateDelegate(
-            issue.internalId,
-            agent.linearUserId,
-            authToken,
-          );
-          if (delegateUpdated) {
-            log.info(
-              `workflow-gate: B2 apply: ${issueId} auto-delegate → ${roleBodies[0]} (linearUserId=${agent.linearUserId})`,
-            );
-          }
-        } else {
-          log.warn(
-            `workflow-gate: B2 apply: singleton body '${roleBodies[0]}' for role '${destOwnerRole}' has no linearUserId — skipping auto-delegate`,
-          );
-        }
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.warn(`workflow-gate: B2 apply: auto-delegate failed for ${issueId}: ${msg}`);
-    }
-  }
-
-  // ── Phase 5 / B-2: Fan-out edge (spawning 1→N) ──────────────────────
+    // ── Phase 5 / B-2: Fan-out edge (spawning 1→N) ──────────────────────
   // After a successful state transition to `managing` via the `spawn` command
   // on a ux-audit ticket, execute the fan-out to create N dev-impl children.
   // Fail-open: fan-out errors are logged and never block the transition.
@@ -1331,36 +1528,63 @@ async function postFanoutSummaryComment(
   }
 }
 
-async function issueUpdateLabels(
+/**
+ * AI-1493: Atomic issue update — sets labels AND delegate in a single mutation.
+ * This replaces the separate issueUpdateLabels + issueUpdateDelegate calls
+ * so the transition is all-or-nothing: either the full tuple lands or nothing does.
+ *
+ * @param delegateId - Linear user ID for the new delegate, or null to skip delegate update.
+ */
+async function issueUpdateAtomic(
   internalId: string,
   labelIds: string[],
   authToken: string,
+  delegateId?: string | null,
 ): Promise<boolean> {
+  // Build the mutation input: include delegateId when explicitly set (string or null to clear).
+  // undefined means "don't touch delegate". null means "clear delegate".
+  const hasDelegate = delegateId !== undefined;
+  const inputFields = hasDelegate
+    ? "labelIds: $labelIds, delegateId: $delegateId"
+    : "labelIds: $labelIds";
   const mutation = `
-    mutation ApplyStateTransition($issueId: String!, $labelIds: [String!]!) {
-      issueUpdate(id: $issueId, input: { labelIds: $labelIds }) {
+    mutation ApplyAtomicTransition($issueId: String!, $labelIds: [String!]!${hasDelegate ? ", $delegateId: String" : ""}) {
+      issueUpdate(id: $issueId, input: { ${inputFields} }) {
         success
       }
     }
   `;
+  const variables: Record<string, unknown> = { issueId: internalId, labelIds };
+  if (hasDelegate) variables.delegateId = delegateId;
   try {
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query: mutation, variables: { issueId: internalId, labelIds } }),
+      body: JSON.stringify({ query: mutation, variables }),
     });
     type Resp = { data?: { issueUpdate?: { success: boolean } } };
     const data = (await res.json()) as Resp;
     if (!data.data?.issueUpdate?.success) {
-      log.warn(`workflow-gate: B2 apply: issueUpdate returned non-success for ${internalId}`);
+      log.warn(`workflow-gate: atomic issueUpdate returned non-success for ${internalId}`);
       return false;
     }
     return true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    log.warn(`workflow-gate: B2 apply: issueUpdate failed for ${internalId}: ${msg}`);
+    log.warn(`workflow-gate: atomic issueUpdate failed for ${internalId}: ${msg}`);
     return false;
   }
+}
+
+/**
+ * Legacy label-only update, kept for non-atomic paths (ad_hoc demote, re-stamp).
+ */
+async function issueUpdateLabels(
+  internalId: string,
+  labelIds: string[],
+  authToken: string,
+): Promise<boolean> {
+  return issueUpdateAtomic(internalId, labelIds, authToken);
 }
 
 /**
@@ -1369,7 +1593,11 @@ async function issueUpdateLabels(
  * to ensure the new state's owner body becomes the delegate.
  * Fail-open: returns false on any error, never throws.
  */
-async function issueUpdateDelegate(
+/**
+ * Update only the delegate (for cases where the atomic label+delegate path
+ * is not needed). Delegates to issueUpdateAtomic with empty label behavior.
+ */
+async function issueUpdateDelegateOnly(
   internalId: string,
   delegateLinearUserId: string,
   authToken: string,
@@ -1390,13 +1618,13 @@ async function issueUpdateDelegate(
     type Resp = { data?: { issueUpdate?: { success: boolean } } };
     const data = (await res.json()) as Resp;
     if (!data.data?.issueUpdate?.success) {
-      log.warn(`workflow-gate: auto-delegate: issueUpdate returned non-success for ${internalId}`);
+      log.warn(`workflow-gate: delegate-only issueUpdate returned non-success for ${internalId}`);
       return false;
     }
     return true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    log.warn(`workflow-gate: auto-delegate: issueUpdate failed for ${internalId}: ${msg}`);
+    log.warn(`workflow-gate: delegate-only issueUpdate failed for ${internalId}: ${msg}`);
     return false;
   }
 }

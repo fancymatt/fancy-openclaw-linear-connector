@@ -203,7 +203,7 @@ async function tryBuildWorkflowMessage(
 
   // Phase 6.5 / H-7 (AI-1482): Include verbatim AC record if captured.
   const acRecordBlock: string[] = [];
-  const acRecord = getAcRecord(identifier);
+  const acRecord = await getAcRecord(identifier);
   if (acRecord) {
     acRecordBlock.push(
       "",
