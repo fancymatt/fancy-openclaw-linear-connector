@@ -30,6 +30,7 @@ states:
     transitions:
       - command: accept
         to: ux-shaping
+        requires_artifact: true   # §5.7 item 1: sprint-plan doc must be bound at intake
         assign: { mode: required }
       - command: demote
         to: __ad_hoc__          # ticket leaves the workflow entirely (design.md §4.5)

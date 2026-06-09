@@ -45,6 +45,7 @@ import { getAgent } from "./agents.js";
 import { executeFanout, shouldTriggerFanout } from "./fanout.js";
 import { onChildTerminal, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
+import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
 
@@ -69,6 +70,8 @@ export interface WorkflowTransition {
   command: string;
   to: string;
   requires_capability?: string;
+  /** §5.7 item 1: if true, this transition requires a bound artifact ref (e.g. sprint-plan doc). */
+  requires_artifact?: boolean;
   feedback?: { required?: boolean; category_enum?: string[] };
   assign?: {
     mode?: 'required' | 'auto' | 'none';
@@ -414,7 +417,8 @@ export async function checkWorkflowRules(
   authToken: string,
   bodyId: string,
   target: string | null = null,
-  callerLinearUserId?: string | null
+  callerLinearUserId?: string | null,
+  artifactRef?: string | null
 ): Promise<string | null> {
   // TODO(AI-1347): fail-open on missing issueId is a Layer A carry-forward.
   // Harden by deriving issueId from the request body when headers are absent.
@@ -533,6 +537,20 @@ export async function checkWorkflowRules(
         `handoff to the deployment body to proceed.`
       );
     }
+  }
+
+  // §5.7 item 1 / C-2: Artifact-binding gate.
+  // If the transition requires an artifact (requires_artifact: true), the caller
+  // must supply an artifact ref via the X-Openclaw-Artifact-Ref header.
+  // The engine refuses the transition if no artifact is bound — freehand scope
+  // has no command (this is the F1 structural kill at the source for Archetype C).
+  if (match.requires_artifact && !artifactRef) {
+    log.warn(`workflow-gate: artifact gate: ${intent} on ${issueId} requires a bound artifact — none provided`);
+    return (
+      `[Proxy] '${intent}' requires a bound sprint-plan artifact. ` +
+      `Provide a sprint-plan doc reference via the --artifact-ref flag (or X-Openclaw-Artifact-Ref header). ` +
+      `Example: ai-systems/projects/<project>/sprints/<sprint-plan>.md`
+    );
   }
 
   // Resolve destination state for subsequent gates.
@@ -827,6 +845,8 @@ export interface ApplyStateTransitionOptions {
   observationStore?: ObservationStore;
   /** Structured feedback data for transitions with feedback.required. */
   feedback?: TransitionFeedback;
+  /** §5.7 item 1 / C-2: artifact ref to bind at intake.accept (sprint-plan doc path). */
+  artifactRef?: string | null;
 }
 
 export async function applyStateTransition(
@@ -969,6 +989,39 @@ export async function applyStateTransition(
     }
   }
 
+  // ── §5.7 item 1 / C-2: Sprint artifact gate at validating → done ────
+  // For the sprint workflow, the approve transition from validating to done
+  // requires that the artifact bound at intake is still present.
+  // This is the §5.6 gate inherited from B-4, adapted for sprint: the
+  // validating gate reads the bound artifact as the parent AC source.
+  if (workflowId === "sprint" && currentStateName === "validating" && intent === "approve") {
+    const artifact = getBoundArtifact(issueId);
+    if (!artifact) {
+      log.warn(`workflow-gate: C-2: sprint artifact gate: ${issueId} validating → done blocked — no bound artifact`);
+      // Post a diagnostic comment
+      const internalId = issue.internalId;
+      const mutation = `
+        mutation($issueId: ID!, $body: String!) {
+          commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
+        }
+      `;
+      const commentBody =
+        `[Artifact Gate] Cannot advance to **done** — no sprint-plan artifact is bound. ` +
+        `The sprint workflow requires a sprint-plan document to be bound at intake before the validating gate can pass.`;
+      try {
+        await fetch(LINEAR_API_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: authToken },
+          body: JSON.stringify({ query: mutation, variables: { issueId: internalId, body: commentBody } }),
+        });
+      } catch (commentErr) {
+        log.warn(`workflow-gate: C-2: failed to post diagnostic comment for ${issueId}: ${commentErr instanceof Error ? commentErr.message : String(commentErr)}`);
+      }
+      return; // Block the transition
+    }
+    log.info(`workflow-gate: C-2: sprint artifact gate: ${issueId} artifact '${artifact.ref}' present — allowing validating → done`);
+  }
+
   // ── Atomic label swap ──────────────────────────────────────────────────
   const oldLabel = issue.labels.find((l) => l.name === `state:${currentStateName}`);
   if (!oldLabel) {
@@ -1000,6 +1053,31 @@ export async function applyStateTransition(
     log.info(
       `workflow-gate: B2 apply: ${issueId} state:${currentStateName} → state:${toStateName}`,
     );
+  }
+
+  // ── §5.7 item 1 / C-2: Artifact-binding recording ────────────────────
+  // After a successful state transition, if the matched transition requires
+  // an artifact and one was provided, record it connector-side.
+  // Also clean up artifacts on escape/demote (ticket leaves the workflow).
+  if (applied && matchedTransition?.requires_artifact && options?.artifactRef) {
+    try {
+      bindArtifact(issueId, {
+        ref: options.artifactRef,
+        boundAt: new Date().toISOString(),
+        boundBy: options.bodyId ?? "unknown",
+      });
+      log.info(
+        `workflow-gate: C-2: artifact bound for ${issueId}: '${options.artifactRef}'`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`workflow-gate: C-2: artifact bind failed for ${issueId}: ${msg}`);
+    }
+  }
+
+  // Clean up artifact binding on escape/demote (ticket leaves workflow)
+  if (applied && (toStateName === "escape" || toStateName === "__ad_hoc__")) {
+    removeArtifact(issueId);
   }
 
   // ── Auto-delegate assignment (AI-1463) ─────────────────────────────────

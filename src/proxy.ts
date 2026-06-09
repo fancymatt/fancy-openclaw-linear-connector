@@ -133,6 +133,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   const intent = (req.headers["x-openclaw-linear-intent"] as string | undefined) ?? null;
   const target = (req.headers["x-openclaw-linear-target"] as string | undefined) ?? null;
   const feedbackCategoryHeader = (req.headers["x-openclaw-feedback-category"] as string | undefined) ?? null;
+  const artifactRefHeader = (req.headers["x-openclaw-artifact-ref"] as string | undefined) ?? null;
   const cliVersion = (req.headers["x-openclaw-linear-cli-version"] as string | undefined) ?? null;
   const body = parseBody(req);
   const opName = body?.operationName ?? "(unnamed)";
@@ -168,7 +169,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       return;
     }
 
-    const p3rejection = await checkWorkflowRules(intent, issueId, authorization, agentId, target, callerLinearUserId);
+    const p3rejection = await checkWorkflowRules(intent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader);
     if (p3rejection) {
       log.warn(`workflow-block agent=${agentId} intent=${intent}${ticketCtx}: ${p3rejection}`);
       res.status(200).json({ errors: [{ message: p3rejection }] });
@@ -228,6 +229,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         bodyId: agentId,
         observationStore: deps?.observationStore,
         feedback,
+        artifactRef: artifactRefHeader,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
