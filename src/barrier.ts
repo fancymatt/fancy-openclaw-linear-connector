@@ -418,6 +418,7 @@ export async function attemptBarrierTransition(
   parentIdentifier: string,
   authToken: string,
   workflowDef?: WorkflowDef,
+  prefetchedParentState?: { labels: string[]; internalId: string; teamId: string } | null,
 ): Promise<BarrierTransitionResult> {
   const result: BarrierTransitionResult = {
     transitioned: false,
@@ -446,7 +447,8 @@ export async function attemptBarrierTransition(
   }
 
   // 2. Verify parent is in managing state
-  const parentState = await fetchParentState(parentIdentifier, authToken);
+  //    Use pre-fetched state if provided (avoids redundant API call)
+  const parentState = prefetchedParentState ?? await fetchParentState(parentIdentifier, authToken);
   if (!parentState) {
     result.error = "Failed to fetch parent state";
     return result;
@@ -467,10 +469,7 @@ export async function attemptBarrierTransition(
   }
 
   // 3. Atomic label swap: state:managing → state:review
-  const managingLabel = parentState.labels
-    .map((name, idx) => ({ name, idx }))
-    .find((l) => l.name === "state:managing");
-  // We need the label ID, not just the name — re-fetch with IDs
+  // We need the label IDs, not just the names — re-fetch with IDs
   const parentWithLabels = await fetchParentWithLabelIds(parentIdentifier, authToken);
   if (!parentWithLabels) {
     result.error = "Failed to fetch parent label IDs";
@@ -557,9 +556,9 @@ export async function onChildTerminal(
     return null;
   }
 
-  // 3. Attempt the barrier transition
+  // 3. Attempt the barrier transition, passing pre-fetched parent state
   log.info(`barrier: child ${childIdentifier} terminal, checking barrier for parent ${parentIdentifier}`);
-  return attemptBarrierTransition(parentIdentifier, authToken);
+  return attemptBarrierTransition(parentIdentifier, authToken, undefined, parentState);
 }
 
 // ── Label fetch with IDs ──────────────────────────────────────────────────

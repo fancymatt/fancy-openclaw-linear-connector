@@ -26,6 +26,7 @@ import type { OperationalEventStore } from "../store/operational-event-store.js"
 import type { ManagingStateStore } from "../store/managing-state-store.js";
 import type { DeliveryConfig } from "../delivery/index.js";
 import { sendManagingWakeSignal, type ManagingWakeTicket } from "./managing-wake.js";
+import { surfaceStalledChildren } from "../barrier.js";
 
 const log = componentLogger(createLogger(), "managing-poller");
 
@@ -260,6 +261,30 @@ export class ManagingPoller {
       if (dueTickets.length === 0) continue;
 
       const openclawAgent = agent.openclawAgent ?? agent.name;
+
+      // §5.5 stall detection: surface stalled children via tripwire comments
+      // before sending the stewardship wake. This wires the stall detection
+      // to a real production trigger (the managing-wake cycle).
+      const stallToken = getAccessToken(agent.name);
+      if (stallToken) {
+        for (const ticket of dueTickets) {
+          try {
+            const stalledCount = await surfaceStalledChildren(
+              ticket.identifier,
+              /^Bearer\s+/i.test(stallToken) ? stallToken : `Bearer ${stallToken}`,
+            );
+            if (stalledCount > 0) {
+              log.info(
+                `§5.5 tripwire: ${stalledCount} stalled child(ren) surfaced on ${ticket.identifier}`,
+              );
+            }
+          } catch (err) {
+            log.warn(
+              `Stall detection failed for ${ticket.identifier}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+      }
 
       try {
         await sendWake(openclawAgent, dueTickets, deliveryConfig);
