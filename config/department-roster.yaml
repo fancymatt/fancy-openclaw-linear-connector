@@ -1,0 +1,37 @@
+# Department Roster — Phase 6.5 Routing Functionary (AI-1479)
+#
+# This file drives the deterministic routing functionary that maps Linear team
+# prefixes to agent targets. When a ticket's identifier prefix matches a
+# department, that department's defaultTarget handles it automatically — no
+# person in the loop required (§7, §16.5).
+#
+# Unroutable requests (no prefix match + no delegate/assignee/mention) are
+# escalated to the steward (Astrid) for judgment.
+#
+# Ad-hoc tickets without a wf:* label are pass-through — no routing functionary
+# intervention.
+
+version: 1
+
+# Steward: the agent that receives unroutable escalations (§16.5).
+# This is a judgment escalation, NOT a default worker pool.
+steward: astrid
+
+departments:
+  AI:
+    name: AI Team
+    defaultTarget: igor
+    description: "Backend web dev — Linear connector, agent orchestration, proxy infrastructure"
+    overrides:
+      Comment: charles        # Code review comments go to Charles
+      IssueNotification: astrid  # Notifications escalated to steward
+
+  ILL:
+    name: ILL Team
+    defaultTarget: charles
+    description: "Frontend development"
+
+  FCY:
+    name: FCY Team
+    defaultTarget: charles
+    description: "Core platform"
