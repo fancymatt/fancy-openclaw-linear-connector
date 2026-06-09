@@ -108,6 +108,7 @@ export declare class ObservationStore {
     counts(query?: {
         workflow?: string;
         step?: string;
+        reasonCode?: ReasonCode;
         since?: string;
         until?: string;
     }): Array<{
@@ -144,6 +145,7 @@ export declare class ObservationStore {
     metrics(query?: {
         workflow?: string;
         step?: string;
+        reasonCode?: ReasonCode;
         since?: string;
         until?: string;
         includeBody?: boolean;

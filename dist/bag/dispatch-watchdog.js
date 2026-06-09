@@ -70,7 +70,7 @@ export class DispatchWatchdog {
      *   - autoAcknowledged: ticket no longer in bag, silently acked
      */
     async runCycle() {
-        const { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig } = this.deps;
+        const { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, wakeConfigForAgent } = this.deps;
         const timedOut = ackTracker.getPendingTimedOut(this.config.ackTimeoutMs);
         if (timedOut.length === 0) {
             return { unconfirmed: 0, resignaled: 0, escalated: 0, autoAcknowledged: 0 };
@@ -118,7 +118,8 @@ export class DispatchWatchdog {
                 bag.add(agentId, ticketId, "Issue");
                 log.warn(`Watchdog: re-added ${ticketId} to bag for ${agentId} (not in bag)`);
             }
-            const results = await resignalPendingTickets(agentId, [ticketId], bag, sessionTracker, wakeConfig, { markActive: true, ...this.deps.resignalOptions });
+            const agentWakeConfig = wakeConfigForAgent ? wakeConfigForAgent(agentId) : wakeConfig;
+            const results = await resignalPendingTickets(agentId, [ticketId], bag, sessionTracker, agentWakeConfig, { markActive: true, ...this.deps.resignalOptions });
             const dispatched = results.some((r) => r.dispatched);
             const pruned = results.some((r) => r.pruned);
             if (dispatched) {

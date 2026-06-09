@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { OperationalEventStore } from "./store/operational-event-store.js";
+import { ObservationStore } from "./store/observation-store.js";
 import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, ManagingPoller } from "./bag/index.js";
@@ -22,6 +23,7 @@ export declare function createApp(options?: CreateAppOptions): {
     bag: PendingWorkBag;
     sessionTracker: SessionTracker;
     operationalEventStore: OperationalEventStore;
+    observationStore: ObservationStore;
     wakeConfig: {
         nodeBin: string;
         hooksUrl: string | undefined;

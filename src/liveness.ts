@@ -91,6 +91,17 @@ async function checkHooksLiveness(
 
     const status = response.status;
     const body = await response.text().catch(() => "");
+
+    // A non-auth 4xx proves the gateway is up and answering — it simply rejected
+    // the lightweight ping payload (our ping omits the `message` field the inbound
+    // contract requires). Liveness measures reachability, not payload acceptance,
+    // so a responding gateway is alive. Without this, a cold-start agent whose
+    // warm session was reaped can never be re-woken (the nudge is suppressed).
+    if (status >= 400 && status < 500 && status !== 401 && status !== 403) {
+      log.info(`Liveness check for ${agentName}: HTTP ${status} (gateway responded) — treating as alive`);
+      return { available: true };
+    }
+
     log.warn(`Liveness check for ${agentName}: HTTP ${status} — ${body.slice(0, 200)}`);
     return {
       available: false,

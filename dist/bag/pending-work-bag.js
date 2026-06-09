@@ -147,6 +147,17 @@ export class PendingWorkBag {
         return result.changes;
     }
     /**
+     * Remove a ticket from every agent bag EXCEPT the specified agent. Used when
+     * a ticket is re-delegated: the new delegate keeps their entry, all previous
+     * holders are cleared so they don't receive spurious wake-up signals.
+     */
+    removeTicketForOtherAgents(agentId, ticketId) {
+        const result = this.db
+            .prepare("DELETE FROM pending_bag WHERE ticket_id = ? AND agent_id != ?")
+            .run(normalizeSessionKey(ticketId), agentId);
+        return result.changes;
+    }
+    /**
      * Check if any agent has pending work. Returns array of agent IDs.
      */
     agentsWithPendingWork() {

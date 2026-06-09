@@ -55,6 +55,10 @@ export interface NoActivityDeps {
     bag: PendingWorkBag;
     operationalEventStore: OperationalEventStore;
     wakeConfig: WakeUpConfig;
+    /** Resolve per-agent WakeUpConfig (hooksUrl/hooksToken from agents.json).
+     *  When provided, used instead of the static wakeConfig so container-retired
+     *  agents receive rescue signals on their own gateway, not the host. */
+    wakeConfigForAgent?: (agentId: string) => WakeUpConfig;
     /** Optional test overrides forwarded to resignalPendingTickets. */
     resignalOptions?: Partial<ResignalOptions>;
     /** Optional: custom Linear comment poster for failed dispatches. */

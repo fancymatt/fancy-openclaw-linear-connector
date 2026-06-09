@@ -11,7 +11,7 @@ const DEFAULT_INTER_AGENT_DELAY_MS = 500;
  * - Emits startup-replayed / startup-pruned operational events.
  */
 export async function replayPendingBag(bag, sessionTracker, wakeConfig, operationalEventStore, options = {}) {
-    const { interAgentDelayMs = DEFAULT_INTER_AGENT_DELAY_MS, ...resignalOptions } = options;
+    const { interAgentDelayMs = DEFAULT_INTER_AGENT_DELAY_MS, wakeConfigForAgent, ...resignalOptions } = options;
     const agents = bag.agentsWithPendingWork();
     if (agents.length === 0) {
         log.info("Startup replay: no pending work found.");
@@ -38,8 +38,9 @@ export async function replayPendingBag(bag, sessionTracker, wakeConfig, operatio
         }
         const ticketIds = pending.map((e) => e.ticketId);
         const beforeCount = ticketIds.length;
+        const agentWakeConfig = wakeConfigForAgent ? wakeConfigForAgent(agentId) : wakeConfig;
         try {
-            const dispatchResults = await resignalPendingTickets(agentId, ticketIds, bag, sessionTracker, wakeConfig, {
+            const dispatchResults = await resignalPendingTickets(agentId, ticketIds, bag, sessionTracker, agentWakeConfig, {
                 // During startup-replay, defer on fail-open: a transient Linear error should not
                 // resurrect Done tickets. Tickets stay in bag for re-check on next start.
                 // Callers can override by passing failOpenBehavior: "dispatch" in resignalOptions.

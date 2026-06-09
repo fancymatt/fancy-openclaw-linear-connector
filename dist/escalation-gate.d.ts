@@ -39,6 +39,12 @@ export declare function resetPolicyCache(): void;
  */
 export declare function bodyHasCapability(bodyId: string, capability: string): Promise<boolean>;
 /**
+ * Returns true when the body ID resolves to a known entry in the capability policy.
+ * Unknown bodies (not in policy) are treated as untrusted callers.
+ * Used by the workflow gate for fail-closed enforcement on wf:dev-impl tickets (AI-1402).
+ */
+export declare function isBodyKnown(bodyId: string): Promise<boolean>;
+/**
  * Returns body IDs that fill the given role (§16.2).
  * Used by the workflow gate to derive legal assignment targets.
  */

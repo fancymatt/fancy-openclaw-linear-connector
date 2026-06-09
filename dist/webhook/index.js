@@ -6,10 +6,15 @@ import { routeEvent } from "../router.js";
 import { createSessionAndEmitThought } from "../agent-session.js";
 import { deliverToAgent } from "../delivery/index.js";
 import { normalizeSessionKey } from "../session-key.js";
-import { buildAgentMap, getAgent, getOpenclawAgentName } from "../agents.js";
+import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgents } from "../agents.js";
+import { checkAgentLiveness } from "../liveness.js";
+import { emitDelegateUnavailable } from "../escalation.js";
+import { checkRoleGuardAndBlock } from "../routing-guard.js";
+import { fetchWorkflowLabels } from "../workflow-gate.js";
 import { resignalPendingTickets } from "../bag/index.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { isLinearIssueStillRoutedToAgent, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
+import { onChildTerminal } from "../barrier.js";
 const log = componentLogger(createLogger(), "webhook");
 export { verifyLinearSignature } from "./signature.js";
 export { normalizeLinearEvent } from "./normalize.js";
@@ -159,6 +164,20 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
                 log.info(`Terminal issue event for ${sessionKey}: pruned ${removedBag} pending bag entr${removedBag === 1 ? "y" : "ies"}` +
                     ` and ${removedQueued} queued signal${removedQueued === 1 ? "" : "s"}; skipping agent dispatch`);
                 appendOperationalEvent(operationalEventStore, { outcome: "terminal-pruned", type: event.type, key: sessionKey, sessionKey, detail: { removedBag, removedQueued } });
+                // Phase 5 / B-3: Barrier (N→1) — event-driven parent auto-advance.
+                // When a child reaches a terminal state, check if all siblings are
+                // terminal and auto-advance the parent managing → review.
+                // Fail-open: barrier errors are logged and never block the terminal prune.
+                const barrierToken = process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+                if (barrierToken) {
+                    onChildTerminal(identifier, barrierToken).then((result) => {
+                        if (result?.transitioned) {
+                            log.info(`Barrier: auto-advanced parent of ${identifier} managing → review`);
+                        }
+                    }).catch((err) => {
+                        log.warn(`Barrier check failed for terminal child ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
+                    });
+                }
             }
             else {
                 log.info("Terminal issue event without identifier; skipping agent dispatch");
@@ -230,6 +249,78 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
         const agentName = route.agentId;
         log.info(`Routed event to ${agentName} [${route.sessionKey}]`);
         appendOperationalEvent(operationalEventStore, { outcome: "routed", type: event.type, agent: agentName, key: route.sessionKey, sessionKey: route.sessionKey, deliveryMode: bag && sessionTracker ? "pending-bag" : agentQueue ? "agent-queue" : "direct" });
+        // ── 9c. AI-1428: Pre-flight liveness check + role-guard ────────────
+        // Before dispatching to an agent, verify it's reachable. If not,
+        // emit DELEGATE_UNAVAILABLE instead of silently stalling.
+        // Also check role-guard for implementation-state tickets.
+        const livenessConfig = {
+            hooksUrl: process.env.OPENCLAW_HOOKS_URL,
+            hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
+        };
+        const agentLivenessCfg = getAgent(route.agentId);
+        if (agentLivenessCfg?.hooksUrl)
+            livenessConfig.hooksUrl = agentLivenessCfg.hooksUrl;
+        if (agentLivenessCfg?.hooksToken)
+            livenessConfig.hooksToken = agentLivenessCfg.hooksToken;
+        const liveness = await checkAgentLiveness(route.agentId, livenessConfig);
+        if (!liveness.available) {
+            // Agent unreachable — emit DELEGATE_UNAVAILABLE escalation.
+            log.warn(`DELEGATE_UNAVAILABLE: ${route.agentId} is unreachable (${liveness.reason}: ${liveness.detail ?? "unknown"}) — skipping delivery for ${ticketId}`);
+            appendOperationalEvent(operationalEventStore, {
+                outcome: "delivery-failed",
+                type: event.type,
+                agent: agentName,
+                key: ticketId,
+                sessionKey: ticketId,
+                deliveryMode: "delegate-unavailable",
+                attemptCount: 1,
+                errorSummary: `DELEGATE_UNAVAILABLE: ${liveness.reason}: ${liveness.detail ?? "unknown"}`,
+            });
+            await emitDelegateUnavailable(ticketId.replace(/^linear-/, ""), route.agentId, `${liveness.reason}: ${liveness.detail ?? "unknown"}`);
+            // Do NOT deliver — return immediately.
+            return;
+        }
+        // Role-guard (AI-1459 enforcement mode): check whether the target agent
+        // fills the owner_role for the ticket's current workflow state.
+        // If blocked: skip delivery — the guard has posted a comment and
+        // attempted delegate correction.
+        const issueIdentifier = ticketId.replace(/^linear-/, "");
+        const roleGuardToken = getAccessToken(route.agentId) ??
+            process.env.LINEAR_OAUTH_TOKEN ??
+            process.env.LINEAR_API_KEY;
+        if (roleGuardToken) {
+            try {
+                const guardLabels = await fetchWorkflowLabels(issueIdentifier, roleGuardToken);
+                // Provide a resolver so the guard can auto-correct the delegate
+                // without needing to import agents.ts directly (avoids the test
+                // compile-time dependency on fancy-openclaw-linear-skill-cli).
+                const linearUserIdResolver = (bodyName) => {
+                    const agents = getAgents();
+                    const agent = agents.find((a) => a.name.toLowerCase() === bodyName.toLowerCase() ||
+                        a.openclawAgent?.toLowerCase() === bodyName.toLowerCase());
+                    return agent?.linearUserId ?? null;
+                };
+                const guardResult = await checkRoleGuardAndBlock(route.agentId, issueIdentifier, guardLabels, linearUserIdResolver);
+                if (guardResult.blocked) {
+                    log.warn(`routing-guard: dispatch blocked for ${route.agentId} [${issueIdentifier}] — ${guardResult.reason ?? "role mismatch"}; ` +
+                        (guardResult.correctedTo ? `corrected to ${guardResult.correctedTo}` : "delegate cleared"));
+                    appendOperationalEvent(operationalEventStore, {
+                        outcome: "delivery-failed",
+                        type: event.type,
+                        agent: agentName,
+                        key: ticketId,
+                        sessionKey: ticketId,
+                        deliveryMode: "role-guard-blocked",
+                        attemptCount: 1,
+                        errorSummary: `routing-guard blocked: ${guardResult.reason ?? "role mismatch"}`,
+                    });
+                    return;
+                }
+            }
+            catch (err) {
+                log.warn(`Role-guard check failed for ${issueIdentifier}: ${err instanceof Error ? err.message : String(err)} — continuing`);
+            }
+        }
         // ── 10. Create agent session + emit thought ───────────────────────────
         const data = event.data;
         const issueId = data?.id;

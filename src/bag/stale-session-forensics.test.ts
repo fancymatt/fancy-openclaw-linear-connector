@@ -530,3 +530,109 @@ describe("recoverTicket — C2/C4 redispatch cap", () => {
     expect(ownershipOnlyCalls).toHaveLength(0);
   });
 });
+
+// ── recoverTicket — terminal guard + robust state resolution ────────────────
+
+function makeFetchMockWithState(opts: { stateName?: string; stateType?: string; teamStates?: Array<{ id: string; name: string; type: string }> }) {
+  const stateName = opts.stateName ?? "In Progress";
+  const stateType = opts.stateType ?? "started";
+  const teamStates = opts.teamStates ?? [{ id: "state-todo", name: "To Do", type: "unstarted" }];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return jest.fn<(...args: Parameters<typeof fetch>) => Promise<any>>().mockImplementation(async (_url: unknown, reqOpts?: unknown) => {
+    const body = (reqOpts as RequestInit | undefined)?.body ? JSON.parse((reqOpts as RequestInit).body as string) : {};
+    const query: string = body.query ?? "";
+    if (query.includes("IssueWithTeam")) {
+      return { ok: true, json: async () => ({ data: { issue: { id: "issue-123", team: { id: "team-456" }, state: { name: stateName, type: stateType } } } }) };
+    }
+    if (query.includes("TeamStates") || query.includes("workflow")) {
+      return { ok: true, json: async () => ({ data: { team: { workflow: { states: teamStates } } } }) };
+    }
+    if (query.includes("commentCreate")) {
+      return { ok: true, json: async () => ({ data: { commentCreate: { comment: { id: "comment-1" } } } }) };
+    }
+    if (query.includes("RecoverIssue") || query.includes("issueUpdate")) {
+      return { ok: true, json: async () => ({ data: { issueUpdate: { success: true, issue: { id: "issue-123", state: { name: "To Do" } } } } }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  });
+}
+
+describe("recoverTicket — terminal guard", () => {
+  let dbPath: string;
+  beforeEach(() => {
+    dbPath = `/tmp/stale-terminal-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    process.env.LINEAR_API_KEY = "test-key";
+  });
+  afterEach(() => {
+    delete process.env.LINEAR_API_KEY;
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  test("skips recovery when ticket is already terminal (completed) — no comment, no mutation", async () => {
+    global.fetch = makeFetchMockWithState({ stateName: "Done", stateType: "completed" }) as unknown as typeof fetch;
+
+    const result = await recoverTicket(makeSnapshot("C4"), "igor", { redispatchDbPath: dbPath });
+
+    expect(result.success).toBe(true);
+    expect(result.action).toBe("skipped-terminal");
+
+    const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
+    const allCalls = fetchMock.mock.calls as Array<[string, RequestInit]>;
+    // Only the IssueWithTeam query should have fired — no comment, no RecoverIssue.
+    const mutating = allCalls.filter(([, o]) => {
+      const b = JSON.parse((o?.body ?? "{}") as string);
+      return b.query?.includes("commentCreate") || b.query?.includes("RecoverIssue");
+    });
+    expect(mutating).toHaveLength(0);
+  });
+
+  test("skips recovery when ticket is canceled", async () => {
+    global.fetch = makeFetchMockWithState({ stateName: "Canceled", stateType: "canceled" }) as unknown as typeof fetch;
+    const result = await recoverTicket(makeSnapshot("C2"), "igor", { redispatchDbPath: dbPath });
+    expect(result.action).toBe("skipped-terminal");
+  });
+
+  test("proceeds with recovery when ticket is still active (started)", async () => {
+    global.fetch = makeFetchMockWithState({ stateName: "In Progress", stateType: "started" }) as unknown as typeof fetch;
+    const result = await recoverTicket(makeSnapshot("C4"), "igor", { redispatchDbPath: dbPath });
+    expect(result.action).not.toBe("skipped-terminal");
+    const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
+    const allCalls = fetchMock.mock.calls as Array<[string, RequestInit]>;
+    const recoverCall = allCalls.find(([, o]) => JSON.parse((o?.body ?? "{}") as string).query?.includes("RecoverIssue"));
+    expect(recoverCall).toBeDefined();
+  });
+});
+
+describe("recoverTicket — robust state-name resolution", () => {
+  let dbPath: string;
+  beforeEach(() => {
+    dbPath = `/tmp/stale-stateres-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+    process.env.LINEAR_API_KEY = "test-key";
+  });
+  afterEach(() => {
+    delete process.env.LINEAR_API_KEY;
+    try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  });
+
+  test('resolves "To Do" target by exact name', async () => {
+    global.fetch = makeFetchMockWithState({
+      teamStates: [{ id: "s-todo", name: "To Do", type: "unstarted" }, { id: "s-done", name: "Done", type: "completed" }],
+    }) as unknown as typeof fetch;
+    await recoverTicket(makeSnapshot("C4"), "igor", { redispatchDbPath: dbPath });
+    const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
+    const recoverCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, o]) => JSON.parse((o?.body ?? "{}") as string).query?.includes("RecoverIssue"));
+    const recoverBody = JSON.parse((recoverCall![1].body ?? "{}") as string);
+    expect(recoverBody.variables.input.stateId).toBe("s-todo");
+  });
+
+  test('falls back to unstarted type when team uses a different name (e.g. "Backlog Ready")', async () => {
+    global.fetch = makeFetchMockWithState({
+      teamStates: [{ id: "s-ready", name: "Backlog Ready", type: "unstarted" }, { id: "s-done", name: "Done", type: "completed" }],
+    }) as unknown as typeof fetch;
+    await recoverTicket(makeSnapshot("C4"), "igor", { redispatchDbPath: dbPath });
+    const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
+    const recoverCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, o]) => JSON.parse((o?.body ?? "{}") as string).query?.includes("RecoverIssue"));
+    const recoverBody = JSON.parse((recoverCall![1].body ?? "{}") as string);
+    expect(recoverBody.variables.input.stateId).toBe("s-ready");
+  });
+});

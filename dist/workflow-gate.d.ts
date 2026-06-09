@@ -1,6 +1,7 @@
 /**
  * Phase 3 / B1 — Workflow-def-driven inbound command validation (AI-1352).
  * Phase 3 / B2 — Atomic state-label transition application (AI-1353).
+ * Layer 2 — Raw status/assignee mutation interception (AI-1387).
  *
  * B1: Generalizes the Phase 2 single-rule escalation-gate (escalation-gate.ts) into
  * a full legal-move validator driven by the workflow definition YAML. The rule
@@ -37,6 +38,8 @@ export interface WorkflowTransition {
     command: string;
     to: string;
     requires_capability?: string;
+    /** §5.7 item 1: if true, this transition requires a bound artifact ref (e.g. sprint-plan doc). */
+    requires_artifact?: boolean;
     feedback?: {
         required?: boolean;
         category_enum?: string[];
@@ -92,8 +95,44 @@ export declare function fetchWorkflowLabels(issueId: string, authToken: string):
  * Returns a rejection message when the command should be blocked, or null to forward.
  * Fails open on missing issueId, missing state label, unknown workflow, or label-fetch
  * failure — enforcement only blocks with affirmative evidence of a violation.
+ *
+ * @param callerLinearUserId - Linear user ID of the requesting agent (from agents.ts);
+ *   used for delegate-only enforcement (AI-1397). Null/undefined → fail-open.
  */
-export declare function checkWorkflowRules(intent: string, issueId: string | null, authToken: string, bodyId: string, target?: string | null): Promise<string | null>;
+export declare function checkWorkflowRules(intent: string, issueId: string | null, authToken: string, bodyId: string, target?: string | null, callerLinearUserId?: string | null, artifactRef?: string | null): Promise<string | null>;
+/**
+ * Detect raw mutations on workflow tickets (AI-1387, expanded in AI-1402).
+ *
+ * When an agent sends an `issueUpdate` with `stateId`, `assigneeId`, or `labelIds`
+ * in the input but WITHOUT the `x-openclaw-linear-intent` header, they're bypassing
+ * the workflow CLI commands. This function intercepts those raw mutations,
+ * resolves the ticket's current state from its labels, and returns a rejection
+ * that includes the legal verb set for that state.
+ *
+ * AI-1402 expansion: also blocks `labelIds` mutations (label manipulation is as
+ * capable as state changes for bypassing workflow state) and adds fail-closed
+ * enforcement for unknown callers on workflow tickets.
+ *
+ * Returns null to allow the request through (non-workflow ticket, non-mutation,
+ * or no workflow-affecting fields in input). Returns a rejection string otherwise.
+ * Fail-open on any error — missing issueId, label fetch failure, etc.
+ */
+export declare function checkRawMutationInterception(body: {
+    query?: string;
+    variables?: Record<string, unknown>;
+    operationName?: string;
+} | null, issueId: string | null, authToken: string, bodyId?: string): Promise<string | null>;
+/**
+ * Generate a legal-verb reminder for the NEW state after a successful transition.
+ *
+ * Layer 1 (AI-1387): re-surfaces the legal command set at the completion/decision
+ * moment, so agents don't need to rely on the stale delegation-time injection.
+ *
+ * Returns null when not applicable (ad-hoc ticket, unknown state, terminal state).
+ * Returns a formatted string with the legal commands for the NEW state.
+ * Fail-open on any error.
+ */
+export declare function buildStateTransitionReminder(intent: string, issueId: string | null, authToken: string): Promise<string | null>;
 /**
  * Apply the state-label transition triggered by a legal command (AI-1353 / §4.2).
  *
@@ -130,6 +169,8 @@ export interface ApplyStateTransitionOptions {
     observationStore?: ObservationStore;
     /** Structured feedback data for transitions with feedback.required. */
     feedback?: TransitionFeedback;
+    /** §5.7 item 1 / C-2: artifact ref to bind at intake.accept (sprint-plan doc path). */
+    artifactRef?: string | null;
 }
 export declare function applyStateTransition(intent: string, issueId: string | null, authToken: string, options?: ApplyStateTransitionOptions): Promise<void>;
 //# sourceMappingURL=workflow-gate.d.ts.map
