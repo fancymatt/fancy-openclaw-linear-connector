@@ -304,12 +304,12 @@ export function createApp(options?: CreateAppOptions) {
   }
 
   const watchdog = new DispatchWatchdog(
-    { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, resignalOptions },
+    { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions },
   );
   watchdog.start();
 
   const noActivityDetector = new NoActivityDetector(
-    { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, resignalOptions, postLinearComment },
+    { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions, postLinearComment },
   );
   noActivityDetector.start();
 
@@ -472,7 +472,7 @@ export function createApp(options?: CreateAppOptions) {
       // Re-signal: agent has work waiting. Send one signal per ticket so each
       // issue is delivered into its own canonical per-ticket session key.
       try {
-        await resignalPendingTickets(agentId, allPending, bag, sessionTracker, wakeConfig, { markActive: true });
+        await resignalPendingTickets(agentId, allPending, bag, sessionTracker, wakeConfigForAgent(agentId), { markActive: true });
       } catch (err) {
         log.error(`Session-end re-signal failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -560,7 +560,7 @@ if (isEntryPoint) {
     startTokenRefresh();
   }
 
-  const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, wakeConfig, resignalOptions, ackTracker, watchdog, noActivityDetector } = createApp();
+  const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector } = createApp();
 
   // P4-3: periodic distillation of reject metrics into skill-workshop proposals
   registerDistillationCron(observationStore);
@@ -574,6 +574,7 @@ if (isEntryPoint) {
     // Replay persisted pending-bag work left behind by a prior process restart.
     replayPendingBag(bag, sessionTracker, wakeConfig, operationalEventStore, {
       ...resignalOptions,
+      wakeConfigForAgent,
       onDispatched: (agentId, ticketId) => ackTracker.recordDispatch(agentId, ticketId),
     }).catch((err) => {
       log.error(`Startup replay failed: ${err instanceof Error ? err.message : String(err)}`);

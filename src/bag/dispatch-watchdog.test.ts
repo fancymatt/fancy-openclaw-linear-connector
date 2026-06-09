@@ -29,6 +29,13 @@ function tempDir(): string {
 }
 
 const wakeConfig: WakeUpConfig = { nodeBin: process.execPath, timeoutMs: 10, maxRetries: 0 };
+const containerWakeConfig: WakeUpConfig = {
+  nodeBin: process.execPath,
+  timeoutMs: 10,
+  maxRetries: 0,
+  hooksUrl: "http://127.0.0.1:18823/hooks/agent-nodelivery-kana",
+  hooksToken: "tok-kana",
+};
 
 function setupDeps(dir: string) {
   const bag = new PendingWorkBag(path.join(dir, "bag.db"), 60_000);
@@ -362,6 +369,82 @@ describe("DispatchWatchdog — CT-52 failure mode", () => {
     expect(dispatchedTickets).toContain("linear-CT-52");
     // Session is re-started by resignalPendingTickets(markActive:true) after dispatch
     expect(sessionTracker.isActiveForTicket("emi", "linear-CT-52")).toBe(true);
+
+    watchdog.stop();
+    bag.close();
+    sessionTracker.close();
+    ackTracker.close();
+    operationalEventStore.close();
+  });
+
+  test("AI-1474: wakeConfigForAgent routes re-signal to per-agent container gateway", async () => {
+    const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+    const capturedConfigs: WakeUpConfig[] = [];
+
+    bag.add("kana", "linear-AI-1474", "Issue");
+    sessionTracker.startSession("kana", "linear-AI-1474");
+    ackTracker.recordDispatch("kana", "linear-AI-1474");
+
+    const watchdog = new DispatchWatchdog(
+      {
+        bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig,
+        wakeConfigForAgent: (agentId: string) => {
+          if (agentId === "kana") return containerWakeConfig;
+          return wakeConfig;
+        },
+        resignalOptions: {
+          isTicketActionable: () => true,
+          sendWakeUp: async (_agentId, _ticketIds, config) => {
+            capturedConfigs.push(config);
+          },
+        },
+      },
+      { ackTimeoutMs: 0, maxResignals: 3, cycleIntervalMs: 60_000 },
+    );
+
+    const result = await watchdog.runCycle();
+
+    expect(result.resignaled).toBe(1);
+    expect(capturedConfigs).toHaveLength(1);
+    // The re-signal must use the per-agent container hooksUrl, not the global one
+    expect(capturedConfigs[0].hooksUrl).toBe("http://127.0.0.1:18823/hooks/agent-nodelivery-kana");
+    expect(capturedConfigs[0].hooksToken).toBe("tok-kana");
+
+    watchdog.stop();
+    bag.close();
+    sessionTracker.close();
+    ackTracker.close();
+    operationalEventStore.close();
+  });
+
+  test("AI-1474: without wakeConfigForAgent, falls back to global wakeConfig", async () => {
+    const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+    const capturedConfigs: WakeUpConfig[] = [];
+
+    bag.add("kana", "linear-AI-1474", "Issue");
+    sessionTracker.startSession("kana", "linear-AI-1474");
+    ackTracker.recordDispatch("kana", "linear-AI-1474");
+
+    const watchdog = new DispatchWatchdog(
+      {
+        bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig,
+        // No wakeConfigForAgent — backward compat
+        resignalOptions: {
+          isTicketActionable: () => true,
+          sendWakeUp: async (_agentId, _ticketIds, config) => {
+            capturedConfigs.push(config);
+          },
+        },
+      },
+      { ackTimeoutMs: 0, maxResignals: 3, cycleIntervalMs: 60_000 },
+    );
+
+    const result = await watchdog.runCycle();
+
+    expect(result.resignaled).toBe(1);
+    expect(capturedConfigs).toHaveLength(1);
+    // Without wakeConfigForAgent, falls back to the global wakeConfig (no hooksUrl)
+    expect(capturedConfigs[0].hooksUrl).toBeUndefined();
 
     watchdog.stop();
     bag.close();

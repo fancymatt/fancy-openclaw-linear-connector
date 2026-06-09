@@ -68,6 +68,10 @@ export interface NoActivityDeps {
   bag: PendingWorkBag;
   operationalEventStore: OperationalEventStore;
   wakeConfig: WakeUpConfig;
+  /** Resolve per-agent WakeUpConfig (hooksUrl/hooksToken from agents.json).
+   *  When provided, used instead of the static wakeConfig so container-retired
+   *  agents receive rescue signals on their own gateway, not the host. */
+  wakeConfigForAgent?: (agentId: string) => WakeUpConfig;
   /** Optional test overrides forwarded to resignalPendingTickets. */
   resignalOptions?: Partial<ResignalOptions>;
   /** Optional: custom Linear comment poster for failed dispatches. */
@@ -196,7 +200,7 @@ export class NoActivityDetector {
    * Call this after sessionTracker.endSession() for an agent.
    */
   public async checkDeferredOnSessionEnd(agentId: string): Promise<void> {
-    const { sessionTracker, bag, operationalEventStore, wakeConfig } = this.deps;
+    const { sessionTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent } = this.deps;
     const set = this.deferredAtCapacity.get(agentId);
     if (!set || set.size === 0) return;
 
@@ -222,12 +226,13 @@ export class NoActivityDetector {
         bag.add(agentId, ticketId, "Issue");
       }
 
+      const agentWakeConfig = wakeConfigForAgent ? wakeConfigForAgent(agentId) : wakeConfig;
       const results = await resignalPendingTickets(
         agentId,
         [ticketId],
         bag,
         sessionTracker,
-        wakeConfig,
+        agentWakeConfig,
         { markActive: true, ...this.deps.resignalOptions },
       );
 
@@ -253,7 +258,7 @@ export class NoActivityDetector {
    * Run one detection cycle. Returns a summary of actions taken.
    */
   async runCycle(): Promise<NoActivityCycleResult> {
-    const { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig } = this.deps;
+    const { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent } = this.deps;
     const result: NoActivityCycleResult = { warned: 0, failed: 0, alreadyEnded: 0, deferredAtCapacity: 0 };
 
     // Get all currently tracked dispatches that are still pending/unconfirmed
@@ -341,12 +346,13 @@ export class NoActivityDetector {
         log.info(`No-activity: stale-deferred ticket ${ticketId} no longer actionable — pruning`);
         continue;
       }
+      const agentWakeConfig = wakeConfigForAgent ? wakeConfigForAgent(agentId) : wakeConfig;
       const rescueResults = await resignalPendingTickets(
         agentId,
         [ticketId],
         bag,
         sessionTracker,
-        wakeConfig,
+        agentWakeConfig,
         { markActive: true, ...this.deps.resignalOptions },
       );
       if (rescueResults.some((r) => r.dispatched)) {
@@ -369,7 +375,7 @@ export class NoActivityDetector {
     sessionKey: string,
   ): Promise<boolean> {
     const { agentId, ticketId, attemptCount } = entry;
-    const { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig } = this.deps;
+    const { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent } = this.deps;
     const ageMs = Date.now() - new Date(entry.dispatchedAt.replace(' ', 'T') + 'Z').getTime();
 
     log.error(
@@ -476,12 +482,13 @@ export class NoActivityDetector {
       return false;
     }
 
+    const agentWakeConfig = wakeConfigForAgent ? wakeConfigForAgent(agentId) : wakeConfig;
     const results = await resignalPendingTickets(
       agentId,
       [ticketId],
       bag,
       sessionTracker,
-      wakeConfig,
+      agentWakeConfig,
       { markActive: true, ...this.deps.resignalOptions },
     );
     const dispatched = results.some((r) => r.dispatched);

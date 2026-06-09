@@ -52,6 +52,10 @@ export interface WatchdogDeps {
   ackTracker: DispatchAckTracker;
   operationalEventStore: OperationalEventStore;
   wakeConfig: WakeUpConfig;
+  /** Resolve per-agent WakeUpConfig (hooksUrl/hooksToken from agents.json).
+   *  When provided, used instead of the static wakeConfig so container-retired
+   *  agents receive rescue signals on their own gateway, not the host. */
+  wakeConfigForAgent?: (agentId: string) => WakeUpConfig;
   /** Optional test overrides forwarded to resignalPendingTickets (sendWakeUp, isTicketActionable). */
   resignalOptions?: Partial<ResignalOptions>;
 }
@@ -119,7 +123,7 @@ export class DispatchWatchdog {
    *   - autoAcknowledged: ticket no longer in bag, silently acked
    */
   async runCycle(): Promise<WatchdogCycleResult> {
-    const { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig } = this.deps;
+    const { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, wakeConfigForAgent } = this.deps;
     const timedOut = ackTracker.getPendingTimedOut(this.config.ackTimeoutMs);
 
     if (timedOut.length === 0) {
@@ -183,12 +187,13 @@ export class DispatchWatchdog {
         );
       }
 
+      const agentWakeConfig = wakeConfigForAgent ? wakeConfigForAgent(agentId) : wakeConfig;
       const results = await resignalPendingTickets(
         agentId,
         [ticketId],
         bag,
         sessionTracker,
-        wakeConfig,
+        agentWakeConfig,
         { markActive: true, ...this.deps.resignalOptions },
       );
       const dispatched = results.some((r) => r.dispatched);

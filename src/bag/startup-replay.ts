@@ -36,9 +36,14 @@ export async function replayPendingBag(
   sessionTracker: SessionTracker,
   wakeConfig: WakeUpConfig,
   operationalEventStore?: OperationalEventStore,
-  options: StartupReplayOptions = {},
+  options: StartupReplayOptions & {
+    /** Resolve per-agent WakeUpConfig (hooksUrl/hooksToken from agents.json).
+     *  When provided, used instead of the static wakeConfig so container-retired
+     *  agents receive replay signals on their own gateway, not the host. */
+    wakeConfigForAgent?: (agentId: string) => WakeUpConfig;
+  } = {},
 ): Promise<StartupReplayResult> {
-  const { interAgentDelayMs = DEFAULT_INTER_AGENT_DELAY_MS, ...resignalOptions } = options;
+  const { interAgentDelayMs = DEFAULT_INTER_AGENT_DELAY_MS, wakeConfigForAgent, ...resignalOptions } = options;
 
   const agents = bag.agentsWithPendingWork();
   if (agents.length === 0) {
@@ -72,9 +77,10 @@ export async function replayPendingBag(
 
     const ticketIds = pending.map((e) => e.ticketId);
     const beforeCount = ticketIds.length;
+    const agentWakeConfig = wakeConfigForAgent ? wakeConfigForAgent(agentId) : wakeConfig;
 
     try {
-      const dispatchResults = await resignalPendingTickets(agentId, ticketIds, bag, sessionTracker, wakeConfig, {
+      const dispatchResults = await resignalPendingTickets(agentId, ticketIds, bag, sessionTracker, agentWakeConfig, {
         // During startup-replay, defer on fail-open: a transient Linear error should not
         // resurrect Done tickets. Tickets stay in bag for re-check on next start.
         // Callers can override by passing failOpenBehavior: "dispatch" in resignalOptions.

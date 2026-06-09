@@ -608,4 +608,56 @@ describe("NoActivityDetector", () => {
     ackTracker.close();
     operationalEventStore.close();
   });
+
+  test("AI-1474: wakeConfigForAgent routes re-dispatch to per-agent container gateway", async () => {
+    const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+    const capturedConfigs: import("./wake-up.js").WakeUpConfig[] = [];
+
+    bag.add("kana", "linear-AI-1474", "Issue");
+    sessionTracker.startSession("kana", "linear-AI-1474");
+    ackTracker.recordDispatch("kana", "linear-AI-1474");
+
+    const containerConfig: import("./wake-up.js").WakeUpConfig = {
+      nodeBin: process.execPath,
+      timeoutMs: 10,
+      maxRetries: 0,
+      hooksUrl: "http://127.0.0.1:18823/hooks/agent-nodelivery-kana",
+      hooksToken: "tok-kana",
+    };
+
+    const detector = new NoActivityDetector(
+      {
+        sessionTracker,
+        ackTracker,
+        bag,
+        operationalEventStore,
+        wakeConfig,
+        wakeConfigForAgent: (agentId: string) => {
+          if (agentId === "kana") return containerConfig;
+          return wakeConfig;
+        },
+        resignalOptions: {
+          isTicketActionable: () => true,
+          sendWakeUp: async (_agentId, _ticketIds, config) => {
+            capturedConfigs.push(config);
+          },
+        },
+      },
+      { warnMs: 0, failMs: 0, pollMs: 60_000 },
+    );
+
+    const result = await detector.runCycle();
+
+    expect(result.failed).toBe(1);
+    expect(capturedConfigs).toHaveLength(1);
+    // The re-dispatch must use the per-agent container hooksUrl, not the global one
+    expect(capturedConfigs[0].hooksUrl).toBe("http://127.0.0.1:18823/hooks/agent-nodelivery-kana");
+    expect(capturedConfigs[0].hooksToken).toBe("tok-kana");
+
+    detector.stop();
+    bag.close();
+    sessionTracker.close();
+    ackTracker.close();
+    operationalEventStore.close();
+  });
 });

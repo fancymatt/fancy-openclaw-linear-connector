@@ -138,4 +138,55 @@ describe("replayPendingBag", () => {
     expect(result.replayed).toBe(2);
     expect(result.agents).toBe(2);
   });
+
+  test("AI-1474: wakeConfigForAgent routes replay to per-agent container gateway", async () => {
+    const containerWakeConfig: WakeUpConfig = {
+      nodeBin: process.execPath,
+      timeoutMs: 10,
+      maxRetries: 0,
+      hooksUrl: "http://127.0.0.1:18827/hooks/agent-nodelivery-clay",
+      hooksToken: "tok-clay",
+    };
+    const capturedConfigs: WakeUpConfig[] = [];
+
+    bag.add("clay", "AI-1412", "Issue");
+
+    const result = await replayPendingBag(bag, sessionTracker, wakeConfig, undefined, {
+      isTicketActionable: () => true,
+      sendWakeUp: async (_agentId, _ticketIds, config) => {
+        capturedConfigs.push(config);
+      },
+      interAgentDelayMs: 0,
+      wakeConfigForAgent: (agentId: string) => {
+        if (agentId === "clay") return containerWakeConfig;
+        return wakeConfig;
+      },
+    });
+
+    expect(result.replayed).toBe(1);
+    expect(capturedConfigs).toHaveLength(1);
+    // Replay must use the per-agent container hooksUrl, not the global one
+    expect(capturedConfigs[0].hooksUrl).toBe("http://127.0.0.1:18827/hooks/agent-nodelivery-clay");
+    expect(capturedConfigs[0].hooksToken).toBe("tok-clay");
+  });
+
+  test("AI-1474: without wakeConfigForAgent, replay falls back to global wakeConfig", async () => {
+    const capturedConfigs: WakeUpConfig[] = [];
+
+    bag.add("clay", "AI-1412", "Issue");
+
+    const result = await replayPendingBag(bag, sessionTracker, wakeConfig, undefined, {
+      isTicketActionable: () => true,
+      sendWakeUp: async (_agentId, _ticketIds, config) => {
+        capturedConfigs.push(config);
+      },
+      interAgentDelayMs: 0,
+      // No wakeConfigForAgent — backward compat
+    });
+
+    expect(result.replayed).toBe(1);
+    expect(capturedConfigs).toHaveLength(1);
+    // Without wakeConfigForAgent, falls back to the global wakeConfig (no hooksUrl)
+    expect(capturedConfigs[0].hooksUrl).toBeUndefined();
+  });
 });
