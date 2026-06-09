@@ -46,6 +46,9 @@ states:
     transitions:
       - command: submit
         to: code-review
+        assign:
+          mode: required          # reviewer must be explicitly specified (§4.3)
+          constraint: not-implementer  # reviewer must differ from implementer (AI-1475 D2)
 
   - id: code-review
     owner_role: code-review

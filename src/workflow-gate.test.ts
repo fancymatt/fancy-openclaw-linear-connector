@@ -52,6 +52,8 @@ containers:
     grants: [linear:transition, deploy:execute]
   - id: steward
     grants: [linear:transition, human:escalate]
+  - id: code-review
+    grants: [linear:transition]
 
 roles:
   - id: dev
@@ -60,6 +62,8 @@ roles:
     requires: [deploy:execute]
   - id: steward
     requires: [human:escalate]
+  - id: code-review
+    requires: [linear:transition]
 
 bodies:
   - id: hanzo
@@ -71,6 +75,9 @@ bodies:
   - id: astrid
     container: steward
     fills_roles: [steward]
+  - id: reviewer
+    container: code-review
+    fills_roles: [code-review]
 `;
 
 // ── Capability policy with ux-audit roles (AI-1438 Phase 5 / B-1) ────────
@@ -207,6 +214,9 @@ states:
     transitions:
       - command: submit
         to: code-review
+        assign:
+          mode: required
+          constraint: not-implementer
 
   - id: code-review
     owner_role: code-review
@@ -253,8 +263,40 @@ beforeEach(() => {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-function makeLabelFetch(labelNames: string[]): typeof globalThis.fetch {
-  return async (_url, _init) => {
+function makeLabelFetch(labelNames: string[], branchAndPR?: { hasBranch: boolean; hasPR: boolean }): typeof globalThis.fetch {
+  const branch = branchAndPR ?? { hasBranch: true, hasPR: true };
+  return async (_url, init) => {
+    const bodyText = typeof init?.body === "string" ? init.body : "";
+    // Return branch/PR data when the query asks for it (AI-1475 D1 done gate)
+    if (bodyText.includes("IssueBranchAndPR")) {
+      return new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              branch: branch.hasBranch ? { id: "branch-id", name: "feature-branch", updatedAt: "2026-06-09T00:00:00Z" } : null,
+              pullRequests: branch.hasPR ? { nodes: [{ id: "pr-id", state: "open" }] } : { nodes: [] },
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    // Return delegate context when query asks for it
+    if (bodyText.includes("delegate")) {
+      const body: Record<string, unknown> = {
+        data: {
+          issue: {
+            labels: { nodes: labelNames.map((name) => ({ name })) },
+            delegate: null,
+          },
+        },
+      };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    // Default: label-only response
     const body = {
       data: {
         issue: {
@@ -414,9 +456,31 @@ describe("checkWorkflowRules — implementation state", () => {
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("allows 'submit' in implementation", async () => {
+  it("allows 'submit' in implementation — auto-assigns to singleton reviewer", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    // code-review role has a single body ('reviewer'), so no target needed — auto-assign
     expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+  });
+
+  it("blocks 'submit' when author tries to self-assign as reviewer (not-implementer constraint)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    // charles is the caller (implementer) and tries to pass himself as reviewer.
+    // With singleton code-review role (reviewer), the singleton override rejects first.
+    // The effective block is that charles is not the singleton reviewer body.
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("charles");
+    // Either singleton override or self-review constraint blocks it
+    expect(result!.includes("auto-assigns") || result!.includes("Self-review blocked")).toBe(true);
+  });
+
+  it("rejects submit with wrong target (not a code-review body)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("auto-assigns");
+    expect(result).toContain("reviewer");
+    expect(result).toContain("hanzo");
   });
 
   it("blocks 'deploy' in implementation", async () => {
@@ -573,7 +637,7 @@ describe("checkWorkflowRules — canonical vault schema (src/__fixtures__/canoni
 
   it("parses the canonical YAML without error (passes for a legal command)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
-    // 'submit' is legal in implementation; null means pass-through
+    // 'submit' is legal in implementation; auto-assigns to singleton reviewer; null means pass-through
     expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles")).toBeNull();
   });
 
@@ -638,11 +702,18 @@ function makeTransitionFetch(opts: {
   issueError?: boolean;
   /** Override to simulate a fetch error for the issueUpdate call. */
   updateError?: boolean;
+  /** Branch/PR status for done gate (AI-1475 D1). Defaults to has branch + PR (pass gate). */
+  branchStatus?: { hasBranch?: boolean; hasPR?: boolean } | null;
 }): { fetch: typeof globalThis.fetch; calls: FetchCall[] } {
   const calls: FetchCall[] = [];
   const teamId = opts.teamId ?? "team-uuid";
   const teamLabels = opts.teamLabels ?? [];
   const issueUpdateSuccess = opts.issueUpdateSuccess ?? true;
+  // Default: branch pushed + PR exists (gate passes)
+  const branch = opts.branchStatus === null ? null : {
+    hasBranch: opts.branchStatus?.hasBranch ?? true,
+    hasPR: opts.branchStatus?.hasPR ?? true,
+  };
 
   const mockFetch: typeof globalThis.fetch = async (url, init) => {
     if (typeof url !== "string" || !url.includes("api.linear.app")) {
@@ -701,6 +772,25 @@ function makeTransitionFetch(opts: {
     if (query.includes("UpdateDelegate")) {
       return new Response(
         JSON.stringify({ data: { issueUpdate: { success: true } } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // AI-1475 D1: Branch/PR status for done gate.
+    if (query.includes("IssueBranchAndPR")) {
+      if (branch === null) {
+        // Simulate fetch error for branch/PR query
+        throw new Error("simulated branch/PR fetch error");
+      }
+      return new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              branch: branch.hasBranch ? { id: "branch-id", name: "feature-branch", updatedAt: "2026-06-09T00:00:00Z" } : null,
+              pullRequests: branch.hasPR ? { nodes: [{ id: "pr-id", state: "open" }] } : { nodes: [] },
+            },
+          },
+        }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -1200,6 +1290,168 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
   });
 });
 
+// ── AI-1475 Defect 1: Done gate — branch/PR verification before deploy→done ──────
+
+describe("checkWorkflowRules — AI-1475 D1: done gate (branch/PR verification)", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("allows 'deploy' → done when branch exists and PR exists", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: true, hasPR: true });
+    expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  });
+
+  it("blocks 'deploy' → done when branch is not pushed", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: true });
+    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("branch not pushed to origin");
+  });
+
+  it("blocks 'deploy' → done when no PR exists", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: true, hasPR: false });
+    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("no pull request associated");
+  });
+
+  it("blocks 'deploy' → done when neither branch nor PR exist", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: false });
+    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("branch not pushed to origin");
+    expect(result).toContain("no pull request associated");
+  });
+
+  it("fail-closed: blocks 'deploy' → done when branch/PR fetch returns null (API error)", async () => {
+    // Simulate: label fetch works, but branch/PR fetch returns no data
+    let fetchCallCount = 0;
+    globalThis.fetch = async (_url, init) => {
+      fetchCallCount++;
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+      // Label fetch works
+      if (bodyText.includes("IssueContext")) {
+        return new Response(JSON.stringify({
+          data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] }, delegate: null } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      // Branch/PR fetch returns null-like data (no issue)
+      if (bodyText.includes("IssueBranchAndPR")) {
+        return new Response(JSON.stringify({ data: { issue: null } }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected fetch call: ${bodyText.slice(0, 60)}`);
+    };
+    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("unable to verify branch/pull-request status");
+  });
+
+  it("done gate does NOT fire for non-deploy commands (reject in deployment state)", async () => {
+    // 'reject' goes deployment → implementation, not to done
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: false });
+    expect(await checkWorkflowRules("reject", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  });
+});
+
+// ── AI-1475 Defect 2: Submit requires reviewer ≠ author ──────────────────────
+
+describe("checkWorkflowRules — AI-1475 D2: submit self-review prevention", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("allows submit from implementer (charles) with auto-assign to reviewer", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+  });
+
+  it("blocks submit when implementer tries to self-assign as reviewer target", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("charles");
+  });
+
+  it("blocks submit with explicit target that is not a code-review body", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("hanzo");
+  });
+});
+
+// ── AI-1475 D1: applyStateTransition done gate defense-in-depth ──────────
+
+describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("blocks label swap to done when branch not pushed (defense-in-depth)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+      branchStatus: { hasBranch: false, hasPR: true },
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
+    // No ApplyStateTransition call — done gate blocked it
+    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
+  });
+
+  it("blocks label swap to done when no PR exists (defense-in-depth)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+      branchStatus: { hasBranch: true, hasPR: false },
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
+    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyStateTransition"))).toBe(false);
+  });
+
+  it("allows label swap to done when branch + PR exist", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+      branchStatus: { hasBranch: true, hasPR: true },
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    expect(updateCall).toBeDefined();
+  });
+
+  it("done gate does not block non-deploy transitions", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:implementation" },
+      ],
+      teamLabels: [{ id: "cr-lbl", name: "state:code-review" }],
+      branchStatus: { hasBranch: false, hasPR: false }, // Should not matter for submit
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("submit", "issue-uuid", "Bearer tok");
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyStateTransition"));
+    expect(updateCall).toBeDefined();
+  });
+});
+
 // ── AI-1402: Default-deny + needs-human blocking + unknown-caller ─────────
 
 describe("checkWorkflowRules — AI-1402: needs-human blocked when forward path exists", () => {
@@ -1325,7 +1577,7 @@ describe("checkRawMutationInterception — AI-1402: labelIds blocking + unknown-
     return async (url: any, init?: RequestInit) => {
       if (typeof url === "string" && url.includes("api.linear.app")) {
         const bodyText = typeof init?.body === "string" ? init.body : "";
-        if (bodyText.includes("IssueLabels")) {
+        if (bodyText.includes("IssueContext") || bodyText.includes("IssueLabels")) {
           return new Response(JSON.stringify(labelResponse), {
             status: 200, headers: { "Content-Type": "application/json" },
           });
@@ -1939,9 +2191,24 @@ bodies:
       }
 
       // Barrier: resolve internal ID
-      if (q.includes("issue(id: $id) { id }") && !q.includes("team") && !q.includes("parent") && !q.includes("labels")) {
+      if (q.includes("issue(id: $id) { id }") && !q.includes("team") && !q.includes("parent") && !q.includes("labels") && !q.includes("branch")) {
         return new Response(
           JSON.stringify({ data: { issue: { id: "parent-internal-id" } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // AI-1475 D1: Branch/PR status for done gate
+      if (q.includes("IssueBranchAndPR")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                branch: { id: "branch-id", name: "feature-branch", updatedAt: "2026-06-09T00:00:00Z" },
+                pullRequests: { nodes: [{ id: "pr-id", state: "open" }] },
+              },
+            },
+          }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
