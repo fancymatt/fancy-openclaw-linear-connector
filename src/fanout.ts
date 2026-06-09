@@ -440,14 +440,18 @@ export async function executeFanout(
 /**
  * Determine if the fan-out should be triggered for a given workflow + state + command.
  * Returns true when:
- *   - The workflow is ux-audit
+ *   - The workflow is ux-audit or sprint (any archetype that fans out 1→N)
  *   - The state is spawning
  *   - The command is spawn
+ *
+ * Phase 6 / C-3 (AI-1473): generalized from ux-audit-only to archetype-agnostic.
+ * Both orchestrator (ux-audit) and feature-initiative (sprint) archetypes use
+ * the same fan-out pattern: spawning state, spawn command → mint dev-impl children.
  */
 export function shouldTriggerFanout(
   workflowId: string,
   currentState: string,
   intent: string,
 ): boolean {
-  return workflowId === "ux-audit" && currentState === "spawning" && intent === "spawn";
+  return (workflowId === "ux-audit" || workflowId === "sprint") && currentState === "spawning" && intent === "spawn";
 }

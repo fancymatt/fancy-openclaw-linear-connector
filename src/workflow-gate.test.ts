@@ -2156,6 +2156,14 @@ bodies:
         );
       }
 
+      // Barrier: fetch parent with label IDs (via fetchIssueWithLabels → IssueLabels query)
+      if (q.includes("IssueLabels") && !q.includes("IssueWithLabels")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { id: "parent-internal-id", team: { id: "team-uuid" }, labels: { nodes: parentLabels } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
       // Barrier: fetch children
       if (q.includes("ParentChildren")) {
         return new Response(
@@ -2175,8 +2183,8 @@ bodies:
         );
       }
 
-      // Barrier: label swap
-      if (q.includes("BarrierTransition")) {
+      // Barrier: label swap (via issueUpdateLabels → UpdateLabels mutation)
+      if (q.includes("UpdateLabels")) {
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success: true } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
@@ -2250,7 +2258,7 @@ bodies:
     expect(childrenFetch).toBeDefined();
 
     // Should have transitioned parent managing → review
-    const barrierTransition = calls.find((c) => c.query.includes("BarrierTransition"));
+    const barrierTransition = calls.find((c) => c.query.includes("UpdateLabels"));
     expect(barrierTransition).toBeDefined();
 
     // Should have posted a barrier comment
@@ -2939,5 +2947,519 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
     expect(labelSwapHappened).toBe(true);
 
     clearArtifactStore();
+  });
+});
+
+// ── Phase 6 / C-3: End-to-end milestone validation walk (AI-1473) ──────────
+// Proves that F1–F4 are structurally unreachable through the enforcing proxy.
+// This is the "walk" from AI-1318 re-targeted to the sprint (Archetype C)
+// workflow. Each test exercises the full checkWorkflowRules + applyStateTransition
+// pipeline with sprint.yaml loaded as the workflow def.
+//
+// F1 (skip-UX): No intake → spawning edge. Only forward path is intake → ux-shaping.
+// F2a (stall-in-managing): Event-driven barrier auto-advances managing → validating
+//   when all children terminal.
+// F2b (self-sign-off): Barrier lands in validating, never done. Done requires
+//   the bound artifact gate (§5.6) + explicit approve.
+// F3 (wrong-capability body): Fan-out mints dev-impl children; only registered
+//   dev-impl bodies can be assigned to implementation steps.
+// F4 (self-merge): Deploy edge is Hanzo-only (deploy:execute); sprint owner
+//   has no deployment path.
+
+describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let originalWorkflowPath: string | undefined;
+  let originalPolicyPath: string | undefined;
+  let c3Dir: string;
+
+  // Agents file with sprint-owner (soren) having a linearUserId
+  const C3_AGENTS_JSON = {
+    agents: [
+      { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "astrid-client", clientSecret: "astrid-secret", accessToken: "astrid-token", refreshToken: "astrid-refresh" },
+      { name: "maya", linearUserId: "maya-linear-uuid", clientId: "maya-client", clientSecret: "maya-secret", accessToken: "maya-token", refreshToken: "maya-refresh" },
+      { name: "engine-1", linearUserId: "engine-1-linear-uuid", clientId: "engine-1-client", clientSecret: "engine-1-secret", accessToken: "engine-1-token", refreshToken: "engine-1-refresh" },
+      { name: "soren", linearUserId: "soren-linear-uuid", clientId: "soren-client", clientSecret: "soren-secret", accessToken: "soren-token", refreshToken: "soren-refresh" },
+      { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "hanzo-client", clientSecret: "hanzo-secret", accessToken: "hanzo-token", refreshToken: "hanzo-refresh" },
+      { name: "charles", linearUserId: "charles-linear-uuid", clientId: "charles-client", clientSecret: "charles-secret", accessToken: "charles-token", refreshToken: "charles-refresh" },
+    ],
+  };
+
+  beforeAll(() => {
+    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    originalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+
+    c3Dir = fs.mkdtempSync(path.join(os.tmpdir(), "c3-walk-"));
+    const policyFile = path.join(c3Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, SPRINT_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_SPRINT_FIXTURE;
+
+    const agentsFile = path.join(c3Dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify(C3_AGENTS_JSON, null, 2), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+  });
+
+  afterAll(() => {
+    if (originalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    if (originalPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+    delete process.env.AGENTS_FILE;
+    reloadAgents();
+  });
+
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetPolicyCache();
+    originalFetch = globalThis.fetch;
+    clearArtifactStore();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    clearArtifactStore();
+  });
+
+  // ── F1: Skip-UX is structurally impossible ────────────────────────────
+
+  describe("F1: skip-UX is structurally impossible", () => {
+    it("F1a: proxy blocks 'spawn' command in intake state", async () => {
+      globalThis.fetch = makeLabelFetch(["wf:sprint", "state:intake"]);
+      const result = await checkWorkflowRules("spawn", "SPRINT-1", "Bearer tok", "astrid");
+      expect(result).not.toBeNull();
+      expect(result).toContain("[Proxy]");
+      expect(result).toContain("spawn");
+      expect(result).toContain("intake");
+      expect(result).toContain("accept");
+      expect(result).toContain("demote");
+      expect(result).toContain("escape");
+    });
+
+    it("F1b: proxy blocks 'submit' in intake", async () => {
+      globalThis.fetch = makeLabelFetch(["wf:sprint", "state:intake"]);
+      const result = await checkWorkflowRules("submit", "SPRINT-1", "Bearer tok", "astrid");
+      expect(result).not.toBeNull();
+      expect(result).toContain("[Proxy]");
+    });
+
+    it("F1c: spawning is only reachable from ux-shaping and validating (schema-level)", async () => {
+      const { loadWorkflowDef } = await import("./workflow-gate.js");
+      const def = await loadWorkflowDef();
+      const predecessors: string[] = [];
+      for (const state of def.states) {
+        if ((state.transitions ?? []).some((t) => t.to === "spawning")) {
+          predecessors.push(state.id);
+        }
+      }
+      expect(predecessors).toContain("ux-shaping");
+      expect(predecessors).toContain("validating");
+      expect(predecessors).not.toContain("intake");
+    });
+
+    it("F1d: accept without artifact is blocked", async () => {
+      globalThis.fetch = makeLabelFetch(["wf:sprint", "state:intake"]);
+      const result = await checkWorkflowRules("accept", "SPRINT-1", "Bearer tok", "astrid", null, null, null);
+      expect(result).not.toBeNull();
+      expect(result).toContain("artifact");
+    });
+
+    it("F1e: happy path intake → ux-shaping → spawning with artifact", async () => {
+      globalThis.fetch = makeLabelFetch(["wf:sprint", "state:intake"]);
+      expect(await checkWorkflowRules("accept", "SPRINT-1", "Bearer tok", "astrid", null, null, "sprints/plan.md")).toBeNull();
+
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:sprint", "state:ux-shaping"]);
+      expect(await checkWorkflowRules("submit", "SPRINT-1", "Bearer tok", "maya")).toBeNull();
+
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:sprint", "state:spawning"]);
+      expect(await checkWorkflowRules("spawn", "SPRINT-1", "Bearer tok", "engine-1")).toBeNull();
+    });
+  });
+
+  // ── F2a: Barrier auto-advances managing → validating ────────────────
+
+  describe("F2a: barrier auto-advances managing → validating (not done)", () => {
+    it("barrier evaluation finds all children terminal", async () => {
+      const { evaluateBarrier } = await import("./barrier.js");
+      globalThis.fetch = async (_url, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("ParentChildren")) {
+          return new Response(JSON.stringify({
+            data: { issue: { children: { nodes: [
+              { identifier: "AI-3001", labels: { nodes: [{ name: "state:done" }] } },
+              { identifier: "AI-3002", labels: { nodes: [{ name: "state:done" }] } },
+            ] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        throw new Error(`unexpected: ${bodyText.slice(0, 80)}`);
+      };
+      const result = await evaluateBarrier("SPRINT-1", "Bearer tok");
+      expect(result.allTerminal).toBe(true);
+      expect(result.totalChildren).toBe(2);
+    });
+
+    it("barrier auto-transition targets validating for sprint (not review)", async () => {
+      const { attemptBarrierTransition } = await import("./barrier.js");
+
+      globalThis.fetch = async (_url, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+
+        // evaluateBarrier → fetchChildren
+        if (bodyText.includes("ParentChildren")) {
+          return new Response(JSON.stringify({
+            data: { issue: { children: { nodes: [
+              { identifier: "AI-3001", labels: { nodes: [{ name: "state:done" }] } },
+            ] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+
+        // fetchParentState (not prefetched)
+        if (bodyText.includes("ParentState")) {
+          return new Response(JSON.stringify({
+            data: { issue: {
+              id: "sprint-internal-id",
+              team: { id: "team-uuid" },
+              labels: { nodes: [
+                { id: "lbl-wf", name: "wf:sprint" },
+                { id: "lbl-state", name: "state:managing" },
+              ] },
+            } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+
+        // fetchIssueWithLabels from linear-helpers (query name: IssueLabels)
+        if (bodyText.includes("IssueLabels")) {
+          return new Response(JSON.stringify({
+            data: { issue: {
+              id: "sprint-internal-id",
+              team: { id: "team-uuid" },
+              labels: { nodes: [
+                { id: "lbl-wf", name: "wf:sprint" },
+                { id: "lbl-state", name: "state:managing" },
+              ] },
+            } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+
+        // TeamLabels lookup
+        if (bodyText.includes("TeamLabels")) {
+          return new Response(
+            JSON.stringify({ data: { team: { labels: { nodes: [] } } } }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
+        // Label creation — must create state:validating
+        if (bodyText.includes("issueLabelCreate")) {
+          const parsed = JSON.parse(bodyText) as { variables: { name: string } };
+          expect(parsed.variables.name).toBe("state:validating");
+          return new Response(
+            JSON.stringify({ data: { issueLabelCreate: { success: true, issueLabel: { id: "lbl-validating" } } } }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
+        // Label swap + comment mutations
+        if (bodyText.includes("issueUpdate") || bodyText.includes("commentCreate")) {
+          return new Response(
+            JSON.stringify({ data: { issueUpdate: { success: true }, commentCreate: { success: true, comment: { id: "c-id" } } } }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
+        throw new Error(`unexpected query: ${bodyText.slice(0, 100)}`);
+      };
+
+      const result = await attemptBarrierTransition("SPRINT-1", "Bearer tok");
+      expect(result.transitioned).toBe(true);
+      expect(result.error).toBeUndefined();
+    });
+
+    it("barrier does NOT fire when sprint parent is not in managing", async () => {
+      const { onChildTerminal } = await import("./barrier.js");
+      globalThis.fetch = async (_url, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("ChildParent")) {
+          return new Response(JSON.stringify({ data: { issue: { parent: { identifier: "SPRINT-1" } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("ParentState")) {
+          return new Response(JSON.stringify({ data: { issue: {
+            id: "sprint-internal-id",
+            team: { id: "team-uuid" },
+            labels: { nodes: [{ id: "lbl-wf", name: "wf:sprint" }, { id: "lbl-state", name: "state:validating" }] },
+          } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        throw new Error(`unexpected: ${bodyText.slice(0, 80)}`);
+      };
+      const result = await onChildTerminal("AI-3001", "Bearer tok");
+      expect(result).toBeNull();
+    });
+  });
+
+  // ── F2b: Barrier lands in validating, never done ──────────────────────
+
+  describe("F2b: barrier lands in validating, never done (self-sign-off blocked)", () => {
+    it("validating state blocks 'complete' — cannot self-sign-off", async () => {
+      globalThis.fetch = makeLabelFetch(["wf:sprint", "state:validating"]);
+      const result = await checkWorkflowRules("complete", "SPRINT-1", "Bearer tok", "soren");
+      expect(result).not.toBeNull();
+      expect(result).toContain("[Proxy]");
+      expect(result).toContain("complete");
+      expect(result).toContain("validating");
+      expect(result).toContain("approve");
+      expect(result).toContain("request-rework");
+    });
+
+    it("validating → approve blocked when no artifact bound (§5.6 gate)", async () => {
+      clearArtifactStore();
+      let diagnosticComment = false;
+      globalThis.fetch = async (_url, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueWithLabels")) {
+          return new Response(JSON.stringify({ data: { issue: { id: "sprint-internal-id", team: { id: "team-uuid" }, labels: { nodes: [
+            { id: "lbl-wf", name: "wf:sprint" }, { id: "lbl-state", name: "state:validating" },
+          ] } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("TeamLabels")) {
+          return new Response(JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-done", name: "state:done" }] } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("commentCreate")) {
+          diagnosticComment = true;
+          return new Response(JSON.stringify({ data: { commentCreate: { success: true, comment: { id: "c-id" } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("issueUpdate")) {
+          return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        return new Response(JSON.stringify({ data: {} }), { status: 200, headers: { "Content-Type": "application/json" } });
+      };
+      await applyStateTransition("approve", "SPRINT-NO-ARTIFACT", "Bearer tok", { bodyId: "soren" });
+      expect(diagnosticComment).toBe(true);
+    });
+
+    it("validating → approve passes when artifact is bound", async () => {
+      clearArtifactStore();
+      const { bindArtifact: doBind } = await import("./artifact-store.js");
+      doBind("SPRINT-WITH-ARTIFACT", { ref: "sprints/sprint-42.md", boundAt: new Date().toISOString(), boundBy: "astrid" });
+
+      let labelSwapHappened = false;
+      globalThis.fetch = async (_url, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueWithLabels")) {
+          return new Response(JSON.stringify({ data: { issue: { id: "sprint-internal-id", team: { id: "team-uuid" }, labels: { nodes: [
+            { id: "lbl-wf", name: "wf:sprint" }, { id: "lbl-state", name: "state:validating" },
+          ] } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("TeamLabels")) {
+          return new Response(JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-done", name: "state:done" }] } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("issueUpdate") && bodyText.includes("labelIds")) {
+          labelSwapHappened = true;
+          return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("issueUpdate")) {
+          return new Response(JSON.stringify({ data: { issueUpdate: { success: true } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        return new Response(JSON.stringify({ data: {} }), { status: 200, headers: { "Content-Type": "application/json" } });
+      };
+      await applyStateTransition("approve", "SPRINT-WITH-ARTIFACT", "Bearer tok", { bodyId: "soren" });
+      expect(labelSwapHappened).toBe(true);
+    });
+
+    it("schema: done has satisfies_parent_barrier but NO transitions out", async () => {
+      const { loadWorkflowDef } = await import("./workflow-gate.js");
+      const def = await loadWorkflowDef();
+      const doneState = def.states.find((s) => s.id === "done");
+      expect(doneState).toBeDefined();
+      expect(doneState!.kind).toBe("terminal");
+      expect((doneState as Record<string, unknown>).satisfies_parent_barrier).toBe(true);
+      expect(doneState!.transitions ?? []).toHaveLength(0);
+    });
+  });
+
+  // ── F3: Wrong-capability body cannot be assigned ──────────────────────
+  // soren is in the sprint policy but NOT in the dev-impl policy.
+  // When dev-impl is loaded, soren is an unknown caller → blocked.
+
+  describe("F3: wrong-capability body cannot be assigned to child steps", () => {
+    it("sprint-owner (soren) blocked from submit on dev-impl child", async () => {
+      const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
+      process.env.WORKFLOW_DEF_PATH = devImplFixture;
+      resetWorkflowCache();
+
+      // Write a dev-impl-only policy that does NOT include soren
+      const devImplPolicyFile = path.join(c3Dir, "dev-impl-policy.yaml");
+      fs.writeFileSync(devImplPolicyFile, TEST_POLICY_YAML, "utf8");
+      process.env.CAPABILITY_POLICY_PATH = devImplPolicyFile;
+      resetPolicyCache();
+
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+      const result = await checkWorkflowRules("submit", "AI-3001", "Bearer tok", "soren");
+      expect(result).not.toBeNull();
+      expect(result).toContain("[Proxy]");
+      expect(result).toContain("soren");
+
+      // Restore sprint fixture
+      process.env.WORKFLOW_DEF_PATH = CANONICAL_SPRINT_FIXTURE;
+      process.env.CAPABILITY_POLICY_PATH = path.join(c3Dir, "capability-policy.yaml");
+      resetPolicyCache();
+    });
+
+    it("sprint-owner (soren) blocked from deploy on dev-impl child", async () => {
+      const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
+      process.env.WORKFLOW_DEF_PATH = devImplFixture;
+      resetWorkflowCache();
+
+      const devImplPolicyFile = path.join(c3Dir, "dev-impl-policy.yaml");
+      fs.writeFileSync(devImplPolicyFile, TEST_POLICY_YAML, "utf8");
+      process.env.CAPABILITY_POLICY_PATH = devImplPolicyFile;
+      resetPolicyCache();
+
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+      const result = await checkWorkflowRules("deploy", "AI-3001", "Bearer tok", "soren");
+      expect(result).not.toBeNull();
+      // soren is blocked — either as unknown caller or by deploy:execute capability gate.
+      // Both reasons are structurally sound: the sprint owner cannot deploy.
+      expect(result).toContain("[Proxy]");
+      expect(result!.includes("deploy:execute") || result!.includes("Unknown caller")).toBe(true);
+
+      process.env.WORKFLOW_DEF_PATH = CANONICAL_SPRINT_FIXTURE;
+      process.env.CAPABILITY_POLICY_PATH = path.join(c3Dir, "capability-policy.yaml");
+      resetPolicyCache();
+    });
+
+    it("fan-out triggers for sprint just like ux-audit", async () => {
+      const { shouldTriggerFanout } = await import("./fanout.js");
+      expect(shouldTriggerFanout("sprint", "spawning", "spawn")).toBe(true);
+      expect(shouldTriggerFanout("sprint", "managing", "spawn")).toBe(false);
+      expect(shouldTriggerFanout("sprint", "spawning", "complete")).toBe(false);
+      expect(shouldTriggerFanout("ux-audit", "spawning", "spawn")).toBe(true);
+    });
+  });
+
+  // ── F4: Self-merge is structurally impossible ────────────────────────
+
+  describe("F4: self-merge is structurally impossible (deploy:execute gate)", () => {
+    it("sprint-owner cannot deploy even if in deployment state", async () => {
+      const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
+      process.env.WORKFLOW_DEF_PATH = devImplFixture;
+      resetWorkflowCache();
+
+      const devImplPolicyFile = path.join(c3Dir, "dev-impl-policy.yaml");
+      fs.writeFileSync(devImplPolicyFile, TEST_POLICY_YAML, "utf8");
+      process.env.CAPABILITY_POLICY_PATH = devImplPolicyFile;
+      resetPolicyCache();
+
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+      const result = await checkWorkflowRules("deploy", "AI-3001", "Bearer tok", "soren");
+      expect(result).not.toBeNull();
+      // Blocked — either unknown caller or deploy:execute. Both prove F4.
+      expect(result!.includes("deploy:execute") || result!.includes("Unknown caller")).toBe(true);
+
+      process.env.WORKFLOW_DEF_PATH = CANONICAL_SPRINT_FIXTURE;
+      process.env.CAPABILITY_POLICY_PATH = path.join(c3Dir, "capability-policy.yaml");
+      resetPolicyCache();
+    });
+
+    it("only Hanzo (deployment body) can deploy", async () => {
+      const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
+      process.env.WORKFLOW_DEF_PATH = devImplFixture;
+      resetWorkflowCache();
+
+      const devImplPolicyFile = path.join(c3Dir, "dev-impl-policy.yaml");
+      fs.writeFileSync(devImplPolicyFile, TEST_POLICY_YAML, "utf8");
+      process.env.CAPABILITY_POLICY_PATH = devImplPolicyFile;
+      resetPolicyCache();
+
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: true, hasPR: true });
+      expect(await checkWorkflowRules("deploy", "AI-3001", "Bearer tok", "hanzo")).toBeNull();
+
+      process.env.WORKFLOW_DEF_PATH = CANONICAL_SPRINT_FIXTURE;
+      process.env.CAPABILITY_POLICY_PATH = path.join(c3Dir, "capability-policy.yaml");
+      resetPolicyCache();
+    });
+
+    it("sprint workflow has no deploy command at all", async () => {
+      const { loadWorkflowDef } = await import("./workflow-gate.js");
+      const def = await loadWorkflowDef();
+      const deployTransitions: string[] = [];
+      for (const state of def.states) {
+        for (const t of state.transitions ?? []) {
+          if (t.command === "deploy") deployTransitions.push(state.id);
+        }
+      }
+      expect(deployTransitions).toHaveLength(0);
+    });
+
+    it("dev-impl deploy also requires branch + PR (AI-1475 done gate)", async () => {
+      const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
+      process.env.WORKFLOW_DEF_PATH = devImplFixture;
+      resetWorkflowCache();
+
+      const devImplPolicyFile = path.join(c3Dir, "dev-impl-policy.yaml");
+      fs.writeFileSync(devImplPolicyFile, TEST_POLICY_YAML, "utf8");
+      process.env.CAPABILITY_POLICY_PATH = devImplPolicyFile;
+      resetPolicyCache();
+
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: false });
+      const result = await checkWorkflowRules("deploy", "AI-3001", "Bearer tok", "hanzo");
+      expect(result).not.toBeNull();
+      expect(result).toContain("branch not pushed");
+
+      process.env.WORKFLOW_DEF_PATH = CANONICAL_SPRINT_FIXTURE;
+      process.env.CAPABILITY_POLICY_PATH = path.join(c3Dir, "capability-policy.yaml");
+      resetPolicyCache();
+    });
+  });
+
+  // ── Full end-to-end walk: happy path ────────────────────────────────
+
+  describe("E2E happy path: intake → done with all gates satisfied", () => {
+    it("complete walk: intake → ux-shaping → spawning → managing → validating → done", async () => {
+      const ARTIFACT_REF = "sprints/sprint-42.md";
+      const SPRINT_ID = "SPRINT-E2E";
+      const { bindArtifact: doBind } = await import("./artifact-store.js");
+      doBind(SPRINT_ID, { ref: ARTIFACT_REF, boundAt: new Date().toISOString(), boundBy: "astrid" });
+
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:sprint", "state:intake"]);
+      expect(await checkWorkflowRules("accept", SPRINT_ID, "Bearer tok", "astrid", null, null, ARTIFACT_REF)).toBeNull();
+
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:sprint", "state:ux-shaping"]);
+      expect(await checkWorkflowRules("submit", SPRINT_ID, "Bearer tok", "maya")).toBeNull();
+
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:sprint", "state:spawning"]);
+      expect(await checkWorkflowRules("spawn", SPRINT_ID, "Bearer tok", "engine-1")).toBeNull();
+
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:sprint", "state:managing"]);
+      expect(await checkWorkflowRules("complete", SPRINT_ID, "Bearer tok", "soren")).toBeNull();
+
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:sprint", "state:validating"]);
+      expect(await checkWorkflowRules("approve", SPRINT_ID, "Bearer tok", "soren")).toBeNull();
+
+      expect(hasBoundArtifact(SPRINT_ID)).toBe(true);
+    });
+
+    it("complete walk: every shortcut attempt is blocked", async () => {
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:sprint", "state:intake"]);
+      expect(await checkWorkflowRules("spawn", "SPRINT-SHORTCUT", "Bearer tok", "engine-1")).not.toBeNull();
+
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:sprint", "state:intake"]);
+      expect(await checkWorkflowRules("approve", "SPRINT-SHORTCUT", "Bearer tok", "soren")).not.toBeNull();
+
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:sprint", "state:managing"]);
+      const block3 = await checkWorkflowRules("approve", "SPRINT-SHORTCUT", "Bearer tok", "soren");
+      expect(block3).not.toBeNull();
+      expect(block3).toContain("complete"); // should suggest 'complete', not 'approve'
+    });
   });
 });

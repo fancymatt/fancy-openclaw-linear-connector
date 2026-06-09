@@ -345,9 +345,14 @@ export async function attemptBarrierTransition(
   }
 
   const workflowId = getWorkflowId(parentState.labels);
-  if (workflowId !== "ux-audit") {
-    log.info(`barrier: parent ${parentIdentifier} is not ux-audit (wf:${workflowId}) — skipping`);
-    result.error = `Parent workflow is '${workflowId}', expected 'ux-audit'`;
+  // Phase 6 / C-3 (AI-1473): generalized from ux-audit-only to archetype-agnostic.
+  // Both ux-audit (managing → review) and sprint (managing → validating) use the
+  // same barrier pattern: all children terminal → auto-advance.
+  const isOrchestrator = workflowId === "ux-audit";
+  const isFeatureInitiative = workflowId === "sprint";
+  if (!isOrchestrator && !isFeatureInitiative) {
+    log.info(`barrier: parent ${parentIdentifier} is not an orchestrator or feature-initiative (wf:${workflowId}) — skipping`);
+    result.error = `Parent workflow is '${workflowId}', expected 'ux-audit' or 'sprint'`;
     return result;
   }
 
@@ -372,9 +377,11 @@ export async function attemptBarrierTransition(
     return result;
   }
 
+  // Phase 6 / C-3: ux-audit advances to 'review', sprint advances to 'validating'.
+  const barrierTarget = isOrchestrator ? "review" : "validating";
   const reviewLabelId = await findOrCreateLabel(
     parentWithLabels.teamId,
-    "state:review",
+    `state:${barrierTarget}`,
     authToken,
   );
   if (!reviewLabelId) {
@@ -399,12 +406,12 @@ export async function attemptBarrierTransition(
     .join("\n");
   const commentBody =
     `[Barrier] All ${barrier.totalChildren} child(ren) reached terminal state. ` +
-    `Auto-advancing parent managing → review.\n\n${childSummary}`;
+    `Auto-advancing parent managing → ${barrierTarget}.\n\n${childSummary}`;
   await postComment(parentWithLabels.internalId, commentBody, authToken);
 
   result.transitioned = true;
   log.info(
-    `barrier: ${parentIdentifier} managing → review ` +
+    `barrier: ${parentIdentifier} managing → ${barrierTarget} ` +
     `(${barrier.terminalCount}/${barrier.totalChildren} children terminal)`,
   );
   return result;
@@ -438,7 +445,8 @@ export async function onChildTerminal(
   if (!parentState) return null;
 
   const workflowId = getWorkflowId(parentState.labels);
-  if (workflowId !== "ux-audit") return null;
+  // Phase 6 / C-3: support both ux-audit and sprint archetypes.
+  if (workflowId !== "ux-audit" && workflowId !== "sprint") return null;
 
   const currentState = getCurrentState(parentState.labels);
   if (currentState !== "managing") {
