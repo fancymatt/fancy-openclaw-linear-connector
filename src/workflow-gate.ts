@@ -42,6 +42,7 @@ import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
 import { ObservationStore, type ReasonCode } from "./store/observation-store.js";
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent } from "./agents.js";
+import { executeFanout, shouldTriggerFanout } from "./fanout.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
 
@@ -869,6 +870,34 @@ export async function applyStateTransition(
     }
   }
 
+  // ── Phase 5 / B-2: Fan-out edge (spawning 1→N) ──────────────────────
+  // After a successful state transition to `managing` via the `spawn` command
+  // on a ux-audit ticket, execute the fan-out to create N dev-impl children.
+  // Fail-open: fan-out errors are logged and never block the transition.
+  // AC3: parent auto-transitions to managing once children are minted (the
+  // state transition to `managing` has already been applied above; the fan-out
+  // creates the children and links them to the parent).
+  if (applied && shouldTriggerFanout(workflowId, currentStateName, intent)) {
+    try {
+      log.info(`workflow-gate: B-2 fan-out: triggering fan-out for ${issueId} (spawning → managing)`);
+      const fanoutResult = await executeFanout(issueId, authToken);
+      if (fanoutResult.created > 0) {
+        log.info(
+          `workflow-gate: B-2 fan-out: ${fanoutResult.created} child(ren) created for ${issueId}: ${fanoutResult.childIdentifiers.join(", ")}`,
+        );
+      } else {
+        log.warn(`workflow-gate: B-2 fan-out: no children created for ${issueId} — ${fanoutResult.errors.map((e) => e.message).join(";")}`);
+      }
+      // Post a summary comment on the parent ticket with the fan-out result.
+      if (fanoutResult.created > 0) {
+        await postFanoutSummaryComment(issue.internalId, fanoutResult, authToken);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`workflow-gate: B-2 fan-out: fan-out failed for ${issueId}: ${msg}`);
+    }
+  }
+
   // ── Phase 4 / P4-1: Record feedback observation ──────────────────────
   // After a successful state transition, if the transition has a feedback
   // block and feedback data was provided, write one append-only observation.
@@ -905,6 +934,39 @@ export async function applyStateTransition(
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`workflow-gate: P4-1: observation write failed for ${issueId}: ${msg}`);
     }
+  }
+}
+
+/**
+ * Post a summary comment on the parent ticket after a fan-out, listing
+ * the created child issues.
+ */
+async function postFanoutSummaryComment(
+  issueInternalId: string,
+  result: import("./fanout.js").FanoutResult,
+  authToken: string,
+): Promise<void> {
+  const childLinks = result.childIdentifiers.map((id) => `- ${id}`).join("\n");
+  const body =
+    `[Fan-out] Spawned ${result.created} child issue(s):\n${childLinks}` +
+    (result.errors.length > 0
+      ? `\n\n⚠️ ${result.errors.length} error(s): ${result.errors.map((e) => e.message).join("; ")}`
+      : "");
+
+  const mutation = `
+    mutation($issueId: ID!, $body: String!) {
+      commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
+    }
+  `;
+  try {
+    await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId: issueInternalId, body } }),
+    });
+    log.info(`workflow-gate: B-2 fan-out: summary comment posted on ${issueInternalId}`);
+  } catch (err) {
+    log.warn(`workflow-gate: B-2 fan-out: failed to post summary comment: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
