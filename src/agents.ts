@@ -12,6 +12,7 @@ import {
   getLinearSecretPath,
 } from "fancy-openclaw-linear-skill-cli";
 import { createLogger, componentLogger } from "./logger.js";
+import { recordSuccess, recordFailure } from "./config-health.js";
 
 const log = componentLogger(createLogger(), "agents");
 
@@ -132,10 +133,12 @@ function load(): AgentConfig[] {
   try {
     const raw = fs.readFileSync(filePath, "utf8");
     const data = parseAgentsFile(raw, filePath);
+    recordSuccess("agents");
     return data.agents ?? [];
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log.error(`Failed to load agents from ${filePath}: ${message}`);
+    recordFailure("agents", message);
     throw err;
   }
 }

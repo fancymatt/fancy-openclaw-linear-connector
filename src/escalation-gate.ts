@@ -19,6 +19,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger } from "./logger.js";
+import { recordSuccess, recordFailure } from "./config-health.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "escalation-gate");
 
@@ -91,9 +92,16 @@ let _policyCache: CapabilityPolicy | null = null;
 
 async function loadPolicy(): Promise<CapabilityPolicy> {
   if (_policyCache) return _policyCache;
-  const raw = await fs.readFile(policyPath(), "utf8");
-  _policyCache = yaml.load(raw) as CapabilityPolicy;
-  return _policyCache;
+  try {
+    const raw = await fs.readFile(policyPath(), "utf8");
+    _policyCache = yaml.load(raw) as CapabilityPolicy;
+    recordSuccess("capability-policy");
+    return _policyCache;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    recordFailure("capability-policy", msg);
+    throw err;
+  }
 }
 
 /** Invalidate the in-process policy cache (used in tests). */

@@ -13,6 +13,7 @@ import { createApp } from "./index.js";
 import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { resetWorkflowCache } from "./workflow-gate.js";
+import { resetConfigHealth } from "./config-health.js";
 
 const TEST_POLICY_YAML = `
 capabilities:
@@ -432,6 +433,12 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
           status: 200, headers: { "Content-Type": "application/json" },
         });
       }
+      // Done gate (AI-1475): branch/PR status check for deploy → done
+      if (parsed.query?.includes("IssueBranchAndPR")) {
+        return new Response(JSON.stringify({
+          data: { issue: { branch: { id: "branch-1", name: "main", updatedAt: "2026-01-01" }, pullRequests: { nodes: [{ id: "pr-1", state: "merged" }] } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
       return new Response(JSON.stringify(mainResponse), {
         status: 200, headers: { "Content-Type": "application/json" },
       });
@@ -655,7 +662,7 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeDefined();
     expect(res.body.errors[0].message).toContain("[Proxy]");
-    expect(res.body.errors[0].message).toContain("cannot be verified");
+    expect(res.body.errors[0].message).toContain("blocked on workflow ticket");
   });
 
   it("accepts a v-prefixed CLI version string (parseSemver fix)", async () => {
@@ -1081,7 +1088,7 @@ describe("proxy — Layer 1 workflow reminder header (AI-1387)", () => {
       const parsed = JSON.parse(bodyText) as { query?: string };
       const q = parsed.query ?? "";
 
-      if (q.includes("IssueLabels") && !q.includes("IssueWithLabels")) {
+      if ((q.includes("IssueLabels") || q.includes("IssueContext")) && !q.includes("IssueWithLabels")) {
         return new Response(JSON.stringify(opts.b1LabelResponse), {
           status: 200, headers: { "Content-Type": "application/json" },
         });
@@ -1151,5 +1158,182 @@ describe("proxy — Layer 1 workflow reminder header (AI-1387)", () => {
 
     expect(res.status).toBe(200);
     expect(res.body._workflowReminder).toBeUndefined();
+  });
+});
+
+// ── Phase 6.5 / H-1: fail-closed + break-glass + canary (AI-1476) ──────────
+
+describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
+  let dir: string;
+  let appState: ReturnType<typeof createApp>;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-p65-test-"));
+    process.env.AGENTS_FILE = writeAgents(dir);
+    process.env.CAPABILITY_POLICY_PATH = writePolicyFile(dir, TEST_POLICY_WITH_MERGE_YAML);
+    writeWorkflowFile(dir);
+    resetPolicyCache();
+    resetWorkflowCache();
+    resetConfigHealth();
+    reloadAgents();
+    appState = createApp({
+      bagDbPath: path.join(dir, "bag.db"),
+      agentQueueDbPath: path.join(dir, "queue.db"),
+      operationalEventsDbPath: path.join(dir, "events.db"),
+    });
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    appState.bag.close();
+    appState.sessionTracker.close();
+    appState.agentQueue.close();
+    appState.operationalEventStore.close();
+    appState.watchdog.stop();
+    appState.noActivityDetector.stop();
+    appState.managingPoller.stop();
+  });
+
+  function makeFetch(labelResponse: object, mainResponse = MOCK_RESPONSE) {
+    return async (url: any, init?: RequestInit) => {
+      if (typeof url !== "string" || !url.includes("api.linear.app")) {
+        return originalFetch(url, init);
+      }
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+      const parsed = bodyText ? JSON.parse(bodyText) as { query?: string } : {};
+      if (parsed.query?.includes("IssueContext") || parsed.query?.includes("IssueLabels")) {
+        return new Response(JSON.stringify(labelResponse), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify(mainResponse), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    };
+  }
+
+  // AC1: With the proxy stopped (upstream unreachable), a workflow command is refused.
+  // (e.g., config is broken). The proxy still runs but rejects wf:* commands.
+  it("rejects workflow commands when config is degraded (config-load fail-closed §16.0)", async () => {
+    // Point the workflow def to a non-existent file so loadWorkflowDef fails
+    process.env.WORKFLOW_DEF_PATH = path.join(dir, "nonexistent-workflow.yaml");
+    resetWorkflowCache();
+
+    // The proxy should still work — it'll load config and record the failure
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("[Proxy]");
+    expect(res.body.errors[0].message).toContain("could not be loaded");
+    expect(res.body.errors[0].message).toContain("break-glass");
+  });
+
+  // AC2: A deliberately broken config refuses workflow advancement.
+  it("refuses workflow advancement when workflow def YAML is malformed", async () => {
+    // Write invalid YAML
+    const badYamlPath = path.join(dir, "bad-dev-impl.yaml");
+    fs.writeFileSync(badYamlPath, "not: [valid: yaml: {{{", "utf8");
+    process.env.WORKFLOW_DEF_PATH = badYamlPath;
+    resetWorkflowCache();
+
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("could not be loaded");
+  });
+
+  // AC4: The break-glass moves a wedged ticket.
+  it("allows break-glass header to bypass enforcement when config is degraded", async () => {
+    // Break config
+    process.env.WORKFLOW_DEF_PATH = path.join(dir, "nonexistent-workflow.yaml");
+    resetWorkflowCache();
+
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .set("X-Openclaw-Break-Glass", "true")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    // Break-glass should bypass the fail-closed check
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    expect(res.body.data).toBeDefined();
+  });
+
+  it("rejects break-glass with value 'false'", async () => {
+    process.env.WORKFLOW_DEF_PATH = path.join(dir, "nonexistent-workflow.yaml");
+    resetWorkflowCache();
+
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .set("X-Openclaw-Break-Glass", "false")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    // 'false' is not a truthy break-glass value — should still fail
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+  });
+
+  it("allows ad-hoc tickets even when config is degraded (§4.6 pass-through)", async () => {
+    process.env.WORKFLOW_DEF_PATH = path.join(dir, "nonexistent-workflow.yaml");
+    resetWorkflowCache();
+
+    // Non-workflow ticket — should still pass through
+    globalThis.fetch = makeFetch(NON_WORKFLOW_LABEL_RESPONSE);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    expect(res.body.data).toBeDefined();
+  });
+
+  it("returns 502 when upstream Linear API is unreachable (existing behavior unchanged)", async () => {
+    globalThis.fetch = async (url) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        throw new Error("ECONNREFUSED");
+      }
+      return originalFetch(url);
+    };
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .send({ query: "{ viewer { id } }" });
+
+    expect(res.status).toBe(502);
+    expect(res.body.errors[0].message).toContain("Linear API unreachable");
   });
 });

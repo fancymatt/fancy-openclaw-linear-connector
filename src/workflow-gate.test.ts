@@ -332,9 +332,24 @@ describe("checkWorkflowRules — mode switch", () => {
     expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles")).toBeNull();
   });
 
-  it("returns null when label fetch throws — fail open", async () => {
+  it("returns null when label fetch throws — begin-work passes through (§4.6)", async () => {
     globalThis.fetch = async () => { throw new Error("network error"); };
-    expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+    // begin-work and note pass through on fetch failure — they're safe even on unknown tickets
+    expect(await checkWorkflowRules("begin-work", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+    expect(await checkWorkflowRules("note", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+  });
+
+  it("blocks state-advancing intents when label fetch throws — fail closed (H-1)", async () => {
+    globalThis.fetch = async () => { throw new Error("network error"); };
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("unable to fetch ticket context");
+  });
+
+  it("allows blocked intent through on fetch failure with break-glass (H-1)", async () => {
+    globalThis.fetch = async () => { throw new Error("network error"); };
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", null, null, null, true);
+    expect(result).toBeNull();
   });
 
   it("blocks state-advancing intents when no state:* label — fail closed (corrupt projection)", async () => {
