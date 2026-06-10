@@ -1364,7 +1364,7 @@ export async function applyStateTransition(
   } else {
     // Deterministic routing for reject / request-changes (back to implementation).
     if ((intent === 'reject' || intent === 'request-changes') && toStateName === 'implementation') {
-      const priorImplementer = getImplementer(issueId);
+      const priorImplementer = await getImplementer(issueId);
       if (priorImplementer) {
         const agent = getAgent(priorImplementer);
         if (agent?.linearUserId) {
@@ -1399,6 +1399,15 @@ export async function applyStateTransition(
             );
           }
         } else if (roleBodies.length > 1) {
+          // AI-1493 review fix: fail-closed for reject/request-changes when no prior implementer.
+          // Multi-body roles on these intents MUST have a resolved delegate — silently
+          // skipping leaves the ticket owner-less, which violates AC.
+          if (intent === 'reject' || intent === 'request-changes') {
+            log.error(
+              `workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' on '${intent}' with no prior implementer. Cannot auto-resolve delegate for ${issueId}. Use --target.`,
+            );
+            return;
+          }
           log.info(
             `workflow-gate: B2 apply: ${issueId} multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) — delegate set by CLI target, skipping proxy auto-assign`,
           );
@@ -1428,12 +1437,12 @@ export async function applyStateTransition(
     const agents = getAgents();
     const implementerAgent = agents.find(a => a.linearUserId === resolvedDelegateId);
     if (implementerAgent) {
-      recordImplementer(issueId, implementerAgent.name, workflowId);
+      await recordImplementer(issueId, implementerAgent.name, workflowId);
       log.info(
         `workflow-gate: B2 apply: recorded implementer '${implementerAgent.name}' for ${issueId}`,
       );
     } else if (options?.bodyId) {
-      recordImplementer(issueId, options.bodyId, workflowId);
+      await recordImplementer(issueId, options.bodyId, workflowId);
       log.info(
         `workflow-gate: B2 apply: recorded implementer from bodyId '${options.bodyId}' for ${issueId}`,
       );
@@ -1484,10 +1493,10 @@ export async function applyStateTransition(
   }
   // Clean up implementer record on terminal states
   if (isTerminal) {
-    removeImplementer(issueId);
+    await removeImplementer(issueId);
   }
 
-    // ── Phase 5 / B-2: Fan-out edge (spawning 1→N) ──────────────────────
+  // ── Phase 5 / B-2: Fan-out edge (spawning 1→N) ──────────────────────
   // After a successful state transition to `managing` via the `spawn` command
   // on a ux-audit ticket, execute the fan-out to create N dev-impl children.
   // Fail-open: fan-out errors are logged and never block the transition.
@@ -1668,14 +1677,12 @@ async function issueUpdateLabels(
 }
 
 /**
- * Update the delegate (assignee) of a Linear issue via a delegateId mutation.
- * Used by the auto-delegate assignment logic (AI-1463) after a state transition
- * to ensure the new state's owner body becomes the delegate.
- * Fail-open: returns false on any error, never throws.
- */
 /**
  * Update only the delegate (for cases where the atomic label+delegate path
  * is not needed). Delegates to issueUpdateAtomic with empty label behavior.
+ * Used by the auto-delegate assignment logic (AI-1463) after a state transition
+ * to ensure the new state's owner body becomes the delegate.
+ * Fail-open: returns false on any error, never throws.
  */
 async function issueUpdateDelegateOnly(
   internalId: string,
