@@ -61,36 +61,6 @@ function workflowDefPath() {
 }
 // ── Workflow def cache ─────────────────────────────────────────────────────
 let _workflowCache = null;
-/** Parse an SLA duration string (e.g. "24h", "30m", "2d", "90s") to milliseconds. */
-export function parseSlaDuration(value) {
-    if (value === undefined || value === null)
-        return undefined;
-    if (typeof value === "number")
-        return value > 0 ? value : undefined;
-    const m = /^(\d+(?:\.\d+)?)\s*([smhd]?)$/.exec(value.trim());
-    if (!m)
-        return undefined;
-    const n = parseFloat(m[1]);
-    if (isNaN(n) || n <= 0)
-        return undefined;
-    const unit = (m[2] || "m").toLowerCase();
-    switch (unit) {
-        case "s": return n * 1000;
-        case "m": return n * 60 * 1000;
-        case "h": return n * 60 * 60 * 1000;
-        case "d": return n * 24 * 60 * 60 * 1000;
-        default: return undefined;
-    }
-}
-/** Post-process a loaded WorkflowDef: parse sla duration strings to ms. */
-function parseWorkflowSla(def) {
-    for (const state of def.states) {
-        const raw = state.sla;
-        if (raw !== undefined && typeof raw === "string") {
-            state.sla = parseSlaDuration(raw);
-        }
-    }
-}
 export async function loadWorkflowDef() {
     if (_workflowCache)
         return _workflowCache;
@@ -100,13 +70,19 @@ export async function loadWorkflowDef() {
         if (def.break_glass && !def.break_glass.command) {
             log.warn(`workflow-gate: break_glass block in ${workflowDefPath()} has no 'command' field — falling back to hardcoded "escape". Canonicalize the YAML to add command: escape.`);
         }
-        parseWorkflowSla(def);
         _workflowCache = def;
         recordSuccess("workflow-def");
-        // AI-1490: validate native_state mappings on load.
+        // AI-1490 / AI-1498: validate native_state mappings on load — hard-fail if any state
+        // lacks a valid native_state (the proxy must be able to write native stateId for every
+        // transition; a missing mapping is what made deployment fall through to native Invalid).
         const warnings = validateNativeStateMappings(def);
         for (const w of warnings) {
-            log.warn(`workflow-gate: native_state validation: ${w}`);
+            log.error(`workflow-gate: native_state validation FAILURE: ${w}`);
+        }
+        if (warnings.length > 0) {
+            const msg = `Workflow definition has ${warnings.length} invalid native_state mapping(s): ${warnings.join("; ")}`;
+            recordFailure("workflow-def", msg);
+            throw new Error(msg);
         }
         return _workflowCache;
     }
@@ -121,30 +97,44 @@ export function resetWorkflowCache() {
     _workflowCache = null;
 }
 /**
+ * AI-1498: Semantic-to-native mapping — mirrors the CLI's SEMANTIC_STATE_MAP
+ * so the proxy can resolve native Linear stateId UUIDs without depending on the CLI.
+ * Each semantic state maps to an ordered list of candidate Linear workflow state names;
+ * the first match found in the team's actual states wins.
+ * Keep in sync with the CLI's SEMANTIC_STATE_MAP when new semantic names are added.
+ */
+const SEMANTIC_STATE_MAP = {
+    backlog: ["Backlog"],
+    todo: ["Todo", "To Do", "To Develop"],
+    thinking: ["Thinking", "In Progress"],
+    doing: ["Doing", "In Progress", "Developing"],
+    managing: ["Managing"],
+    done: ["Done"],
+    invalid: ["Invalid", "Canceled", "Cancelled"],
+};
+/**
  * Valid semantic state names that the CLI's SEMANTIC_STATE_MAP recognizes.
  * AI-1490: used to validate that every workflow state's native_state field
  * maps to a real CLI semantic state (which in turn resolves to an actual
  * Linear workflow state per team).
  */
-const VALID_SEMANTIC_STATES = new Set([
-    "backlog", "todo", "thinking", "doing", "managing", "done", "invalid",
-]);
+const VALID_SEMANTIC_STATES = new Set(Object.keys(SEMANTIC_STATE_MAP));
 /**
- * AI-1490: Validate that every workflow state with a native_state field
- * references a valid semantic state name. Returns an array of diagnostic
- * warnings (empty if all valid). Does not throw — used for startup checks
- * and config-health reporting.
+ * AI-1490 / AI-1498: Validate that every workflow state has a valid native_state field.
+ * AI-1498 hardens this from warn → hard-fail for non-terminal states: a missing or
+ * invalid native_state means the proxy cannot compute the native Linear stateId,
+ * making desync structurally impossible. Returns an array of diagnostic errors.
+ * The caller should throw when errors is non-empty for governed workflows.
  */
 export function validateNativeStateMappings(def) {
     const warnings = [];
     for (const state of def.states) {
         if (!state.native_state) {
-            // Missing native_state is a problem for non-terminal states
-            // (terminals like done/escape should have them for completeness).
-            if (state.kind !== "terminal") {
-                warnings.push(`Workflow state '${state.id}' has no native_state field — its native Linear state projection is undefined. ` +
-                    `Add a native_state field (e.g. 'doing', 'thinking', 'todo', 'done', 'invalid').`);
-            }
+            // AI-1498: hard-fail for ALL states (terminal and non-terminal).
+            // A terminal state without native_state means done/escape tickets land
+            // in an undefined native column — exactly the projection bugs this ticket fixes.
+            warnings.push(`Workflow state '${state.id}' has no native_state field — its native Linear state projection is undefined. ` +
+                `Add a native_state field (e.g. 'doing', 'thinking', 'todo', 'done', 'invalid').`);
             continue;
         }
         if (!VALID_SEMANTIC_STATES.has(state.native_state)) {
@@ -153,6 +143,75 @@ export function validateNativeStateMappings(def) {
         }
     }
     return warnings;
+}
+// ── AI-1498: Native state resolution cache ────────────────────────────────
+// Maps (teamId, semanticName) → Linear workflow state UUID.
+// Resolved once per team, cached indefinitely. Invalidated on cache reset.
+/** Cache: teamId → array of team workflow states from Linear API. */
+let _teamStateCache = new Map();
+/** Reset the native-state cache (used in tests). */
+export function resetNativeStateCache() {
+    _teamStateCache.clear();
+}
+/**
+ * Fetch a team's workflow states from Linear (with caching).
+ * Returns the raw state nodes for the team.
+ */
+async function fetchTeamWorkflowStates(teamId, authToken) {
+    const cached = _teamStateCache.get(teamId);
+    if (cached)
+        return cached;
+    const query = `
+    query TeamStates($teamId: String!) {
+      team(id: $teamId) {
+        states {
+          nodes {
+            id
+            name
+            type
+          }
+        }
+      }
+    }
+  `;
+    try {
+        const res = await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authToken },
+            body: JSON.stringify({ query, variables: { teamId } }),
+        });
+        const data = (await res.json());
+        const nodes = data.data?.team?.states?.nodes ?? [];
+        _teamStateCache.set(teamId, nodes);
+        return nodes;
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`workflow-gate: team state fetch failed for team=${teamId}: ${msg}`);
+        return [];
+    }
+}
+/**
+ * AI-1498: Resolve a semantic native_state name (e.g. "doing", "done") to the actual
+ * Linear workflow state UUID for the given team. Uses the same SEMANTIC_STATE_MAP
+ * candidate-order resolution as the CLI so the proxy and CLI always agree.
+ * Returns null if the state cannot be resolved.
+ */
+export async function resolveNativeStateId(teamId, semanticName, authToken) {
+    const candidates = SEMANTIC_STATE_MAP[semanticName.toLowerCase()];
+    if (!candidates) {
+        log.warn(`workflow-gate: resolveNativeStateId: unknown semantic name '${semanticName}'`);
+        return null;
+    }
+    const states = await fetchTeamWorkflowStates(teamId, authToken);
+    const normalize = (s) => s.toLowerCase().replace(/\s+/g, "");
+    for (const candidate of candidates) {
+        const match = states.find((s) => normalize(s.name) === normalize(candidate));
+        if (match)
+            return match.id;
+    }
+    log.warn(`workflow-gate: resolveNativeStateId: no match for '${semanticName}' (tried: ${candidates.join(", ")}) in team ${teamId}`);
+    return null;
 }
 /**
  * Fetch label names and delegate for a Linear issue using the caller's auth token.
@@ -622,64 +681,57 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
     }
     // Resolve destination state for subsequent gates.
     const destStateNode = def.states.find((s) => s.id === match.to);
-    // AI-1475 Defect 1 + AI-1492 + AI-1497: Done gate (§5.6) — terminal 'done'
-    // requires evidence of merged PR. A wf:dev-impl ticket must not reach terminal
-    // done without evidence that the implementation was pushed, reviewed, and merged.
+    // AI-1475 Defect 1 + AI-1492 + AI-1497: Done gate (§5.6) — terminal 'done' requires
+    // evidence of merged PR. A wf:dev-impl ticket must not reach terminal done without
+    // evidence that the implementation was pushed, reviewed, and merged.
     // Only applies to the deploy command (dev-impl workflow: deployment → done).
     // Other workflows (ux-audit) have their own gate paths (parent-AC gate).
     //
-    // AI-1492: A merged PR satisfies the gate even when the source branch was
+    // AI-1492 fix: A merged PR satisfies the gate even when the source branch was
     // auto-deleted by GitHub after a squash merge.
     //
-    // AI-1497: When the branch was auto-deleted by GitHub after a squash merge,
-    // Linear may lose BOTH the branch reference AND the PR association. In this
-    // case the API returns {hasBranch: false, hasPR: false, hasMergedPR: false} —
-    // indistinguishable from a ticket that was never pushed. Since the ticket is
-    // in `deployment` state (reachable only after code-review approval), we
-    // trust the workflow state and fail-open rather than stranding the ticket.
+    // AI-1497 fix: When branch+PR data are completely absent (both false), this is
+    // indistinguishable from a successfully-merged ticket whose data was lost to
+    // auto-delete. Since the ticket is in 'deployment' state (reachable only after
+    // code-review approval), fail-open rather than stranding the ticket. Only block
+    // when partial evidence exists (has branch but no PR = pushed but never reviewed).
+    // Also fail-open on null (transient API failure) after one retry.
     if (intent === 'deploy' && destStateNode?.kind === 'terminal' && match.to === 'done') {
-        const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+        let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+        // AI-1497: retry once on null — transient Linear API failure during
+        // Hanzo merge+deploy quick succession.
         if (!branchStatus) {
-            // Could not fetch branch/PR data at all — fail-open because the ticket
-            // is in deployment state (already approved through code review).
-            log.warn(`workflow-gate: done gate: could not verify branch/PR status for ${issueId} — failing open (ticket in deployment state)`);
+            await new Promise((r) => setTimeout(r, 1000));
+            branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+        }
+        if (!branchStatus) {
+            // Two consecutive nulls — transient API failure. Fail-open to avoid
+            // stranding tickets; deployment state is already past code review.
+            log.warn(`workflow-gate: done gate: could not verify branch/PR status for ${issueId} after retry — failing open`);
         }
         else if (branchStatus.hasMergedPR) {
-            // A merged PR is sufficient evidence — the code was reviewed and merged,
-            // regardless of whether the branch was auto-deleted after merge (AI-1492).
             log.info(`workflow-gate: done gate: ${issueId} passed (merged PR confirmed)`);
         }
-        else if (branchStatus.hasBranch && branchStatus.hasPR) {
-            // Has branch + PR but not yet merged — allowed (deploy merges + completes).
-            log.info(`workflow-gate: done gate: ${issueId} passed (has branch + PR, not yet merged)`);
+        else if (!branchStatus.hasBranch && !branchStatus.hasPR) {
+            // AI-1497: Complete absence of evidence — likely lost to auto-delete.
+            // Fail-open: a ticket in deployment state has already passed code review,
+            // so the PR almost certainly existed and was merged.
+            log.info(`workflow-gate: done gate: ${issueId} passed (no branch/PR evidence — treating as merged, data likely lost to auto-delete)`);
         }
         else {
-            // No merged PR, and missing either branch or PR (or both).
-            // AI-1497: When both branch AND PR are absent, the data was likely lost
-            // to GitHub auto-delete. The ticket is in deployment state (post-approval),
-            // so fail-open rather than stranding. Only block when we have affirmative
-            // evidence that the work was NOT done (e.g. has branch but no PR — the
-            // author pushed but never opened a review).
+            // Partial evidence exists (has branch but no PR, or similar).
+            // Block: affirmative evidence that review was not completed.
             const missing = [];
             if (!branchStatus.hasBranch)
                 missing.push('branch not pushed to origin');
             if (!branchStatus.hasPR)
                 missing.push('no pull request associated');
-            const bothMissing = !branchStatus.hasBranch && !branchStatus.hasPR;
-            if (bothMissing) {
-                // Indeterminate — branch+PR data absent, likely lost to auto-delete.
-                // Ticket is in deployment state (post-approval). Fail-open.
-                log.warn(`workflow-gate: done gate: ${issueId} has no branch or PR data ` +
-                    `(likely lost to GitHub auto-delete after squash merge). ` +
-                    `Failing open — ticket is in deployment state (post-code-review approval).`);
-            }
-            else {
-                // Partial evidence: has one but not the other. This is stronger signal
-                // that the work was NOT completed — block.
+            if (missing.length > 0) {
                 log.warn(`workflow-gate: done gate: ${issueId} blocked — ${missing.join('; ')}`);
                 return (`[Proxy] 'deploy' blocked: cannot reach terminal done. Missing: ${missing.join('; ')}. ` +
                     `Push the branch and open a pull request before deploying.`);
             }
+            log.info(`workflow-gate: done gate: ${issueId} passed (has branch + PR, not yet merged)`);
         }
     }
     // Assignment target validation (§4.3, §16.1)
@@ -961,35 +1013,42 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
     // ── AI-1475 Defect 1 + AI-1492 + AI-1497: Done gate defense-in-depth (§5.6) ─
     // Block the label swap to done if the branch/PR gate is not satisfied.
     // This is defense-in-depth: checkWorkflowRules is the primary gate, but
-    // applyStateTransition also checks to prevent any bypass path.
+    // applyStateTransition also blocks to prevent any bypass path.
     // Only applies when intent is 'deploy' (dev-impl workflow: deployment → done).
     //
     // AI-1492: A merged PR satisfies the gate even without a branch (auto-deleted
     // after squash merge).
     //
-    // AI-1497: When both branch AND PR data are absent (GitHub auto-deleted the
-    // branch after squash merge and Linear lost the PR association), fail-open
-    // because the ticket is in deployment state (post-code-review approval).
+    // AI-1497: Fail-open on null (after retry) and on complete absence of evidence
+    // (no branch + no PR). Only block on partial evidence (branch exists but no PR).
     if (intent === 'deploy' && toStateName === 'done') {
-        const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+        let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+        if (!branchStatus) {
+            await new Promise((r) => setTimeout(r, 1000));
+            branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+        }
         const hasMergedPR = branchStatus?.hasMergedPR === true;
         const hasBranchAndPR = branchStatus?.hasBranch && branchStatus?.hasPR;
-        // Both missing — indeterminate, likely lost to auto-delete. Fail-open.
-        const bothMissing = branchStatus && !branchStatus.hasBranch && !branchStatus.hasPR;
-        if (!hasMergedPR && !hasBranchAndPR && !bothMissing && branchStatus) {
-            // Partial evidence: has one but not the other — block.
-            const missing = [];
-            if (!branchStatus.hasBranch)
-                missing.push('branch not pushed to origin');
-            if (!branchStatus.hasPR)
-                missing.push('no pull request associated');
-            log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
-            return; // Block the transition
+        const noEvidenceAtAll = branchStatus && !branchStatus.hasBranch && !branchStatus.hasPR;
+        if (!hasMergedPR && !hasBranchAndPR && !noEvidenceAtAll) {
+            // Block: either null after retry (branchStatus is null → noEvidenceAtAll is false)
+            // or partial evidence (has branch but no PR).
+            // But AI-1497: if null after retry, fail-open instead of blocking.
+            if (!branchStatus) {
+                log.warn(`workflow-gate: B2 apply: done gate could not verify status for ${issueId} after retry — failing open`);
+            }
+            else {
+                const missing = [];
+                if (!branchStatus.hasBranch)
+                    missing.push('branch not pushed to origin');
+                if (!branchStatus.hasPR)
+                    missing.push('no pull request associated');
+                log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
+                return; // Block the transition
+            }
         }
-        if (!branchStatus || bothMissing) {
-            log.warn(`workflow-gate: B2 apply: done gate for ${issueId} — branch/PR data unavailable ` +
-                `(${!branchStatus ? 'fetch returned null' : 'both branch and PR absent, likely auto-delete'}). ` +
-                `Failing open — ticket is in deployment state (post-code-review approval).`);
+        else if (noEvidenceAtAll) {
+            log.info(`workflow-gate: B2 apply: done gate for ${issueId} — no branch/PR evidence, treating as merged (AI-1497 fail-open)`);
         }
     }
     // ── Phase 5 / B-4: Parent-AC gate for review → done (F2b, §5.6) ─────
@@ -1199,11 +1258,34 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
             log.info(`workflow-gate: B2 apply: recorded implementer from bodyId '${options.bodyId}' for ${issueId}`);
         }
     }
-    // Step 4: Apply the FULL transition atomically (labels + delegate in one mutation).
-    const applied = await issueUpdateAtomic(issue.internalId, newLabelIds, authToken, resolvedDelegateId);
+    // Step 4 (AI-1498): Resolve native stateId from YAML native_state field.
+    // The proxy is now the SOLE writer of all three facets: label, delegate, AND native state.
+    // Fail-closed: if the destination state has a native_state field but we can't resolve
+    // the Linear stateId, abort the transition (this is the structural guarantee that
+    // prevents desync).
+    let resolvedNativeStateId = undefined;
+    const destNativeState = destStateNode?.native_state;
+    if (destNativeState) {
+        const stateId = await resolveNativeStateId(issue.teamId, destNativeState, authToken);
+        if (!stateId) {
+            log.error(`workflow-gate: B2 apply: FAIL-CLOSED — could not resolve native stateId for '${destNativeState}' on team ${issue.teamId}. Transition aborted.`);
+            return;
+        }
+        resolvedNativeStateId = stateId;
+        log.info(`workflow-gate: B2 apply: resolved native_state '${destNativeState}' → stateId=${stateId} for ${issueId}`);
+    }
+    else if (destStateNode) {
+        // State exists but has no native_state — this should have been caught at load-time
+        // validation (AI-1498 hard-fail). If we somehow reach here, fail-closed.
+        log.error(`workflow-gate: B2 apply: FAIL-CLOSED — destination state '${toStateName}' has no native_state field. Transition aborted.`);
+        return;
+    }
+    // Step 5: Apply the FULL transition atomically (labels + delegate + native state in one mutation).
+    const applied = await issueUpdateAtomic(issue.internalId, newLabelIds, authToken, resolvedDelegateId, resolvedNativeStateId);
     if (applied) {
         log.info(`workflow-gate: B2 apply: ${issueId} state:${currentStateName} → state:${toStateName}` +
-            (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``));
+            (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
+            (resolvedNativeStateId ? ` native=${destNativeState}(${resolvedNativeStateId})` : ``));
     }
     else {
         log.error(`workflow-gate: B2 apply: atomic mutation FAILED for ${issueId} — all facets rolled back (no partial state)`);
@@ -1348,16 +1430,21 @@ async function postFanoutSummaryComment(issueInternalId, result, authToken) {
  *
  * @param delegateId - Linear user ID for the new delegate, or null to skip delegate update.
  */
-async function issueUpdateAtomic(internalId, labelIds, authToken, delegateId) {
+async function issueUpdateAtomic(internalId, labelIds, authToken, delegateId, nativeStateId) {
     // Build the mutation input: include delegateId when explicitly set (string or null to clear).
     // undefined means "don't touch delegate". null means "clear delegate".
+    // AI-1498: include nativeStateId when explicitly set — the proxy writes ALL three facets
+    // (label, delegate, native state) in a single mutation.
     const hasDelegate = delegateId !== undefined;
-    const inputFields = hasDelegate
-        ? "labelIds: $labelIds, delegateId: $delegateId"
-        : "labelIds: $labelIds";
+    const hasStateId = nativeStateId !== undefined;
+    const inputParts = ["labelIds: $labelIds"];
+    if (hasDelegate)
+        inputParts.push("delegateId: $delegateId");
+    if (hasStateId)
+        inputParts.push("stateId: $stateId");
     const mutation = `
-    mutation ApplyAtomicTransition($issueId: String!, $labelIds: [String!]!${hasDelegate ? ", $delegateId: String" : ""}) {
-      issueUpdate(id: $issueId, input: { ${inputFields} }) {
+    mutation ApplyAtomicTransition($issueId: String!, $labelIds: [String!]!${hasDelegate ? ", $delegateId: String" : ""}${hasStateId ? ", $stateId: String" : ""}) {
+      issueUpdate(id: $issueId, input: { ${inputParts.join(", ")} }) {
         success
       }
     }
@@ -1365,6 +1452,8 @@ async function issueUpdateAtomic(internalId, labelIds, authToken, delegateId) {
     const variables = { issueId: internalId, labelIds };
     if (hasDelegate)
         variables.delegateId = delegateId;
+    if (hasStateId)
+        variables.stateId = nativeStateId;
     try {
         const res = await fetch(LINEAR_API_URL, {
             method: "POST",

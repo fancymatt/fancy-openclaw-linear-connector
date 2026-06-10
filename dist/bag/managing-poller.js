@@ -199,10 +199,9 @@ export class ManagingPoller {
             if (stallToken) {
                 for (const ticket of dueTickets) {
                     try {
-                        const { surfaced, events } = await surfaceStalledChildren(ticket.identifier, /^Bearer\s+/i.test(stallToken) ? stallToken : `Bearer ${stallToken}`);
-                        if (surfaced > 0) {
-                            log.info(`§5.5/§16.1: ${surfaced} stall event(s) emitted on ${ticket.identifier}` +
-                                events.map((e) => `\n  - ${e.childIdentifier}: ${e.currentState} breached SLA ${Math.round(e.slaMs / 60000)}m by ${Math.round(e.breachMs / 60000)}m`).join(""));
+                        const stalledCount = await surfaceStalledChildren(ticket.identifier, /^Bearer\s+/i.test(stallToken) ? stallToken : `Bearer ${stallToken}`);
+                        if (stalledCount > 0) {
+                            log.info(`§5.5 tripwire: ${stalledCount} stalled child(ren) surfaced on ${ticket.identifier}`);
                         }
                     }
                     catch (err) {

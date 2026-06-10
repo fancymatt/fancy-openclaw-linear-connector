@@ -62,9 +62,6 @@ export interface WorkflowState {
      *  Must be a key in the CLI's SEMANTIC_STATE_MAP (doing, thinking, done, invalid, etc.)
      *  or a literal Linear state name. Validated at connector startup. */
     native_state?: string;
-    /** Per-state time-in-state SLA (ms). Parsed from YAML duration strings like "24h", "30m".
-     *  When a child breaches this SLA, the engine emits a stall event (§5.5 / §16.1). */
-    sla?: number;
     transitions?: WorkflowTransition[];
 }
 export interface StakesLevel {
@@ -88,18 +85,26 @@ export interface WorkflowDef {
     stakes?: StakesLevel;
     states: WorkflowState[];
 }
-/** Parse an SLA duration string (e.g. "24h", "30m", "2d", "90s") to milliseconds. */
-export declare function parseSlaDuration(value: string | number | undefined): number | undefined;
 export declare function loadWorkflowDef(): Promise<WorkflowDef>;
 /** Invalidate the in-process workflow def cache (used in tests). */
 export declare function resetWorkflowCache(): void;
 /**
- * AI-1490: Validate that every workflow state with a native_state field
- * references a valid semantic state name. Returns an array of diagnostic
- * warnings (empty if all valid). Does not throw — used for startup checks
- * and config-health reporting.
+ * AI-1490 / AI-1498: Validate that every workflow state has a valid native_state field.
+ * AI-1498 hardens this from warn → hard-fail for non-terminal states: a missing or
+ * invalid native_state means the proxy cannot compute the native Linear stateId,
+ * making desync structurally impossible. Returns an array of diagnostic errors.
+ * The caller should throw when errors is non-empty for governed workflows.
  */
 export declare function validateNativeStateMappings(def: WorkflowDef): string[];
+/** Reset the native-state cache (used in tests). */
+export declare function resetNativeStateCache(): void;
+/**
+ * AI-1498: Resolve a semantic native_state name (e.g. "doing", "done") to the actual
+ * Linear workflow state UUID for the given team. Uses the same SEMANTIC_STATE_MAP
+ * candidate-order resolution as the CLI so the proxy and CLI always agree.
+ * Returns null if the state cannot be resolved.
+ */
+export declare function resolveNativeStateId(teamId: string, semanticName: string, authToken: string): Promise<string | null>;
 /**
  * Derive legal assignment targets for a transition based on destination state's owner_role.
  * Returns mode=none for terminal states or roles with no bodies.
