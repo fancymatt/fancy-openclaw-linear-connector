@@ -160,6 +160,17 @@ export function getAccessToken(agentName) {
 export function getAgent(agentName) {
     return _agents.find((a) => a.name === agentName);
 }
+/**
+ * Resolve an agent by its opaque broker proxy token. This is the authenticated
+ * identity path: the token can only have come from the agent's own env, so the
+ * proxy trusts it over the spoofable X-Openclaw-Agent header. Returns undefined
+ * for an unrecognized token (legacy/direct-token callers fall through).
+ */
+export function getAgentByProxyToken(token) {
+    if (!token)
+        return undefined;
+    return _agents.find((a) => a.proxyToken && a.proxyToken === token);
+}
 /** Get the OpenClaw agent name for routing */
 export function getOpenclawAgentName(agentName) {
     const agent = _agents.find((a) => a.name === agentName);
@@ -190,11 +201,28 @@ function syncWorkspaceSecrets(agentName, accessToken) {
         // and the reader in the Linear skill CLI can never disagree.
         secretsPath = getLinearSecretPath(wsName);
     }
+    // Broker model: once an agent is provisioned with a proxy token, its env must
+    // NEVER receive the real Linear OAuth token. Write the opaque proxy token plus
+    // the proxy URL so the CLI routes through the connector (which swaps in the
+    // vaulted real token). The real accessToken update lands only in agents.json
+    // via save(). This also runs on every token refresh, so we re-emit the proxy
+    // URL line here to keep it from being clobbered. Agents with no proxyToken yet
+    // keep the legacy direct-token behavior for an incremental migration.
+    let contents;
+    if (agent.proxyToken) {
+        const lines = [`LINEAR_OAUTH_TOKEN=${agent.proxyToken}`];
+        if (agent.proxyUrl)
+            lines.push(`LINEAR_PROXY_URL=${agent.proxyUrl}`);
+        contents = lines.join("\n") + "\n";
+    }
+    else {
+        contents = `LINEAR_OAUTH_TOKEN=${accessToken}\n`;
+    }
     try {
         fs.mkdirSync(path.dirname(secretsPath), { recursive: true });
-        fs.writeFileSync(secretsPath, `LINEAR_OAUTH_TOKEN=${accessToken}\n`, "utf8");
+        fs.writeFileSync(secretsPath, contents, "utf8");
         fs.chmodSync(secretsPath, 0o600);
-        log.info(`Synced token to ${secretsPath}`);
+        log.info(`Synced ${agent.proxyToken ? "proxy token" : "token"} to ${secretsPath}`);
     }
     catch (err) {
         log.error(`Failed to sync token to ${secretsPath}: ${err instanceof Error ? err.message : String(err)}`);

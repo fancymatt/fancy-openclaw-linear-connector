@@ -27,6 +27,17 @@ export interface AgentConfig {
   host?: "ishikawa" | "local";
   /** Path to write LINEAR_OAUTH_TOKEN when tokens refresh */
   secretsPath?: string;
+  /**
+   * Opaque per-agent broker credential. When set, this — NOT the real Linear
+   * OAuth token — is what gets written into the agent's environment. The agent
+   * presents it as its Authorization; the proxy resolves the agent from it and
+   * swaps in the vaulted `accessToken` for the upstream call. A proxy token is
+   * useless against api.linear.app directly, so an agent cannot bypass the gate
+   * by hitting Linear without the proxy. The real token stays only in this file.
+   */
+  proxyToken?: string;
+  /** Proxy GraphQL URL written into the agent env alongside the proxy token. */
+  proxyUrl?: string;
   /** Per-agent OpenClaw hooks URL override (e.g. for agents in a different fleet/gateway) */
   hooksUrl?: string;
   /** Per-agent OpenClaw hooks token override */
@@ -220,6 +231,17 @@ export function getAgent(agentName: string): AgentConfig | undefined {
   return _agents.find((a) => a.name === agentName);
 }
 
+/**
+ * Resolve an agent by its opaque broker proxy token. This is the authenticated
+ * identity path: the token can only have come from the agent's own env, so the
+ * proxy trusts it over the spoofable X-Openclaw-Agent header. Returns undefined
+ * for an unrecognized token (legacy/direct-token callers fall through).
+ */
+export function getAgentByProxyToken(token: string): AgentConfig | undefined {
+  if (!token) return undefined;
+  return _agents.find((a) => a.proxyToken && a.proxyToken === token);
+}
+
 /** Get the OpenClaw agent name for routing */
 export function getOpenclawAgentName(agentName: string): string {
   const agent = _agents.find((a) => a.name === agentName);
@@ -257,11 +279,27 @@ function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
     secretsPath = getLinearSecretPath(wsName);
   }
 
+  // Broker model: once an agent is provisioned with a proxy token, its env must
+  // NEVER receive the real Linear OAuth token. Write the opaque proxy token plus
+  // the proxy URL so the CLI routes through the connector (which swaps in the
+  // vaulted real token). The real accessToken update lands only in agents.json
+  // via save(). This also runs on every token refresh, so we re-emit the proxy
+  // URL line here to keep it from being clobbered. Agents with no proxyToken yet
+  // keep the legacy direct-token behavior for an incremental migration.
+  let contents: string;
+  if (agent.proxyToken) {
+    const lines = [`LINEAR_OAUTH_TOKEN=${agent.proxyToken}`];
+    if (agent.proxyUrl) lines.push(`LINEAR_PROXY_URL=${agent.proxyUrl}`);
+    contents = lines.join("\n") + "\n";
+  } else {
+    contents = `LINEAR_OAUTH_TOKEN=${accessToken}\n`;
+  }
+
   try {
     fs.mkdirSync(path.dirname(secretsPath), { recursive: true });
-    fs.writeFileSync(secretsPath, `LINEAR_OAUTH_TOKEN=${accessToken}\n`, "utf8");
+    fs.writeFileSync(secretsPath, contents, "utf8");
     fs.chmodSync(secretsPath, 0o600);
-    log.info(`Synced token to ${secretsPath}`);
+    log.info(`Synced ${agent.proxyToken ? "proxy token" : "token"} to ${secretsPath}`);
   } catch (err) {
     log.error(`Failed to sync token to ${secretsPath}: ${err instanceof Error ? err.message : String(err)}`);
   }

@@ -242,6 +242,152 @@ describe("proxy /proxy/graphql", () => {
   });
 });
 
+// ── Broker token injection (AI-1382 follow-up) ─────────────────────────────
+
+describe("proxy broker token injection", () => {
+  let dir: string;
+  let appState: ReturnType<typeof createApp>;
+  let originalFetch: typeof globalThis.fetch;
+
+  // Agents file where charles carries an opaque proxy token + vaulted real token.
+  function writeBrokerAgents(d: string): string {
+    const file = path.join(d, "agents.json");
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        agents: [
+          {
+            name: "charles",
+            linearUserId: "u1",
+            openclawAgent: "charles",
+            accessToken: "real-charles-linear-token",
+            proxyToken: "lpx_charles_opaque_secret",
+            proxyUrl: "http://127.0.0.1:3100/proxy/graphql",
+            host: "local",
+          },
+        ],
+      }),
+      "utf8"
+    );
+    return file;
+  }
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-broker-test-"));
+    process.env.AGENTS_FILE = writeBrokerAgents(dir);
+    process.env.CAPABILITY_POLICY_PATH = writePolicyFile(dir);
+    writeWorkflowFile(dir);
+    resetPolicyCache();
+    resetWorkflowCache();
+    reloadAgents();
+    appState = createApp({
+      bagDbPath: path.join(dir, "bag.db"),
+      agentQueueDbPath: path.join(dir, "queue.db"),
+      operationalEventsDbPath: path.join(dir, "events.db"),
+    });
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    appState.bag.close();
+    appState.sessionTracker.close();
+    appState.agentQueue.close();
+    appState.operationalEventStore.close();
+    appState.watchdog.stop();
+    appState.noActivityDetector.stop();
+    appState.managingPoller.stop();
+  });
+
+  it("swaps a known proxy token for the agent's vaulted real Linear token upstream", async () => {
+    let capturedAuth: string | undefined;
+    globalThis.fetch = async (url, init) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        capturedAuth = (init?.headers as Record<string, string>)?.["Authorization"];
+        return new Response(JSON.stringify(MOCK_RESPONSE), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return originalFetch(url, init);
+    };
+
+    await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "lpx_charles_opaque_secret")
+      .send({ query: "{ viewer { id } }" });
+
+    // The opaque proxy token must never reach Linear; the vaulted token does.
+    expect(capturedAuth).toBe("real-charles-linear-token");
+    expect(capturedAuth).not.toContain("lpx_");
+  });
+
+  it("derives identity from the proxy token, ignoring a spoofed X-Openclaw-Agent header", async () => {
+    let capturedAuth: string | undefined;
+    globalThis.fetch = async (url, init) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        capturedAuth = (init?.headers as Record<string, string>)?.["Authorization"];
+        return new Response(JSON.stringify(MOCK_RESPONSE), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return originalFetch(url, init);
+    };
+
+    await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "lpx_charles_opaque_secret")
+      .set("X-Openclaw-Agent", "someone-else")
+      .send({ query: "{ viewer { id } }" });
+
+    // Identity resolved from the token (charles), so charles's real token is injected.
+    expect(capturedAuth).toBe("real-charles-linear-token");
+  });
+
+  it("forwards an unrecognized Authorization unchanged (legacy direct-token fallback)", async () => {
+    let capturedAuth: string | undefined;
+    globalThis.fetch = async (url, init) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        capturedAuth = (init?.headers as Record<string, string>)?.["Authorization"];
+        return new Response(JSON.stringify(MOCK_RESPONSE), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return originalFetch(url, init);
+    };
+
+    await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "lin_oa_some_direct_token")
+      .send({ query: "{ viewer { id } }" });
+
+    expect(capturedAuth).toBe("lin_oa_some_direct_token");
+  });
+
+  it("strips a Bearer prefix when matching the proxy token", async () => {
+    let capturedAuth: string | undefined;
+    globalThis.fetch = async (url, init) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        capturedAuth = (init?.headers as Record<string, string>)?.["Authorization"];
+        return new Response(JSON.stringify(MOCK_RESPONSE), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return originalFetch(url, init);
+    };
+
+    await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer lpx_charles_opaque_secret")
+      .send({ query: "{ viewer { id } }" });
+
+    expect(capturedAuth).toBe("real-charles-linear-token");
+  });
+});
+
 // ── Phase 2 / slice 1: enforcement tests ──────────────────────────────────
 
 describe("proxy enforcement — needs-human (Phase 2 slice 1)", () => {

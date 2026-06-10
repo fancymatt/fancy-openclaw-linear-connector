@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   getAccessToken,
+  getAgentByProxyToken,
   getAgents,
   isAgentLocal,
   reloadAgents,
@@ -146,5 +147,79 @@ describe("agents credential file encryption", () => {
 
     reloadAgents();
     expect(getAccessToken("charles")).toBe("access-token-1");
+  });
+});
+
+describe("broker proxy-token model", () => {
+  let dir: string;
+  let agentsFile: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "agents-broker-test-"));
+    agentsFile = path.join(dir, "agents.json");
+    process.env.AGENTS_FILE = agentsFile;
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+    delete process.env.SECRETS_DIR;
+    reloadAgents();
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTS_FILE;
+    reloadAgents();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("getAgentByProxyToken resolves an agent by its proxy token", () => {
+    upsertAgent({
+      ...makeAgent(path.join(dir, "linear.env")),
+      proxyToken: "lpx_charles_secret",
+      proxyUrl: "http://127.0.0.1:3100/proxy/graphql",
+    });
+    expect(getAgentByProxyToken("lpx_charles_secret")?.name).toBe("charles");
+    expect(getAgentByProxyToken("unknown")).toBeUndefined();
+    expect(getAgentByProxyToken("")).toBeUndefined();
+  });
+
+  test("syncWorkspaceSecrets writes the proxy token + URL, never the real token, when provisioned", () => {
+    const secretsPath = path.join(dir, "linear.env");
+    upsertAgent({
+      ...makeAgent(secretsPath),
+      accessToken: "real-secret-token",
+      proxyToken: "lpx_charles_secret",
+      proxyUrl: "http://127.0.0.1:3100/proxy/graphql",
+    });
+
+    const env = fs.readFileSync(secretsPath, "utf8");
+    expect(env).toContain("LINEAR_OAUTH_TOKEN=lpx_charles_secret");
+    expect(env).toContain("LINEAR_PROXY_URL=http://127.0.0.1:3100/proxy/graphql");
+    expect(env).not.toContain("real-secret-token");
+  });
+
+  test("syncWorkspaceSecrets keeps legacy direct-token behavior when no proxy token is set", () => {
+    const secretsPath = path.join(dir, "linear.env");
+    upsertAgent({ ...makeAgent(secretsPath), accessToken: "real-secret-token" });
+
+    const env = fs.readFileSync(secretsPath, "utf8");
+    expect(env.trim()).toBe("LINEAR_OAUTH_TOKEN=real-secret-token");
+    expect(env).not.toContain("LINEAR_PROXY_URL");
+  });
+
+  test("token refresh does not leak the real token into a provisioned agent's env", () => {
+    const secretsPath = path.join(dir, "linear.env");
+    upsertAgent({
+      ...makeAgent(secretsPath),
+      proxyToken: "lpx_charles_secret",
+      proxyUrl: "http://127.0.0.1:3100/proxy/graphql",
+    });
+
+    updateTokens("charles", "rotated-real-token", "rotated-refresh");
+
+    const env = fs.readFileSync(secretsPath, "utf8");
+    expect(env).toContain("LINEAR_OAUTH_TOKEN=lpx_charles_secret");
+    expect(env).toContain("LINEAR_PROXY_URL=http://127.0.0.1:3100/proxy/graphql");
+    expect(env).not.toContain("rotated-real-token");
+    // The rotated real token still lands in the vault for the proxy to use.
+    expect(getAccessToken("charles")).toBe("rotated-real-token");
   });
 });

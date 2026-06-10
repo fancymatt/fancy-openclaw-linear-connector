@@ -33,7 +33,7 @@ import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, getCurrentState, type TransitionFeedback } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
-import { getAgent } from "./agents.js";
+import { getAgent, getAgentByProxyToken } from "./agents.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
@@ -61,6 +61,11 @@ function semverLt(a: [number, number, number], b: [number, number, number]): boo
   if (a[0] !== b[0]) return a[0] < b[0];
   if (a[1] !== b[1]) return a[1] < b[1];
   return a[2] < b[2];
+}
+
+/** Strip an optional "Bearer " prefix so proxy-token lookup matches the raw value. */
+function stripBearer(auth: string): string {
+  return auth.replace(/^Bearer\s+/i, "").trim();
 }
 
 interface GraphQLRequestBody {
@@ -128,13 +133,27 @@ export interface ProxyDeps {
 }
 
 export async function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void> {
-  const authorization = req.headers["authorization"];
-  if (!authorization) {
+  const rawAuthorization = req.headers["authorization"];
+  if (!rawAuthorization) {
     res.status(401).json({ errors: [{ message: "Missing Authorization header" }] });
     return;
   }
+  const authHeader = Array.isArray(rawAuthorization) ? rawAuthorization[0] : rawAuthorization;
 
-  const agentId = (req.headers["x-openclaw-agent"] as string | undefined) ?? "unknown";
+  // Broker model (AI-1382 follow-up): if the caller presents an opaque broker
+  // proxy token, resolve the agent from it — authenticated identity, not the
+  // spoofable X-Openclaw-Agent header — and swap in the vaulted real Linear
+  // OAuth token for every Linear read and the upstream forward. Actions then
+  // appear as that agent's real Linear app user. A proxy token is rejected by
+  // api.linear.app, so an agent can no longer bypass the gate by hitting Linear
+  // without the proxy. Legacy fallback: an unrecognized Authorization is
+  // forwarded as-is, so direct-token agents keep working during migration.
+  const brokerAgent = getAgentByProxyToken(stripBearer(authHeader));
+  const authorization = brokerAgent ? brokerAgent.accessToken : authHeader;
+
+  const agentId = brokerAgent
+    ? brokerAgent.name
+    : ((req.headers["x-openclaw-agent"] as string | undefined) ?? "unknown");
   const intent = (req.headers["x-openclaw-linear-intent"] as string | undefined) ?? null;
   const target = (req.headers["x-openclaw-linear-target"] as string | undefined) ?? null;
   const feedbackCategoryHeader = (req.headers["x-openclaw-feedback-category"] as string | undefined) ?? null;
