@@ -3976,3 +3976,67 @@ describe("AI-1493: transition-walk canary", () => {
 });
 
 });
+
+describe("validateNativeStateMappings (AI-1490)", () => {
+  it("canonical dev-impl fixture has valid native_state on all states", () => {
+    const raw = fs.readFileSync(CANONICAL_FIXTURE, "utf8");
+    const def = yaml.load(raw) as any;
+    const warnings = validateNativeStateMappings(def);
+    expect(warnings).toEqual([]);
+  });
+
+  it("flags missing native_state on non-terminal states", () => {
+    const def = {
+      id: "test",
+      states: [
+        { id: "intake", kind: "normal" }, // missing native_state
+        { id: "done", kind: "terminal", native_state: "done" },
+      ],
+    };
+    const warnings = validateNativeStateMappings(def);
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain("intake");
+    expect(warnings[0]).toContain("no native_state");
+  });
+
+  it("flags invalid native_state values", () => {
+    const def = {
+      id: "test",
+      states: [
+        { id: "building", kind: "normal", native_state: "nonexistent-state" },
+      ],
+    };
+    const warnings = validateNativeStateMappings(def);
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain("nonexistent-state");
+    expect(warnings[0]).toContain("not a recognized semantic state");
+  });
+
+  it("allows all valid semantic states", () => {
+    const def = {
+      id: "test",
+      states: [
+        { id: "a", kind: "normal", native_state: "backlog" },
+        { id: "b", kind: "normal", native_state: "todo" },
+        { id: "c", kind: "normal", native_state: "thinking" },
+        { id: "d", kind: "normal", native_state: "doing" },
+        { id: "e", kind: "normal", native_state: "managing" },
+        { id: "f", kind: "terminal", native_state: "done" },
+        { id: "g", kind: "terminal", native_state: "invalid" },
+      ],
+    };
+    const warnings = validateNativeStateMappings(def);
+    expect(warnings).toEqual([]);
+  });
+
+  it("terminal states without native_state are allowed (non-blocking warning)", () => {
+    const def = {
+      id: "test",
+      states: [
+        { id: "done", kind: "terminal" }, // no native_state on terminal — ok
+      ],
+    };
+    const warnings = validateNativeStateMappings(def);
+    expect(warnings).toEqual([]);
+  });
+});
