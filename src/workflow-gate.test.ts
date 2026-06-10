@@ -1410,15 +1410,18 @@ describe("checkWorkflowRules — AI-1475 D1: done gate (branch/PR verification)"
     expect(result).toContain("no pull request associated");
   });
 
-  it("blocks 'deploy' → done when neither branch nor PR exist", async () => {
+  // AI-1497: When both branch AND PR data are absent (e.g. GitHub auto-deleted the
+  // branch after squash merge and Linear lost the PR association), the gate fails open
+  // because the ticket is in deployment state (post-code-review approval). Previously
+  // this blocked, stranding tickets whose branches were auto-deleted post-merge.
+  it("allows 'deploy' → done when neither branch nor PR data exist (AI-1497: post-merge auto-delete)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: false });
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
-    expect(result).not.toBeNull();
-    expect(result).toContain("branch not pushed to origin");
-    expect(result).toContain("no pull request associated");
+    expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 
-  it("fail-closed: blocks 'deploy' → done when branch/PR fetch returns null (API error)", async () => {
+  // AI-1497: When the branch/PR fetch returns null (API error / no issue data),
+  // the gate now fails open because the ticket is in deployment state (post-approval).
+  it("fail-open: allows 'deploy' → done when branch/PR fetch returns null (AI-1497)", async () => {
     // Simulate: label fetch works, but branch/PR fetch returns no data
     let fetchCallCount = 0;
     globalThis.fetch = async (_url, init) => {
@@ -1438,9 +1441,7 @@ describe("checkWorkflowRules — AI-1475 D1: done gate (branch/PR verification)"
       }
       throw new Error(`unexpected fetch call: ${bodyText.slice(0, 60)}`);
     };
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
-    expect(result).not.toBeNull();
-    expect(result).toContain("unable to verify branch/pull-request status");
+    expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 
   it("done gate does NOT fire for non-deploy commands (reject in deployment state)", async () => {
@@ -1590,6 +1591,24 @@ describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () =
     await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
     // No ApplyAtomicTransition call — done gate blocked it
     expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
+  });
+
+  // AI-1497: When both branch AND PR data are absent (GitHub auto-deleted branch
+  // after squash merge, Linear lost PR association), the B2 defense-in-depth
+  // now fails open because the ticket is in deployment state (post-approval).
+  it("allows label swap to done when neither branch nor PR data exist (AI-1497)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+      branchStatus: { hasBranch: false, hasPR: false, hasMergedPR: false },
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
   });
 });
 

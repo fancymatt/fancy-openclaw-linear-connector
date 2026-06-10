@@ -95,6 +95,9 @@ export interface WorkflowState {
    *  Must be a key in the CLI's SEMANTIC_STATE_MAP (doing, thinking, done, invalid, etc.)
    *  or a literal Linear state name. Validated at connector startup. */
   native_state?: string;
+  /** Per-state time-in-state SLA (ms). Parsed from YAML duration strings like "24h", "30m".
+   *  When a child breaches this SLA, the engine emits a stall event (§5.5 / §16.1). */
+  sla?: number;
   transitions?: WorkflowTransition[];
 }
 
@@ -121,6 +124,34 @@ export interface WorkflowDef {
 
 let _workflowCache: WorkflowDef | null = null;
 
+/** Parse an SLA duration string (e.g. "24h", "30m", "2d", "90s") to milliseconds. */
+export function parseSlaDuration(value: string | number | undefined): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "number") return value > 0 ? value : undefined;
+  const m = /^(\d+(?:\.\d+)?)\s*([smhd]?)$/.exec(value.trim());
+  if (!m) return undefined;
+  const n = parseFloat(m[1]);
+  if (isNaN(n) || n <= 0) return undefined;
+  const unit = (m[2] || "m").toLowerCase();
+  switch (unit) {
+    case "s": return n * 1000;
+    case "m": return n * 60 * 1000;
+    case "h": return n * 60 * 60 * 1000;
+    case "d": return n * 24 * 60 * 60 * 1000;
+    default: return undefined;
+  }
+}
+
+/** Post-process a loaded WorkflowDef: parse sla duration strings to ms. */
+function parseWorkflowSla(def: WorkflowDef): void {
+  for (const state of def.states) {
+    const raw = (state as unknown as Record<string, unknown>).sla;
+    if (raw !== undefined && typeof raw === "string") {
+      state.sla = parseSlaDuration(raw);
+    }
+  }
+}
+
 export async function loadWorkflowDef(): Promise<WorkflowDef> {
   if (_workflowCache) return _workflowCache;
   try {
@@ -129,6 +160,7 @@ export async function loadWorkflowDef(): Promise<WorkflowDef> {
     if (def.break_glass && !def.break_glass.command) {
       log.warn(`workflow-gate: break_glass block in ${workflowDefPath()} has no 'command' field — falling back to hardcoded "escape". Canonicalize the YAML to add command: escape.`);
     }
+    parseWorkflowSla(def);
     _workflowCache = def;
     recordSuccess("workflow-def");
     // AI-1490: validate native_state mappings on load.
@@ -779,42 +811,63 @@ export async function checkWorkflowRules(
   // Resolve destination state for subsequent gates.
   const destStateNode = def.states.find((s) => s.id === match.to);
 
-  // AI-1475 Defect 1 + AI-1492: Done gate (§5.6) — terminal 'done' requires evidence of merged PR.
-  // A wf:dev-impl ticket must not reach terminal done without evidence that the
-  // implementation was pushed, reviewed, and merged. Fail-closed: if we cannot
-  // determine branch/PR status, block the transition.
+  // AI-1475 Defect 1 + AI-1492 + AI-1497: Done gate (§5.6) — terminal 'done'
+  // requires evidence of merged PR. A wf:dev-impl ticket must not reach terminal
+  // done without evidence that the implementation was pushed, reviewed, and merged.
   // Only applies to the deploy command (dev-impl workflow: deployment → done).
   // Other workflows (ux-audit) have their own gate paths (parent-AC gate).
   //
-  // AI-1492 fix: A merged PR satisfies the gate even when the source branch was
-  // auto-deleted by GitHub after a squash merge. Previously the gate keyed off
-  // branch existence, which breaks when the branch is deleted post-merge.
+  // AI-1492: A merged PR satisfies the gate even when the source branch was
+  // auto-deleted by GitHub after a squash merge.
+  //
+  // AI-1497: When the branch was auto-deleted by GitHub after a squash merge,
+  // Linear may lose BOTH the branch reference AND the PR association. In this
+  // case the API returns {hasBranch: false, hasPR: false, hasMergedPR: false} —
+  // indistinguishable from a ticket that was never pushed. Since the ticket is
+  // in `deployment` state (reachable only after code-review approval), we
+  // trust the workflow state and fail-open rather than stranding the ticket.
   if (intent === 'deploy' && destStateNode?.kind === 'terminal' && match.to === 'done') {
     const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     if (!branchStatus) {
-      log.warn(`workflow-gate: done gate: could not verify branch/PR status for ${issueId} — blocking`);
-      return (
-        `[Proxy] 'deploy' blocked: unable to verify branch/pull-request status for ${issueId}. ` +
-        `Ensure the branch has been pushed to origin and a pull request exists.`
-      );
-    }
-    // A merged PR is sufficient evidence — the code was reviewed and merged,
-    // regardless of whether the branch was auto-deleted after merge (AI-1492).
-    if (branchStatus.hasMergedPR) {
+      // Could not fetch branch/PR data at all — fail-open because the ticket
+      // is in deployment state (already approved through code review).
+      log.warn(`workflow-gate: done gate: could not verify branch/PR status for ${issueId} — failing open (ticket in deployment state)`);
+    } else if (branchStatus.hasMergedPR) {
+      // A merged PR is sufficient evidence — the code was reviewed and merged,
+      // regardless of whether the branch was auto-deleted after merge (AI-1492).
       log.info(`workflow-gate: done gate: ${issueId} passed (merged PR confirmed)`);
+    } else if (branchStatus.hasBranch && branchStatus.hasPR) {
+      // Has branch + PR but not yet merged — allowed (deploy merges + completes).
+      log.info(`workflow-gate: done gate: ${issueId} passed (has branch + PR, not yet merged)`);
     } else {
-      // No merged PR — require both a pushed branch AND an open/existing PR.
+      // No merged PR, and missing either branch or PR (or both).
+      // AI-1497: When both branch AND PR are absent, the data was likely lost
+      // to GitHub auto-delete. The ticket is in deployment state (post-approval),
+      // so fail-open rather than stranding. Only block when we have affirmative
+      // evidence that the work was NOT done (e.g. has branch but no PR — the
+      // author pushed but never opened a review).
       const missing: string[] = [];
       if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
       if (!branchStatus.hasPR) missing.push('no pull request associated');
-      if (missing.length > 0) {
+
+      const bothMissing = !branchStatus.hasBranch && !branchStatus.hasPR;
+      if (bothMissing) {
+        // Indeterminate — branch+PR data absent, likely lost to auto-delete.
+        // Ticket is in deployment state (post-approval). Fail-open.
+        log.warn(
+          `workflow-gate: done gate: ${issueId} has no branch or PR data ` +
+          `(likely lost to GitHub auto-delete after squash merge). ` +
+          `Failing open — ticket is in deployment state (post-code-review approval).`
+        );
+      } else {
+        // Partial evidence: has one but not the other. This is stronger signal
+        // that the work was NOT completed — block.
         log.warn(`workflow-gate: done gate: ${issueId} blocked — ${missing.join('; ')}`);
         return (
           `[Proxy] 'deploy' blocked: cannot reach terminal done. Missing: ${missing.join('; ')}. ` +
           `Push the branch and open a pull request before deploying.`
         );
       }
-      log.info(`workflow-gate: done gate: ${issueId} passed (has branch + PR, not yet merged)`);
     }
   }
 
@@ -1190,27 +1243,38 @@ export async function applyStateTransition(
     return;
   }
 
-  // ── AI-1475 Defect 1 + AI-1492: Done gate defense-in-depth (§5.6) ────────
+  // ── AI-1475 Defect 1 + AI-1492 + AI-1497: Done gate defense-in-depth (§5.6) ─
   // Block the label swap to done if the branch/PR gate is not satisfied.
   // This is defense-in-depth: checkWorkflowRules is the primary gate, but
-  // applyStateTransition also blocks to prevent any bypass path.
+  // applyStateTransition also checks to prevent any bypass path.
   // Only applies when intent is 'deploy' (dev-impl workflow: deployment → done).
   //
   // AI-1492: A merged PR satisfies the gate even without a branch (auto-deleted
   // after squash merge).
+  //
+  // AI-1497: When both branch AND PR data are absent (GitHub auto-deleted the
+  // branch after squash merge and Linear lost the PR association), fail-open
+  // because the ticket is in deployment state (post-code-review approval).
   if (intent === 'deploy' && toStateName === 'done') {
     const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     const hasMergedPR = branchStatus?.hasMergedPR === true;
     const hasBranchAndPR = branchStatus?.hasBranch && branchStatus?.hasPR;
-    if (!hasMergedPR && !hasBranchAndPR) {
+    // Both missing — indeterminate, likely lost to auto-delete. Fail-open.
+    const bothMissing = branchStatus && !branchStatus.hasBranch && !branchStatus.hasPR;
+    if (!hasMergedPR && !hasBranchAndPR && !bothMissing && branchStatus) {
+      // Partial evidence: has one but not the other — block.
       const missing: string[] = [];
-      if (!branchStatus) missing.push('could not verify branch/PR status');
-      else {
-        if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
-        if (!branchStatus.hasPR) missing.push('no pull request associated');
-      }
+      if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
+      if (!branchStatus.hasPR) missing.push('no pull request associated');
       log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
       return; // Block the transition
+    }
+    if (!branchStatus || bothMissing) {
+      log.warn(
+        `workflow-gate: B2 apply: done gate for ${issueId} — branch/PR data unavailable ` +
+        `(${!branchStatus ? 'fetch returned null' : 'both branch and PR absent, likely auto-delete'}). ` +
+        `Failing open — ticket is in deployment state (post-code-review approval).`
+      );
     }
   }
 
