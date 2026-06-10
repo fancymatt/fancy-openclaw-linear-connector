@@ -1365,16 +1365,16 @@ describe("checkWorkflowRules — AI-1475 D1: done gate (branch/PR verification)"
     expect(result).toContain("no pull request associated");
   });
 
-  it("blocks 'deploy' → done when neither branch nor PR exist", async () => {
+  // AI-1497: Complete absence of evidence is now fail-open — data likely lost to auto-delete.
+  it("allows 'deploy' → done when neither branch nor PR exist (AI-1497 fail-open)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: false });
     const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
-    expect(result).not.toBeNull();
-    expect(result).toContain("branch not pushed to origin");
-    expect(result).toContain("no pull request associated");
+    expect(result).toBeNull(); // fail-open: data likely lost to auto-delete
   });
 
-  it("fail-closed: blocks 'deploy' → done when branch/PR fetch returns null (API error)", async () => {
-    // Simulate: label fetch works, but branch/PR fetch returns no data
+  // AI-1497: null after retry is now fail-open to avoid stranding tickets.
+  it("fail-open: allows 'deploy' → done when branch/PR fetch returns null twice (API error, AI-1497)", async () => {
+    // Simulate: label fetch works, but branch/PR fetch returns no data twice
     let fetchCallCount = 0;
     globalThis.fetch = async (_url, init) => {
       fetchCallCount++;
@@ -1385,7 +1385,7 @@ describe("checkWorkflowRules — AI-1475 D1: done gate (branch/PR verification)"
           data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] }, delegate: null } },
         }), { status: 200, headers: { "Content-Type": "application/json" } });
       }
-      // Branch/PR fetch returns null-like data (no issue)
+      // Branch/PR fetch returns null-like data (no issue) — both times
       if (bodyText.includes("IssueBranchAndPR")) {
         return new Response(JSON.stringify({ data: { issue: null } }), {
           status: 200, headers: { "Content-Type": "application/json" },
@@ -1394,8 +1394,8 @@ describe("checkWorkflowRules — AI-1475 D1: done gate (branch/PR verification)"
       throw new Error(`unexpected fetch call: ${bodyText.slice(0, 60)}`);
     };
     const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
-    expect(result).not.toBeNull();
-    expect(result).toContain("unable to verify branch/pull-request status");
+    expect(result).toBeNull(); // fail-open after retry
+    expect(fetchCallCount).toBeGreaterThanOrEqual(3); // label fetch + 2 branch/PR fetches
   });
 
   it("done gate does NOT fire for non-deploy commands (reject in deployment state)", async () => {
@@ -1525,6 +1525,38 @@ describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () =
       ],
       teamLabels: [{ id: "done-lbl", name: "state:done" }],
       branchStatus: { hasBranch: false, hasPR: true, hasMergedPR: true },
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+  });
+
+  // AI-1497: complete absence of evidence is fail-open in B2 too.
+  it("allows label swap to done when neither branch nor PR exist (AI-1497 fail-open)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+      branchStatus: { hasBranch: false, hasPR: false },
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+  });
+
+  // AI-1497: null after retry is fail-open in B2.
+  it("allows label swap to done when branch/PR fetch throws both times (AI-1497 fail-open)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+      teamLabels: [{ id: "done-lbl", name: "state:done" }],
+      branchStatus: null, // simulates fetch error on every attempt
     });
     globalThis.fetch = mock;
     await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
@@ -3489,7 +3521,9 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       expect(deployTransitions).toHaveLength(0);
     });
 
-    it("dev-impl deploy also requires branch + PR (AI-1475 done gate)", async () => {
+    // AI-1497: deploy now fails open when no branch/PR evidence exists (data likely lost to auto-delete).
+    // Previously this blocked, but the absence of evidence is not evidence of absence.
+    it("dev-impl deploy passes done gate when no branch/PR evidence (AI-1497 fail-open)", async () => {
       const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
       process.env.WORKFLOW_DEF_PATH = devImplFixture;
       resetWorkflowCache();
@@ -3501,8 +3535,7 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
 
       globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment", "stakes:low"], { hasBranch: false, hasPR: false });
       const result = await checkWorkflowRules("deploy", "AI-3001", "Bearer tok", "hanzo");
-      expect(result).not.toBeNull();
-      expect(result).toContain("branch not pushed");
+      expect(result).toBeNull(); // AI-1497: fail-open on no evidence
 
       process.env.WORKFLOW_DEF_PATH = CANONICAL_SPRINT_FIXTURE;
       process.env.CAPABILITY_POLICY_PATH = path.join(c3Dir, "capability-policy.yaml");

@@ -731,31 +731,43 @@ export async function checkWorkflowRules(
   // Resolve destination state for subsequent gates.
   const destStateNode = def.states.find((s) => s.id === match.to);
 
-  // AI-1475 Defect 1 + AI-1492: Done gate (§5.6) — terminal 'done' requires evidence of merged PR.
-  // A wf:dev-impl ticket must not reach terminal done without evidence that the
-  // implementation was pushed, reviewed, and merged. Fail-closed: if we cannot
-  // determine branch/PR status, block the transition.
+  // AI-1475 Defect 1 + AI-1492 + AI-1497: Done gate (§5.6) — terminal 'done' requires
+  // evidence of merged PR. A wf:dev-impl ticket must not reach terminal done without
+  // evidence that the implementation was pushed, reviewed, and merged.
   // Only applies to the deploy command (dev-impl workflow: deployment → done).
   // Other workflows (ux-audit) have their own gate paths (parent-AC gate).
   //
   // AI-1492 fix: A merged PR satisfies the gate even when the source branch was
-  // auto-deleted by GitHub after a squash merge. Previously the gate keyed off
-  // branch existence, which breaks when the branch is deleted post-merge.
+  // auto-deleted by GitHub after a squash merge.
+  //
+  // AI-1497 fix: When branch+PR data are completely absent (both false), this is
+  // indistinguishable from a successfully-merged ticket whose data was lost to
+  // auto-delete. Since the ticket is in 'deployment' state (reachable only after
+  // code-review approval), fail-open rather than stranding the ticket. Only block
+  // when partial evidence exists (has branch but no PR = pushed but never reviewed).
+  // Also fail-open on null (transient API failure) after one retry.
   if (intent === 'deploy' && destStateNode?.kind === 'terminal' && match.to === 'done') {
-    const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+    let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+    // AI-1497: retry once on null — transient Linear API failure during
+    // Hanzo merge+deploy quick succession.
     if (!branchStatus) {
-      log.warn(`workflow-gate: done gate: could not verify branch/PR status for ${issueId} — blocking`);
-      return (
-        `[Proxy] 'deploy' blocked: unable to verify branch/pull-request status for ${issueId}. ` +
-        `Ensure the branch has been pushed to origin and a pull request exists.`
-      );
+      await new Promise((r) => setTimeout(r, 1000));
+      branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     }
-    // A merged PR is sufficient evidence — the code was reviewed and merged,
-    // regardless of whether the branch was auto-deleted after merge (AI-1492).
-    if (branchStatus.hasMergedPR) {
+    if (!branchStatus) {
+      // Two consecutive nulls — transient API failure. Fail-open to avoid
+      // stranding tickets; deployment state is already past code review.
+      log.warn(`workflow-gate: done gate: could not verify branch/PR status for ${issueId} after retry — failing open`);
+    } else if (branchStatus.hasMergedPR) {
       log.info(`workflow-gate: done gate: ${issueId} passed (merged PR confirmed)`);
+    } else if (!branchStatus.hasBranch && !branchStatus.hasPR) {
+      // AI-1497: Complete absence of evidence — likely lost to auto-delete.
+      // Fail-open: a ticket in deployment state has already passed code review,
+      // so the PR almost certainly existed and was merged.
+      log.info(`workflow-gate: done gate: ${issueId} passed (no branch/PR evidence — treating as merged, data likely lost to auto-delete)`);
     } else {
-      // No merged PR — require both a pushed branch AND an open/existing PR.
+      // Partial evidence exists (has branch but no PR, or similar).
+      // Block: affirmative evidence that review was not completed.
       const missing: string[] = [];
       if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
       if (!branchStatus.hasPR) missing.push('no pull request associated');
@@ -1111,7 +1123,7 @@ export async function applyStateTransition(
     return;
   }
 
-  // ── AI-1475 Defect 1 + AI-1492: Done gate defense-in-depth (§5.6) ────────
+  // ── AI-1475 Defect 1 + AI-1492 + AI-1497: Done gate defense-in-depth (§5.6) ─
   // Block the label swap to done if the branch/PR gate is not satisfied.
   // This is defense-in-depth: checkWorkflowRules is the primary gate, but
   // applyStateTransition also blocks to prevent any bypass path.
@@ -1119,19 +1131,33 @@ export async function applyStateTransition(
   //
   // AI-1492: A merged PR satisfies the gate even without a branch (auto-deleted
   // after squash merge).
+  //
+  // AI-1497: Fail-open on null (after retry) and on complete absence of evidence
+  // (no branch + no PR). Only block on partial evidence (branch exists but no PR).
   if (intent === 'deploy' && toStateName === 'done') {
-    const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+    let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+    if (!branchStatus) {
+      await new Promise((r) => setTimeout(r, 1000));
+      branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+    }
     const hasMergedPR = branchStatus?.hasMergedPR === true;
     const hasBranchAndPR = branchStatus?.hasBranch && branchStatus?.hasPR;
-    if (!hasMergedPR && !hasBranchAndPR) {
-      const missing: string[] = [];
-      if (!branchStatus) missing.push('could not verify branch/PR status');
-      else {
+    const noEvidenceAtAll = branchStatus && !branchStatus.hasBranch && !branchStatus.hasPR;
+    if (!hasMergedPR && !hasBranchAndPR && !noEvidenceAtAll) {
+      // Block: either null after retry (branchStatus is null → noEvidenceAtAll is false)
+      // or partial evidence (has branch but no PR).
+      // But AI-1497: if null after retry, fail-open instead of blocking.
+      if (!branchStatus) {
+        log.warn(`workflow-gate: B2 apply: done gate could not verify status for ${issueId} after retry — failing open`);
+      } else {
+        const missing: string[] = [];
         if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
         if (!branchStatus.hasPR) missing.push('no pull request associated');
+        log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
+        return; // Block the transition
       }
-      log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
-      return; // Block the transition
+    } else if (noEvidenceAtAll) {
+      log.info(`workflow-gate: B2 apply: done gate for ${issueId} — no branch/PR evidence, treating as merged (AI-1497 fail-open)`);
     }
   }
 
