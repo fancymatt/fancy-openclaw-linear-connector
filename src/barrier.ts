@@ -14,16 +14,24 @@
  *      parent. The parent's managing-wake already includes child-status checks;
  *      this module enriches it with stall-surface logic.
  *
- *   3. **Stall detection (§5.5):** Reuses the existing `code-review` SLA-breach /
- *      stale-session tripwire pattern from StuckDelegateDetector. When a child
- *      in a non-terminal state has been idle beyond a threshold, surfaces it
- *      via a comment on the parent + a stewardship wake to the parent's owner.
+ *   3. **Stall detection (§5.5 / §16.1):** Engine-owns-detection, parent-owns-response.
+ *      Each state carries an optional time-in-state SLA (from workflow def YAML).
+ *      When an outstanding child breaches its SLA, the engine emits a structured
+ *      **StallEvent** against that child and its ancestor chain. The parent agent's
+ *      managing-wake delivers the stall event — the parent decides the qualitative
+ *      response (nudge, guidance, or escalation via barrier-level break-glass, §5.3).
  *
- * Design: design.md §5.3, §5.5, §14.
+ *      **At-capacity ≠ stall.** A legitimately deferred/at-capacity child has its
+ *      waiting time attributed up the ancestor SLA accounting as **known deferral**,
+ *      so an overloaded-but-healthy subtree doesn't trip stall escalation while a
+ *      genuinely stuck leaf still does.
+ *
+ * Design: design.md §5.3, §5.5, §14, §16.1.
  *
  * ACs:
  *   - Last child terminal → parent auto-moves managing → review (no manual nudge).
- *   - A stalled child raises the §5.5 tripwire (surfaced, not silent).
+ *   - A deliberately stalled leaf produces a stall event to its parent.
+ *   - An at-capacity-but-healthy subtree does NOT trip stall escalation.
  *   - Children cannot address the parent (asymmetry enforced).
  */
 
@@ -102,10 +110,104 @@ export interface StalledChild {
   lastActivityAt: number | null;
   /** How long (ms) the child has been idle. */
   idleDurationMs: number;
+  /** Epoch ms when the child entered its current state (from Linear history). */
+  stateEnteredAt: number | null;
+  /** Per-state SLA in ms from the workflow definition, or null if no SLA defined. */
+  stateSlaMs: number | null;
+  /** How long (ms) the child has been in its current state. */
+  timeInStateMs: number;
+  /** Known-deferral time (ms) attributed to this child's ancestor chain. */
+  knownDeferralMs: number;
+  /** Whether this child is classified as at-capacity (deferred but healthy). */
+  isDeferredAtCapacity: boolean;
 }
 
 const DEFAULT_STALL_THRESHOLD_MS = 30 * 60 * 1000;  // 30 minutes
 const DEFAULT_POLL_INTERVAL_MS = 10 * 60 * 1000;     // 10 minutes
+
+// ── Stall event (§5.5 / §16.1) ─────────────────────────────────────────────
+
+/**
+ * A structured stall event emitted by the engine when a child breaches its
+ * per-state SLA. Delivered to the parent agent via the managing-wake flow.
+ *
+ * The engine detects; the parent agent decides the qualitative response.
+ */
+export interface StallEvent {
+  /** The child that breached its SLA. */
+  childIdentifier: string;
+  /** The parent that receives the stall event. */
+  parentIdentifier: string;
+  /** The child's current workflow state. */
+  currentState: string;
+  /** How long the child has been in this state (ms). */
+  timeInStateMs: number;
+  /** The per-state SLA (ms) from the workflow definition. */
+  slaMs: number;
+  /** How far past the SLA the child is (ms). */
+  breachMs: number;
+  /** Known-deferral time accounted for (at-capacity, §16.1). */
+  knownDeferralMs: number;
+  /** Whether the child is at-capacity (deferred but healthy). */
+  isDeferredAtCapacity: boolean;
+  /** When the stall event was created (epoch ms). */
+  createdAt: number;
+}
+
+/**
+ * In-memory accounting of known-deferral time per (agent, ticket).
+ *
+ * When a child is at-capacity (legitimately deferred, per AI-1339), its
+ * waiting time is tracked here so the stall detection can subtract it from
+ * the SLA clock. An overloaded-but-healthy subtree does NOT trip stall
+ * escalation while a genuinely stuck leaf still does.
+ */
+export class DeferralAccountant {
+  private deferrals: Map<string, { startedAt: number; accumulatedMs: number }> = new Map();
+
+  /** Start tracking deferral for a child. */
+  startDeferral(childIdentifier: string, now: number = Date.now()): void {
+    const key = childIdentifier;
+    const existing = this.deferrals.get(key);
+    if (existing) {
+      // Already deferring — accumulate what we have and restart
+      existing.accumulatedMs += now - existing.startedAt;
+      existing.startedAt = now;
+    } else {
+      this.deferrals.set(key, { startedAt: now, accumulatedMs: 0 });
+    }
+  }
+
+  /** Stop tracking deferral for a child (e.g., when it becomes active again). */
+  stopDeferral(childIdentifier: string, now: number = Date.now()): number {
+    const key = childIdentifier;
+    const entry = this.deferrals.get(key);
+    if (!entry) return 0;
+    const total = entry.accumulatedMs + (now - entry.startedAt);
+    this.deferrals.delete(key);
+    return total;
+  }
+
+  /** Get the total known-deferral time for a child (ms). */
+  getDeferralMs(childIdentifier: string, now: number = Date.now()): number {
+    const entry = this.deferrals.get(childIdentifier);
+    if (!entry) return 0;
+    return entry.accumulatedMs + (now - entry.startedAt);
+  }
+
+  /** Check if a child is currently in deferral. */
+  isDeferring(childIdentifier: string): boolean {
+    return this.deferrals.has(childIdentifier);
+  }
+
+  /** Clear all deferral state. */
+  clearAll(): void {
+    this.deferrals.clear();
+  }
+}
+
+// Global singleton — survives across poll cycles within a single connector process.
+export const deferralAccountant = new DeferralAccountant();
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -505,12 +607,17 @@ export function buildShepherdingMessage(
 
   if (stalledChildren.length > 0) {
     lines.push("");
-    lines.push("⚠️ Stalled children (§5.5 tripwire):");
+    lines.push("⚠️ Stall event(s) (§5.5 / §16.1 — engine-detected SLA breach):");
     for (const stalled of stalledChildren) {
-      const idleMin = Math.round(stalled.idleDurationMs / 60000);
+      const timeInStateMin = Math.round(stalled.timeInStateMs / 60000);
+      const slaMin = stalled.stateSlaMs ? Math.round(stalled.stateSlaMs / 60000) : null;
+      const slaInfo = slaMin ? ` (SLA: ${slaMin}m)` : "";
+      const deferralInfo = stalled.knownDeferralMs > 0
+        ? ` [deferral accounted: ${Math.round(stalled.knownDeferralMs / 60000)}m]`
+        : "";
       lines.push(
         `  - ${stalled.identifier}: ${stalled.currentState ?? "unknown"} ` +
-        `(idle ${idleMin}m)`,
+        `(${timeInStateMin}m in state${slaInfo}${deferralInfo})`,
       );
     }
     lines.push("");
@@ -577,25 +684,121 @@ async function fetchChildLastActivity(
 }
 
 /**
+ * Fetch the epoch ms when a child entered its current state, by examining
+ * Linear history for the most recent `state:*` label change.
+ *
+ * Returns null if the state-entry time cannot be determined.
+ */
+async function fetchChildStateEnteredAt(
+  childIdentifier: string,
+  authToken: string,
+): Promise<number | null> {
+  const query = `
+    query ChildStateHistory($id: String!) {
+      issue(id: $id) {
+        labels { nodes { name } }
+        history(first: 100, orderBy: { createdAt: desc }) {
+          nodes {
+            __typename
+            ... on IssueLabelPayload {
+              createdAt
+              fromLabel { name }
+              toLabel { name }
+            }
+          }
+        }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: childIdentifier } }),
+    });
+    type HistoryNode = {
+      __typename: string;
+      createdAt?: string;
+      fromLabel?: { name: string } | null;
+      toLabel?: { name: string } | null;
+    };
+    type Resp = {
+      data?: {
+        issue?: {
+          labels?: { nodes?: Array<{ name: string }> };
+          history?: { nodes?: HistoryNode[] };
+        } | null;
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const issue = data.data?.issue;
+    if (!issue) return null;
+
+    // Get the current state from labels
+    const labelNames = (issue.labels?.nodes ?? []).map((l) => l.name);
+    const currentState = getCurrentState(labelNames);
+    if (!currentState) return null;
+
+    const stateLabel = `state:${currentState}`;
+    const historyNodes = issue.history?.nodes ?? [];
+
+    // Find the most recent history event where the state:* label was set to the current state
+    for (const node of historyNodes) {
+      if (node.__typename === "IssueLabelPayload" && node.toLabel?.name === stateLabel && node.createdAt) {
+        return new Date(node.createdAt).getTime();
+      }
+    }
+
+    return null; // Couldn't determine state entry time
+  } catch (err) {
+    log.error(`barrier: failed to fetch state entry for ${childIdentifier}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/**
  * Detect stalled children of a parent issue in `managing` state.
  *
- * A child is stalled when:
+ * Phase 6.5 / H-3 (AI-1478): Engine-owns-detection split.
+ *
+ * A child is stalled when ALL of the following are true:
  *   - It is in a non-terminal state.
- *   - Its last activity (updatedAt) exceeds the stall threshold.
- *   - The parent is in `managing` state on `ux-audit` workflow.
+ *   - It has been in its current state longer than the per-state SLA
+ *     (from the workflow definition YAML), MINUS any known-deferral time.
+ *   - It is NOT classified as at-capacity (deferred but healthy).
  *
- * Returns the list of stalled children for the §5.5 tripwire.
+ * At-capacity children (§16.1) have their waiting time attributed as
+ * known deferral so they do NOT trip stall escalation. Genuinely stuck
+ * leaves that are NOT at-capacity still do.
  *
- * AC2: A stalled child raises the §5.5 tripwire (surfaced, not silent).
+ * Returns the list of stalled children with StallEvent data.
+ *
+ * AC1: A deliberately stalled leaf produces a stall event to its parent.
+ * AC2: An at-capacity-but-healthy subtree does NOT trip stall escalation.
  */
 export async function detectStalledChildren(
   parentIdentifier: string,
   authToken: string,
   stallThresholdMs: number = DEFAULT_STALL_THRESHOLD_MS,
   now: number = Date.now(),
+  workflowDef?: WorkflowDef,
+  accountant?: DeferralAccountant,
 ): Promise<StalledChild[]> {
   const children = await fetchChildren(parentIdentifier, authToken);
   const stalled: StalledChild[] = [];
+
+  // Load workflow def if not provided
+  let def = workflowDef;
+  if (!def) {
+    try {
+      def = await loadWorkflowDef();
+    } catch {
+      // Fallback to legacy flat-threshold behavior if workflow def unavailable
+      log.warn("barrier: workflow def unavailable, using flat stall threshold");
+    }
+  }
+
+  const acct = accountant ?? deferralAccountant;
 
   for (const child of children) {
     if (child.isTerminal) continue;
@@ -604,13 +807,51 @@ export async function detectStalledChildren(
     if (lastActivity === null) continue;
 
     const idleDurationMs = now - lastActivity;
-    if (idleDurationMs >= stallThresholdMs) {
+
+    // Fetch state-entry time for per-state SLA
+    const stateEnteredAt = await fetchChildStateEnteredAt(child.identifier, authToken);
+    const timeInStateMs = stateEnteredAt !== null ? now - stateEnteredAt : idleDurationMs;
+
+    // Look up per-state SLA from workflow def
+    let stateSlaMs: number | null = null;
+    if (def && child.workflowState) {
+      const stateDef = def.states.find((s) => s.id === child.workflowState);
+      if (stateDef?.sla) {
+        stateSlaMs = stateDef.sla;
+      }
+    }
+
+    // Known-deferral accounting (at-capacity, §16.1)
+    const isDeferredAtCapacity = acct.isDeferring(child.identifier);
+    const knownDeferralMs = acct.getDeferralMs(child.identifier, now);
+
+    // Determine effective threshold: per-state SLA or flat fallback
+    const effectiveThresholdMs = stateSlaMs ?? stallThresholdMs;
+
+    // Effective time in state = time in state minus known deferral
+    // At-capacity children get their deferral time subtracted so they don't
+    // trip stall escalation (AC2)
+    const effectiveTimeMs = Math.max(0, timeInStateMs - knownDeferralMs);
+
+    // Skip at-capacity children: they are deferred but healthy (AC2)
+    if (isDeferredAtCapacity) {
+      // Even though they might have a large time-in-state, they are accounted for
+      // and should not trigger stall escalation
+      continue;
+    }
+
+    if (effectiveTimeMs >= effectiveThresholdMs) {
       stalled.push({
         identifier: child.identifier,
         parentIdentifier,
         currentState: child.workflowState,
         lastActivityAt: lastActivity,
         idleDurationMs,
+        stateEnteredAt,
+        stateSlaMs,
+        timeInStateMs,
+        knownDeferralMs,
+        isDeferredAtCapacity,
       });
     }
   }
@@ -619,21 +860,46 @@ export async function detectStalledChildren(
 }
 
 /**
- * Surface stalled children by posting a tripwire comment on the parent.
+ * Build a StallEvent from a StalledChild.
  *
- * This is the §5.5 tripwire: a stalled child surfaces instead of hanging
- * the barrier. The comment is posted on the parent ticket so the parent's
- * owner (researcher/engine) can take action.
+ * The engine emits this structured event; the parent agent decides the response.
+ */
+export function buildStallEvent(
+  child: StalledChild,
+  now: number = Date.now(),
+): StallEvent {
+  const slaMs = child.stateSlaMs ?? DEFAULT_STALL_THRESHOLD_MS;
+  return {
+    childIdentifier: child.identifier,
+    parentIdentifier: child.parentIdentifier,
+    currentState: child.currentState ?? "unknown",
+    timeInStateMs: child.timeInStateMs,
+    slaMs,
+    breachMs: Math.max(0, child.timeInStateMs - child.knownDeferralMs - slaMs),
+    knownDeferralMs: child.knownDeferralMs,
+    isDeferredAtCapacity: child.isDeferredAtCapacity,
+    createdAt: now,
+  };
+}
+
+/**
+ * Surface stalled children by emitting stall events to the parent.
  *
- * Returns the number of stalled children surfaced.
+ * Phase 6.5 / H-3 (AI-1478): Engine detects stall → emits StallEvent(s) →
+ * parent agent responds via managing-wake flow.
+ *
+ * Posts a tripwire comment on the parent ticket with structured stall data.
+ * Returns the list of StallEvents for downstream delivery (managing-wake).
  */
 export async function surfaceStalledChildren(
   parentIdentifier: string,
   authToken: string,
   stallThresholdMs: number = DEFAULT_STALL_THRESHOLD_MS,
-): Promise<number> {
+): Promise<{ surfaced: number; events: StallEvent[] }> {
   const stalled = await detectStalledChildren(parentIdentifier, authToken, stallThresholdMs);
-  if (stalled.length === 0) return 0;
+  if (stalled.length === 0) return { surfaced: 0, events: [] };
+
+  const events: StallEvent[] = stalled.map((child) => buildStallEvent(child));
 
   const children = await fetchChildren(parentIdentifier, authToken);
   const message = buildShepherdingMessage(parentIdentifier, children, stalled);
@@ -641,16 +907,16 @@ export async function surfaceStalledChildren(
   const internalId = await resolveInternalId(parentIdentifier, authToken);
   if (!internalId) {
     log.error(`barrier: cannot surface stalled children — failed to resolve ${parentIdentifier}`);
-    return 0;
+    return { surfaced: 0, events };
   }
 
   const posted = await postComment(internalId, message, authToken);
   if (posted) {
     log.info(
-      `barrier: §5.5 tripwire — surfaced ${stalled.length} stalled child(ren) on ${parentIdentifier}`,
+      `barrier: §5.5/§16.1 — emitted ${events.length} stall event(s) on ${parentIdentifier}`,
     );
   }
-  return stalled.length;
+  return { surfaced: events.length, events };
 }
 
 /**
