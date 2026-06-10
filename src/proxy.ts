@@ -31,7 +31,7 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, type TransitionFeedback } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, type TransitionFeedback, type TransitionOutcome } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import { getAgent } from "./agents.js";
 
@@ -194,6 +194,71 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
     }
   }
 
+  // ── AI-1498: Proxy is the SOLE atomic writer of all transition facets ──────
+  // For governed transitions (intent present), run B2 BEFORE any forward. If B2
+  // handles the transition it writes label + delegate + native stateId in ONE
+  // issueUpdate mutation, and we synthesize the CLI's response instead of
+  // forwarding — guaranteeing exactly one mutation per transition (AC#3) and no
+  // two-writer drift seam. The CLI's own facet-writing mutation is never relayed.
+  if (intent) {
+    let feedback: TransitionFeedback | undefined;
+    if (feedbackCategoryHeader && (intent === "request-changes" || intent === "reject")) {
+      const fromBodyHeader = (req.headers["x-openclaw-from-body"] as string | undefined) ?? null;
+      feedback = {
+        fromBody: fromBodyHeader,
+        reasonCode: feedbackCategoryHeader as ReasonCode,
+        freeText: extractCommentBody(body),
+      };
+    }
+
+    const outcome: TransitionOutcome = { handled: false, committed: false, blocked: null, internalId: null };
+    try {
+      await applyStateTransition(intent, issueId, authorization, {
+        bodyId: agentId,
+        observationStore: deps?.observationStore,
+        feedback,
+        artifactRef: artifactRefHeader,
+        outcome,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`state-transition failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+      // Fail-open: fall through to forward verbatim (legacy posture).
+    }
+
+    // B2 refused the transition — return the reason, never forward (so no facet
+    // is written and the ticket cannot land in a partial/inconsistent state).
+    if (outcome.handled && outcome.blocked) {
+      log.warn(`transition-block agent=${agentId} intent=${intent}${ticketCtx}: ${outcome.blocked}`);
+      res.status(200).json({ errors: [{ message: `[Workflow] ${outcome.blocked}` }] });
+      return;
+    }
+
+    // B2 committed the full transition — synthesize the issueUpdate response the
+    // CLI expects (it follows up with its own getIssue, forwarded normally).
+    if (outcome.handled && outcome.committed) {
+      const synthesized: Record<string, unknown> = {
+        data: { issueUpdate: { success: true, issue: { id: outcome.internalId } } },
+      };
+      // Layer 1 (AI-1387): proactive legal-verb re-injection at completion. B2 has
+      // already written the new state, so the reminder reflects the NEW legal moves.
+      let workflowReminder: string | null = null;
+      try {
+        workflowReminder = await buildStateTransitionReminder(intent, issueId, authorization);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`reminder-build failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+      }
+      if (workflowReminder) synthesized._workflowReminder = workflowReminder;
+      log.info(`sole-writer committed agent=${agentId} intent=${intent}${ticketCtx} — synthesized response (no forward)`);
+      res.status(200).set("Content-Type", "application/json").send(JSON.stringify(synthesized));
+      return;
+    }
+    // outcome.handled === false → non-governed / fail-open: forward verbatim below.
+  }
+
+  // Forward to Linear: non-intent requests (queries, comments, the CLI's own
+  // follow-up getIssue) and governed requests B2 declined to handle (fail-open).
   let upstreamRes: globalThis.Response;
   try {
     upstreamRes = await fetch(LINEAR_API_URL, {
@@ -215,63 +280,6 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
 
   const responseText = await upstreamRes.text();
   log.info(`response agent=${agentId} op=${opName} status=${upstreamRes.status}`);
-
-  // Phase 3 B2: apply state:* label transition after a successful forward.
-  // Phase 4 / P4-1: record feedback observation for feedback transitions.
-  // Only runs when the command was validated (intent present, no P2/P3 block).
-  // Fail-open: errors are logged and never propagate to the agent's response.
-  if (intent && upstreamRes.ok) {
-    try {
-      // Build feedback context for observation recording.
-      let feedback: TransitionFeedback | undefined;
-      if (feedbackCategoryHeader && (intent === "request-changes" || intent === "reject")) {
-        const fromBodyHeader = (req.headers["x-openclaw-from-body"] as string | undefined) ?? null;
-        feedback = {
-          fromBody: fromBodyHeader,
-          reasonCode: feedbackCategoryHeader as ReasonCode,
-          freeText: extractCommentBody(body),
-        };
-      }
-      await applyStateTransition(intent, issueId, authorization, {
-        bodyId: agentId,
-        observationStore: deps?.observationStore,
-        feedback,
-        artifactRef: artifactRefHeader,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.warn(`state-transition failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
-    }
-
-    // Layer 1 (AI-1387): proactive legal-verb re-injection at completion.
-    // After a successful state transition, generate the legal commands for
-    // the NEW state and include in the response body so the agent sees them
-    // at the decision moment — not just at delegation time.
-    // Injected into the response JSON as `_workflowReminder` since HTTP headers
-    // cannot carry newlines.
-    let workflowReminder: string | null = null;
-    try {
-      workflowReminder = await buildStateTransitionReminder(intent, issueId, authorization);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.warn(`reminder-build failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
-    }
-
-    // If we have a reminder, inject it into the response body.
-    if (workflowReminder) {
-      try {
-        const parsedResponse = JSON.parse(responseText);
-        parsedResponse._workflowReminder = workflowReminder;
-        res
-          .status(upstreamRes.status)
-          .set("Content-Type", "application/json")
-          .send(JSON.stringify(parsedResponse));
-        return;
-      } catch {
-        // If response isn't valid JSON, fall through to send as-is.
-      }
-    }
-  }
 
   res
     .status(upstreamRes.status)

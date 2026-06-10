@@ -750,7 +750,7 @@ describe("proxy enforcement — B2 state-label transition application", () => {
    *   IssueLabels   — B1 validation fetch (returns label names)
    *   IssueWithLabels — B2 transition fetch (returns label IDs + team)
    *   TeamLabels    — B2 label lookup
-   *   ApplyStateTransition — B2 issueUpdate mutation
+   *   ApplyAtomicTransition — B2 issueUpdate mutation
    *   everything else → MOCK_RESPONSE (the agent's main mutation)
    * Records every call so tests can assert transition behavior.
    */
@@ -789,7 +789,7 @@ describe("proxy enforcement — B2 state-label transition application", () => {
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
-      if (q.includes("ApplyStateTransition")) {
+      if (q.includes("ApplyAtomicTransition")) {
         const success = opts.updateSuccess ?? true;
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success } } }),
@@ -805,7 +805,7 @@ describe("proxy enforcement — B2 state-label transition application", () => {
     return { fetch: mockFetch, calls };
   }
 
-  it("applies state transition after a legal command is forwarded", async () => {
+  it("is the sole atomic writer of a legal transition (AI-1498: one mutation, CLI body not forwarded)", async () => {
     const { fetch: mock, calls } = makeB2Fetch({
       b1LabelResponse: DEV_IMPL_IMPLEMENTATION_RESPONSE,
     });
@@ -820,10 +820,15 @@ describe("proxy enforcement — B2 state-label transition application", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeUndefined();
-    // B2 transition call should have fired.
-    expect(calls.some((c) => c.query.includes("ApplyStateTransition"))).toBe(true);
-    // The issueUpdate should use internal UUID and contain the new label.
-    const b2call = calls.find((c) => c.query.includes("ApplyStateTransition"));
+    // The proxy synthesizes the CLI's expected issueUpdate response from internalId.
+    expect(res.body.data.issueUpdate.success).toBe(true);
+    expect(res.body.data.issueUpdate.issue.id).toBe("internal-uuid");
+    // B2 transition call should have fired (the SOLE issueUpdate to Linear).
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(true);
+    // The CLI's own facet-writing mutation must NOT have been forwarded (sole-writer).
+    expect(calls.some((c) => c.query.includes("mutation M"))).toBe(false);
+    // The atomic mutation uses the internal UUID and carries the new label.
+    const b2call = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
     expect(b2call).toBeDefined();
     const vars = b2call!.variables as { issueId: string; labelIds: string[] };
     expect(vars.issueId).toBe("internal-uuid");
@@ -846,7 +851,7 @@ describe("proxy enforcement — B2 state-label transition application", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeDefined();
-    expect(calls.some((c) => c.query.includes("ApplyStateTransition"))).toBe(false);
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
   });
 
   it("does NOT apply transition when no intent header (pure pass-through)", async () => {
@@ -864,10 +869,10 @@ describe("proxy enforcement — B2 state-label transition application", () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual(MOCK_RESPONSE);
-    expect(calls.some((c) => c.query.includes("ApplyStateTransition"))).toBe(false);
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
   });
 
-  it("returns the upstream response even when the B2 transition fails", async () => {
+  it("blocks (no partial write) when the B2 atomic transition fails (AI-1498 sole-writer)", async () => {
     const { fetch: mock, calls } = makeB2Fetch({
       b1LabelResponse: DEV_IMPL_IMPLEMENTATION_RESPONSE,
       updateSuccess: false,
@@ -881,10 +886,14 @@ describe("proxy enforcement — B2 state-label transition application", () => {
       .set("X-Openclaw-Linear-Intent", "submit")
       .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
 
-    // Agent response is still 200 even though label update returned non-success.
+    // Under sole-writer there is no forward to fall back on: a failed atomic write
+    // is surfaced as a workflow error so the agent knows nothing landed.
     expect(res.status).toBe(200);
-    expect(res.body.errors).toBeUndefined();
-    expect(calls.some((c) => c.query.includes("ApplyStateTransition"))).toBe(true);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("atomic transition mutation failed");
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(true);
+    // The CLI's own issueUpdate mutation (operation "M") must NOT have been forwarded.
+    expect(calls.some((c) => c.query.includes("mutation M"))).toBe(false);
   });
 });
 
@@ -1072,7 +1081,7 @@ describe("proxy — Layer 1 workflow reminder header (AI-1387)", () => {
    *   IssueLabels — B1 validation
    *   IssueWithLabels — B2 transition
    *   TeamLabels — B2 label lookup
-   *   ApplyStateTransition — B2 issueUpdate
+   *   ApplyAtomicTransition — B2 issueUpdate
    *   everything else → MOCK_RESPONSE
    */
   function makeFullFetch(opts: {
@@ -1105,7 +1114,7 @@ describe("proxy — Layer 1 workflow reminder header (AI-1387)", () => {
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
-      if (q.includes("ApplyStateTransition")) {
+      if (q.includes("ApplyAtomicTransition")) {
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success: true } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },

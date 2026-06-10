@@ -129,13 +129,31 @@ export async function loadWorkflowDef(): Promise<WorkflowDef> {
     if (def.break_glass && !def.break_glass.command) {
       log.warn(`workflow-gate: break_glass block in ${workflowDefPath()} has no 'command' field — falling back to hardcoded "escape". Canonicalize the YAML to add command: escape.`);
     }
-    _workflowCache = def;
-    recordSuccess("workflow-def");
-    // AI-1490: validate native_state mappings on load.
+    // AI-1490 / AI-1498: validate native_state mappings on load.
+    // All-or-nothing rule: a workflow that opts into native projection (declares
+    // native_state on ANY non-terminal state) must declare a valid native_state
+    // on EVERY non-terminal state — a partial/missing mapping is exactly what let
+    // `deployment` fall through to native "Invalid". Hard fail so a bad YAML can
+    // never produce desync in production. Workflows that declare no native_state
+    // at all are treated as legacy (no native projection) and only warned.
     const warnings = validateNativeStateMappings(def);
-    for (const w of warnings) {
+    const optsIntoNative = def.states.some(
+      (s) => s.kind !== "terminal" && !!s.native_state,
+    );
+    const fatal = optsIntoNative
+      ? warnings.filter((w) => w.includes("has no native_state field") || w.includes("not a recognized semantic state"))
+      : [];
+    const nonfatal = warnings.filter((w) => !fatal.includes(w));
+    for (const w of nonfatal) {
       log.warn(`workflow-gate: native_state validation: ${w}`);
     }
+    if (fatal.length > 0) {
+      const msg = `workflow-gate: native_state hard-fail — governed workflow '${def.id}' has invalid native_state mappings: ${fatal.join("; ")}`;
+      recordFailure("workflow-def", msg);
+      throw new Error(msg);
+    }
+    _workflowCache = def;
+    recordSuccess("workflow-def");
     return _workflowCache;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -147,6 +165,109 @@ export async function loadWorkflowDef(): Promise<WorkflowDef> {
 /** Invalidate the in-process workflow def cache (used in tests). */
 export function resetWorkflowCache(): void {
   _workflowCache = null;
+}
+
+// ── AI-1498: Team Linear state cache + native state resolver ───────────────
+
+const _teamStatesCache = new Map<string, Array<{id: string; name: string; type: string}>>();
+const _nativeStateIdCache = new Map<string, string>();
+
+/** Invalidate the team state caches (used in tests). */
+export function resetTeamStatesCache(): void {
+  _teamStatesCache.clear();
+  _nativeStateIdCache.clear();
+}
+
+async function fetchTeamLinearStates(
+  teamId: string,
+  authToken: string,
+): Promise<Array<{id: string; name: string; type: string}>> {
+  const cached = _teamStatesCache.get(teamId);
+  if (cached) return cached;
+  const query = `query TeamStates($teamId: String!) { team(id: $teamId) { workflow { states { id name type } } } }`;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { teamId } }),
+    });
+    type Resp = { data?: { team?: { workflow: { states: Array<{id: string; name: string; type: string}> } } | null } };
+    const data = (await res.json()) as Resp;
+    const states = data.data?.team?.workflow?.states ?? [];
+    _teamStatesCache.set(teamId, states);
+    return states;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: fetchTeamLinearStates failed for team ${teamId}: ${msg}`);
+    return [];
+  }
+}
+
+/**
+ * Candidate Linear state names per semantic native_state, mirroring the CLI's
+ * SEMANTIC_STATE_MAP (src/states.ts) so both layers resolve to the same column.
+ * First-match (case-insensitive) wins; a type-based fallback covers teams whose
+ * state names differ from the canonical set.
+ */
+const NATIVE_STATE_CANDIDATES: Record<string, string[]> = {
+  backlog: ["Backlog"],
+  todo: ["Todo", "To Do", "To Develop"],
+  thinking: ["Thinking", "In Progress"],
+  doing: ["Doing", "In Progress", "Developing"],
+  managing: ["Managing"],
+  done: ["Done"],
+  invalid: ["Invalid", "Canceled", "Cancelled"],
+};
+
+/** Linear state `type` to prefer when no candidate name matches. */
+const NATIVE_STATE_TYPE_FALLBACK: Record<string, string> = {
+  backlog: "backlog",
+  todo: "unstarted",
+  thinking: "started",
+  doing: "started",
+  managing: "started",
+  done: "completed",
+  invalid: "canceled",
+};
+
+/**
+ * Resolve a semantic state name (from workflow YAML native_state) to the team's
+ * actual Linear state UUID. Cached per team+semantic pair.
+ * AI-1498: used to fold stateId into the atomic transition mutation.
+ * Resolution order: exact candidate name → case-insensitive candidate name →
+ * state-type fallback. Returns null when nothing resolves (caller fails closed).
+ */
+export async function resolveNativeStateId(
+  semanticName: string,
+  teamId: string,
+  authToken: string,
+): Promise<string | null> {
+  const cacheKey = `${semanticName}:${teamId}`;
+  const cached = _nativeStateIdCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  const states = await fetchTeamLinearStates(teamId, authToken);
+  if (states.length === 0) return null;
+
+  const candidates = NATIVE_STATE_CANDIDATES[semanticName] ?? [semanticName];
+  let resolved: string | undefined;
+  for (const name of candidates) {
+    resolved = states.find(s => s.name === name)?.id;
+    if (resolved) break;
+  }
+  if (!resolved) {
+    for (const name of candidates) {
+      resolved = states.find(s => s.name.toLowerCase() === name.toLowerCase())?.id;
+      if (resolved) break;
+    }
+  }
+  if (!resolved) {
+    const fallbackType = NATIVE_STATE_TYPE_FALLBACK[semanticName];
+    if (fallbackType) resolved = states.find(s => s.type === fallbackType)?.id;
+  }
+
+  if (resolved) _nativeStateIdCache.set(cacheKey, resolved);
+  return resolved ?? null;
 }
 
 /**
@@ -1081,6 +1202,31 @@ export interface ApplyStateTransitionOptions {
   feedback?: TransitionFeedback;
   /** §5.7 item 1 / C-2: artifact ref to bind at intake.accept (sprint-plan doc path). */
   artifactRef?: string | null;
+  /**
+   * AI-1498: backward-compatible out-param. When provided, applyStateTransition
+   * populates it so the proxy can become the SOLE atomic writer of all transition
+   * facets (label + delegate + native stateId). The function still returns void,
+   * so the ~40 existing tests that ignore this field are unaffected.
+   *
+   * Semantics for the proxy:
+   *   - handled=false           → non-governed / undetermined; proxy forwards verbatim.
+   *   - handled=true, blocked!=null → transition refused; proxy returns the error, no forward.
+   *   - handled=true, committed=true → B2 wrote (or governed no-op); proxy synthesizes the
+   *                                    CLI response from internalId, no forward.
+   */
+  outcome?: TransitionOutcome;
+}
+
+/** AI-1498: out-param describing how a governed transition was resolved. */
+export interface TransitionOutcome {
+  /** True when this was a governed transition the proxy must NOT forward. */
+  handled: boolean;
+  /** True when B2 successfully wrote the transition (or intentionally no-op'd). */
+  committed: boolean;
+  /** Non-null reason when the transition was refused (proxy returns this as an error). */
+  blocked: string | null;
+  /** Internal Linear issue UUID, for synthesizing the CLI's issueUpdate response. */
+  internalId: string | null;
 }
 
 export async function applyStateTransition(
@@ -1089,6 +1235,13 @@ export async function applyStateTransition(
   authToken: string,
   options?: ApplyStateTransitionOptions,
 ): Promise<void> {
+  // AI-1498: out-param helper. Default outcome (handled=false) means "proxy forwards"
+  // — every fail-open early return below leaves that default, so only the governed
+  // write/block/no-op exits need to opt in.
+  const setOutcome = (o: Partial<TransitionOutcome>): void => {
+    if (options?.outcome) Object.assign(options.outcome, o);
+  };
+
   // TODO(AI-1347): no-op on missing issueId carries the same fail-open posture as B1.
   if (!issueId) return;
 
@@ -1097,6 +1250,7 @@ export async function applyStateTransition(
     log.warn(`workflow-gate: B2 apply: could not fetch labels for ${issueId} — skipping`);
     return;
   }
+  setOutcome({ internalId: issue.internalId });
 
   const labelNames = issue.labels.map((l) => l.name);
   const workflowId = getWorkflowId(labelNames);
@@ -1144,10 +1298,21 @@ export async function applyStateTransition(
     const keepIds = issue.labels
       .filter((l) => !l.name.startsWith("state:") && !l.name.startsWith("wf:"))
       .map((l) => l.id);
-    await issueUpdateLabels(issue.internalId, keepIds, authToken);
-    log.info(
-      `workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels`,
+    // AI-1498: demote also resets the native column to backlog so the ticket
+    // leaves governance in a sane non-workflow state (no stranded Doing/Invalid).
+    const backlogStateId = await resolveNativeStateId("backlog", issue.teamId, authToken);
+    const applied = await issueUpdateAtomic(
+      issue.internalId,
+      keepIds,
+      authToken,
+      null,
+      backlogStateId,
     );
+    log.info(
+      `workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels` +
+      (backlogStateId ? `, native→backlog` : ``),
+    );
+    setOutcome(applied ? { handled: true, committed: true } : { handled: true, blocked: "demote atomic write failed" });
     return;
   }
 
@@ -1163,6 +1328,7 @@ export async function applyStateTransition(
       log.info(
         `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' with label present — no-op`,
       );
+      setOutcome({ handled: true, committed: true });
       return;
     }
     // Label is missing despite being in the correct state — re-stamp.
@@ -1176,17 +1342,30 @@ export async function applyStateTransition(
     );
     if (!newLabelId) {
       log.warn(`workflow-gate: B2 apply: could not create label '${targetLabelName}' for re-stamp on ${issueId} — skipping`);
+      setOutcome({ handled: true, blocked: `could not create label '${targetLabelName}' for re-stamp` });
       return;
     }
-    // Remove any stale state:* labels and add the correct one.
+    // Remove any stale state:* labels and add the correct one. AI-1498: also
+    // re-assert the native column so a partial-write recovery restores all facets.
     const cleanedLabelIds = issue.labels
       .filter((l) => !l.name.startsWith("state:"))
       .map((l) => l.id);
     cleanedLabelIds.push(newLabelId);
-    const applied = await issueUpdateLabels(issue.internalId, cleanedLabelIds, authToken);
+    const restampStateNode = def.states.find((s) => s.id === toStateName);
+    const restampStateId = restampStateNode?.native_state
+      ? await resolveNativeStateId(restampStateNode.native_state, issue.teamId, authToken)
+      : null;
+    const applied = await issueUpdateAtomic(
+      issue.internalId,
+      cleanedLabelIds,
+      authToken,
+      undefined,
+      restampStateId,
+    );
     if (applied) {
       log.info(`workflow-gate: B2 apply: ${issueId} re-stamped label '${targetLabelName}'`);
     }
+    setOutcome(applied ? { handled: true, committed: true } : { handled: true, blocked: "re-stamp atomic write failed" });
     return;
   }
 
@@ -1210,6 +1389,7 @@ export async function applyStateTransition(
         if (!branchStatus.hasPR) missing.push('no pull request associated');
       }
       log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
+      setOutcome({ handled: true, blocked: `cannot advance to done: ${missing.join('; ')}` });
       return; // Block the transition
     }
   }
@@ -1227,15 +1407,18 @@ export async function applyStateTransition(
       const acResult = await dispositionToDone(issueId, authToken);
       if (!acResult.applied) {
         log.warn(`workflow-gate: B-4 review: → done blocked for ${issueId}: ${acResult.error ?? "unknown"}`);
+        setOutcome({ handled: true, blocked: `parent-AC gate failed: ${acResult.error ?? "unknown"}` });
         return; // Block the transition — AC gate failed
       }
       // AC gate passed and dispositionToDone already applied the label swap + comment.
       // Skip the normal atomic swap below — dispositionToDone handled it.
       log.info(`workflow-gate: B-4 review: ${issueId} review → done (parent AC satisfied)`);
+      setOutcome({ handled: true, committed: true });
       return;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`workflow-gate: B-4 review: parent-AC gate failed for ${issueId}: ${msg} — blocking transition`);
+      setOutcome({ handled: true, blocked: `parent-AC gate error: ${msg}` });
       return;
     }
   }
@@ -1250,6 +1433,7 @@ export async function applyStateTransition(
       } else {
         // dispositionToSpawning applied the label swap + comment.
         log.info(`workflow-gate: B-4 review: ${issueId} review → spawning (follow-up)`);
+        setOutcome({ handled: true, committed: true });
         return;
       }
     } catch (err) {
@@ -1287,6 +1471,7 @@ export async function applyStateTransition(
       } catch (commentErr) {
         log.warn(`workflow-gate: C-2: failed to post diagnostic comment for ${issueId}: ${commentErr instanceof Error ? commentErr.message : String(commentErr)}`);
       }
+      setOutcome({ handled: true, blocked: "sprint artifact gate: no bound sprint-plan artifact" });
       return; // Block the transition
     }
     log.info(`workflow-gate: C-2: sprint artifact gate: ${issueId} artifact '${artifact.ref}' present — allowing validating → done`);
@@ -1332,6 +1517,7 @@ export async function applyStateTransition(
     log.error(
       `workflow-gate: B2 apply: FAIL-CLOSED — could not find label id for state:${currentStateName} on ${issueId}. Transition aborted.`,
     );
+    setOutcome({ handled: true, blocked: `could not resolve current state label state:${currentStateName}` });
     return;
   }
 
@@ -1344,6 +1530,7 @@ export async function applyStateTransition(
     log.error(
       `workflow-gate: B2 apply: FAIL-CLOSED — could not resolve label id for state:${toStateName}. Transition aborted.`,
     );
+    setOutcome({ handled: true, blocked: `could not resolve destination state label state:${toStateName}` });
     return;
   }
 
@@ -1376,6 +1563,7 @@ export async function applyStateTransition(
           log.error(
             `workflow-gate: B2 apply: FAIL-CLOSED — prior implementer '${priorImplementer}' has no linearUserId. Cannot route ${intent} on ${issueId}.`,
           );
+          setOutcome({ handled: true, blocked: `prior implementer '${priorImplementer}' has no linearUserId` });
           return;
         }
       } else {
@@ -1406,6 +1594,7 @@ export async function applyStateTransition(
             log.error(
               `workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' on '${intent}' with no prior implementer. Cannot auto-resolve delegate for ${issueId}. Use --target.`,
             );
+            setOutcome({ handled: true, blocked: `multi-body role '${destOwnerRole}' on '${intent}' needs an explicit --target` });
             return;
           }
           log.info(
@@ -1416,6 +1605,7 @@ export async function applyStateTransition(
             log.error(
               `workflow-gate: B2 apply: FAIL-CLOSED — no bodies found for role '${destOwnerRole}' on '${intent}'. Transition aborted per AI-1493.`,
             );
+            setOutcome({ handled: true, blocked: `no bodies found for role '${destOwnerRole}' on '${intent}'` });
             return;
           }
           log.warn(
@@ -1427,6 +1617,7 @@ export async function applyStateTransition(
         log.error(
           `workflow-gate: B2 apply: FAIL-CLOSED — role resolution failed for '${destOwnerRole}': ${msg}. Transition aborted.`,
         );
+        setOutcome({ handled: true, blocked: `role resolution failed for '${destOwnerRole}': ${msg}` });
         return;
       }
     }
@@ -1449,23 +1640,45 @@ export async function applyStateTransition(
     }
   }
 
-  // Step 4: Apply the FULL transition atomically (labels + delegate in one mutation).
+  // Step 3.5: Resolve the native Linear stateId so the column moves in the SAME
+  // mutation as the label + delegate (AI-1498: single atomic writer of all facets).
+  // Non-terminal destinations MUST resolve — fail closed rather than strand the
+  // ticket with a state:* label but a stale/Invalid native column. Terminals
+  // tolerate an unresolved native (best-effort) since they leave governance.
+  let resolvedStateId: string | null | undefined = undefined;
+  if (destStateNode?.native_state) {
+    resolvedStateId = await resolveNativeStateId(destStateNode.native_state, issue.teamId, authToken);
+    if (resolvedStateId == null && !isTerminal) {
+      log.error(
+        `workflow-gate: B2 apply: FAIL-CLOSED — could not resolve native stateId for '${destStateNode.native_state}' (state:${toStateName}) on ${issueId}. Transition aborted.`,
+      );
+      setOutcome({ handled: true, blocked: `could not resolve native state '${destStateNode.native_state}' for state:${toStateName}` });
+      return;
+    }
+  }
+
+  // Step 4: Apply the FULL transition atomically (labels + delegate + native stateId
+  // in one issueUpdate mutation). All-or-nothing: either the whole tuple lands or none.
   const applied = await issueUpdateAtomic(
     issue.internalId,
     newLabelIds,
     authToken,
     resolvedDelegateId,
+    resolvedStateId,
   );
 
   if (applied) {
     log.info(
       `workflow-gate: B2 apply: ${issueId} state:${currentStateName} → state:${toStateName}` +
-      (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``),
+      (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
+      (resolvedStateId != null ? ` native=${destStateNode?.native_state}` : ``),
     );
+    setOutcome({ handled: true, committed: true });
   } else {
     log.error(
       `workflow-gate: B2 apply: atomic mutation FAILED for ${issueId} — all facets rolled back (no partial state)`,
     );
+    setOutcome({ handled: true, blocked: "atomic transition mutation failed" });
     return;
   }
 
@@ -1618,33 +1831,35 @@ async function postFanoutSummaryComment(
 }
 
 /**
- * AI-1493: Atomic issue update — sets labels AND delegate in a single mutation.
- * This replaces the separate issueUpdateLabels + issueUpdateDelegate calls
- * so the transition is all-or-nothing: either the full tuple lands or nothing does.
+ * AI-1493 / AI-1498: Atomic issue update — sets labels, delegate, AND native stateId
+ * in a single mutation. All-or-nothing: either the full tuple lands or nothing does.
  *
- * @param delegateId - Linear user ID for the new delegate, or null to skip delegate update.
+ * @param delegateId - Linear user ID for the new delegate, undefined to leave unchanged, null to clear.
+ * @param stateId    - Linear workflow state UUID for the native column. undefined/null = skip.
  */
 async function issueUpdateAtomic(
   internalId: string,
   labelIds: string[],
   authToken: string,
   delegateId?: string | null,
+  stateId?: string | null,
 ): Promise<boolean> {
-  // Build the mutation input: include delegateId when explicitly set (string or null to clear).
-  // undefined means "don't touch delegate". null means "clear delegate".
   const hasDelegate = delegateId !== undefined;
-  const inputFields = hasDelegate
-    ? "labelIds: $labelIds, delegateId: $delegateId"
-    : "labelIds: $labelIds";
+  const hasState = stateId != null;
+  const inputParts: string[] = ["labelIds: $labelIds"];
+  const varParts: string[] = ["$issueId: String!", "$labelIds: [String!]!"];
+  if (hasDelegate) { inputParts.push("delegateId: $delegateId"); varParts.push("$delegateId: String"); }
+  if (hasState)    { inputParts.push("stateId: $stateId");    varParts.push("$stateId: String"); }
   const mutation = `
-    mutation ApplyAtomicTransition($issueId: String!, $labelIds: [String!]!${hasDelegate ? ", $delegateId: String" : ""}) {
-      issueUpdate(id: $issueId, input: { ${inputFields} }) {
+    mutation ApplyAtomicTransition(${varParts.join(", ")}) {
+      issueUpdate(id: $issueId, input: { ${inputParts.join(", ")} }) {
         success
       }
     }
   `;
   const variables: Record<string, unknown> = { issueId: internalId, labelIds };
   if (hasDelegate) variables.delegateId = delegateId;
+  if (hasState)    variables.stateId = stateId;
   try {
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",
