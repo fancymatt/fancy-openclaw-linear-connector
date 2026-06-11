@@ -1,7 +1,7 @@
 /**
  * Unit tests for the verbatim AC record store (AI-1482 Phase 6.5 / H-7).
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "@jest/globals";
 
 import fs from "node:fs/promises";
 import os from "node:os";
