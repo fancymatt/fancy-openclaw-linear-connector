@@ -38,6 +38,7 @@ import { reloadAgents } from "./agents.js";
 import { clearArtifactStore, getBoundArtifact, hasBoundArtifact } from "./artifact-store.js";
 import { runTransitionWalk } from "./canary.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
+import { resetConfigHealth } from "./config-health.js";
 
 // Resolved from the project root (jest cwd) so it works under both the
 // ESM tsc build and the CommonJS ts-jest transpile.
@@ -258,7 +259,10 @@ states:
   - id: escape
     kind: terminal
     native_state: invalid
-    transitions: []
+    transitions:
+      - command: unescape
+        to: intake
+        assign: { mode: auto }
 `;
 
 let dir: string;
@@ -3831,7 +3835,10 @@ states:
   - id: escape
     kind: terminal
     native_state: invalid
-    transitions: []
+    transitions:
+      - command: unescape
+        to: intake
+        assign: { mode: auto }
 `;
 
 describe("AI-1482: Verbatim AC + Stakes-threshold sign-off", () => {
@@ -4532,5 +4539,119 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     const vars = atomicMutations[0].variables as { labelIds?: string[]; delegateId?: string; stateId?: string };
     expect(vars.labelIds).toBeDefined();
     expect(vars.stateId).toBeDefined(); // AI-1498: native state is in the same mutation
+  });
+});
+
+// ── AI-1521: unescape re-entry verb ──────────────────────────────────────
+
+// Shared setup for AI-1521 test suites: own temp dir so corrupted WORKFLOW_DEF_PATH /
+// CAPABILITY_POLICY_PATH from earlier test suites (ai1463, ai1493) don't interfere.
+let ai1521Dir: string;
+let ai1521OrigWorkflowPath: string | undefined;
+let ai1521OrigPolicyPath: string | undefined;
+
+function setupAi1521(): void {
+  ai1521OrigWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+  ai1521OrigPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+  ai1521Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1521-test-"));
+  const policyFile = path.join(ai1521Dir, "capability-policy.yaml");
+  fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+  process.env.CAPABILITY_POLICY_PATH = policyFile;
+  process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
+}
+
+function teardownAi1521(): void {
+  fs.rmSync(ai1521Dir, { recursive: true, force: true });
+  if (ai1521OrigWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = ai1521OrigWorkflowPath;
+  else delete process.env.WORKFLOW_DEF_PATH;
+  if (ai1521OrigPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = ai1521OrigPolicyPath;
+  else delete process.env.CAPABILITY_POLICY_PATH;
+}
+
+describe("checkWorkflowRules — AI-1521: unescape from escape state", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeAll(setupAi1521);
+  afterAll(teardownAi1521);
+
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetNativeStateCache();
+    resetPolicyCache();
+    resetConfigHealth();
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("unescape is legal from escape state", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:escape"]);
+    expect(await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
+
+  it("unescape is blocked from non-escape states (e.g. implementation)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("implementation");
+    expect(result).toContain("submit");
+  });
+
+  it("unescape is blocked from done state", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:done"]);
+    const result = await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("done");
+  });
+
+  it("illegal command on escaped ticket names unescape as legal move", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:escape"]);
+    const result = await checkWorkflowRules("accept", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("unescape");
+    expect(result).toContain("escape"); // break-glass still listed
+  });
+});
+
+describe("applyStateTransition — AI-1521: unescape re-entry", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeAll(setupAi1521);
+  afterAll(teardownAi1521);
+
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetNativeStateCache();
+    resetPolicyCache();
+    resetConfigHealth();
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("transitions escape → intake atomically (labels + delegate + native state)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "escape-lbl", name: "state:escape" },
+      ],
+      teamLabels: [{ id: "intake-lbl", name: "state:intake" }],
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("unescape", "issue-uuid", "Bearer tok", { bodyId: "astrid" });
+
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.body.variables as { labelIds: string[]; delegateId?: string; stateId?: string };
+    // state:intake label is added, state:escape is removed
+    expect(vars.labelIds).toContain("intake-lbl");
+    expect(vars.labelIds).not.toContain("escape-lbl");
+    // native state is set (Todo for intake)
+    expect(vars.stateId).toBe("state-todo-uuid");
+  });
+
+  it("canonical: unescape is legal from escape state", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:escape"]);
+    expect(await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
   });
 });
