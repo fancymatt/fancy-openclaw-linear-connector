@@ -49,6 +49,7 @@ import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
 import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
+import { recordProjection, getProjection, getAllProjections, removeProjection } from "./label-projection-store.js";
 
 /**
  * Phase 6.5 / H-6: Label read-only projection + override path + drift reconciliation.
@@ -806,7 +807,24 @@ export async function checkWorkflowRules(
     );
   }
 
-  const currentState = getCurrentState(labels);
+  // Phase 6.5 / H-6: Read authoritative state from the connector-side store.
+  // The store is the sole writer of truth; labels are a read-only projection.
+  // Falls back to label-based state for tickets not yet in the store
+  // (bootstrapping: tickets created before H-6 deployment).
+  let currentState: string | null;
+  const storedProjection = await getProjection(issueId);
+  if (storedProjection && storedProjection.workflowId === workflowId) {
+    const labelState = getCurrentState(labels);
+    if (labelState && labelState !== storedProjection.stateName) {
+      log.warn(
+        `workflow-gate: H-6 drift on ${issueId}: store='${storedProjection.stateName}', label='${labelState}' — store wins; reconciler will repair label`,
+      );
+    }
+    currentState = storedProjection.stateName;
+  } else {
+    currentState = getCurrentState(labels);
+  }
+
   if (!currentState) {
     // AI-1402: For needs-human, fail-closed even without a state label.
     // We cannot determine if there is a forward path, so treat the ticket as actionable.
@@ -1284,6 +1302,10 @@ export async function applyStateTransition(
     log.info(
       `workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels`,
     );
+    // H-6: remove from projection store — ticket leaves the workflow.
+    await removeProjection(issueId).catch((err: unknown) => {
+      log.warn(`workflow-gate: H-6: removeProjection failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+    });
     return;
   }
 
@@ -1642,6 +1664,10 @@ export async function applyStateTransition(
       (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
       (resolvedNativeStateId ? ` native=${destNativeState}(${resolvedNativeStateId})` : ``),
     );
+    // H-6: record authoritative state in the projection store.
+    await recordProjection(issueId, workflowId, toStateName).catch((err: unknown) => {
+      log.warn(`workflow-gate: H-6: recordProjection failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+    });
   } else {
     log.error(
       `workflow-gate: B2 apply: atomic mutation FAILED for ${issueId} — all facets rolled back (no partial state)`,
@@ -1901,4 +1927,129 @@ async function issueUpdateDelegateOnly(
     log.warn(`workflow-gate: delegate-only issueUpdate failed for ${internalId}: ${msg}`);
     return false;
   }
+}
+
+// ── Phase 6.5 / H-6: Drift reconciliation ────────────────────────────────
+
+/**
+ * A single drift entry detected during reconciliation.
+ */
+export interface DriftEntry {
+  issueId: string;
+  storedState: string;
+  labelState: string | null;
+  repaired: boolean;
+}
+
+/**
+ * Result of a reconcileLabelDrift run.
+ */
+export interface ReconcileResult {
+  checked: number;
+  drifted: number;
+  repaired: number;
+  errors: number;
+  details: DriftEntry[];
+}
+
+/**
+ * Phase 6.5 / H-6: Drift reconciliation.
+ *
+ * Iterates all tickets tracked in the label-projection store, fetches their
+ * current state:* label from Linear, and repairs any that diverge from the
+ * stored authoritative state. The label never wins: when a human hand-edits
+ * a state:* label in the Linear UI, the next reconcile pass overwrites it
+ * with the store value and fires an alert.
+ *
+ * Called periodically (cron job) or on-demand by a steward.
+ * Fail-open: individual ticket errors increment the errors counter and are
+ * logged, but never abort the full run.
+ *
+ * @param authToken - Linear API token for fetching and writing labels.
+ * @param alertFn   - Optional override for alert emission (default: log.error).
+ */
+export async function reconcileLabelDrift(
+  authToken: string,
+  alertFn?: (msg: string) => void,
+): Promise<ReconcileResult> {
+  const projections = await getAllProjections();
+  const result: ReconcileResult = {
+    checked: projections.size,
+    drifted: 0,
+    repaired: 0,
+    errors: 0,
+    details: [],
+  };
+
+  const alert = alertFn ?? ((msg: string) => log.error(`workflow-gate: H-6 DRIFT ALERT: ${msg}`));
+
+  for (const [issueId, projection] of projections) {
+    try {
+      const labels = await fetchWorkflowLabels(issueId, authToken);
+      const labelState = getCurrentState(labels);
+
+      if (labelState === projection.stateName) continue; // no drift
+
+      result.drifted++;
+      const detail: DriftEntry = {
+        issueId,
+        storedState: projection.stateName,
+        labelState,
+        repaired: false,
+      };
+
+      alert(
+        `ticket ${issueId}: store=${projection.stateName}, label=${labelState ?? "(none)"} — overwriting label with store value`,
+      );
+
+      // Re-project: fetch full label set, swap state:* back to store value.
+      const issue = await fetchIssueWithLabels(issueId, authToken);
+      if (!issue) {
+        log.warn(`workflow-gate: H-6 reconcile: could not fetch labels for ${issueId} — skipping repair`);
+        result.errors++;
+        result.details.push(detail);
+        continue;
+      }
+
+      const newLabelId = await findOrCreateLabel(
+        issue.teamId,
+        `state:${projection.stateName}`,
+        authToken,
+      );
+      if (!newLabelId) {
+        log.warn(
+          `workflow-gate: H-6 reconcile: could not find/create label state:${projection.stateName} for ${issueId} — skipping repair`,
+        );
+        result.errors++;
+        result.details.push(detail);
+        continue;
+      }
+
+      // Replace all state:* labels with the authoritative one.
+      const cleanedIds = issue.labels
+        .filter((l) => !l.name.startsWith("state:"))
+        .map((l) => l.id);
+      cleanedIds.push(newLabelId);
+
+      const repaired = await issueUpdateLabels(issue.internalId, cleanedIds, authToken);
+      detail.repaired = repaired;
+      if (repaired) {
+        result.repaired++;
+        log.info(
+          `workflow-gate: H-6 reconcile: repaired ${issueId} label → state:${projection.stateName}`,
+        );
+      } else {
+        result.errors++;
+        log.warn(`workflow-gate: H-6 reconcile: label repair mutation failed for ${issueId}`);
+      }
+
+      result.details.push(detail);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`workflow-gate: H-6 reconcile: error processing ${issueId}: ${msg}`);
+      result.errors++;
+    }
+  }
+
+  return result;
 }

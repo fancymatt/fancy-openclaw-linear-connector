@@ -32,6 +32,7 @@ import {
   resolveStakesLevel,
   resolveNativeStateId,
   resetNativeStateCache,
+  reconcileLabelDrift,
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
@@ -39,6 +40,7 @@ import { clearArtifactStore, getBoundArtifact, hasBoundArtifact } from "./artifa
 import { runTransitionWalk } from "./canary.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
 import { resetConfigHealth } from "./config-health.js";
+import { clearProjectionStore, recordProjection, getProjection } from "./label-projection-store.js";
 
 // Resolved from the project root (jest cwd) so it works under both the
 // ESM tsc build and the CommonJS ts-jest transpile.
@@ -297,6 +299,7 @@ beforeEach(() => {
   resetWorkflowCache();
   resetNativeStateCache();
   resetPolicyCache();
+  clearProjectionStore(); // H-6: ensure each test starts with a clean projection store
 });
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -4653,5 +4656,359 @@ describe("applyStateTransition — AI-1521: unescape re-entry", () => {
   it("canonical: unescape is legal from escape state", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:escape"]);
     expect(await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
+});
+
+// ── Phase 6.5 / H-6: Label-projection store ───────────────────────────────
+
+describe("Phase 6.5 / H-6: applyStateTransition records projection in store", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    clearProjectionStore();
+  });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("records the authoritative state in the projection store on successful transition", async () => {
+    const { fetch: mock } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:implementation" },
+      ],
+      teamLabels: [{ id: "cr-lbl", name: "state:code-review" }],
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("submit", "issue-uuid", "Bearer tok");
+
+    // Import getProjection to verify the store was written.
+
+    const proj = await getProjection("issue-uuid");
+    expect(proj).not.toBeNull();
+    expect(proj!.workflowId).toBe("dev-impl");
+    expect(proj!.stateName).toBe("code-review");
+  });
+
+  it("removes the projection from the store on __ad_hoc__ demotion", async () => {
+    // Pre-seed the store to simulate an existing tracked ticket.
+    await recordProjection("issue-uuid", "dev-impl", "intake");
+
+    const { fetch: mock } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:intake" },
+      ],
+      teamLabels: [],
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("demote", "issue-uuid", "Bearer tok");
+
+
+    const proj = await getProjection("issue-uuid");
+    expect(proj).toBeNull();
+  });
+
+  it("does not record projection when issueUpdate fails", async () => {
+    const { fetch: mock } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:implementation" },
+      ],
+      teamLabels: [{ id: "cr-lbl", name: "state:code-review" }],
+      issueUpdateSuccess: false,
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("submit", "issue-uuid", "Bearer tok");
+
+
+    const proj = await getProjection("issue-uuid");
+    expect(proj).toBeNull();
+  });
+
+  it("records escape state in the projection store", async () => {
+    const { fetch: mock } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:implementation" },
+      ],
+      teamLabels: [{ id: "escape-lbl", name: "state:escape" }],
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("escape", "issue-uuid", "Bearer tok");
+
+
+    const proj = await getProjection("issue-uuid");
+    expect(proj).not.toBeNull();
+    expect(proj!.stateName).toBe("escape");
+  });
+});
+
+describe("Phase 6.5 / H-6: checkWorkflowRules reads from store (not labels)", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    clearProjectionStore();
+  });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("uses stored state over label state — allows command valid for stored state", async () => {
+    // Store says 'implementation', labels say 'intake' (drift).
+    await recordProjection("issue-uuid", "dev-impl", "implementation");
+
+    // Label says intake, but store says implementation — 'submit' is legal in implementation.
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", null, "charles-linear-uuid");
+    expect(result).toBeNull(); // submit is legal in implementation
+  });
+
+  it("uses stored state over label state — blocks command illegal for stored state", async () => {
+    // Store says 'implementation', labels say 'code-review' (drift).
+    await recordProjection("issue-uuid", "dev-impl", "implementation");
+
+    // Store says implementation, so 'approve' (valid in code-review) should be rejected.
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
+    const result = await checkWorkflowRules("approve", "issue-uuid", "Bearer tok", "reviewer");
+    expect(result).not.toBeNull();
+    expect(result).toContain("implementation");
+    expect(result).toContain("submit"); // legal moves for implementation
+  });
+
+  it("falls back to label state when store has no entry (bootstrapping)", async () => {
+    // No store entry — should fall back to label (existing behavior).
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", null, "charles-linear-uuid");
+    expect(result).toBeNull(); // submit is legal in implementation
+  });
+
+  it("ignores store entry for a different workflow (workflowId mismatch)", async () => {
+    // Store has entry for 'sprint' workflow, but labels say 'dev-impl'.
+    await recordProjection("issue-uuid", "sprint", "implementation");
+
+    // Should fall back to label since store workflowId !== label workflowId.
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", null, "charles-linear-uuid");
+    expect(result).toBeNull();
+  });
+});
+
+// ── Phase 6.5 / H-6: reconcileLabelDrift ─────────────────────────────────
+
+describe("Phase 6.5 / H-6: reconcileLabelDrift", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    clearProjectionStore();
+  });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("returns zero counts when store is empty", async () => {
+    globalThis.fetch = async () => { throw new Error("should not be called"); };
+    const result = await reconcileLabelDrift("Bearer tok");
+    expect(result.checked).toBe(0);
+    expect(result.drifted).toBe(0);
+    expect(result.repaired).toBe(0);
+    expect(result.errors).toBe(0);
+  });
+
+  it("no drift: checked count matches store size, drifted is 0", async () => {
+    await recordProjection("issue-a", "dev-impl", "implementation");
+    await recordProjection("issue-b", "dev-impl", "code-review");
+
+    // Both labels match the store.
+    globalThis.fetch = async (_url, init) => {
+      const q = JSON.parse((init?.body as string) ?? "{}").query ?? "";
+      if (q.includes("IssueLabels")) {
+        const vars = JSON.parse((init?.body as string) ?? "{}").variables as { id: string };
+        const state = vars.id === "issue-a" ? "implementation" : "code-review";
+        return new Response(
+          JSON.stringify({ data: { issue: { labels: { nodes: [{ name: `state:${state}` }, { name: "wf:dev-impl" }] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected call: ${q.slice(0, 80)}`);
+    };
+
+    const result = await reconcileLabelDrift("Bearer tok");
+    expect(result.checked).toBe(2);
+    expect(result.drifted).toBe(0);
+    expect(result.repaired).toBe(0);
+  });
+
+  it("drift detected: label repaired to store value and alert fires", async () => {
+    await recordProjection("issue-uuid", "dev-impl", "implementation");
+
+    const alerts: string[] = [];
+    const mockTeamLabels = [{ id: "impl-lbl", name: "state:implementation" }];
+
+    globalThis.fetch = async (_url, init) => {
+      const body = JSON.parse((init?.body as string) ?? "{}");
+      const q = body.query ?? "";
+
+      if (q.includes("IssueLabels")) {
+        // Label says 'intake' but store says 'implementation' → drift.
+        return new Response(
+          JSON.stringify({ data: { issue: { labels: { nodes: [{ name: "state:intake" }, { name: "wf:dev-impl" }] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (q.includes("IssueWithLabels")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "internal-uuid",
+                team: { id: "team-uuid" },
+                labels: { nodes: [{ id: "intake-lbl", name: "state:intake" }, { id: "wf-lbl", name: "wf:dev-impl" }] },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (q.includes("TeamLabels")) {
+        return new Response(
+          JSON.stringify({ data: { team: { labels: { nodes: mockTeamLabels } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (q.includes("ApplyAtomicTransition") || q.includes("issueUpdate")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected: ${q.slice(0, 80)}`);
+    };
+
+    const result = await reconcileLabelDrift("Bearer tok", (msg) => alerts.push(msg));
+    expect(result.drifted).toBe(1);
+    expect(result.repaired).toBe(1);
+    expect(result.errors).toBe(0);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toContain("issue-uuid");
+    expect(alerts[0]).toContain("implementation");
+    expect(alerts[0]).toContain("intake");
+
+    // Drift detail should record the correct states.
+    expect(result.details).toHaveLength(1);
+    expect(result.details[0].storedState).toBe("implementation");
+    expect(result.details[0].labelState).toBe("intake");
+    expect(result.details[0].repaired).toBe(true);
+  });
+
+  it("drift detected but repair mutation fails: increments errors", async () => {
+    await recordProjection("issue-uuid", "dev-impl", "implementation");
+
+    const alerts: string[] = [];
+
+    globalThis.fetch = async (_url, init) => {
+      const q = JSON.parse((init?.body as string) ?? "{}").query ?? "";
+      if (q.includes("IssueLabels")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { labels: { nodes: [{ name: "state:intake" }] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (q.includes("IssueWithLabels")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "internal-uuid",
+                team: { id: "team-uuid" },
+                labels: { nodes: [{ id: "intake-lbl", name: "state:intake" }] },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (q.includes("TeamLabels")) {
+        return new Response(
+          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "impl-lbl", name: "state:implementation" }] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      // Mutation fails.
+      if (q.includes("ApplyAtomicTransition") || q.includes("issueUpdate")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: false } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected: ${q.slice(0, 80)}`);
+    };
+
+    const result = await reconcileLabelDrift("Bearer tok", (msg) => alerts.push(msg));
+    expect(result.drifted).toBe(1);
+    expect(result.repaired).toBe(0);
+    expect(result.errors).toBe(1);
+    // Alert still fired even though repair failed.
+    expect(alerts).toHaveLength(1);
+    expect(result.details[0].repaired).toBe(false);
+  });
+
+  it("drift detected but issue fetch fails: increments errors, no repair", async () => {
+    await recordProjection("issue-uuid", "dev-impl", "implementation");
+
+    globalThis.fetch = async (_url, init) => {
+      const q = JSON.parse((init?.body as string) ?? "{}").query ?? "";
+      if (q.includes("IssueLabels")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { labels: { nodes: [{ name: "state:intake" }] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      // IssueWithLabels fetch fails.
+      if (q.includes("IssueWithLabels")) {
+        throw new Error("simulated fetch error");
+      }
+      throw new Error(`unexpected: ${q.slice(0, 80)}`);
+    };
+
+    const result = await reconcileLabelDrift("Bearer tok");
+    expect(result.drifted).toBe(1);
+    expect(result.repaired).toBe(0);
+    expect(result.errors).toBe(1);
+  });
+
+  it("steward override: command through proxy records in store and label follows", async () => {
+    // This exercises the full override path: a steward issues 'accept' through the proxy,
+    // applyStateTransition writes both the label and the store. The label is now in sync.
+    // This verifies that the steward override path (proxy command → store + label update)
+    // produces a projection the reconciler would confirm as non-drifted.
+
+    const { fetch: mock } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:intake" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock;
+
+    // Steward issues 'accept' through proxy (applyStateTransition simulates the proxy side).
+    await applyStateTransition("accept", "issue-uuid", "Bearer tok", { bodyId: "astrid" });
+
+
+    const proj = await getProjection("issue-uuid");
+    expect(proj).not.toBeNull();
+    expect(proj!.stateName).toBe("implementation");
+    expect(proj!.workflowId).toBe("dev-impl");
+
+    // Now verify reconciler sees no drift (store and label agree after proxy command).
+    globalThis.fetch = async (_url, init) => {
+      const q = JSON.parse((init?.body as string) ?? "{}").query ?? "";
+      if (q.includes("IssueLabels")) {
+        // Label is now 'implementation' (proxy wrote it).
+        return new Response(
+          JSON.stringify({ data: { issue: { labels: { nodes: [{ name: "state:implementation" }] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected: ${q.slice(0, 80)}`);
+    };
+    const reconcileResult = await reconcileLabelDrift("Bearer tok");
+    expect(reconcileResult.drifted).toBe(0);
+    expect(reconcileResult.repaired).toBe(0);
   });
 });
