@@ -167,24 +167,22 @@ export class DeferralAccountant {
 
   /** Start tracking deferral for a child. */
   startDeferral(childIdentifier: string, now: number = Date.now()): void {
-    const key = childIdentifier;
-    const existing = this.deferrals.get(key);
+    const existing = this.deferrals.get(childIdentifier);
     if (existing) {
       // Already deferring — accumulate what we have and restart
       existing.accumulatedMs += now - existing.startedAt;
       existing.startedAt = now;
     } else {
-      this.deferrals.set(key, { startedAt: now, accumulatedMs: 0 });
+      this.deferrals.set(childIdentifier, { startedAt: now, accumulatedMs: 0 });
     }
   }
 
   /** Stop tracking deferral for a child (e.g., when it becomes active again). */
   stopDeferral(childIdentifier: string, now: number = Date.now()): number {
-    const key = childIdentifier;
-    const entry = this.deferrals.get(key);
+    const entry = this.deferrals.get(childIdentifier);
     if (!entry) return 0;
     const total = entry.accumulatedMs + (now - entry.startedAt);
-    this.deferrals.delete(key);
+    this.deferrals.delete(childIdentifier);
     return total;
   }
 
@@ -783,9 +781,10 @@ export async function detectStalledChildren(
   now: number = Date.now(),
   workflowDef?: WorkflowDef,
   accountant?: DeferralAccountant,
-): Promise<StalledChild[]> {
+): Promise<{ stalled: StalledChild[]; atCapacitySkipped: number }> {
   const children = await fetchChildren(parentIdentifier, authToken);
   const stalled: StalledChild[] = [];
+  let atCapacitySkipped = 0;
 
   // Load workflow def if not provided
   let def = workflowDef;
@@ -828,17 +827,14 @@ export async function detectStalledChildren(
     // Determine effective threshold: per-state SLA or flat fallback
     const effectiveThresholdMs = stateSlaMs ?? stallThresholdMs;
 
-    // Effective time in state = time in state minus known deferral
-    // At-capacity children get their deferral time subtracted so they don't
-    // trip stall escalation (AC2)
-    const effectiveTimeMs = Math.max(0, timeInStateMs - knownDeferralMs);
-
     // Skip at-capacity children: they are deferred but healthy (AC2)
     if (isDeferredAtCapacity) {
-      // Even though they might have a large time-in-state, they are accounted for
-      // and should not trigger stall escalation
+      atCapacitySkipped++;
       continue;
     }
+
+    // Effective time in state = time in state minus known deferral
+    const effectiveTimeMs = Math.max(0, timeInStateMs - knownDeferralMs);
 
     if (effectiveTimeMs >= effectiveThresholdMs) {
       stalled.push({
@@ -856,7 +852,7 @@ export async function detectStalledChildren(
     }
   }
 
-  return stalled;
+  return { stalled, atCapacitySkipped };
 }
 
 /**
@@ -895,9 +891,9 @@ export async function surfaceStalledChildren(
   parentIdentifier: string,
   authToken: string,
   stallThresholdMs: number = DEFAULT_STALL_THRESHOLD_MS,
-): Promise<{ surfaced: number; events: StallEvent[] }> {
-  const stalled = await detectStalledChildren(parentIdentifier, authToken, stallThresholdMs);
-  if (stalled.length === 0) return { surfaced: 0, events: [] };
+): Promise<{ surfaced: number; events: StallEvent[]; atCapacitySkipped: number }> {
+  const { stalled, atCapacitySkipped } = await detectStalledChildren(parentIdentifier, authToken, stallThresholdMs);
+  if (stalled.length === 0) return { surfaced: 0, events: [], atCapacitySkipped };
 
   const events: StallEvent[] = stalled.map((child) => buildStallEvent(child));
 
@@ -906,8 +902,8 @@ export async function surfaceStalledChildren(
 
   const internalId = await resolveInternalId(parentIdentifier, authToken);
   if (!internalId) {
-    log.error(`barrier: cannot surface stalled children — failed to resolve ${parentIdentifier}`);
-    return { surfaced: 0, events };
+    log.error(`barrier: cannot surface stalled children — failed to resolve ${parentIdentifier}; ${events.length} stall event(s) detected but not posted`);
+    return { surfaced: events.length, events, atCapacitySkipped };
   }
 
   const posted = await postComment(internalId, message, authToken);
@@ -916,7 +912,7 @@ export async function surfaceStalledChildren(
       `barrier: §5.5/§16.1 — emitted ${events.length} stall event(s) on ${parentIdentifier}`,
     );
   }
-  return { surfaced: events.length, events };
+  return { surfaced: events.length, events, atCapacitySkipped };
 }
 
 /**

@@ -607,14 +607,14 @@ describe("AC3: §5.5 tripwire — child stall exercised in live run", () => {
     ]);
 
     // Detect stalled children
-    const stalled = await detectStalledChildren("PARENT-1", "Bearer tok", 30 * 60 * 1000, now);
+    const { stalled } = await detectStalledChildren("PARENT-1", "Bearer tok", 30 * 60 * 1000, now);
     expect(stalled).toHaveLength(1);
     expect(stalled[0].identifier).toBe("CHILD-2");
     expect(stalled[0].currentState).toBe("implementation");
     expect(stalled[0].idleDurationMs).toBe(45 * 60 * 1000);
 
     // Surface the tripwire — this re-fetches children and re-detects stalls
-    const surfaced = await surfaceStalledChildren("PARENT-1", "Bearer tok", 30 * 60 * 1000, now);
+    const { surfaced } = await surfaceStalledChildren("PARENT-1", "Bearer tok", 30 * 60 * 1000, now);
     expect(surfaced).toBe(1);
 
     // Verify the mock was called correctly
@@ -659,7 +659,7 @@ describe("AC3: §5.5 tripwire — child stall exercised in live run", () => {
       },
     ]);
 
-    const surfaced = await surfaceStalledChildren("PARENT-1", "Bearer tok", 30 * 60 * 1000, now);
+    const { surfaced } = await surfaceStalledChildren("PARENT-1", "Bearer tok", 30 * 60 * 1000, now);
     expect(surfaced).toBe(0);
     expect(commentPosted).toBe(false);
   });
@@ -687,7 +687,7 @@ describe("AC3: §5.5 tripwire — child stall exercised in live run", () => {
       },
     ]);
 
-    const stalled = await detectStalledChildren("PARENT-1", "Bearer tok", 30 * 60 * 1000, now);
+    const { stalled } = await detectStalledChildren("PARENT-1", "Bearer tok", 30 * 60 * 1000, now);
     expect(stalled).toHaveLength(0);
   });
 });

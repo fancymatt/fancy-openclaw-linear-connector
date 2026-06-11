@@ -115,6 +115,9 @@ export interface WorkflowState {
    *  Must be a key in the CLI's SEMANTIC_STATE_MAP (doing, thinking, done, invalid, etc.)
    *  or a literal Linear state name. Validated at connector startup. */
   native_state?: string;
+  /** Per-state time-in-state SLA (ms). Parsed from YAML duration strings like "24h", "30m".
+   *  When a child breaches this SLA, the engine emits a stall event (§5.5 / §16.1). */
+  sla?: number;
   transitions?: WorkflowTransition[];
 }
 
@@ -139,6 +142,34 @@ export interface WorkflowDef {
 
 // ── Workflow def cache ─────────────────────────────────────────────────────
 
+/** Parse an SLA duration string (e.g. "24h", "30m", "2d", "90s") to milliseconds. */
+export function parseSlaDuration(value: string | number | undefined): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "number") return value > 0 ? value : undefined;
+  const m = /^(\d+(?:\.\d+)?)\s*([smhd]?)$/.exec(value.trim());
+  if (!m) return undefined;
+  const n = parseFloat(m[1]);
+  if (isNaN(n) || n <= 0) return undefined;
+  const unit = (m[2] || "m").toLowerCase();
+  switch (unit) {
+    case "s": return n * 1000;
+    case "m": return n * 60 * 1000;
+    case "h": return n * 60 * 60 * 1000;
+    case "d": return n * 24 * 60 * 60 * 1000;
+    default: return undefined;
+  }
+}
+
+/** Post-process a loaded WorkflowDef: parse sla duration strings to ms. */
+function parseWorkflowSla(def: WorkflowDef): void {
+  for (const state of def.states) {
+    const raw = (state as unknown as Record<string, unknown>).sla;
+    if (raw !== undefined && typeof raw === "string") {
+      state.sla = parseSlaDuration(raw);
+    }
+  }
+}
+
 let _workflowCache: WorkflowDef | null = null;
 
 export async function loadWorkflowDef(): Promise<WorkflowDef> {
@@ -149,6 +180,7 @@ export async function loadWorkflowDef(): Promise<WorkflowDef> {
     if (def.break_glass && !def.break_glass.command) {
       log.warn(`workflow-gate: break_glass block in ${workflowDefPath()} has no 'command' field — falling back to hardcoded "escape". Canonicalize the YAML to add command: escape.`);
     }
+    parseWorkflowSla(def);
     _workflowCache = def;
     recordSuccess("workflow-def");
     // AI-1490 / AI-1498: validate native_state mappings on load — hard-fail if any state

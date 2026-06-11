@@ -17,7 +17,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { isChildTerminal, isTerminalState, evaluateBarrier, attemptBarrierTransition, onChildTerminal, buildShepherdingMessage, detectStalledChildren, surfaceStalledChildren, parseStallConfig, type ChildState, type StalledChild } from "./barrier.js";
+import { isChildTerminal, isTerminalState, evaluateBarrier, attemptBarrierTransition, onChildTerminal, buildShepherdingMessage, detectStalledChildren, surfaceStalledChildren, parseStallConfig, deferralAccountant, buildStallEvent, type ChildState, type StalledChild } from "./barrier.js";
 
 // ── isChildTerminal ────────────────────────────────────────────────────────
 
@@ -595,15 +595,14 @@ describe("buildShepherdingMessage", () => {
       { identifier: "AI-2001", labels: ["wf:dev-impl", "state:implementation"], isTerminal: false, workflowState: "implementation" },
     ];
     const stalled: StalledChild[] = [
-      { identifier: "AI-2001", parentIdentifier: "AI-1439", currentState: "implementation", lastActivityAt: 1000000, idleDurationMs: 45 * 60 * 1000 },
+      { identifier: "AI-2001", parentIdentifier: "AI-1439", currentState: "implementation", lastActivityAt: 1000000, idleDurationMs: 45 * 60 * 1000, stateEnteredAt: null, stateSlaMs: null, timeInStateMs: 45 * 60 * 1000, knownDeferralMs: 0, isDeferredAtCapacity: false },
     ];
 
     const msg = buildShepherdingMessage("AI-1439", children, stalled);
 
-    expect(msg).toContain("Stalled children");
+    expect(msg).toContain("Stall event");
     expect(msg).toContain("AI-2001");
     expect(msg).toContain("45m");
-    expect(msg).toContain("tripwire");
     expect(msg).toContain("nudge");
   });
 
@@ -668,7 +667,7 @@ describe("detectStalledChildren — mocked Linear API", () => {
       throw new Error(`unexpected query: ${(parsed.query ?? "").slice(0, 80)}`);
     };
 
-    const stalled = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
+    const { stalled } = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
 
     expect(stalled).toHaveLength(1);
     expect(stalled[0].identifier).toBe("AI-2001");
@@ -710,7 +709,7 @@ describe("detectStalledChildren — mocked Linear API", () => {
       throw new Error("unexpected query");
     };
 
-    const stalled = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
+    const { stalled } = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
     expect(stalled).toHaveLength(0);
   });
 
@@ -739,7 +738,7 @@ describe("detectStalledChildren — mocked Linear API", () => {
       throw new Error("unexpected query — should not check activity for terminal child");
     };
 
-    const stalled = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000);
+    const { stalled } = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000);
     expect(stalled).toHaveLength(0);
   });
 });
@@ -809,9 +808,11 @@ describe("surfaceStalledChildren — §5.5 tripwire", () => {
       throw new Error(`unexpected query: ${(parsed.query ?? "").slice(0, 80)}`);
     };
 
-    const count = await surfaceStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
+    const result = await surfaceStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000);
 
-    expect(count).toBe(1);
+    expect(result.surfaced).toBe(1);
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0].childIdentifier).toBe("AI-2001");
     expect(commentPosted).toBe(true);
   });
 
@@ -850,8 +851,9 @@ describe("surfaceStalledChildren — §5.5 tripwire", () => {
       throw new Error("unexpected query");
     };
 
-    const count = await surfaceStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
-    expect(count).toBe(0);
+    const result = await surfaceStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000);
+    expect(result.surfaced).toBe(0);
+    expect(result.events).toHaveLength(0);
   });
 });
 
@@ -949,5 +951,215 @@ describe("AC3: Children cannot address the parent (asymmetry enforced)", () => {
     expect(isChildTerminal(devImplDone)).toBe(true);
     expect(isChildTerminal(devImplEscaped)).toBe(true);
     expect(isChildTerminal(devImplActive)).toBe(false);
+  });
+});
+
+// ── AI-1478: AC1 / AC2 — Stall detection with at-capacity accounting ─────
+
+describe("AI-1478 AC1: deliberately stalled leaf produces stall event to parent", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    deferralAccountant.clearAll();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    deferralAccountant.clearAll();
+  });
+
+  it("a child beyond its SLA threshold produces a stall event", async () => {
+    const now = Date.now();
+    const staleTime = new Date(now - 45 * 60 * 1000).toISOString(); // 45 min ago — beyond 30m threshold
+
+    globalThis.fetch = async (_url, init) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string };
+
+      if ((parsed.query ?? "").includes("ParentChildren")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                children: {
+                  nodes: [
+                    { identifier: "AI-2001", labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] } },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if ((parsed.query ?? "").includes("ChildActivity")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { updatedAt: staleTime } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      throw new Error(`unexpected query: ${(parsed.query ?? "").slice(0, 80)}`);
+    };
+
+    const { stalled } = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
+
+    // AC1: The stalled leaf produces a result
+    expect(stalled).toHaveLength(1);
+    expect(stalled[0].identifier).toBe("AI-2001");
+    expect(stalled[0].isDeferredAtCapacity).toBe(false);
+  });
+
+  it("stalled child produces a valid StallEvent via buildStallEvent", () => {
+    const child: StalledChild = {
+      identifier: "AI-2001",
+      parentIdentifier: "AI-1439",
+      currentState: "implementation",
+      lastActivityAt: Date.now() - 45 * 60 * 1000,
+      idleDurationMs: 45 * 60 * 1000,
+      stateEnteredAt: Date.now() - 45 * 60 * 1000,
+      stateSlaMs: 30 * 60 * 1000,
+      timeInStateMs: 45 * 60 * 1000,
+      knownDeferralMs: 0,
+      isDeferredAtCapacity: false,
+    };
+
+    const event = buildStallEvent(child);
+
+    expect(event.childIdentifier).toBe("AI-2001");
+    expect(event.parentIdentifier).toBe("AI-1439");
+    expect(event.currentState).toBe("implementation");
+    expect(event.slaMs).toBe(30 * 60 * 1000);
+    expect(event.breachMs).toBe(15 * 60 * 1000);
+    expect(event.knownDeferralMs).toBe(0);
+    expect(event.isDeferredAtCapacity).toBe(false);
+  });
+});
+
+describe("AI-1478 AC2: at-capacity-but-healthy subtree does NOT trip stall escalation", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    deferralAccountant.clearAll();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    deferralAccountant.clearAll();
+  });
+
+  it("at-capacity child is skipped even when beyond SLA threshold", async () => {
+    const now = Date.now();
+    const staleTime = new Date(now - 60 * 60 * 1000).toISOString(); // 60 min ago — well beyond 30m threshold
+
+    // Register child as at-capacity (deferred)
+    deferralAccountant.startDeferral("AI-2001", now - 60 * 60 * 1000);
+
+    globalThis.fetch = async (_url, init) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string };
+
+      if ((parsed.query ?? "").includes("ParentChildren")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                children: {
+                  nodes: [
+                    { identifier: "AI-2001", labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] } },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if ((parsed.query ?? "").includes("ChildActivity")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { updatedAt: staleTime } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      throw new Error(`unexpected query: ${(parsed.query ?? "").slice(0, 80)}`);
+    };
+
+    const { stalled } = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
+
+    // AC2: At-capacity child should be skipped — NOT in the stalled list
+    expect(stalled).toHaveLength(0);
+  });
+
+  it("non-deferred child still trips stall when at-capacity sibling does not", async () => {
+    const now = Date.now();
+    const staleTime = new Date(now - 45 * 60 * 1000).toISOString();
+
+    // AI-2001 is at-capacity (deferred)
+    deferralAccountant.startDeferral("AI-2001", now - 45 * 60 * 1000);
+    // AI-2002 is NOT at-capacity
+
+    let activityCall = 0;
+    globalThis.fetch = async (_url, init) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string };
+
+      if ((parsed.query ?? "").includes("ParentChildren")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                children: {
+                  nodes: [
+                    { identifier: "AI-2001", labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] } },
+                    { identifier: "AI-2002", labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] } },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if ((parsed.query ?? "").includes("ChildActivity")) {
+        activityCall++;
+        return new Response(
+          JSON.stringify({ data: { issue: { updatedAt: staleTime } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      throw new Error(`unexpected query: ${(parsed.query ?? "").slice(0, 80)}`);
+    };
+
+    const { stalled } = await detectStalledChildren("AI-1439", "Bearer tok", 30 * 60 * 1000, now);
+
+    // Only AI-2002 should be stalled — AI-2001 is at-capacity and skipped
+    expect(stalled).toHaveLength(1);
+    expect(stalled[0].identifier).toBe("AI-2002");
+    expect(stalled[0].isDeferredAtCapacity).toBe(false);
+  });
+
+  it("DeferralAccountant tracks and clears deferral time", () => {
+    const now = Date.now();
+
+    // Not deferring initially
+    expect(deferralAccountant.isDeferring("AI-2001")).toBe(false);
+    expect(deferralAccountant.getDeferralMs("AI-2001", now)).toBe(0);
+
+    // Start deferral
+    deferralAccountant.startDeferral("AI-2001", now - 30 * 60 * 1000);
+    expect(deferralAccountant.isDeferring("AI-2001")).toBe(true);
+    expect(deferralAccountant.getDeferralMs("AI-2001", now)).toBe(30 * 60 * 1000);
+
+    // Stop deferral
+    const totalMs = deferralAccountant.stopDeferral("AI-2001", now);
+    expect(totalMs).toBe(30 * 60 * 1000);
+    expect(deferralAccountant.isDeferring("AI-2001")).toBe(false);
   });
 });
