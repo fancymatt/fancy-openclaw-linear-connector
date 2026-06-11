@@ -128,3 +128,8 @@ states:
     kind: terminal
     native_state: invalid        # targetState: "invalid" → Invalid (canceled-type terminal)
     # break-glass terminal; steward decides if Matt escalation is warranted (design.md §11)
+    # AI-1521: unescape re-enters the workflow at intake so live tickets can be rescued.
+    transitions:
+      - command: unescape
+        to: intake
+        assign: { mode: auto }  # steward role is singleton; auto-delegates to Astrid

@@ -50,6 +50,26 @@ import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./co
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
 import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
 
+/**
+ * Phase 6.5 / H-6: Label read-only projection + override path + drift reconciliation.
+ *
+ * **Store is the sole writer of truth.** Labels (`wf:*`, `state:*`) are a read-only projection
+ * re-derived as the ticket advances; nothing in the engine reads state back out of labels.
+ *
+ * **Override = steward-issued proxy command.** A human who wants to move a ticket out-of-band
+ * does so through a steward proxy command that updates the store and re-projects the labels
+ * — a first-class transition, not a hand-edit.
+ *
+ * **Drift reconciliation.** A label that diverges from the store (e.g. hand-edited in the
+ * Linear UI) is overwritten on the next reconcile pass and an alert is emitted. The label
+ * never wins.
+ *
+ * **Atomic projection.** On advance, remove old `state:` and add new in one op; never two
+ * `state:` labels at once.
+ *
+ * Design: design.md §4.2, §4.4, §4.6, §11, §13, §16.1, §16.2, and H-6.
+ */
+
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
