@@ -21,7 +21,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import yaml from "js-yaml";
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "@jest/globals";
 import {
   checkWorkflowRules,
   applyStateTransition,
@@ -297,6 +297,7 @@ beforeEach(() => {
   resetWorkflowCache();
   resetNativeStateCache();
   resetPolicyCache();
+  resetConfigHealth();
 });
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -1185,8 +1186,12 @@ describe("applyStateTransition — __ad_hoc__ demotion", () => {
 describe("checkRawMutationInterception — Layer 2 (AI-1387)", () => {
   let layer2Dir: string;
   let layer2OriginalFetch: typeof globalThis.fetch;
+  let layer2OriginalCapabilityPath: string | undefined;
+  let layer2OriginalWorkflowPath: string | undefined;
 
   beforeEach(() => {
+    layer2OriginalCapabilityPath = process.env.CAPABILITY_POLICY_PATH;
+    layer2OriginalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
     layer2Dir = fs.mkdtempSync(path.join(os.tmpdir(), "layer2-test-"));
     const policyFile = path.join(layer2Dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
@@ -1203,6 +1208,10 @@ describe("checkRawMutationInterception — Layer 2 (AI-1387)", () => {
 
   afterEach(() => {
     globalThis.fetch = layer2OriginalFetch;
+    if (layer2OriginalCapabilityPath !== undefined) process.env.CAPABILITY_POLICY_PATH = layer2OriginalCapabilityPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+    if (layer2OriginalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = layer2OriginalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
   });
 
   // Minimal label response: workflow ticket in implementation state.
@@ -1364,8 +1373,12 @@ describe("checkRawMutationInterception — Layer 2 (AI-1387)", () => {
 describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
   let layer1Dir: string;
   let layer1OriginalFetch: typeof globalThis.fetch;
+  let layer1OriginalCapabilityPath: string | undefined;
+  let layer1OriginalWorkflowPath: string | undefined;
 
   beforeEach(() => {
+    layer1OriginalCapabilityPath = process.env.CAPABILITY_POLICY_PATH;
+    layer1OriginalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
     layer1Dir = fs.mkdtempSync(path.join(os.tmpdir(), "layer1-test-"));
     const policyFile = path.join(layer1Dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
@@ -1382,6 +1395,10 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
 
   afterEach(() => {
     globalThis.fetch = layer1OriginalFetch;
+    if (layer1OriginalCapabilityPath !== undefined) process.env.CAPABILITY_POLICY_PATH = layer1OriginalCapabilityPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+    if (layer1OriginalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = layer1OriginalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
   });
 
   it("returns reminder for code-review state after submit from implementation", async () => {
@@ -1772,8 +1789,12 @@ describe("checkWorkflowRules — AI-1402: unknown-caller fail-closed", () => {
 describe("checkRawMutationInterception — AI-1402: labelIds blocking + unknown-caller", () => {
   let ai1402Dir: string;
   let ai1402OriginalFetch: typeof globalThis.fetch;
+  let ai1402OriginalCapabilityPath: string | undefined;
+  let ai1402OriginalWorkflowPath: string | undefined;
 
   beforeEach(() => {
+    ai1402OriginalCapabilityPath = process.env.CAPABILITY_POLICY_PATH;
+    ai1402OriginalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
     ai1402Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1402-test-"));
     const policyFile = path.join(ai1402Dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
@@ -1790,6 +1811,10 @@ describe("checkRawMutationInterception — AI-1402: labelIds blocking + unknown-
 
   afterEach(() => {
     globalThis.fetch = ai1402OriginalFetch;
+    if (ai1402OriginalCapabilityPath !== undefined) process.env.CAPABILITY_POLICY_PATH = ai1402OriginalCapabilityPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+    if (ai1402OriginalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = ai1402OriginalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
   });
 
   const WORKFLOW_IMPL_LABELS = {
@@ -2079,8 +2104,12 @@ describe("applyStateTransition — auto-delegate assignment (AI-1463)", () => {
   let autoDelegateDir: string;
   let autoDelegateOriginalFetch: typeof globalThis.fetch;
   let originalAgentsFile: string | undefined;
+  let autoDelegateOriginalCapabilityPath: string | undefined;
+  let autoDelegateOriginalWorkflowPath: string | undefined;
 
   beforeEach(() => {
+    autoDelegateOriginalCapabilityPath = process.env.CAPABILITY_POLICY_PATH;
+    autoDelegateOriginalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
     autoDelegateDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1463-test-"));
     const policyFile = path.join(autoDelegateDir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
@@ -2127,6 +2156,10 @@ describe("applyStateTransition — auto-delegate assignment (AI-1463)", () => {
     }
     reloadAgents();
     fs.rmSync(autoDelegateDir, { recursive: true, force: true });
+    if (autoDelegateOriginalCapabilityPath !== undefined) process.env.CAPABILITY_POLICY_PATH = autoDelegateOriginalCapabilityPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+    if (autoDelegateOriginalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = autoDelegateOriginalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
   });
 
   it("auto-assigns delegate to hanzo when approve transitions code-review → deployment", async () => {
@@ -3963,8 +3996,12 @@ describe("applyStateTransition — AI-1493 atomic transitions", () => {
   let ai1493Dir: string;
   let ai1493OriginalFetch: typeof globalThis.fetch;
   let ai1493OriginalAgentsFile: string | undefined;
+  let ai1493OriginalCapabilityPath: string | undefined;
+  let ai1493OriginalWorkflowPath: string | undefined;
 
   beforeEach(() => {
+    ai1493OriginalCapabilityPath = process.env.CAPABILITY_POLICY_PATH;
+    ai1493OriginalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
     ai1493Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1493-test-"));
     const policyFile = path.join(ai1493Dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
@@ -4010,6 +4047,10 @@ describe("applyStateTransition — AI-1493 atomic transitions", () => {
     }
     reloadAgents();
     fs.rmSync(ai1493Dir, { recursive: true, force: true });
+    if (ai1493OriginalCapabilityPath !== undefined) process.env.CAPABILITY_POLICY_PATH = ai1493OriginalCapabilityPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+    if (ai1493OriginalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = ai1493OriginalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
 
     const { removeImplementer: doRemove } = await import("./implementer-store.js");
     doRemove("issue-reject-ai1493");
@@ -4106,8 +4147,10 @@ describe("applyStateTransition — AI-1493 atomic transitions", () => {
 
 describe("AI-1493: transition-walk canary", () => {
   let canaryDir: string;
+  let canaryOriginalWorkflowPath: string | undefined;
 
   beforeEach(() => {
+    canaryOriginalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
     canaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1493-canary-"));
     const workflowFile = path.join(canaryDir, "dev-impl.yaml");
     fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
@@ -4117,6 +4160,8 @@ describe("AI-1493: transition-walk canary", () => {
 
   afterEach(() => {
     fs.rmSync(canaryDir, { recursive: true, force: true });
+    if (canaryOriginalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = canaryOriginalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
   });
 
   it("passes on valid dev-impl workflow definition", async () => {
