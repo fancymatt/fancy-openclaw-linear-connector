@@ -4012,12 +4012,19 @@ describe("applyStateTransition — AI-1493 atomic transitions", () => {
   let ai1493Dir: string;
   let ai1493OriginalFetch: typeof globalThis.fetch;
   let ai1493OriginalAgentsFile: string | undefined;
+  let ai1493OriginalImplementerStorePath: string | undefined;
 
   beforeEach(() => {
     ai1493Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1493-test-"));
     const policyFile = path.join(ai1493Dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
     process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    // AI-1531: isolate the implementer store to this suite's tmpdir so a stale
+    // /tmp/implementer-store.json can never poison reject/request-changes.
+    ai1493OriginalImplementerStorePath = process.env.IMPLEMENTER_STORE_PATH;
+    process.env.IMPLEMENTER_STORE_PATH = path.join(ai1493Dir, "implementer-store.json");
+    clearImplementerStore();
 
     const workflowFile = path.join(ai1493Dir, "dev-impl.yaml");
     fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
@@ -4058,13 +4065,17 @@ describe("applyStateTransition — AI-1493 atomic transitions", () => {
       delete process.env.AGENTS_FILE;
     }
     reloadAgents();
-    fs.rmSync(ai1493Dir, { recursive: true, force: true });
 
-    const { removeImplementer: doRemove } = await import("./implementer-store.js");
-    doRemove("issue-reject-ai1493");
-    doRemove("issue-rc-ai1493");
-    doRemove("issue-atomic-ai1493");
-    doRemove("issue-done-ai1493");
+    // AI-1531: clear the in-memory store and restore the env override before
+    // removing the tmpdir, so no record leaks across suites.
+    clearImplementerStore();
+    if (ai1493OriginalImplementerStorePath !== undefined) {
+      process.env.IMPLEMENTER_STORE_PATH = ai1493OriginalImplementerStorePath;
+    } else {
+      delete process.env.IMPLEMENTER_STORE_PATH;
+    }
+
+    fs.rmSync(ai1493Dir, { recursive: true, force: true });
   });
 
   it("routes reject back to prior implementer from implementer store", async () => {
@@ -4343,6 +4354,7 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
   let confDir: string;
   let originalWorkflowPath: string | undefined;
   let originalPolicyPath: string | undefined;
+  let originalImplementerStorePath: string | undefined;
 
   beforeAll(() => {
     originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
@@ -4353,6 +4365,11 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
     process.env.CAPABILITY_POLICY_PATH = policyFile;
     process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
+
+    // AI-1531: isolate the implementer store to this suite's tmpdir so a stale
+    // /tmp/implementer-store.json can never poison reject/request-changes.
+    originalImplementerStorePath = process.env.IMPLEMENTER_STORE_PATH;
+    process.env.IMPLEMENTER_STORE_PATH = path.join(confDir, "implementer-store.json");
   });
 
   afterAll(() => {
@@ -4360,6 +4377,8 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     else delete process.env.WORKFLOW_DEF_PATH;
     if (originalPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
     else delete process.env.CAPABILITY_POLICY_PATH;
+    if (originalImplementerStorePath !== undefined) process.env.IMPLEMENTER_STORE_PATH = originalImplementerStorePath;
+    else delete process.env.IMPLEMENTER_STORE_PATH;
   });
 
   beforeEach(() => {
@@ -4367,10 +4386,12 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     resetWorkflowCache();
     resetNativeStateCache();
     resetPolicyCache();
+    clearImplementerStore();
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    clearImplementerStore();
   });
 
   /**
