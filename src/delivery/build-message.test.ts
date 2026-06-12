@@ -15,6 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { resetWorkflowCache } from "../workflow-gate.js";
+import { recordAppliedState, _resetAppliedStateStore } from "../store/applied-state-store.js";
 
 // ── Test workflow YAML ─────────────────────────────────────────────────────
 
@@ -137,6 +138,7 @@ beforeAll(() => {
 
 beforeEach(() => {
   resetWorkflowCache();
+  _resetAppliedStateStore();
   process.env.WORKFLOW_DEF_PATH = tmpYamlPath;
   process.env.WORKFLOW_GUIDANCE_DIR = tmpGuidanceDir;
   originalFetch = globalThis.fetch;
@@ -391,6 +393,68 @@ describe("B3 — outbound per-step instruction injection", () => {
 
       expect(msg).toContain("Next Steps:");
       expect(msg).toContain("2 additional event(s)");
+    });
+  });
+
+  // ── AI-1534 — read-after-write lag guard via applied-state cache ──────────
+  describe("AI-1534 — prefers just-applied state over a stale live read", () => {
+    it("AC1: live read still shows old state but cache has new state → names the NEW state's verb", async () => {
+      // Live label read lags at the pre-transition state (intake)...
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+      // ...but the connector just applied accept (intake → implementation) and
+      // recorded the authoritative destination.
+      recordAppliedState("AI-100", "implementation");
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const msg = await buildDeliveryMessage(makeRoute("AI-100", "Lagged read"), "Bearer tok");
+
+      // Message describes the NEW state and lists its verb (submit), never the
+      // previous state's verb (accept) that the gate would reject.
+      expect(msg).toContain("state: **implementation**");
+      expect(msg).toContain("linear submit AI-100");
+      expect(msg).not.toContain("linear accept AI-100");
+      expect(msg).not.toContain("state: **intake**");
+    });
+
+    it("AC2: coalesced delivery across a transition rebuilds against current state", async () => {
+      // Simulate the bug's exact shape: intake→write-tests-equivalent fires
+      // near-simultaneous webhooks; the delivery that wins is built while the
+      // live read is still stale. The cache makes the (coalesced) send-time
+      // build name the correct verb.
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+      recordAppliedState("AI-101", "implementation");
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const route = { ...makeRoute("AI-101", "Coalesced across transition"), coalescedCount: 2 };
+      const msg = await buildDeliveryMessage(route, "Bearer tok");
+
+      expect(msg).toContain("state: **implementation**");
+      expect(msg).toContain("linear submit AI-101");
+      expect(msg).not.toContain("linear accept AI-101");
+      // Coalescing note still present — the cache guard does not suppress it.
+      expect(msg).toContain("2 additional event(s)");
+    });
+
+    it("no cache entry → falls back to the live read (unchanged behavior)", async () => {
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+      // No recordAppliedState call.
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const msg = await buildDeliveryMessage(makeRoute("AI-102", "No cache"), "Bearer tok");
+
+      expect(msg).toContain("state: **intake**");
+      expect(msg).toContain("linear accept AI-102");
+    });
+
+    it("cache agreeing with live read → identical message, no spurious switch", async () => {
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+      recordAppliedState("AI-103", "implementation");
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const msg = await buildDeliveryMessage(makeRoute("AI-103", "Agreeing"), "Bearer tok");
+
+      expect(msg).toContain("state: **implementation**");
+      expect(msg).toContain("linear submit AI-103");
     });
   });
 });
