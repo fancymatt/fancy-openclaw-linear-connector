@@ -85,8 +85,39 @@ export interface WorkflowDef {
     stakes?: StakesLevel;
     states: WorkflowState[];
 }
+/**
+ * Legacy single-def accessor. Returns the primary workflow def, derived from the
+ * registry so its cache stays coherent with loadWorkflowRegistry().
+ *   - Single-file mode (no WORKFLOW_DEFS_DIR): the registry holds exactly the
+ *     WORKFLOW_DEF_PATH def — return it (preserving prior behavior and its
+ *     fail-closed-on-load posture, which loadWorkflowRegistry rethrows).
+ *   - Dir mode: return the def named by WORKFLOW_DEF_PATH if present in the
+ *     registry, else the first registered def.
+ */
 export declare function loadWorkflowDef(): Promise<WorkflowDef>;
-/** Invalidate the in-process workflow def cache (used in tests). */
+/**
+ * AI-1530: Load ALL workflow defs into a registry keyed by def.id.
+ *
+ * This is the dispatch source for multi-workflow enforcement: the gate resolves
+ * a ticket's def by its wf:<id> label via this registry, instead of comparing
+ * against a single loaded def. After this lands, dev-impl, ux-audit and sprint
+ * can all be enforced simultaneously by the same connector.
+ *
+ * Directory resolution:
+ *   - If WORKFLOW_DEFS_DIR is set, load every *.yaml in that directory.
+ *   - Otherwise (backwards-compat), load the single WORKFLOW_DEF_PATH file as a
+ *     1-entry registry — preserving the current single-def deploy exactly (AC6).
+ *
+ * Per-def fail-closed (AC2): a def that fails native_state validation (or fails
+ * to parse) is excluded from the registry and surfaced via logs + config-health,
+ * while every other valid def still loads. In single-file mode a load failure
+ * rethrows, preserving the existing fail-closed posture for the primary deploy.
+ *
+ * The result is cached; resetWorkflowCache() clears it (AC5) so a vault edit is
+ * picked up on the next load without a code rebuild.
+ */
+export declare function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>>;
+/** Invalidate the in-process workflow registry cache (used in tests & live-reload). */
 export declare function resetWorkflowCache(): void;
 /**
  * AI-1490 / AI-1498: Validate that every workflow state has a valid native_state field.
@@ -218,4 +249,40 @@ export interface ApplyStateTransitionOptions {
     artifactRef?: string | null;
 }
 export declare function applyStateTransition(intent: string, issueId: string | null, authToken: string, options?: ApplyStateTransitionOptions): Promise<void>;
+/**
+ * A single drift entry detected during reconciliation.
+ */
+export interface DriftEntry {
+    issueId: string;
+    storedState: string;
+    labelState: string | null;
+    repaired: boolean;
+}
+/**
+ * Result of a reconcileLabelDrift run.
+ */
+export interface ReconcileResult {
+    checked: number;
+    drifted: number;
+    repaired: number;
+    errors: number;
+    details: DriftEntry[];
+}
+/**
+ * Phase 6.5 / H-6: Drift reconciliation.
+ *
+ * Iterates all tickets tracked in the label-projection store, fetches their
+ * current state:* label from Linear, and repairs any that diverge from the
+ * stored authoritative state. The label never wins: when a human hand-edits
+ * a state:* label in the Linear UI, the next reconcile pass overwrites it
+ * with the store value and fires an alert.
+ *
+ * Called periodically (cron job) or on-demand by a steward.
+ * Fail-open: individual ticket errors increment the errors counter and are
+ * logged, but never abort the full run.
+ *
+ * @param authToken - Linear API token for fetching and writing labels.
+ * @param alertFn   - Optional override for alert emission (default: log.error).
+ */
+export declare function reconcileLabelDrift(authToken: string, alertFn?: (msg: string) => void): Promise<ReconcileResult>;
 //# sourceMappingURL=workflow-gate.d.ts.map

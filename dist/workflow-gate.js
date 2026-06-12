@@ -34,6 +34,7 @@
  * Design: design.md §4.2, §4.4, §4.6, §11, §13, §16.1, §16.2.
  */
 import fs from "node:fs/promises";
+import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger } from "./logger.js";
 import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
@@ -47,6 +48,7 @@ import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
 import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
+import { recordProjection, getProjection, getAllProjections, removeProjection } from "./label-projection-store.js";
 /**
  * Phase 6.5 / H-6: Label read-only projection + override path + drift reconciliation.
  *
@@ -78,42 +80,154 @@ const DEFAULT_WORKFLOW_DEF_PATH = "/home/fancymatt/obsidian-vault/ai-systems/pro
 function workflowDefPath() {
     return process.env.WORKFLOW_DEF_PATH ?? DEFAULT_WORKFLOW_DEF_PATH;
 }
-// ── Workflow def cache ─────────────────────────────────────────────────────
-let _workflowCache = null;
+// ── Workflow def cache & registry ──────────────────────────────────────────
+// AI-1530: a single registry cache is the sole source of truth. loadWorkflowDef
+// (the legacy single-def accessor) derives its def from the same registry so the
+// two cannot diverge — resetWorkflowCache() invalidates everything at once.
+let _registryCache = null;
+/**
+ * Read, parse, and validate a single workflow def file. Throws on read/parse
+ * failure or if native_state validation fails (AI-1490 / AI-1498 fail-closed
+ * posture: the proxy must be able to write a native stateId for every state).
+ * Performs no config-health accounting — callers own that.
+ */
+async function loadDefFromFile(file) {
+    const raw = await fs.readFile(file, "utf8");
+    const def = yaml.load(raw);
+    if (!def || typeof def !== "object" || !def.id) {
+        throw new Error(`workflow def at ${file} has no 'id' field`);
+    }
+    if (def.break_glass && !def.break_glass.command) {
+        log.warn(`workflow-gate: break_glass block in ${file} has no 'command' field — falling back to hardcoded "escape". Canonicalize the YAML to add command: escape.`);
+    }
+    const warnings = validateNativeStateMappings(def);
+    for (const w of warnings) {
+        log.error(`workflow-gate: native_state validation FAILURE (${def.id}): ${w}`);
+    }
+    if (warnings.length > 0) {
+        throw new Error(`Workflow definition '${def.id}' has ${warnings.length} invalid native_state mapping(s): ${warnings.join("; ")}`);
+    }
+    return def;
+}
+/**
+ * Legacy single-def accessor. Returns the primary workflow def, derived from the
+ * registry so its cache stays coherent with loadWorkflowRegistry().
+ *   - Single-file mode (no WORKFLOW_DEFS_DIR): the registry holds exactly the
+ *     WORKFLOW_DEF_PATH def — return it (preserving prior behavior and its
+ *     fail-closed-on-load posture, which loadWorkflowRegistry rethrows).
+ *   - Dir mode: return the def named by WORKFLOW_DEF_PATH if present in the
+ *     registry, else the first registered def.
+ */
 export async function loadWorkflowDef() {
-    if (_workflowCache)
-        return _workflowCache;
-    try {
-        const raw = await fs.readFile(workflowDefPath(), "utf8");
-        const def = yaml.load(raw);
-        if (def.break_glass && !def.break_glass.command) {
-            log.warn(`workflow-gate: break_glass block in ${workflowDefPath()} has no 'command' field — falling back to hardcoded "escape". Canonicalize the YAML to add command: escape.`);
-        }
-        _workflowCache = def;
-        recordSuccess("workflow-def");
-        // AI-1490 / AI-1498: validate native_state mappings on load — hard-fail if any state
-        // lacks a valid native_state (the proxy must be able to write native stateId for every
-        // transition; a missing mapping is what made deployment fall through to native Invalid).
-        const warnings = validateNativeStateMappings(def);
-        for (const w of warnings) {
-            log.error(`workflow-gate: native_state validation FAILURE: ${w}`);
-        }
-        if (warnings.length > 0) {
-            const msg = `Workflow definition has ${warnings.length} invalid native_state mapping(s): ${warnings.join("; ")}`;
+    const registry = await loadWorkflowRegistry();
+    if (!process.env.WORKFLOW_DEFS_DIR) {
+        const only = registry.values().next().value;
+        if (!only) {
+            const msg = `no workflow def loaded from ${workflowDefPath()}`;
             recordFailure("workflow-def", msg);
             throw new Error(msg);
         }
-        return _workflowCache;
+        return only;
     }
-    catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        recordFailure("workflow-def", msg);
-        throw err;
+    let primaryId = null;
+    try {
+        primaryId = (await loadDefFromFile(workflowDefPath())).id;
     }
+    catch {
+        primaryId = null;
+    }
+    if (primaryId && registry.has(primaryId))
+        return registry.get(primaryId);
+    const first = registry.values().next().value;
+    if (!first)
+        throw new Error(`no workflow def loaded`);
+    return first;
 }
-/** Invalidate the in-process workflow def cache (used in tests). */
+/**
+ * AI-1530: Load ALL workflow defs into a registry keyed by def.id.
+ *
+ * This is the dispatch source for multi-workflow enforcement: the gate resolves
+ * a ticket's def by its wf:<id> label via this registry, instead of comparing
+ * against a single loaded def. After this lands, dev-impl, ux-audit and sprint
+ * can all be enforced simultaneously by the same connector.
+ *
+ * Directory resolution:
+ *   - If WORKFLOW_DEFS_DIR is set, load every *.yaml in that directory.
+ *   - Otherwise (backwards-compat), load the single WORKFLOW_DEF_PATH file as a
+ *     1-entry registry — preserving the current single-def deploy exactly (AC6).
+ *
+ * Per-def fail-closed (AC2): a def that fails native_state validation (or fails
+ * to parse) is excluded from the registry and surfaced via logs + config-health,
+ * while every other valid def still loads. In single-file mode a load failure
+ * rethrows, preserving the existing fail-closed posture for the primary deploy.
+ *
+ * The result is cached; resetWorkflowCache() clears it (AC5) so a vault edit is
+ * picked up on the next load without a code rebuild.
+ */
+export async function loadWorkflowRegistry() {
+    if (_registryCache)
+        return _registryCache;
+    const registry = new Map();
+    const dir = process.env.WORKFLOW_DEFS_DIR;
+    if (dir) {
+        let entries;
+        try {
+            entries = await fs.readdir(dir);
+        }
+        catch (err) {
+            // Catastrophic: the defs directory itself is unreadable. Surface and
+            // rethrow so enforcement callers fail closed.
+            const msg = err instanceof Error ? err.message : String(err);
+            recordFailure("workflow-def", `WORKFLOW_DEFS_DIR unreadable (${dir}): ${msg}`);
+            throw err;
+        }
+        const yamlFiles = entries.filter((f) => f.endsWith(".yaml")).sort();
+        let failures = 0;
+        for (const f of yamlFiles) {
+            const full = path.join(dir, f);
+            try {
+                const def = await loadDefFromFile(full);
+                if (registry.has(def.id)) {
+                    log.warn(`workflow-gate: duplicate workflow id '${def.id}' (${full}) — keeping first, ignoring this file`);
+                    continue;
+                }
+                registry.set(def.id, def);
+            }
+            catch (err) {
+                // AC2: one bad def fails that def only — exclude it, keep the rest.
+                failures++;
+                const msg = err instanceof Error ? err.message : String(err);
+                log.error(`workflow-gate: workflow def excluded from registry (${full}): ${msg}`);
+            }
+        }
+        if (failures > 0) {
+            recordFailure("workflow-def", `${failures} workflow def(s) excluded from registry (see logs)`);
+        }
+        else {
+            recordSuccess("workflow-def");
+        }
+    }
+    else {
+        // Backwards-compat (AC6): single WORKFLOW_DEF_PATH file → 1-entry registry.
+        // A load failure rethrows here (fail-closed) exactly as the legacy single-def
+        // loader did, so the current deploy's safety posture is unchanged.
+        try {
+            const def = await loadDefFromFile(workflowDefPath());
+            registry.set(def.id, def);
+            recordSuccess("workflow-def");
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            recordFailure("workflow-def", msg);
+            throw err;
+        }
+    }
+    _registryCache = registry;
+    return registry;
+}
+/** Invalidate the in-process workflow registry cache (used in tests & live-reload). */
 export function resetWorkflowCache() {
-    _workflowCache = null;
+    _registryCache = null;
 }
 /**
  * AI-1498: Semantic-to-native mapping — mirrors the CLI's SEMANTIC_STATE_MAP
@@ -564,21 +678,23 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
     }
     let def;
     try {
-        def = await loadWorkflowDef();
+        const registry = await loadWorkflowRegistry();
+        def = registry.get(workflowId);
     }
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        // Phase 6.5 / H-1: FAIL CLOSED on workflow def load failure (§16.0).
+        // Phase 6.5 / H-1: FAIL CLOSED on workflow registry load failure (§16.0).
         if (breakGlassOverride) {
-            log.warn(`workflow-gate: workflow def load failed but break-glass override active — allowing through: ${msg}`);
+            log.warn(`workflow-gate: workflow registry load failed but break-glass override active — allowing through: ${msg}`);
             return null;
         }
-        log.error(`workflow-gate: FAIL-CLOSED — workflow def load failed, rejecting '${intent}' on wf:${workflowId} ticket ${issueId}: ${msg}`);
+        log.error(`workflow-gate: FAIL-CLOSED — workflow registry load failed, rejecting '${intent}' on wf:${workflowId} ticket ${issueId}: ${msg}`);
         return (`[Proxy] '${intent}' blocked: workflow definition could not be loaded (${msg}). ` +
             `A steward can use break-glass to bypass this check.`);
     }
-    // Only enforce for the workflow whose def is loaded; others fail open.
-    if (workflowId !== def.id)
+    // AI-1530: dispatch by wf:<id> label. A ticket whose wf: matches no registered
+    // def remains pass-through (unknown / unenforced workflow).
+    if (!def)
         return null;
     // §5.3 Asymmetry enforcement: children running wf:dev-impl have no legal
     // command to address the parent's ux-audit workflow. This is structural:
@@ -623,7 +739,22 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
         return (`[Proxy] '${intent}' blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
             `Only the ticket delegate may mutate its state.`);
     }
-    const currentState = getCurrentState(labels);
+    // Phase 6.5 / H-6: Read authoritative state from the connector-side store.
+    // The store is the sole writer of truth; labels are a read-only projection.
+    // Falls back to label-based state for tickets not yet in the store
+    // (bootstrapping: tickets created before H-6 deployment).
+    let currentState;
+    const storedProjection = await getProjection(issueId);
+    if (storedProjection && storedProjection.workflowId === workflowId) {
+        const labelState = getCurrentState(labels);
+        if (labelState && labelState !== storedProjection.stateName) {
+            log.warn(`workflow-gate: H-6 drift on ${issueId}: store='${storedProjection.stateName}', label='${labelState}' — store wins; reconciler will repair label`);
+        }
+        currentState = storedProjection.stateName;
+    }
+    else {
+        currentState = getCurrentState(labels);
+    }
     if (!currentState) {
         // AI-1402: For needs-human, fail-closed even without a state label.
         // We cannot determine if there is a forward path, so treat the ticket as actionable.
@@ -835,13 +966,14 @@ export async function checkRawMutationInterception(body, issueId, authToken, bod
     }
     let def;
     try {
-        def = await loadWorkflowDef();
+        const registry = await loadWorkflowRegistry();
+        def = registry.get(workflowId);
     }
     catch {
         return null; // fail-open
     }
-    if (workflowId !== def.id)
-        return null; // unknown workflow — pass-through
+    if (!def)
+        return null; // unknown workflow — pass-through (AI-1530)
     const breakGlassCommand = def.break_glass?.command ?? "escape";
     const currentState = getCurrentState(labels);
     if (!currentState) {
@@ -959,15 +1091,16 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
         return; // ad-hoc ticket — no-op
     let def;
     try {
-        def = await loadWorkflowDef();
+        const registry = await loadWorkflowRegistry();
+        def = registry.get(workflowId);
     }
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        log.warn(`workflow-gate: B2 apply: failed to load workflow def: ${msg} — skipping`);
+        log.warn(`workflow-gate: B2 apply: failed to load workflow registry: ${msg} — skipping`);
         return;
     }
-    if (workflowId !== def.id)
-        return; // unknown workflow — no-op
+    if (!def)
+        return; // unknown workflow — no-op (AI-1530)
     const currentStateName = getCurrentState(labelNames);
     if (!currentStateName) {
         log.warn(`workflow-gate: B2 apply: no state:* label on ${issueId} — skipping`);
@@ -997,6 +1130,10 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
             .map((l) => l.id);
         await issueUpdateLabels(issue.internalId, keepIds, authToken);
         log.info(`workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels`);
+        // H-6: remove from projection store — ticket leaves the workflow.
+        await removeProjection(issueId).catch((err) => {
+            log.warn(`workflow-gate: H-6: removeProjection failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+        });
         return;
     }
     // ── Idempotency check (AI-1490 hardened) ────────────────────────────────
@@ -1305,6 +1442,10 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
         log.info(`workflow-gate: B2 apply: ${issueId} state:${currentStateName} → state:${toStateName}` +
             (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
             (resolvedNativeStateId ? ` native=${destNativeState}(${resolvedNativeStateId})` : ``));
+        // H-6: record authoritative state in the projection store.
+        await recordProjection(issueId, workflowId, toStateName).catch((err) => {
+            log.warn(`workflow-gate: H-6: recordProjection failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+        });
     }
     else {
         log.error(`workflow-gate: B2 apply: atomic mutation FAILED for ${issueId} — all facets rolled back (no partial state)`);
@@ -1532,5 +1673,85 @@ async function issueUpdateDelegateOnly(internalId, delegateLinearUserId, authTok
         log.warn(`workflow-gate: delegate-only issueUpdate failed for ${internalId}: ${msg}`);
         return false;
     }
+}
+/**
+ * Phase 6.5 / H-6: Drift reconciliation.
+ *
+ * Iterates all tickets tracked in the label-projection store, fetches their
+ * current state:* label from Linear, and repairs any that diverge from the
+ * stored authoritative state. The label never wins: when a human hand-edits
+ * a state:* label in the Linear UI, the next reconcile pass overwrites it
+ * with the store value and fires an alert.
+ *
+ * Called periodically (cron job) or on-demand by a steward.
+ * Fail-open: individual ticket errors increment the errors counter and are
+ * logged, but never abort the full run.
+ *
+ * @param authToken - Linear API token for fetching and writing labels.
+ * @param alertFn   - Optional override for alert emission (default: log.error).
+ */
+export async function reconcileLabelDrift(authToken, alertFn) {
+    const projections = await getAllProjections();
+    const result = {
+        checked: projections.size,
+        drifted: 0,
+        repaired: 0,
+        errors: 0,
+        details: [],
+    };
+    const alert = alertFn ?? ((msg) => log.error(`workflow-gate: H-6 DRIFT ALERT: ${msg}`));
+    for (const [issueId, projection] of projections) {
+        try {
+            const labels = await fetchWorkflowLabels(issueId, authToken);
+            const labelState = getCurrentState(labels);
+            if (labelState === projection.stateName)
+                continue; // no drift
+            result.drifted++;
+            const detail = {
+                issueId,
+                storedState: projection.stateName,
+                labelState,
+                repaired: false,
+            };
+            alert(`ticket ${issueId}: store=${projection.stateName}, label=${labelState ?? "(none)"} — overwriting label with store value`);
+            // Re-project: fetch full label set, swap state:* back to store value.
+            const issue = await fetchIssueWithLabels(issueId, authToken);
+            if (!issue) {
+                log.warn(`workflow-gate: H-6 reconcile: could not fetch labels for ${issueId} — skipping repair`);
+                result.errors++;
+                result.details.push(detail);
+                continue;
+            }
+            const newLabelId = await findOrCreateLabel(issue.teamId, `state:${projection.stateName}`, authToken);
+            if (!newLabelId) {
+                log.warn(`workflow-gate: H-6 reconcile: could not find/create label state:${projection.stateName} for ${issueId} — skipping repair`);
+                result.errors++;
+                result.details.push(detail);
+                continue;
+            }
+            // Replace all state:* labels with the authoritative one.
+            const cleanedIds = issue.labels
+                .filter((l) => !l.name.startsWith("state:"))
+                .map((l) => l.id);
+            cleanedIds.push(newLabelId);
+            const repaired = await issueUpdateLabels(issue.internalId, cleanedIds, authToken);
+            detail.repaired = repaired;
+            if (repaired) {
+                result.repaired++;
+                log.info(`workflow-gate: H-6 reconcile: repaired ${issueId} label → state:${projection.stateName}`);
+            }
+            else {
+                result.errors++;
+                log.warn(`workflow-gate: H-6 reconcile: label repair mutation failed for ${issueId}`);
+            }
+            result.details.push(detail);
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.warn(`workflow-gate: H-6 reconcile: error processing ${issueId}: ${msg}`);
+            result.errors++;
+        }
+    }
+    return result;
 }
 //# sourceMappingURL=workflow-gate.js.map

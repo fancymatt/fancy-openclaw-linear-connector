@@ -339,7 +339,7 @@ states:
 
     for (const [id, def] of registry) {
       const errors = validateNativeStateMappings(def);
-      expect(errors, `${id} should have 0 native_state errors`).toHaveLength(0);
+      expect(errors).toHaveLength(0); // ${id} should have 0 native_state errors
     }
   });
 });
@@ -474,7 +474,7 @@ describe("AC4: dev-impl regression — registry-based gate identical to single-d
       resetWorkflowCache();
       globalThis.fetch = makeLabelFetch(["wf:dev-impl", `state:${state}`]);
       const result = await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "astrid");
-      expect(result, `escape must be allowed from ${state}`).toBeNull();
+      expect(result).toBeNull(); // escape must be allowed from ${state}
     }
   });
 });
