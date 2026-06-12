@@ -5,7 +5,7 @@
  * Phase 2 tests: async `checkRoleGuardEnforced` enforcement path (AI-1459).
  */
 
-import { jest, describe, it, expect, beforeEach } from "@jest/globals";
+import { jest, describe, it, expect, beforeEach, afterEach } from "@jest/globals";
 
 // ── ESM-compatible mocks (must be declared before dynamic imports) ─────────
 
@@ -40,8 +40,21 @@ jest.unstable_mockModule("./escalation-gate.js", () => ({
 }));
 
 // Dynamic import after mocks are registered.
-const { checkRoleGuard, checkRoleGuardEnforced, checkRoleGuardAndBlock } =
-  await import("./routing-guard.js");
+// guardOnLabelChange is the new AC4 function (does not exist yet → undefined).
+const { checkRoleGuard, checkRoleGuardEnforced, checkRoleGuardAndBlock, guardOnLabelChange } =
+  await import("./routing-guard.js") as {
+    checkRoleGuard: (typeof import("./routing-guard.js"))["checkRoleGuard"];
+    checkRoleGuardEnforced: (typeof import("./routing-guard.js"))["checkRoleGuardEnforced"];
+    checkRoleGuardAndBlock: (typeof import("./routing-guard.js"))["checkRoleGuardAndBlock"];
+    // AI-1575 / AC4: exported when the label-change guard path is wired.
+    // Undefined until implemented — tests that call it fail with TypeError.
+    guardOnLabelChange: ((opts: {
+      issueIdentifier: string;
+      newLabels: string[];
+      authToken: string;
+      delegateLinearUserIdResolver?: (name: string) => string | null;
+    }) => Promise<{ fired: boolean; blocked: boolean; correctedTo?: string }>) | undefined;
+  };
 
 // ── Minimal workflow def stub for dev-impl ────────────────────────────────
 
@@ -293,5 +306,215 @@ describe("checkRoleGuardAndBlock (enforcement + comment/correction, no network)"
   it("passes through non-workflow tickets without touching Linear", async () => {
     const result = await checkRoleGuardAndBlock("charles", "AI-1234", []);
     expect(result.blocked).toBe(false);
+  });
+});
+
+// ── AI-1575 / AC4: guard fires on enrollment/label-change path ────────────
+//
+// AC4: checkRoleGuardEnforced must fire on the enrollment/label-change path and
+// correct an illegal delegate to the state's legal owner.
+//
+// AI-1571 incident: enrollment via bare `linear label` (not atomic) added
+// wf:dev-impl + state:intake labels but left a stale delegate (Hanzo, the
+// deployment owner). The guard DID NOT fire on the label-change webhook because
+// the webhook handler returned early when routeEvent produced no route — the
+// guard check is only reached after a successful route.
+//
+// Fix (in-scope for AI-1575): the guard must also run on label-change events
+// that make a ticket governed, even when no agent route is resolved from the
+// event payload. These tests define the expected behavior; they will be RED
+// until the webhook handler is updated to call the guard on the label-change path.
+
+describe("checkRoleGuardEnforced — AI-1575 / AC4: intake-state guard logic", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockLoadWorkflowDef.mockResolvedValue(DEV_IMPL_DEF as never);
+  });
+
+  it("blocks Hanzo (deployment role) on state:intake (owner_role=steward)", async () => {
+    mockResolveBodiesForRole.mockImplementation(async (role: string) => {
+      if (role === "steward") return ["astrid"] as never;
+      if (role === "deployment") return ["hanzo"] as never;
+      return [] as never;
+    });
+
+    const result = await checkRoleGuardEnforced("hanzo", ["wf:dev-impl", "state:intake"]);
+
+    expect(result.blocked).toBe(true);
+    expect(result.reason).toContain("intake");
+    expect(result.correctedTo).toBe("astrid");
+  });
+
+  it("identifies the steward singleton as correctedTo so webhook can auto-correct", async () => {
+    mockResolveBodiesForRole.mockResolvedValueOnce(["astrid"] as never);
+
+    const result = await checkRoleGuardEnforced("hanzo", ["wf:dev-impl", "state:intake"]);
+
+    // Must produce correctedTo so checkRoleGuardAndBlock can issue the delegate update.
+    expect(result.correctedTo).toBeDefined();
+    expect(typeof result.correctedTo).toBe("string");
+  });
+
+  it("passes Astrid (steward) through on state:intake — correct owner", async () => {
+    mockResolveBodiesForRole.mockResolvedValueOnce(["astrid"] as never);
+
+    const result = await checkRoleGuardEnforced("astrid", ["wf:dev-impl", "state:intake"]);
+
+    expect(result.blocked).toBe(false);
+  });
+});
+
+describe("checkRoleGuardAndBlock — AI-1575 / AC4: label-change path guard (AI-1571 regression)", () => {
+  // These tests cover the NEW behavior required by AC4: the guard must fire and
+  // correct the delegate when a wf:dev-impl + state:intake label-change event
+  // arrives and the current delegate is Hanzo.
+  //
+  // The webhook handler currently skips the guard when routeEvent returns null
+  // (no delegate/assignee in the event payload). These tests will be RED until
+  // the handler is updated to run the guard on the label-change path.
+
+  let savedFetch: typeof globalThis.fetch;
+  let fetchCalls: Array<{ query: string; variables: Record<string, unknown> }>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockLoadWorkflowDef.mockResolvedValue(DEV_IMPL_DEF as never);
+    mockResolveBodiesForRole.mockImplementation(async (role: string) => {
+      if (role === "steward") return ["astrid"] as never;
+      if (role === "deployment") return ["hanzo"] as never;
+      return [] as never;
+    });
+    // Token so checkRoleGuardAndBlock proceeds to comment + correction.
+    mockGetAccessToken.mockReturnValue("Bearer test-token");
+
+    fetchCalls = [];
+    savedFetch = globalThis.fetch;
+    globalThis.fetch = async (_url, init) => {
+      const body = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(body) as { query?: string; variables?: Record<string, unknown> };
+      fetchCalls.push({ query: parsed.query ?? "", variables: parsed.variables ?? {} });
+
+      const q = parsed.query ?? "";
+      if (q.includes("issue(")) {
+        // Resolve issue UUID
+        return new Response(
+          JSON.stringify({ data: { issue: { id: "internal-issue-uuid" } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (q.includes("commentCreate")) {
+        return new Response(
+          JSON.stringify({ data: { commentCreate: { success: true, comment: { id: "c1" } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (q.includes("issueUpdate")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true, issue: { id: "internal-issue-uuid" } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ data: {} }), { status: 200 });
+    };
+  });
+
+  afterEach(() => {
+    globalThis.fetch = savedFetch;
+  });
+
+  it("AI-1571 repro: checkRoleGuardAndBlock blocks Hanzo on intake and corrects delegate to steward", async () => {
+    const astridLinearId = "astrid-linear-uuid";
+    const resolver = (bodyName: string): string | null => {
+      if (bodyName.toLowerCase() === "astrid") return astridLinearId;
+      return null;
+    };
+
+    const result = await checkRoleGuardAndBlock(
+      "hanzo",
+      "AI-1571",
+      ["wf:dev-impl", "state:intake"],
+      resolver,
+    );
+
+    expect(result.blocked).toBe(true);
+    expect(result.correctedTo).toBe("astrid");
+
+    // The guard must have attempted to correct the delegate to the steward.
+    const delegateCorrectionCalls = fetchCalls.filter(
+      (c) => c.query.includes("issueUpdate") && c.variables.delegateId === astridLinearId,
+    );
+    expect(delegateCorrectionCalls).toHaveLength(1);
+  });
+
+  it("AC4 label-change path: guardOnLabelChange fires guard even when event payload has no delegate field", async () => {
+    // This test asserts the NEW behavior required by AC4:
+    // guardOnLabelChange is a new exported function in routing-guard.ts that the
+    // webhook handler calls when a label-change event makes a ticket governed
+    // (wf:dev-impl + state:intake added) and routeEvent returns null (no delegate
+    // in the event payload). The function:
+    //   1. Fetches the ticket's CURRENT delegate from Linear
+    //   2. Runs checkRoleGuardEnforced against that delegate
+    //   3. If blocked, posts a comment and corrects the delegate
+    //
+    // This function does NOT exist yet → calling it raises TypeError → test is RED.
+
+    // Feed a fetch mock that returns Hanzo as the current delegate.
+    globalThis.fetch = async (_url, init) => {
+      const body = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(body) as { query?: string; variables?: Record<string, unknown> };
+      fetchCalls.push({ query: parsed.query ?? "", variables: parsed.variables ?? {} });
+      const q = parsed.query ?? "";
+      if (q.includes("IssueDelegateAndLabels") || q.includes("issue(")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "internal-issue-uuid",
+                delegate: { id: "hanzo-linear-uuid", name: "Hanzo" },
+                labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:intake" }] },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (q.includes("commentCreate")) {
+        return new Response(
+          JSON.stringify({ data: { commentCreate: { success: true, comment: { id: "c1" } } } }),
+          { status: 200 },
+        );
+      }
+      if (q.includes("issueUpdate")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true, issue: { id: "internal-issue-uuid" } } } }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ data: {} }), { status: 200 });
+    };
+
+    // guardOnLabelChange does not exist yet → TypeError: guardOnLabelChange is not a function.
+    expect(typeof guardOnLabelChange).toBe("function"); // fails until implemented
+
+    const result = await guardOnLabelChange!({
+      issueIdentifier: "AI-1571",
+      newLabels: ["wf:dev-impl", "state:intake"],
+      authToken: "Bearer test-token",
+      delegateLinearUserIdResolver: (name: string) =>
+        name.toLowerCase() === "astrid" ? "astrid-linear-uuid" : null,
+    });
+
+    // Guard must have fired (not skipped).
+    expect(result.fired).toBe(true);
+    // Guard must have blocked Hanzo.
+    expect(result.blocked).toBe(true);
+    // Correction target is the steward.
+    expect(result.correctedTo).toBe("astrid");
+
+    // A delegate-correction issueUpdate was sent.
+    const correctionCalls = fetchCalls.filter(
+      (c) => c.query.includes("issueUpdate") && c.variables.delegateId === "astrid-linear-uuid",
+    );
+    expect(correctionCalls).toHaveLength(1);
   });
 });
