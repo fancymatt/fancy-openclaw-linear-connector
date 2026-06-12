@@ -13,7 +13,7 @@ import { ObservationStore } from "./store/observation-store.js";
 import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
-import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, StuckDelegateDetector, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
+import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, StuckDelegateDetector, HoldRetryTracker, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus } from "./engagement-status.js";
@@ -101,6 +101,12 @@ export interface CreateAppOptions {
   observationsDbPath?: string;
   /** Override ManagingStateStore database path (for testing). */
   managingStateDbPath?: string;
+  /**
+   * Test hook: override wake-up delivery for resignal/hold-retry dispatches.
+   * When provided, replaces the real sendWakeUpSignal so tests don't hit the
+   * live hooks URL. Also used as isTicketActionable bypass when provided.
+   */
+  sendWakeUp?: (agentId: string, ticketIds: string[]) => Promise<void>;
 }
 
 export function createApp(options?: CreateAppOptions) {
@@ -170,8 +176,11 @@ export function createApp(options?: CreateAppOptions) {
     };
   };
   const resignalOptions = {
-    sendWakeUp: (agentId: string, ticketIds: string[]) =>
-      sendWakeUpSignal(agentId, ticketIds, wakeConfigForAgent(agentId)),
+    sendWakeUp: options?.sendWakeUp
+      ? (agentId: string, ticketIds: string[]) => options.sendWakeUp!(agentId, ticketIds)
+      : (agentId: string, ticketIds: string[]) => sendWakeUpSignal(agentId, ticketIds, wakeConfigForAgent(agentId)),
+    // When a test sendWakeUp is provided, also bypass the Linear API routing check.
+    ...(options?.sendWakeUp ? { isTicketActionable: () => true as boolean | Promise<boolean> } : {}),
   };
   const forensicsConfig: ForensicsConfig = {
     diagnosticsDir: process.env.STALE_SESSION_DIAGNOSTICS_DIR,
@@ -382,6 +391,11 @@ export function createApp(options?: CreateAppOptions) {
   });
   stuckDelegateDetector.start();
 
+  // ── AI-1533: Hold-retry tracker ──────────────────────────────────────
+  // Detects sessions that end gracefully without a state-advancing transition
+  // (transient-error holds) and re-dispatches them within a bounded grace window.
+  const holdRetryTracker = new HoldRetryTracker();
+
   // ── Managing-state stewardship poller ────────────────────────────────
   // Wakes agents on a cadence to review Managing-state tickets (parent /
   // externally-blocked work the agent has claimed responsibility for but
@@ -536,6 +550,8 @@ export function createApp(options?: CreateAppOptions) {
       if (acknowledged > 0) {
         noActivityDetector.clearWarned(agentId, ticketId);
       }
+      // AI-1533: mark transition seen so session-end won't hold-retry this ticket.
+      holdRetryTracker.recordTransition(agentId, ticketId);
       // AI-1510: agent authored Linear activity → actively working → Doing.
       flipEngagementStatus(agentId, ticketId, "doing");
     },
@@ -587,6 +603,38 @@ export function createApp(options?: CreateAppOptions) {
     // them, so we can reset native status → To Do for each ticket the agent is
     // releasing. (This handler ends ALL of the agent's sessions.)
     const endedKeys = sessionTracker.getActiveSessionKeys(agentId);
+
+    // AI-1533: Identify hold-retry candidates BEFORE acknowledging dispatches so
+    // we can still read dispatch ages from the ackTracker.
+    // A "hold" is a session that ended gracefully with no state-advancing transition.
+    // We re-dispatch these once (up to maxAttempts) so transient errors self-heal.
+    const pendingAckEntries = ackTracker.getPendingTimedOut(0);
+    const dispatchAgeByTicket = new Map<string, number>(
+      pendingAckEntries
+        .filter((e) => e.agentId === agentId)
+        .map((e) => [
+          e.ticketId,
+          Date.now() - new Date(e.dispatchedAt.replace(" ", "T") + "Z").getTime(),
+        ]),
+    );
+    const holdCandidates = endedKeys.filter((key) => {
+      const normalizedKey = normalizeSessionKey(key);
+      const dispatchAge = dispatchAgeByTicket.get(normalizedKey);
+      // If there's no ack entry for this session, it wasn't a tracked dispatch — skip.
+      if (dispatchAge === undefined) return false;
+      return holdRetryTracker.shouldRetryHold(agentId, normalizedKey, dispatchAge);
+    });
+    // Update hold-retry state for all ended sessions.
+    for (const key of endedKeys) {
+      if (holdRetryTracker.hasTransition(agentId, key)) {
+        // Healthy run: transition was seen — reset attempt count for the next dispatch.
+        holdRetryTracker.clearTicket(agentId, key);
+      } else {
+        // Hold or no-dispatch: clear only the transition flag; preserve attempt count.
+        holdRetryTracker.clearTransition(agentId, key);
+      }
+    }
+
     const queuedTickets = sessionTracker.endSession(agentId);
     // Reset engagement status to To Do for each released ticket — but only if no
     // successor (post-handoff delegate) already holds it. Handoff dispatches the
@@ -603,7 +651,6 @@ export function createApp(options?: CreateAppOptions) {
     // Acknowledge dispatches for this agent — the session completed (even briefly).
     ackTracker.acknowledge(agentId);
     // Clear no-activity warnings for any sessions that just ended.
-    const activeKeys = sessionTracker.getActiveSessionKeys(agentId); // Already ended, so empty — but clear anyway.
     noActivityDetector.clearWarned(agentId, "*");
     // Also drain any dispatched-but-unconfirmed bag entries for this agent.
     // These were dispatched on HTTP 200 but not confirmed as processed.
@@ -611,23 +658,59 @@ export function createApp(options?: CreateAppOptions) {
     if (bagTickets.length > 0) bag.clearAgent(agentId);
     // Normalize queued tickets so dedup works correctly vs already-normalized bag IDs.
     const queuedNormalized = (queuedTickets ?? []).map(t => normalizeSessionKey(t));
-    const allPending = [...new Set([...queuedNormalized, ...bagTickets])];
+    const regularPending = [...new Set([...queuedNormalized, ...bagTickets])];
+
+    // AI-1533: Compute hold-retry tickets that aren't already in regular pending.
+    const holdIds = holdCandidates.map((key) => normalizeSessionKey(key));
+    const newHoldIds = holdIds.filter((id) => !regularPending.includes(id));
+    if (newHoldIds.length > 0) {
+      for (const holdId of newHoldIds) {
+        const attempt = holdRetryTracker.incrementHoldAttempt(agentId, holdId);
+        log.info(
+          `[hold-retry] Re-dispatching ${agentId} [${holdId}] after graceful hold ` +
+          `(attempt ${attempt}/${holdRetryTracker.config.maxAttempts})`,
+        );
+        operationalEventStore.append({
+          outcome: "hold-retry-dispatch",
+          agent: agentId,
+          key: holdId,
+          sessionKey: holdId,
+          deliveryMode: "hold-retry",
+          attemptCount: attempt,
+          detail: { maxAttempts: holdRetryTracker.config.maxAttempts },
+        });
+      }
+    }
+
+    const allPending = [...new Set([...regularPending, ...newHoldIds])];
     operationalEventStore.append({
       outcome: "session-ended", agent: agentId, deliveryMode: "session-end-callback",
-      detail: { queuedTickets: queuedTickets ?? [], bagTickets, allPending }
+      detail: { queuedTickets: queuedTickets ?? [], bagTickets, regularPending, holdRetry: newHoldIds, allPending }
     });
-    if (allPending.length > 0) {
+
+    if (regularPending.length > 0) {
       // Re-signal: agent has work waiting. Send one signal per ticket so each
       // issue is delivered into its own canonical per-ticket session key.
       try {
-        await resignalPendingTickets(agentId, allPending, bag, sessionTracker, wakeConfigForAgent(agentId), { markActive: true });
+        await resignalPendingTickets(agentId, regularPending, bag, sessionTracker, wakeConfigForAgent(agentId), { markActive: true, ...resignalOptions });
       } catch (err) {
         log.error(`Session-end re-signal failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
       }
-      res.json({ ok: true, pendingTickets: allPending.length });
-    } else {
-      res.json({ ok: true, pendingTickets: 0 });
     }
+    if (newHoldIds.length > 0) {
+      // Re-dispatch hold-retry tickets with ack tracking so the watchdog monitors them.
+      try {
+        await resignalPendingTickets(agentId, newHoldIds, bag, sessionTracker, wakeConfigForAgent(agentId), {
+          markActive: true,
+          ...resignalOptions,
+          onDispatched: (aid, tid) => ackTracker.recordDispatch(aid, tid),
+        });
+      } catch (err) {
+        log.error(`Session-end hold-retry re-signal failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    res.json({ ok: true, pendingTickets: allPending.length });
   });
 
   // ── v1.1: Metrics endpoint ───────────────────────────────────────────
@@ -653,7 +736,7 @@ export function createApp(options?: CreateAppOptions) {
     });
   });
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, managingPoller, managingStateStore };
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore };
 }
 
 /**
