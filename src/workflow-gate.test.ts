@@ -5115,3 +5115,262 @@ describe("applyStateTransition — AI-1521: unescape re-entry", () => {
     expect(await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
   });
 });
+
+// ── AI-1575: atomic enroll verb ───────────────────────────────────────────
+//
+// Verifies that the `enroll` intent bypasses state-machine validation and
+// applies label + delegate + native state in a single atomic mutation.
+// Regression coverage for the AI-1571 orphaned-delegate collision.
+
+// Shared fixture for all AI-1575 suites — created once, torn down after the last.
+let ai1575Dir = "";
+let ai1575OrigWorkflowPath: string | undefined;
+let ai1575OrigPolicyPath: string | undefined;
+let ai1575OrigAgentsFile: string | undefined;
+let ai1575RefCount = 0;
+
+function setupAi1575(): void {
+  if (ai1575RefCount++ === 0) {
+    ai1575OrigWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    ai1575OrigPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    ai1575OrigAgentsFile = process.env.AGENTS_FILE;
+    ai1575Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1575-test-"));
+    const policyFile = path.join(ai1575Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+    const workflowFile = path.join(ai1575Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+    // Write agents file so getAgent("astrid") resolves linearUserId correctly
+    // regardless of whether a prior suite deleted AGENTS_FILE from env.
+    const agentsFile = path.join(ai1575Dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+        { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-client", clientSecret: "h-secret", accessToken: "h-token", refreshToken: "h-refresh" },
+        { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-client", clientSecret: "c-secret", accessToken: "c-token", refreshToken: "c-refresh" },
+        { name: "reviewer", linearUserId: "reviewer-linear-uuid", clientId: "r-client", clientSecret: "r-secret", accessToken: "r-token", refreshToken: "r-refresh" },
+      ],
+    }, null, 2), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+  }
+}
+
+function teardownAi1575(): void {
+  if (--ai1575RefCount === 0) {
+    fs.rmSync(ai1575Dir, { recursive: true, force: true });
+    if (ai1575OrigWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = ai1575OrigWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    if (ai1575OrigPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = ai1575OrigPolicyPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+    if (ai1575OrigAgentsFile !== undefined) process.env.AGENTS_FILE = ai1575OrigAgentsFile;
+    else delete process.env.AGENTS_FILE;
+    reloadAgents();
+  }
+}
+
+describe("checkWorkflowRules — AI-1575: enroll meta-command", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeAll(setupAi1575);
+  afterAll(teardownAi1575);
+
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetNativeStateCache();
+    resetPolicyCache();
+    resetConfigHealth();
+    originalFetch = globalThis.fetch;
+  });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("enroll is legal from intake state (bypasses state-machine check)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+    expect(await checkWorkflowRules("enroll", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
+
+  it("enroll is legal from implementation state (can re-enroll from any state)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    expect(await checkWorkflowRules("enroll", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
+
+  it("enroll is legal from deployment state (can re-enroll from any state)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+    expect(await checkWorkflowRules("enroll", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
+
+  it("enroll is pass-through on ad-hoc tickets (no wf:* label)", async () => {
+    globalThis.fetch = makeLabelFetch([]);
+    expect(await checkWorkflowRules("enroll", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
+
+  it("enroll bypasses delegate-only enforcement (non-delegate steward can enroll)", async () => {
+    // Simulate: ticket has state:implementation with a different delegate (hanzo-linear-uuid)
+    // and caller is astrid (the steward). Without the enroll bypass, this would be blocked
+    // by the delegate-only enforcement because astrid is not the current delegate.
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    expect(await checkWorkflowRules(
+      "enroll",
+      "issue-uuid",
+      "Bearer tok",
+      "astrid",
+      undefined,       // target
+      "astrid-linear-uuid", // callerLinearUserId
+      null,            // artifactRef
+      false,           // breakGlass
+    )).toBeNull();
+  });
+});
+
+describe("applyStateTransition — AI-1575: enroll atomic enrollment", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeAll(setupAi1575);
+  afterAll(teardownAi1575);
+
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetNativeStateCache();
+    resetPolicyCache();
+    resetConfigHealth();
+    clearImplementerStore();
+    originalFetch = globalThis.fetch;
+  });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("AC1: enrolls a clean ad-hoc ticket — sets labels + steward delegate + native state atomically", async () => {
+    // Post-CLI state: ticket now has wf:dev-impl + state:intake + risk:medium (CLI wrote them)
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "intake-lbl", name: "state:intake" },
+        { id: "risk-lbl", name: "risk:medium" },
+      ],
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("enroll", "issue-uuid", "Bearer tok", { bodyId: "astrid" });
+
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.body.variables as { labelIds: string[]; delegateId?: string; stateId?: string };
+
+    // All three labels present
+    expect(vars.labelIds).toContain("wf-lbl");
+    expect(vars.labelIds).toContain("intake-lbl");
+    expect(vars.labelIds).toContain("risk-lbl");
+
+    // Steward delegate is set to astrid's linearUserId
+    expect(vars.delegateId).toBe("astrid-linear-uuid");
+
+    // Native state is set to Todo (intake → native_state: todo → state-todo-uuid)
+    expect(vars.stateId).toBe("state-todo-uuid");
+  });
+
+  it("AC2: re-enrollment overwrites a stale/ad-hoc delegate with the steward", async () => {
+    // Simulate: ticket was at state:implementation with a stale delegate (charles/dev)
+    // After CLI enrollment write, it now has state:intake + wf:dev-impl.
+    // The enrollment handler must set delegate = astrid (steward), overwriting charles.
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "intake-lbl", name: "state:intake" },
+        { id: "risk-lbl", name: "risk:low" },
+      ],
+    });
+    globalThis.fetch = mock;
+
+    // sourceStateOverride = "implementation" (what the ticket was before CLI write)
+    await applyStateTransition("enroll", "issue-uuid", "Bearer tok", {
+      bodyId: "astrid",
+      sourceStateOverride: "implementation",
+    });
+
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.body.variables as { delegateId?: string; stateId?: string };
+
+    // Steward (astrid) is set as the new delegate, overwriting the stale dev delegate
+    expect(vars.delegateId).toBe("astrid-linear-uuid");
+    // Native state is set atomically
+    expect(vars.stateId).toBe("state-todo-uuid");
+  });
+
+  it("AC1: exactly one atomic mutation (no separate native-state or delegate writes)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "intake-lbl", name: "state:intake" },
+        { id: "risk-lbl", name: "risk:high" },
+      ],
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("enroll", "issue-uuid", "Bearer tok", { bodyId: "astrid" });
+
+    const atomicCalls = calls.filter((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    // Exactly ONE atomic mutation (labels + delegate + native in one write)
+    expect(atomicCalls).toHaveLength(1);
+    // The mutation includes all three facets
+    const vars = atomicCalls[0].body.variables as Record<string, unknown>;
+    expect(vars.labelIds).toBeDefined();
+    expect(vars.delegateId).toBeDefined();
+    expect(vars.stateId).toBeDefined();
+  });
+
+  it("no-op on ad-hoc ticket (no wf:* label after CLI write) — enrollment with missing workflow label skips", async () => {
+    // If somehow the CLI write didn't add wf:*, the enrollment B2 should not fire
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "state-lbl", name: "state:intake" },
+        { id: "risk-lbl", name: "risk:medium" },
+        // No wf:* label
+      ],
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("enroll", "issue-uuid", "Bearer tok", { bodyId: "astrid" });
+    // No atomic mutation should have been issued (applyStateTransition returns early with no workflowId)
+    const atomicCalls = calls.filter((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(atomicCalls).toHaveLength(0);
+  });
+});
+
+// ── AI-1571 regression: role-guard blocks non-steward dispatch after enrollment ──
+//
+// Verifies AC3/AC4: the routing-guard fires on enrollment-triggered dispatch events
+// and blocks non-steward (e.g. deployment-role) bodies from being dispatched to
+// an intake-state ticket, which is the exact AI-1571 collision scenario.
+//
+// This test is placed here (not routing-guard.test.ts) because it requires the
+// workflow def fixture already set up by beforeAll.
+
+describe("AI-1571 repro: routing-guard blocks non-steward dispatch on enrolled ticket", () => {
+  beforeAll(setupAi1575);
+  afterAll(teardownAi1575);
+
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetNativeStateCache();
+    resetPolicyCache();
+    resetConfigHealth();
+  });
+
+  it("AC3/AC4: routing-guard blocks hanzo (deployment role) dispatch on intake-state ticket", async () => {
+    // After atomic enrollment: ticket is state:intake + wf:dev-impl + risk:medium
+    // Router would dispatch to hanzo if old delegate was left (AI-1571 scenario)
+    // The guard must block hanzo and correct to astrid (steward)
+    const { checkRoleGuardEnforced } = await import("./routing-guard.js");
+    const result = await checkRoleGuardEnforced("hanzo", ["wf:dev-impl", "state:intake"]);
+    // Hanzo does not fill the steward role — dispatch is blocked
+    expect(result.blocked).toBe(true);
+    expect(result.reason).toMatch(/hanzo/i);
+    // Singleton steward correction target is provided
+    expect(result.correctedTo).toBe("astrid");
+  });
+
+  it("AC3/AC4: routing-guard allows astrid (steward role) dispatch on intake-state ticket", async () => {
+    const { checkRoleGuardEnforced } = await import("./routing-guard.js");
+    const result = await checkRoleGuardEnforced("astrid", ["wf:dev-impl", "state:intake"]);
+    // Astrid fills the steward role — dispatch is allowed
+    expect(result.blocked).toBe(false);
+  });
+});
