@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 
-export const OPERATIONAL_EVENT_OUTCOMES = ["received", "signature-rejected", "duplicate", "normalized", "terminal-pruned", "no-route", "routed", "dedup-suppressed", "bag-added", "delivered", "dispatch-accepted", "queued", "delivery-failed", "delivery-unconfirmed", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "no-activity-warn", "no-activity-failed", "deferred-at-capacity", "deferred-capacity-rearm", "stuck-delegate-reprompt"] as const;
+export const OPERATIONAL_EVENT_OUTCOMES = ["received", "signature-rejected", "duplicate", "normalized", "terminal-pruned", "no-route", "routed", "dedup-suppressed", "bag-added", "delivered", "dispatch-accepted", "queued", "delivery-failed", "delivery-unconfirmed", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "no-activity-warn", "no-activity-failed", "deferred-at-capacity", "deferred-capacity-rearm", "stuck-delegate-reprompt", "engagement-thinking", "engagement-doing", "engagement-todo"] as const;
 export type OperationalEventOutcome = typeof OPERATIONAL_EVENT_OUTCOMES[number];
 
 export interface OperationalEventInput {

@@ -133,7 +133,9 @@ export async function applyEngagementStatus(
 
     const targetStateId = await resolveNativeStateId(issue.teamId, semantic, authHeader);
     if (!targetStateId) return; // resolver already logged
-    if (targetStateId === issue.stateId) return; // idempotent — already there
+    // "todo" is a session-end reset — always write to reliably clear the engagement
+    // signal even if Linear already shows To Do (prior flip may have been skipped).
+    if (semantic !== "todo" && targetStateId === issue.stateId) return;
 
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",

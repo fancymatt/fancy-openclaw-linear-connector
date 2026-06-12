@@ -312,6 +312,17 @@ export function createApp(options?: CreateAppOptions) {
   function flipEngagementStatus(agentId: string, ticketId: string, semantic: "thinking" | "doing" | "todo"): void {
     const token = getAccessToken(agentId) ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
     void applyEngagementStatus(ticketId, semantic, token);
+    const outcomeMap = { thinking: "engagement-thinking", doing: "engagement-doing", todo: "engagement-todo" } as const;
+    try {
+      operationalEventStore.append({
+        outcome: outcomeMap[semantic],
+        agent: agentId,
+        key: normalizeSessionKey(ticketId),
+        type: "engagement",
+      });
+    } catch {
+      // fire-and-forget: never block on observability
+    }
   }
 
   const watchdog = new DispatchWatchdog(
@@ -397,6 +408,64 @@ export function createApp(options?: CreateAppOptions) {
       return;
     }
     res.json({ success: true, sessionId, agent: activeAgent });
+  });
+
+  // ── AC1 (AI-1560): Pull-pickup engagement endpoints ──────────────────────
+  // Agents that claim work via `linear queue --next` (self-pull) never go
+  // through the connector's dispatch path, so the Thinking/Doing hooks never
+  // fire. These endpoints let the agent signal the same lifecycle as a
+  // connector-dispatched ticket.
+  //
+  // POST /pull-ack   — agent read/claimed the ticket → Thinking
+  // POST /pull-ack-activity — agent authored first activity → Doing
+
+  function parsePullBody(req: express.Request, res: express.Response): { agentId: string; ticketId: string } | null {
+    let body: { agentId?: string; ticketId?: string } | null;
+    try {
+      body = parseJsonBody(req);
+    } catch {
+      res.status(400).json({ error: "Malformed JSON" });
+      return null;
+    }
+    if (!body?.agentId || !body?.ticketId) {
+      res.status(400).json({ error: "agentId and ticketId are required" });
+      return null;
+    }
+    return { agentId: body.agentId, ticketId: body.ticketId };
+  }
+
+  app.post("/pull-ack", (req: express.Request, res: express.Response) => {
+    const secret = process.env.SESSION_END_SECRET;
+    if (secret) {
+      const header = req.headers["x-session-end-secret"];
+      if (typeof header !== "string" || !verifySecret(header, secret)) {
+        res.status(401).json({ error: "Unauthorized" });
+        return;
+      }
+    }
+    const parsed = parsePullBody(req, res);
+    if (!parsed) return;
+    const { agentId, ticketId } = parsed;
+    ackTracker.recordDispatch(agentId, ticketId);
+    flipEngagementStatus(agentId, ticketId, "thinking");
+    res.json({ ok: true });
+  });
+
+  app.post("/pull-ack-activity", (req: express.Request, res: express.Response) => {
+    const secret = process.env.SESSION_END_SECRET;
+    if (secret) {
+      const header = req.headers["x-session-end-secret"];
+      if (typeof header !== "string" || !verifySecret(header, secret)) {
+        res.status(401).json({ error: "Unauthorized" });
+        return;
+      }
+    }
+    const parsed = parsePullBody(req, res);
+    if (!parsed) return;
+    const { agentId, ticketId } = parsed;
+    ackTracker.acknowledge(agentId, ticketId);
+    flipEngagementStatus(agentId, ticketId, "doing");
+    res.json({ ok: true });
   });
 
   // v1 admin dashboard — read-only operational UI and safe JSON API.

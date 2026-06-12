@@ -9,6 +9,7 @@ import type { LinearEvent } from "./webhook/schema.js";
 import type { OperationalEventStore, OperationalEventOutcome } from "./store/operational-event-store.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
+import { tryNormalizeSessionKey } from "./session-key.js";
 
 interface AdminDeps {
   agentQueue: AgentQueue;
@@ -475,6 +476,30 @@ export function createAdminRouter(deps: AdminDeps): Router {
   });
   router.get("/api/tasks/:key/events", (req: Request, res: Response) => {
     res.json(deps.operationalEventStore?.snapshot({ key: req.params.key }) ?? { key: req.params.key, lifecycle: [] });
+  });
+  // AC5 (AI-1560): Per-ticket engagement event observability.
+  router.get("/api/engagement/:ticketId", (req: Request, res: Response) => {
+    const { ticketId } = req.params;
+    const normalizedKey = tryNormalizeSessionKey(ticketId);
+    if (!normalizedKey || !deps.operationalEventStore) {
+      res.status(404).json({ ticketId });
+      return;
+    }
+    const events = deps.operationalEventStore.query({ key: normalizedKey, limit: 200 });
+    const engagementEvent = events.find(
+      (e) => e.outcome === "engagement-thinking" || e.outcome === "engagement-doing" || e.outcome === "engagement-todo",
+    );
+    if (!engagementEvent) {
+      res.status(404).json({ ticketId });
+      return;
+    }
+    res.json({
+      ticketId,
+      lastEvent: {
+        semantic: engagementEvent.outcome.replace("engagement-", ""),
+        agentId: engagementEvent.agent,
+      },
+    });
   });
   router.get("/api/stale-digest", (_req: Request, res: Response) => {
     const daysBack = typeof _req.query.days === "string" ? Number.parseInt(_req.query.days, 10) : 7;
