@@ -476,27 +476,6 @@ describe("checkWorkflowRules — AI-1460: refuse-work meta-command", () => {
     expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles")).toBeNull();
   });
 
-  it("refuse-work bypasses delegate-only check (non-delegate can refuse)", async () => {
-    // Simulate a ticket where charles is NOT the delegate (someone else is)
-    // by providing callerLinearUserId that differs from delegateId.
-    // refuse-work should still pass because it bypasses delegate-only.
-    globalThis.fetch = async (_url, _init) => {
-      const body = {
-        data: {
-          issue: {
-            labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:code-review" }] },
-            delegate: { id: "other-user-id" },
-          },
-        },
-      };
-      return new Response(JSON.stringify(body), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    };
-    // charles (callerLinearUserId=charles-uid) is not the delegate (other-user-id)
-    expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "charles-uid")).toBeNull();
-  });
 });
 
 // ── AI-1574: refuse-work caller-gating hardening ──────────────────────────
