@@ -1249,7 +1249,37 @@ export async function checkRawMutationInterception(
         `Only the ticket delegate may re-route it (use handoff-work as the delegate, or advance via a workflow transition verb).`
       );
     }
-    return null; // no current delegate to protect — fail-open
+    // AI-1570: no current delegate, but the ticket is governed. The old code
+    // fail-opened here, letting ANY known body ESTABLISH a delegate — including a
+    // stale out-of-role session (the AI-1560 dogfood: Igor, role `dev`, was sitting
+    // in `deployment` state and re-spawned a duplicate Hanzo by writing the delegate
+    // after it had been cleared). Authorize the first-delegate write by role: the
+    // caller may only set the delegate if it fills the current state's owner_role or
+    // the workflow steward (break-glass owner) role. Fail open only on genuine
+    // resolution failure (no state label, unknown/terminal/ownerless state, or roles
+    // with zero bodies — a policy gap) so legitimate traffic is never blocked.
+    const stateId = getCurrentState(labels);
+    if (!stateId) return null; // no state label — can't determine owner, fail-open
+    const stateNode = def.states.find((s) => s.id === stateId);
+    const ownerRole = stateNode?.owner_role;
+    if (!ownerRole) return null; // ownerless/terminal state — fail-open
+    const authorized = new Set<string>(await resolveBodiesForRole(ownerRole));
+    const stewardRole = def.break_glass?.owner_role;
+    if (stewardRole) {
+      for (const b of await resolveBodiesForRole(stewardRole)) authorized.add(b);
+    }
+    if (authorized.size === 0) return null; // misconfigured role (no bodies) — fail-open
+    if (!bodyId || !authorized.has(bodyId)) {
+      log.warn(
+        `workflow-gate: raw first-delegate block agent=${bodyId} ticket=${issueId} state=${stateId} owner_role=${ownerRole} (caller is not the state owner or steward)`,
+      );
+      return (
+        `[Proxy] Direct delegate change blocked: '${bodyId}' may not establish a delegate on ${issueId} ` +
+        `(state '${stateId}' is owned by role '${ownerRole}'). ` +
+        `Only the state owner or workflow steward may set the delegate — advance the ticket via a workflow transition verb instead.`
+      );
+    }
+    return null; // caller fills the owning/steward role — allow first-delegate write
   }
 
   const breakGlassCommand = def.break_glass?.command ?? "escape";

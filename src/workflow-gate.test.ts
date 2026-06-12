@@ -208,6 +208,7 @@ entry_state: intake
 
 break_glass:
   command: escape
+  owner_role: steward
 
 states:
   - id: intake
@@ -2066,10 +2067,54 @@ describe("checkRawMutationInterception — AI-1535: delegate-only raw mutations"
     expect(result).toContain("cannot be verified");
   });
 
-  it("fails open (allows) a raw delegate write when the ticket has NO current delegate", async () => {
+  // AI-1570: a NO-delegate raw write is no longer a blanket fail-open. The caller
+  // may only ESTABLISH a first delegate if it fills the current state's owner_role
+  // (or the workflow steward / break-glass owner role). charles fills `dev`, which
+  // owns the `implementation` state of WORKFLOW_IMPL_NO_DELEGATE, so this stays allowed.
+  it("ALLOWS a no-delegate raw write by the current state's owner role (charles=dev on implementation)", async () => {
     globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_NO_DELEGATE);
     const result = await checkRawMutationInterception(
       delegateBodies["variables.input shape"], "issue-uuid", "Bearer tok", "charles", "some-other-user-uuid",
+    );
+    expect(result).toBeNull();
+  });
+
+  // AI-1570 regression — the AI-1560 dogfood bug. A NO-delegate ticket in `deployment`
+  // state (owner_role `deployment`, filled only by hanzo). A stale `dev`-role session
+  // (charles, standing in for Igor) tries to raw-establish the delegate from a state it
+  // does not own. The old code fail-opened here, letting it re-spawn a duplicate owner.
+  // Now it must be BLOCKED across all three delegateId encodings.
+  const WORKFLOW_DEPLOY_NO_DELEGATE = {
+    data: { issue: {
+      labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] },
+      delegate: null,
+    } },
+  };
+
+  for (const [name, body] of Object.entries(delegateBodies)) {
+    it(`BLOCKS a no-delegate raw write by an out-of-role caller (charles=dev on deployment state) (${name})`, async () => {
+      globalThis.fetch = mockLabelFetch(WORKFLOW_DEPLOY_NO_DELEGATE);
+      const result = await checkRawMutationInterception(
+        body, "issue-uuid", "Bearer tok", "charles", "some-other-user-uuid",
+      );
+      expect(result).not.toBeNull();
+      expect(result).toContain("[Proxy]");
+      expect(result).toContain("may not establish a delegate");
+    });
+  }
+
+  it("ALLOWS a no-delegate raw write by the state owner (hanzo=deployment on deployment state)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_DEPLOY_NO_DELEGATE);
+    const result = await checkRawMutationInterception(
+      delegateBodies["variables.input shape"], "issue-uuid", "Bearer tok", "hanzo", "some-other-user-uuid",
+    );
+    expect(result).toBeNull();
+  });
+
+  it("ALLOWS a no-delegate raw write by the workflow steward (astrid via break-glass owner_role)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_DEPLOY_NO_DELEGATE);
+    const result = await checkRawMutationInterception(
+      delegateBodies["variables.input shape"], "issue-uuid", "Bearer tok", "astrid", "some-other-user-uuid",
     );
     expect(result).toBeNull();
   });
