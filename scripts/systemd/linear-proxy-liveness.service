@@ -1,0 +1,14 @@
+[Unit]
+Description=Linear connector/proxy external liveness check (G-15, AI-1559)
+Documentation=https://linear.app/fancymatt/issue/AI-1559
+After=network.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/fancymatt
+Environment=PATH=/home/fancymatt/.nvm/versions/node/v24.15.0/bin:/home/fancymatt/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Deliberately NOT bound to linear-webhook-fancymatt.service: this monitor must
+# survive (and detect) a dead proxy, so it shares no fate with it.
+ExecStart=/home/fancymatt/.nvm/versions/node/v24.15.0/bin/node /home/fancymatt/Code/repos/life-os/linear-webhook-fancymatt/scripts/proxy-liveness-monitor.mjs
+StandardOutput=journal
+StandardError=journal

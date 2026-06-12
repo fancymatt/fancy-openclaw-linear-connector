@@ -1,0 +1,10 @@
+[Unit]
+Description=Linear connector/proxy liveness check - every 1 minute (G-15, AI-1559)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
