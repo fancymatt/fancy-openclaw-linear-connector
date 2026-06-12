@@ -30,6 +30,8 @@ function makeIssueEvent(overrides: Partial<{
   identifier: string;
   title: string;
   commentBody: string;
+  /** Top-level updatedFrom for Issue update events (AI-1573). */
+  updatedFrom: Record<string, unknown>;
 }>): LinearEvent {
   const {
     actorId = "actor-human",
@@ -40,6 +42,7 @@ function makeIssueEvent(overrides: Partial<{
     identifier = "AI-1",
     title = "Test issue",
     commentBody,
+    updatedFrom,
   } = overrides;
 
   if (commentBody !== undefined) {
@@ -85,6 +88,7 @@ function makeIssueEvent(overrides: Partial<{
       ...(assigneeId ? { assigneeId, assignee: { id: assigneeId, name: "Assignee" } } : {}),
       ...(delegateId ? { delegateId, delegate: { id: delegateId, name: delegateName ?? "Delegate" } } : {}),
     },
+    ...(updatedFrom !== undefined ? { updatedFrom } : {}),
     raw: {},
   } as unknown as LinearEvent;
 }
@@ -168,6 +172,93 @@ describe("extractAgentTarget", () => {
 
   it("allows agent-to-agent delegation (actor is agent A, target is agent B)", () => {
     const event = makeIssueEvent({ actorId: ASTRID_ID, delegateId: CHARLES_ID });
+    const result = extractAgentTarget(event);
+    expect(result).not.toBeNull();
+    expect(result?.name).toBe("charles");
+  });
+
+  // ── AI-1573: updatedFrom delegate-change guard ─────────────────────────────
+  // Linear emits updatedFrom with the *previous* field values for changed fields.
+  // For delegate changes the key may be "delegateId" (UUID string) or "delegate"
+  // (object) — both encodings are tested. When updatedFrom is present but has
+  // neither key, the delegate field was NOT part of this update.
+
+  it("AC1: non-self same-value delegate write (updatedFrom missing delegate key) does not dispatch", () => {
+    // Steward astrid writes delegate=charles when charles is already the delegate.
+    // updatedFrom only records the field that changed; no delegateId/delegate key
+    // means the delegate was unchanged in this update.
+    const event = makeIssueEvent({
+      actorId: ASTRID_ID,
+      delegateId: CHARLES_ID,
+      updatedFrom: { stateId: "prev-state-id" },
+    });
+    const result = extractAgentTarget(event);
+    expect(result).toBeNull();
+  });
+
+  it("AC1 (empty updatedFrom): no fields changed at all does not dispatch", () => {
+    const event = makeIssueEvent({ delegateId: CHARLES_ID, updatedFrom: {} });
+    const result = extractAgentTarget(event);
+    expect(result).toBeNull();
+  });
+
+  it("AC2: unrelated-field edit (labelIds) with unchanged delegate does not dispatch", () => {
+    const event = makeIssueEvent({
+      delegateId: CHARLES_ID,
+      updatedFrom: { labelIds: ["old-label-uuid"] },
+    });
+    const result = extractAgentTarget(event);
+    expect(result).toBeNull();
+  });
+
+  it("AC2: unrelated-field edit (description) with unchanged delegate does not dispatch", () => {
+    const event = makeIssueEvent({
+      delegateId: CHARLES_ID,
+      updatedFrom: { description: "old description text" },
+    });
+    const result = extractAgentTarget(event);
+    expect(result).toBeNull();
+  });
+
+  it("AC3: genuine delegate change (updatedFrom.delegateId present) dispatches correctly", () => {
+    // delegateId encoding: Linear emits previous UUID as updatedFrom.delegateId
+    const event = makeIssueEvent({
+      delegateId: CHARLES_ID,
+      updatedFrom: { delegateId: "prev-user-uuid" },
+    });
+    const result = extractAgentTarget(event);
+    expect(result).not.toBeNull();
+    expect(result?.name).toBe("charles");
+    expect(result?.reason).toBe("delegate");
+  });
+
+  it("AC3 (object encoding): genuine delegate change (updatedFrom.delegate present) dispatches correctly", () => {
+    // delegate-object encoding: Linear emits previous delegate object as updatedFrom.delegate
+    const event = makeIssueEvent({
+      delegateId: CHARLES_ID,
+      updatedFrom: { delegate: { id: "prev-user-uuid", name: "Previous Person" } },
+    });
+    const result = extractAgentTarget(event);
+    expect(result).not.toBeNull();
+    expect(result?.name).toBe("charles");
+    expect(result?.reason).toBe("delegate");
+  });
+
+  it("AC3 (absent updatedFrom): missing updatedFrom means we cannot confirm no-change — dispatch conservatively", () => {
+    // No updatedFrom at all: treat as genuine delegation (safe default — miss a
+    // no-op rather than suppress a real handoff).
+    const event = makeIssueEvent({ delegateId: CHARLES_ID }); // no updatedFrom field
+    const result = extractAgentTarget(event);
+    expect(result).not.toBeNull();
+    expect(result?.name).toBe("charles");
+  });
+
+  it("AC3 (agent-to-agent delegation with updatedFrom.delegateId) dispatches correctly", () => {
+    const event = makeIssueEvent({
+      actorId: ASTRID_ID,
+      delegateId: CHARLES_ID,
+      updatedFrom: { delegateId: ASTRID_ID },
+    });
     const result = extractAgentTarget(event);
     expect(result).not.toBeNull();
     expect(result?.name).toBe("charles");
