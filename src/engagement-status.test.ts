@@ -212,6 +212,36 @@ describe("applyEngagementStatus (AI-1510)", () => {
     expect(updates).toHaveLength(0);
   });
 
+  it("terminal state:done — no engagement write (workflow gate's native write is authoritative)", async () => {
+    const { fetch, updates } = makeEngagementFetch({
+      id: "issue-uuid",
+      teamId: "team-uuid",
+      stateName: "Done",
+      stateId: SEMANTIC_TO_UUID["Done"],
+      labels: ["wf:dev-impl", "state:done"],
+    });
+    globalThis.fetch = fetch;
+
+    await applyEngagementStatus("AI-1", "doing", "tok");
+
+    expect(updates).toHaveLength(0);
+  });
+
+  it("terminal state:escape — no engagement write", async () => {
+    const { fetch, updates } = makeEngagementFetch({
+      id: "issue-uuid",
+      teamId: "team-uuid",
+      stateName: "Done",
+      stateId: SEMANTIC_TO_UUID["Done"],
+      labels: ["wf:dev-impl", "state:escape"],
+    });
+    globalThis.fetch = fetch;
+
+    await applyEngagementStatus("AI-1", "doing", "tok");
+
+    expect(updates).toHaveLength(0);
+  });
+
   it("no-op without a token (never touches the network)", async () => {
     let called = false;
     globalThis.fetch = (async () => {
