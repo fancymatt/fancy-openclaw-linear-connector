@@ -2119,6 +2119,25 @@ describe("checkRawMutationInterception — AI-1535: delegate-only raw mutations"
     expect(result).toBeNull();
   });
 
+  // AI-1570 enrollment carve-out: at the ENTRY state (intake), a known orchestrator
+  // that fills no owning role may still establish the first delegate (ticket joining
+  // the workflow). charles fills `dev`, not the intake owner `steward`, yet must be
+  // allowed here — the routing-guard corrects the delegate target to astrid downstream.
+  const WORKFLOW_INTAKE_NO_DELEGATE = {
+    data: { issue: {
+      labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:intake" }] },
+      delegate: null,
+    } },
+  };
+
+  it("ALLOWS a no-delegate raw write at the ENTRY state by a non-owner known caller (enrollment)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_INTAKE_NO_DELEGATE);
+    const result = await checkRawMutationInterception(
+      delegateBodies["variables.input shape"], "issue-uuid", "Bearer tok", "charles", "some-other-user-uuid",
+    );
+    expect(result).toBeNull();
+  });
+
   it("passes through a delegate write on an ad-hoc (non-workflow) ticket", async () => {
     globalThis.fetch = mockLabelFetch(AD_HOC_LABELS);
     const result = await checkRawMutationInterception(

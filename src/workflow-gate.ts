@@ -1260,6 +1260,14 @@ export async function checkRawMutationInterception(
     // with zero bodies — a policy gap) so legitimate traffic is never blocked.
     const stateId = getCurrentState(labels);
     if (!stateId) return null; // no state label — can't determine owner, fail-open
+    // Enrollment carve-out: at the workflow ENTRY state a known orchestrator (e.g.
+    // `ai`, which fills no role) legitimately establishes the first delegate when a
+    // ticket joins the workflow. The routing-guard corrects the target to the legal
+    // state owner on the webhook side, so the worst case is a dispatch to the rightful
+    // owner. The AI-1560 incident was at `deployment` (a mid-workflow state), not the
+    // entry state, so it stays blocked by the role check below. Only applies with a
+    // known caller (unknown bodies were already rejected above, AI-1402).
+    if (bodyId && def.entry_state && stateId === def.entry_state) return null;
     const stateNode = def.states.find((s) => s.id === stateId);
     const ownerRole = stateNode?.owner_role;
     if (!ownerRole) return null; // ownerless/terminal state — fail-open
