@@ -1513,6 +1513,9 @@ export async function applyStateTransition(
   // is actually present. If it's missing (CLI partial failure, race condition),
   // re-stamp it. Previously this was a blind no-op, which meant a lost label
   // would never be recovered.
+  // AI-1534: this branch is state-preserving (source === destination), so it
+  // intentionally neither records nor clears the applied-state cache — any
+  // existing entry already holds this same state, and its absence is harmless.
   if (currentStateName === toStateName) {
     const targetLabelName = `state:${toStateName}`;
     const hasTargetLabel = issue.labels.some((l) => l.name === targetLabelName);

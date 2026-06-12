@@ -416,23 +416,33 @@ describe("B3 — outbound per-step instruction injection", () => {
       expect(msg).not.toContain("state: **intake**");
     });
 
-    it("AC2: coalesced delivery across a transition rebuilds against current state", async () => {
-      // Simulate the bug's exact shape: intake→write-tests-equivalent fires
-      // near-simultaneous webhooks; the delivery that wins is built while the
-      // live read is still stale. The cache makes the (coalesced) send-time
-      // build name the correct verb.
+    it("AC2: a redelivery built across a transition reflects the NEW state, not the first build", async () => {
+      // The delivery message is always rebuilt at send time (deliver.ts), and
+      // the live label read stays stale at `intake` throughout (eventual
+      // consistency). Build the message BEFORE the transition is recorded, then
+      // record the transition (as applyStateTransition would), then build the
+      // coalesced redelivery — it must reflect the new state even though the
+      // live read never changed. This is the "coalesced webhooks across a
+      // transition" regression: the second (winning) build is correct.
       globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+
+      // First webhook arrives pre-transition: no cache → reflects live read.
+      const firstBuild = await buildDeliveryMessage(makeRoute("AI-101", "Pre"), "Bearer tok");
+      expect(firstBuild).toContain("state: **intake**");
+      expect(firstBuild).toContain("linear accept AI-101");
+
+      // The connector applies accept (intake → implementation) and records it.
       recordAppliedState("AI-101", "implementation");
 
-      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      // Coalesced redelivery (built at send time, live read STILL stale):
       const route = { ...makeRoute("AI-101", "Coalesced across transition"), coalescedCount: 2 };
-      const msg = await buildDeliveryMessage(route, "Bearer tok");
-
-      expect(msg).toContain("state: **implementation**");
-      expect(msg).toContain("linear submit AI-101");
-      expect(msg).not.toContain("linear accept AI-101");
+      const redelivery = await buildDeliveryMessage(route, "Bearer tok");
+      expect(redelivery).toContain("state: **implementation**");
+      expect(redelivery).toContain("linear submit AI-101");
+      expect(redelivery).not.toContain("linear accept AI-101");
       // Coalescing note still present — the cache guard does not suppress it.
-      expect(msg).toContain("2 additional event(s)");
+      expect(redelivery).toContain("2 additional event(s)");
     });
 
     it("no cache entry → falls back to the live read (unchanged behavior)", async () => {
