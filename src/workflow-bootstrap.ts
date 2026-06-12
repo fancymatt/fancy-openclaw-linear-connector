@@ -18,7 +18,7 @@ import { componentLogger, createLogger } from "./logger.js";
 import { loadWorkflowRegistry } from "./workflow-gate.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
 import { findOrCreateLabel } from "./linear-helpers.js";
-import type { LinearEvent } from "./webhook/schema.js";
+import type { LinearEvent, LinearIssueUpdatedEvent } from "./webhook/schema.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-bootstrap");
 
@@ -140,9 +140,10 @@ export async function maybeBootstrapWorkflow(
   authToken: string,
 ): Promise<BootstrapResult | null> {
   if (event.type !== "Issue" || event.action !== "update") return null;
+  const issueEvent = event as LinearIssueUpdatedEvent;
 
-  const currentLabelIds: string[] = event.data.labelIds ?? [];
-  const updatedFrom = event.updatedFrom as Record<string, unknown> | undefined;
+  const currentLabelIds: string[] = issueEvent.data.labelIds ?? [];
+  const updatedFrom = issueEvent.updatedFrom as Record<string, unknown> | undefined;
   const previousLabelIds: string[] = (updatedFrom?.labelIds as string[] | undefined) ?? [];
 
   const currentSet = new Set(currentLabelIds);
@@ -155,7 +156,7 @@ export async function maybeBootstrapWorkflow(
   // Fetch current label names — needed to distinguish wf:* from state:* by ID.
   let issue: IssueContext | null = null;
   try {
-    issue = await fetchIssueContext(event.data.id, authToken);
+    issue = await fetchIssueContext(issueEvent.data.id, authToken);
   } catch {
     return null;
   }
@@ -223,10 +224,10 @@ export async function maybeBootstrapWorkflow(
     const success = await issueUpdateAtomic(issue.id, newLabelIds, authToken, delegateLinearUserId);
 
     if (!success) {
-      log.warn(`workflow-bootstrap: issueUpdate returned non-success for ${event.data.id}`);
+      log.warn(`workflow-bootstrap: issueUpdate returned non-success for ${issueEvent.data.id}`);
     } else {
       log.info(
-        `workflow-bootstrap: bootstrapped ${event.data.id} → ${workflowId}:${entryState}, delegate=${delegateLinearUserId ?? "none"}`,
+        `workflow-bootstrap: bootstrapped ${issueEvent.data.id} → ${workflowId}:${entryState}, delegate=${delegateLinearUserId ?? "none"}`,
       );
     }
 
@@ -241,7 +242,7 @@ export async function maybeBootstrapWorkflow(
     await issueUpdateAtomic(issue.id, newLabelIds, authToken);
 
     log.info(
-      `workflow-bootstrap: demoted ${event.data.id} — removed [${currentStateLabels.map((n) => n.name).join(", ")}]`,
+      `workflow-bootstrap: demoted ${issueEvent.data.id} — removed [${currentStateLabels.map((n) => n.name).join(", ")}]`,
     );
     return { action: "demoted" };
   }

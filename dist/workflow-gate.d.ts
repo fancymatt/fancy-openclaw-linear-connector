@@ -88,8 +88,39 @@ export interface WorkflowDef {
     stakes?: StakesLevel;
     states: WorkflowState[];
 }
+/**
+ * Legacy single-def accessor. Returns the primary workflow def, derived from the
+ * registry so its cache stays coherent with loadWorkflowRegistry().
+ *   - Single-file mode (no WORKFLOW_DEFS_DIR): the registry holds exactly the
+ *     WORKFLOW_DEF_PATH def — return it (preserving prior behavior and its
+ *     fail-closed-on-load posture, which loadWorkflowRegistry rethrows).
+ *   - Dir mode: return the def named by WORKFLOW_DEF_PATH if present in the
+ *     registry, else the first registered def.
+ */
 export declare function loadWorkflowDef(): Promise<WorkflowDef>;
-/** Invalidate the in-process workflow def cache (used in tests). */
+/**
+ * AI-1530: Load ALL workflow defs into a registry keyed by def.id.
+ *
+ * This is the dispatch source for multi-workflow enforcement: the gate resolves
+ * a ticket's def by its wf:<id> label via this registry, instead of comparing
+ * against a single loaded def. After this lands, dev-impl, ux-audit and sprint
+ * can all be enforced simultaneously by the same connector.
+ *
+ * Directory resolution:
+ *   - If WORKFLOW_DEFS_DIR is set, load every *.yaml in that directory.
+ *   - Otherwise (backwards-compat), load the single WORKFLOW_DEF_PATH file as a
+ *     1-entry registry — preserving the current single-def deploy exactly (AC6).
+ *
+ * Per-def fail-closed (AC2): a def that fails native_state validation (or fails
+ * to parse) is excluded from the registry and surfaced via logs + config-health,
+ * while every other valid def still loads. In single-file mode a load failure
+ * rethrows, preserving the existing fail-closed posture for the primary deploy.
+ *
+ * The result is cached; resetWorkflowCache() clears it (AC5) so a vault edit is
+ * picked up on the next load without a code rebuild.
+ */
+export declare function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>>;
+/** Invalidate the in-process workflow registry cache (used in tests & live-reload). */
 export declare function resetWorkflowCache(): void;
 /**
  * AI-1490 / AI-1498: Validate that every workflow state has a valid native_state field.
@@ -127,14 +158,19 @@ export declare function getCurrentState(labels: string[]): string | null;
 export declare function fetchWorkflowLabels(issueId: string, authToken: string): Promise<string[]>;
 /**
  * Resolve a ticket's numeric stakes level from its labels.
- * Checks for stakes:* labels (e.g. stakes:low, stakes:medium, stakes:high)
- * and maps them to numeric values via the workflow's stakes configuration.
+ * The stakes label namespace is whatever the def's `stakes.levels` map keys on
+ * (currently `risk:*` — `risk:low`/`risk:medium`/`risk:high`; historically
+ * `stakes:*`). Resolution is namespace-agnostic: a label counts as the stakes
+ * label iff it is a key in `stakesConfig.levels`. This avoids the AI-1539 class
+ * of bug where a hardcoded prefix (`/^stakes:/`) silently fails to match the
+ * configured namespace and forces every ticket to fail closed.
  *
- * Fails closed: when no stakes label is present, returns the threshold
- * value itself — unlabeled tickets are treated as high-stakes to prevent
- * a missing label from silently bypassing the human sign-off gate.
- * When the label is present but maps to an unknown level, also returns
- * the threshold (fail-closed on unknown metadata).
+ * Fails OPEN (AI-1539, Matt directive 2026-06-11): when the ticket carries none
+ * of the configured level labels, returns 0 (lowest stakes) — a *missing* tag
+ * must not hold a task up for human review. Only an EXPLICIT high-stakes label
+ * (e.g. risk:high mapping to >= threshold) trips the human sign-off gate.
+ * Tradeoff accepted by the owner: a genuinely high-stakes task left untagged
+ * will deploy without sign-off; tag it risk:high to gate it.
  */
 export declare function resolveStakesLevel(labels: string[], stakesConfig: StakesLevel): number;
 /**
@@ -169,7 +205,7 @@ export declare function checkRawMutationInterception(body: {
     query?: string;
     variables?: Record<string, unknown>;
     operationName?: string;
-} | null, issueId: string | null, authToken: string, bodyId?: string): Promise<string | null>;
+} | null, issueId: string | null, authToken: string, bodyId?: string, callerLinearUserId?: string | null): Promise<string | null>;
 /**
  * Generate a legal-verb reminder for the NEW state after a successful transition.
  *
