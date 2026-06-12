@@ -140,43 +140,156 @@ export interface WorkflowDef {
   states: WorkflowState[];
 }
 
-// ── Workflow def cache ─────────────────────────────────────────────────────
+// ── Workflow def cache & registry ──────────────────────────────────────────
+// AI-1530: a single registry cache is the sole source of truth. loadWorkflowDef
+// (the legacy single-def accessor) derives its def from the same registry so the
+// two cannot diverge — resetWorkflowCache() invalidates everything at once.
 
-let _workflowCache: WorkflowDef | null = null;
+let _registryCache: Map<string, WorkflowDef> | null = null;
 
+/**
+ * Read, parse, and validate a single workflow def file. Throws on read/parse
+ * failure or if native_state validation fails (AI-1490 / AI-1498 fail-closed
+ * posture: the proxy must be able to write a native stateId for every state).
+ * Performs no config-health accounting — callers own that.
+ */
+async function loadDefFromFile(file: string): Promise<WorkflowDef> {
+  const raw = await fs.readFile(file, "utf8");
+  const def = yaml.load(raw) as WorkflowDef;
+  if (!def || typeof def !== "object" || !def.id) {
+    throw new Error(`workflow def at ${file} has no 'id' field`);
+  }
+  if (def.break_glass && !def.break_glass.command) {
+    log.warn(`workflow-gate: break_glass block in ${file} has no 'command' field — falling back to hardcoded "escape". Canonicalize the YAML to add command: escape.`);
+  }
+  const warnings = validateNativeStateMappings(def);
+  for (const w of warnings) {
+    log.error(`workflow-gate: native_state validation FAILURE (${def.id}): ${w}`);
+  }
+  if (warnings.length > 0) {
+    throw new Error(
+      `Workflow definition '${def.id}' has ${warnings.length} invalid native_state mapping(s): ${warnings.join("; ")}`,
+    );
+  }
+  return def;
+}
+
+/**
+ * Legacy single-def accessor. Returns the primary workflow def, derived from the
+ * registry so its cache stays coherent with loadWorkflowRegistry().
+ *   - Single-file mode (no WORKFLOW_DEFS_DIR): the registry holds exactly the
+ *     WORKFLOW_DEF_PATH def — return it (preserving prior behavior and its
+ *     fail-closed-on-load posture, which loadWorkflowRegistry rethrows).
+ *   - Dir mode: return the def named by WORKFLOW_DEF_PATH if present in the
+ *     registry, else the first registered def.
+ */
 export async function loadWorkflowDef(): Promise<WorkflowDef> {
-  if (_workflowCache) return _workflowCache;
-  try {
-    const raw = await fs.readFile(workflowDefPath(), "utf8");
-    const def = yaml.load(raw) as WorkflowDef;
-    if (def.break_glass && !def.break_glass.command) {
-      log.warn(`workflow-gate: break_glass block in ${workflowDefPath()} has no 'command' field — falling back to hardcoded "escape". Canonicalize the YAML to add command: escape.`);
-    }
-    _workflowCache = def;
-    recordSuccess("workflow-def");
-    // AI-1490 / AI-1498: validate native_state mappings on load — hard-fail if any state
-    // lacks a valid native_state (the proxy must be able to write native stateId for every
-    // transition; a missing mapping is what made deployment fall through to native Invalid).
-    const warnings = validateNativeStateMappings(def);
-    for (const w of warnings) {
-      log.error(`workflow-gate: native_state validation FAILURE: ${w}`);
-    }
-    if (warnings.length > 0) {
-      const msg = `Workflow definition has ${warnings.length} invalid native_state mapping(s): ${warnings.join("; ")}`;
+  const registry = await loadWorkflowRegistry();
+
+  if (!process.env.WORKFLOW_DEFS_DIR) {
+    const only = registry.values().next().value as WorkflowDef | undefined;
+    if (!only) {
+      const msg = `no workflow def loaded from ${workflowDefPath()}`;
       recordFailure("workflow-def", msg);
       throw new Error(msg);
     }
-    return _workflowCache;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    recordFailure("workflow-def", msg);
-    throw err;
+    return only;
   }
+
+  let primaryId: string | null = null;
+  try {
+    primaryId = (await loadDefFromFile(workflowDefPath())).id;
+  } catch {
+    primaryId = null;
+  }
+  if (primaryId && registry.has(primaryId)) return registry.get(primaryId)!;
+  const first = registry.values().next().value as WorkflowDef | undefined;
+  if (!first) throw new Error(`no workflow def loaded`);
+  return first;
 }
 
-/** Invalidate the in-process workflow def cache (used in tests). */
+/**
+ * AI-1530: Load ALL workflow defs into a registry keyed by def.id.
+ *
+ * This is the dispatch source for multi-workflow enforcement: the gate resolves
+ * a ticket's def by its wf:<id> label via this registry, instead of comparing
+ * against a single loaded def. After this lands, dev-impl, ux-audit and sprint
+ * can all be enforced simultaneously by the same connector.
+ *
+ * Directory resolution:
+ *   - If WORKFLOW_DEFS_DIR is set, load every *.yaml in that directory.
+ *   - Otherwise (backwards-compat), load the single WORKFLOW_DEF_PATH file as a
+ *     1-entry registry — preserving the current single-def deploy exactly (AC6).
+ *
+ * Per-def fail-closed (AC2): a def that fails native_state validation (or fails
+ * to parse) is excluded from the registry and surfaced via logs + config-health,
+ * while every other valid def still loads. In single-file mode a load failure
+ * rethrows, preserving the existing fail-closed posture for the primary deploy.
+ *
+ * The result is cached; resetWorkflowCache() clears it (AC5) so a vault edit is
+ * picked up on the next load without a code rebuild.
+ */
+export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> {
+  if (_registryCache) return _registryCache;
+  const registry = new Map<string, WorkflowDef>();
+  const dir = process.env.WORKFLOW_DEFS_DIR;
+
+  if (dir) {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(dir);
+    } catch (err) {
+      // Catastrophic: the defs directory itself is unreadable. Surface and
+      // rethrow so enforcement callers fail closed.
+      const msg = err instanceof Error ? err.message : String(err);
+      recordFailure("workflow-def", `WORKFLOW_DEFS_DIR unreadable (${dir}): ${msg}`);
+      throw err;
+    }
+    const yamlFiles = entries.filter((f) => f.endsWith(".yaml")).sort();
+    let failures = 0;
+    for (const f of yamlFiles) {
+      const full = path.join(dir, f);
+      try {
+        const def = await loadDefFromFile(full);
+        if (registry.has(def.id)) {
+          log.warn(`workflow-gate: duplicate workflow id '${def.id}' (${full}) — keeping first, ignoring this file`);
+          continue;
+        }
+        registry.set(def.id, def);
+      } catch (err) {
+        // AC2: one bad def fails that def only — exclude it, keep the rest.
+        failures++;
+        const msg = err instanceof Error ? err.message : String(err);
+        log.error(`workflow-gate: workflow def excluded from registry (${full}): ${msg}`);
+      }
+    }
+    if (failures > 0) {
+      recordFailure("workflow-def", `${failures} workflow def(s) excluded from registry (see logs)`);
+    } else {
+      recordSuccess("workflow-def");
+    }
+  } else {
+    // Backwards-compat (AC6): single WORKFLOW_DEF_PATH file → 1-entry registry.
+    // A load failure rethrows here (fail-closed) exactly as the legacy single-def
+    // loader did, so the current deploy's safety posture is unchanged.
+    try {
+      const def = await loadDefFromFile(workflowDefPath());
+      registry.set(def.id, def);
+      recordSuccess("workflow-def");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      recordFailure("workflow-def", msg);
+      throw err;
+    }
+  }
+
+  _registryCache = registry;
+  return registry;
+}
+
+/** Invalidate the in-process workflow registry cache (used in tests & live-reload). */
 export function resetWorkflowCache(): void {
-  _workflowCache = null;
+  _registryCache = null;
 }
 
 /**
@@ -736,25 +849,27 @@ export async function checkWorkflowRules(
     );
   }
 
-  let def: WorkflowDef;
+  let def: WorkflowDef | undefined;
   try {
-    def = await loadWorkflowDef();
+    const registry = await loadWorkflowRegistry();
+    def = registry.get(workflowId);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    // Phase 6.5 / H-1: FAIL CLOSED on workflow def load failure (§16.0).
+    // Phase 6.5 / H-1: FAIL CLOSED on workflow registry load failure (§16.0).
     if (breakGlassOverride) {
-      log.warn(`workflow-gate: workflow def load failed but break-glass override active — allowing through: ${msg}`);
+      log.warn(`workflow-gate: workflow registry load failed but break-glass override active — allowing through: ${msg}`);
       return null;
     }
-    log.error(`workflow-gate: FAIL-CLOSED — workflow def load failed, rejecting '${intent}' on wf:${workflowId} ticket ${issueId}: ${msg}`);
+    log.error(`workflow-gate: FAIL-CLOSED — workflow registry load failed, rejecting '${intent}' on wf:${workflowId} ticket ${issueId}: ${msg}`);
     return (
       `[Proxy] '${intent}' blocked: workflow definition could not be loaded (${msg}). ` +
       `A steward can use break-glass to bypass this check.`
     );
   }
 
-  // Only enforce for the workflow whose def is loaded; others fail open.
-  if (workflowId !== def.id) return null;
+  // AI-1530: dispatch by wf:<id> label. A ticket whose wf: matches no registered
+  // def remains pass-through (unknown / unenforced workflow).
+  if (!def) return null;
 
   // §5.3 Asymmetry enforcement: children running wf:dev-impl have no legal
   // command to address the parent's ux-audit workflow. This is structural:
@@ -1085,14 +1200,15 @@ export async function checkRawMutationInterception(
     );
   }
 
-  let def: WorkflowDef;
+  let def: WorkflowDef | undefined;
   try {
-    def = await loadWorkflowDef();
+    const registry = await loadWorkflowRegistry();
+    def = registry.get(workflowId);
   } catch {
     return null; // fail-open
   }
 
-  if (workflowId !== def.id) return null; // unknown workflow — pass-through
+  if (!def) return null; // unknown workflow — pass-through (AI-1530)
 
   const breakGlassCommand = def.break_glass?.command ?? "escape";
   const currentState = getCurrentState(labels);
@@ -1287,16 +1403,17 @@ export async function applyStateTransition(
   const workflowId = getWorkflowId(labelNames);
   if (!workflowId) return; // ad-hoc ticket — no-op
 
-  let def: WorkflowDef;
+  let def: WorkflowDef | undefined;
   try {
-    def = await loadWorkflowDef();
+    const registry = await loadWorkflowRegistry();
+    def = registry.get(workflowId);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    log.warn(`workflow-gate: B2 apply: failed to load workflow def: ${msg} — skipping`);
+    log.warn(`workflow-gate: B2 apply: failed to load workflow registry: ${msg} — skipping`);
     return;
   }
 
-  if (workflowId !== def.id) return; // unknown workflow — no-op
+  if (!def) return; // unknown workflow — no-op (AI-1530)
 
   // AI-1498 fix: prefer the captured pre-forward state. The CLI advances the
   // state:* label inside its own forwarded mutation, so by now `labelNames`
