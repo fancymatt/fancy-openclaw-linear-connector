@@ -556,8 +556,8 @@ describe("checkWorkflowRules — intake state", () => {
     expect(await checkWorkflowRules("accept", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
   });
 
-  it("allows 'demote' in intake", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+  it("allows 'demote' in intake when ticket has no in-flight work (AC3)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"], { hasBranch: false, hasPR: false, hasMergedPR: false });
     expect(await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
   });
 
