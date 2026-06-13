@@ -32,6 +32,7 @@ import {
   resolveStakesLevel,
   resolveNativeStateId,
   resetNativeStateCache,
+  enrollIfMissing,
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
@@ -5338,5 +5339,170 @@ describe("applyStateTransition — AI-1521: unescape re-entry", () => {
   it("canonical: unescape is legal from escape state", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:escape"]);
     expect(await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
+});
+
+// ── AI-1584: enrollIfMissing ───────────────────────────────────────────────
+
+describe("enrollIfMissing — enrollment gap repair", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let enrollDir: string;
+  let enrollOrigWorkflowPath: string | undefined;
+  let enrollOrigPolicyPath: string | undefined;
+
+  beforeAll(() => {
+    enrollDir = fs.mkdtempSync(path.join(os.tmpdir(), "enroll-test-"));
+    const policyFile = path.join(enrollDir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    const workflowFile = path.join(enrollDir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    enrollOrigWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    enrollOrigPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+  });
+
+  afterAll(() => {
+    if (enrollOrigWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = enrollOrigWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    if (enrollOrigPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = enrollOrigPolicyPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+  });
+
+  beforeEach(() => { originalFetch = globalThis.fetch; resetWorkflowCache(); });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  function makeEnrollFetch(opts: {
+    labels: Array<{ id: string; name: string }>;
+    teamId?: string;
+    teamLabels?: Array<{ id: string; name: string }>;
+    issueError?: boolean;
+    updateSuccess?: boolean;
+  }): { fetch: typeof globalThis.fetch; calls: Array<{ query: string; variables: Record<string, unknown> }> } {
+    const calls: Array<{ query: string; variables: Record<string, unknown> }> = [];
+    const teamId = opts.teamId ?? "team-uuid";
+    const teamLabels = opts.teamLabels ?? [{ id: "intake-lbl", name: "state:intake" }];
+    const updateSuccess = opts.updateSuccess ?? true;
+
+    const mock: typeof globalThis.fetch = async (_url, init) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
+      calls.push({ query: parsed.query ?? "", variables: parsed.variables ?? {} });
+      const query = parsed.query ?? "";
+
+      if (opts.issueError) throw new Error("simulated fetch error");
+
+      if (query.includes("IssueWithLabels")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "internal-uuid",
+                team: { id: teamId },
+                labels: { nodes: opts.labels },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (query.includes("TeamLabels")) {
+        return new Response(
+          JSON.stringify({ data: { team: { labels: { nodes: teamLabels } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (query.includes("ApplyAtomicTransition")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: updateSuccess } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      throw new Error(`unexpected query in enrollIfMissing test: ${query.slice(0, 80)}`);
+    };
+
+    return { fetch: mock, calls };
+  }
+
+  it("AC3: stamps state:intake when wf:dev-impl is present but no state:* label", async () => {
+    const { fetch, calls } = makeEnrollFetch({
+      labels: [{ id: "wf-lbl", name: "wf:dev-impl" }, { id: "risk-lbl", name: "risk:low" }],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
+
+    expect(result.enrolled).toBe(true);
+    expect(result.entryState).toBe("intake");
+
+    const updateCall = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.variables as { labelIds: string[] };
+    expect(vars.labelIds).toContain("intake-lbl");
+    expect(vars.labelIds).toContain("wf-lbl");
+    expect(vars.labelIds).toContain("risk-lbl");
+  });
+
+  it("no-op when state:* label is already present (already enrolled)", async () => {
+    const { fetch, calls } = makeEnrollFetch({
+      labels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:intake" },
+      ],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
+
+    expect(result.enrolled).toBe(false);
+    expect(calls.find((c) => c.query.includes("ApplyAtomicTransition"))).toBeUndefined();
+  });
+
+  it("no-op for ad-hoc ticket with no wf:* label", async () => {
+    const { fetch, calls } = makeEnrollFetch({
+      labels: [{ id: "bug-lbl", name: "bug" }, { id: "prio-lbl", name: "priority:high" }],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
+
+    expect(result.enrolled).toBe(false);
+    expect(calls.find((c) => c.query.includes("ApplyAtomicTransition"))).toBeUndefined();
+  });
+
+  it("no-op for unknown wf:* id (no matching def) — fail open", async () => {
+    const { fetch, calls } = makeEnrollFetch({
+      labels: [{ id: "wf-lbl", name: "wf:unknown-workflow" }],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
+
+    expect(result.enrolled).toBe(false);
+    expect(calls.find((c) => c.query.includes("ApplyAtomicTransition"))).toBeUndefined();
+  });
+
+  it("fail-open when IssueWithLabels fetch throws", async () => {
+    const { fetch } = makeEnrollFetch({ labels: [], issueError: true });
+    globalThis.fetch = fetch;
+
+    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
+
+    expect(result.enrolled).toBe(false);
+  });
+
+  it("fail-open when issueUpdate returns non-success", async () => {
+    const { fetch } = makeEnrollFetch({
+      labels: [{ id: "wf-lbl", name: "wf:dev-impl" }],
+      updateSuccess: false,
+    });
+    globalThis.fetch = fetch;
+
+    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
+
+    expect(result.enrolled).toBe(false);
   });
 });
