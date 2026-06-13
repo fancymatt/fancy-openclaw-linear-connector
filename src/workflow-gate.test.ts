@@ -546,8 +546,8 @@ describe("checkWorkflowRules — intake state", () => {
     expect(await checkWorkflowRules("accept", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
   });
 
-  it("allows 'demote' in intake", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+  it("allows 'demote' in intake when ticket has no in-flight work (AC3)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"], { hasBranch: false, hasPR: false, hasMergedPR: false });
     expect(await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
   });
 
@@ -5338,5 +5338,202 @@ describe("applyStateTransition — AI-1521: unescape re-entry", () => {
   it("canonical: unescape is legal from escape state", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:escape"]);
     expect(await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
+});
+
+// ── AI-1576 AC2: complete/raw-status→Done blocked on wf:dev-impl (regression) ──
+//
+// Regression tests proving:
+//  (a) `complete` is not a legal verb in ANY canonical dev-impl state.
+//  (b) `validated` (from ac-validate) is the SOLE path to done.
+//  (c) A raw stateId→Done mutation is blocked by Layer 2 on a governed ticket.
+//
+// Uses the canonical dev-impl v8 fixture to match the production workflow shape.
+// Provides isolated env setup to avoid config-health bleed from earlier suites.
+
+describe("checkWorkflowRules — AI-1576 AC2: complete blocked; only validated reaches done", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let originalWorkflowPath: string | undefined;
+  let originalPolicyPath: string | undefined;
+  let ac2Dir: string;
+
+  beforeAll(() => {
+    ac2Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1576-ac2-"));
+    const policyFile = path.join(ac2Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+
+    originalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
+  });
+
+  afterAll(() => {
+    if (originalWorkflowPath !== undefined) {
+      process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    } else {
+      delete process.env.WORKFLOW_DEF_PATH;
+    }
+    if (originalPolicyPath !== undefined) {
+      process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
+    } else {
+      delete process.env.CAPABILITY_POLICY_PATH;
+    }
+  });
+
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetNativeStateCache();
+    resetPolicyCache();
+    resetConfigHealth();
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  const ALL_CANONICAL_STATES = [
+    "intake", "write-tests", "implementation", "code-review",
+    "deployment", "host-deploy", "ac-validate", "done",
+  ];
+
+  // AC2(a): complete is not a legal verb in any dev-impl state.
+  for (const state of ALL_CANONICAL_STATES) {
+    it(`AC2: 'complete' is blocked on wf:dev-impl in state '${state}' — not a legal verb`, async () => {
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", `state:${state}`]);
+      const result = await checkWorkflowRules("complete", "issue-uuid", "Bearer tok", "charles");
+      expect(result).not.toBeNull();
+      expect(result).toContain("[Proxy]");
+    });
+  }
+
+  // AC2(b): validated from ac-validate is the sole path to done.
+  it("AC2: 'validated' from ac-validate is allowed — the sole path to done (returns null)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:ac-validate"]);
+    expect(await checkWorkflowRules("validated", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
+
+  const NON_AC_VALIDATE_STATES = ALL_CANONICAL_STATES.filter((s) => s !== "ac-validate");
+  for (const state of NON_AC_VALIDATE_STATES) {
+    it(`AC2: 'validated' is blocked from state '${state}' — not a legal verb outside ac-validate`, async () => {
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", `state:${state}`]);
+      const result = await checkWorkflowRules("validated", "issue-uuid", "Bearer tok", "charles");
+      expect(result).not.toBeNull();
+    });
+  }
+
+  // AC2(c): Layer 2 blocks a raw stateId→Done mutation on a governed ticket.
+  it("AC2: raw stateId→Done mutation is blocked by Layer 2 on a governed wf:dev-impl ticket", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:ac-validate"]);
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { stateId: "done-state-uuid" } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("Direct status");
+  });
+});
+
+// ── AI-1576 AC3: demote blocked when ticket has in-flight/merged PR ─────────
+//
+// These tests are RED against the current implementation. checkWorkflowRules
+// does not yet call fetchBranchAndPRStatus for the 'demote' intent.
+//
+// Implementation must add a PR-presence guard on the demote path:
+//   if (intent === 'demote' && !breakGlassOverride) {
+//     const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+//     if (branchStatus && (branchStatus.hasBranch || branchStatus.hasPR)) → block
+//   }
+//
+// Tests map to: AI-1576 AC3.
+
+describe("checkWorkflowRules — AI-1576 AC3: demote blocked when ticket has in-flight/merged PR", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let ac3Dir: string;
+
+  beforeEach(() => {
+    ac3Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1576-ac3-"));
+
+    const policyFile = path.join(ac3Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ac3Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetWorkflowCache();
+    resetNativeStateCache();
+    resetPolicyCache();
+    resetConfigHealth();
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  // RED: checkWorkflowRules returns null (allowed) for demote regardless of PR status.
+  // These become green once the implementation adds the PR-presence guard.
+
+  it("AC3: demote from intake is blocked when ticket has an open PR", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:intake"],
+      { hasBranch: true, hasPR: true, hasMergedPR: false },
+    );
+    const result = await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("demote");
+  });
+
+  it("AC3: demote from intake is blocked when ticket has a merged PR", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:intake"],
+      { hasBranch: true, hasPR: true, hasMergedPR: true },
+    );
+    const result = await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("demote");
+  });
+
+  it("AC3: demote from intake is blocked when branch is pushed but no PR (in-flight work)", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:intake"],
+      { hasBranch: true, hasPR: false, hasMergedPR: false },
+    );
+    const result = await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+  });
+
+  // GREEN: no branch/PR evidence → genuinely fresh intake → demote is safe.
+  it("AC3: demote from intake is allowed when no branch and no PR (genuinely fresh intake ticket)", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:intake"],
+      { hasBranch: false, hasPR: false, hasMergedPR: false },
+    );
+    expect(await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
+
+  // GREEN: branch/PR fetch failure → fail-open (can't confirm in-flight work; don't strand ticket).
+  it("AC3: demote fails open when branch/PR fetch fails — cannot confirm in-flight work", async () => {
+    globalThis.fetch = async (_url, init?) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+      if (bodyText.includes("delegate") || bodyText.includes("IssueContext")) {
+        return new Response(JSON.stringify({
+          data: { issue: {
+            labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:intake" }] },
+            delegate: null,
+          } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (bodyText.includes("IssueBranchAndPR")) {
+        throw new Error("simulated API failure");
+      }
+      throw new Error(`unexpected fetch: ${bodyText.slice(0, 60)}`);
+    };
+    expect(await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
   });
 });
