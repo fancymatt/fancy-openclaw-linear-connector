@@ -716,6 +716,13 @@ export interface RecoveryResult {
   success: boolean;
   action: string;
   detail?: string;
+  /**
+   * AI-1578 (AC2): set on a C4 first-stall re-poke. When true, recoverTicket
+   * retained the delegate and changed no state — the caller should re-wake the
+   * SAME delegate for this ticket rather than treating it as orphaned. Only the
+   * second consecutive C4 stall sheds the delegate (existing orphan behavior).
+   */
+  rePoke?: boolean;
 }
 
 /**
@@ -798,6 +805,37 @@ export async function recoverTicket(
         success: true,
         action: "skipped-terminal",
         detail: `Ticket already in terminal state "${liveStateName}" — no recovery needed`,
+      };
+    }
+
+    // AI-1578 (AC2): C4 re-poke before orphan. C4 = session spawned but produced
+    // zero output. A single transient stall (container restart, idle-close, the
+    // completion-announce give-up) should NOT immediately shed the delegate and
+    // orphan code-adjacent work. On the FIRST C4 stall, retain the delegate and
+    // re-poke it to resume; only the second consecutive stall falls through to the
+    // normal shed/orphan path below.
+    if (snapshot.classification === "C4" && redispatchAttempt === 1 && !isRedispatchCapped) {
+      const diagSuffix = snapshot.diagnosticPath ? `\n\n📝 Diagnostics: \`${snapshot.diagnosticPath}\`` : "";
+      const rePokeComment =
+        `🟡 **Stale session — re-poking delegate** (class **C4**, ${STALE_CLASS_NAMES.C4})\n\n` +
+        `Your session for ${identifier} ended without producing output. This is your first stall, ` +
+        `so the ticket stays with you (delegate retained, state unchanged) instead of being orphaned.\n\n` +
+        `Resume now and run the pending transition verb. If you genuinely cannot proceed, run ` +
+        `\`linear escape ${identifier}\`.${diagSuffix}`;
+      await fetch("https://api.linear.app/graphql", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: authHeader },
+        body: JSON.stringify({
+          query: `mutation($issueId: ID!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { comment { id } } }`,
+          variables: { issueId, body: rePokeComment },
+        }),
+      });
+      log.info(`Recovery for ${identifier}: class=C4 first stall → re-poke (delegate retained, state unchanged)`);
+      return {
+        success: true,
+        action: "re-poke-c4",
+        rePoke: true,
+        detail: "C4 first stall — delegate retained, re-poke requested",
       };
     }
 

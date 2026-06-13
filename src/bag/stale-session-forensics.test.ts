@@ -448,7 +448,9 @@ describe("recoverTicket — C2/C4 redispatch cap", () => {
     expect(recoverBody.variables.input.delegateId).toBeNull();
   });
 
-  test("C4 below cap: re-dispatches normally with attempt count", async () => {
+  // AI-1578 (AC2/AC3b): C4 FIRST stall re-pokes the existing delegate instead of
+  // orphaning — delegate retained, no state change, rePoke signal set.
+  test("C4 first stall (attempt 1): re-pokes delegate, retains delegate, no RecoverIssue mutation", async () => {
     global.fetch = makeFetchMock() as unknown as typeof fetch;
 
     const snapshot = makeSnapshot("C4");
@@ -458,6 +460,46 @@ describe("recoverTicket — C2/C4 redispatch cap", () => {
     });
 
     expect(result.success).toBe(true);
+    expect(result.action).toBe("re-poke-c4");
+    expect(result.rePoke).toBe(true);
+
+    const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
+
+    // A re-poke comment is posted (delegate retained, not orphaned).
+    const commentCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
+      const b = JSON.parse((opts?.body ?? "{}") as string);
+      return b.query?.includes("commentCreate");
+    });
+    expect(commentCall).toBeDefined();
+    const commentBody = JSON.parse((commentCall![1].body ?? "{}") as string);
+    expect(commentBody.variables.body).toContain("re-poking delegate");
+    expect(commentBody.variables.body).not.toContain("Ticket returned to Todo for re-dispatch.");
+
+    // No RecoverIssue mutation → delegate NOT cleared, state NOT changed.
+    const recoverCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
+      const b = JSON.parse((opts?.body ?? "{}") as string);
+      return b.query?.includes("RecoverIssue") || b.query?.includes("issueUpdate");
+    });
+    expect(recoverCall).toBeUndefined();
+  });
+
+  // AI-1578 (AC3c): C4 SECOND consecutive stall sheds the delegate and re-dispatches
+  // (existing orphan behavior preserved), with the correct attempt count.
+  test("C4 second stall (attempt 2, below cap): re-dispatches normally, clears delegate, attempt count 2", async () => {
+    const setupCounter = new StaleRedispatchCounter(dbPath);
+    setupCounter.incrementAndGet("linear-AI-1044"); // simulate the first stall (re-poked)
+    setupCounter.close();
+
+    global.fetch = makeFetchMock() as unknown as typeof fetch;
+
+    const snapshot = makeSnapshot("C4");
+    const result = await recoverTicket(snapshot, "igor", {
+      redispatchDbPath: dbPath,
+      maxRedispatchAttempts: 3,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.rePoke).toBeFalsy();
 
     const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
     const commentCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
@@ -465,7 +507,16 @@ describe("recoverTicket — C2/C4 redispatch cap", () => {
       return b.query?.includes("commentCreate");
     });
     const commentBody = JSON.parse((commentCall![1].body ?? "{}") as string);
-    expect(commentBody.variables.body).toContain("Re-dispatch attempt **1 of 3**.");
+    expect(commentBody.variables.body).toContain("Re-dispatch attempt **2 of 3**.");
+
+    // RecoverIssue mutation clears the delegate (orphan/re-dispatch).
+    const recoverCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, opts]) => {
+      const b = JSON.parse((opts?.body ?? "{}") as string);
+      return b.query?.includes("RecoverIssue");
+    });
+    expect(recoverCall).toBeDefined();
+    const recoverBody = JSON.parse((recoverCall![1].body ?? "{}") as string);
+    expect(recoverBody.variables.input.delegateId).toBeNull();
   });
 
   test("C4 at cap: escalates to human", async () => {
@@ -594,7 +645,9 @@ describe("recoverTicket — terminal guard", () => {
 
   test("proceeds with recovery when ticket is still active (started)", async () => {
     global.fetch = makeFetchMockWithState({ stateName: "In Progress", stateType: "started" }) as unknown as typeof fetch;
-    const result = await recoverTicket(makeSnapshot("C4"), "igor", { redispatchDbPath: dbPath });
+    // C2 (not C4) so we exercise the full recovery mutation path — C4 first-stall
+    // short-circuits into a re-poke (AI-1578) and never issues RecoverIssue.
+    const result = await recoverTicket(makeSnapshot("C2"), "igor", { redispatchDbPath: dbPath });
     expect(result.action).not.toBe("skipped-terminal");
     const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
     const allCalls = fetchMock.mock.calls as Array<[string, RequestInit]>;
@@ -618,7 +671,7 @@ describe("recoverTicket — robust state-name resolution", () => {
     global.fetch = makeFetchMockWithState({
       teamStates: [{ id: "s-todo", name: "To Do", type: "unstarted" }, { id: "s-done", name: "Done", type: "completed" }],
     }) as unknown as typeof fetch;
-    await recoverTicket(makeSnapshot("C4"), "igor", { redispatchDbPath: dbPath });
+    await recoverTicket(makeSnapshot("C2"), "igor", { redispatchDbPath: dbPath });
     const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
     const recoverCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, o]) => JSON.parse((o?.body ?? "{}") as string).query?.includes("RecoverIssue"));
     const recoverBody = JSON.parse((recoverCall![1].body ?? "{}") as string);
@@ -629,7 +682,7 @@ describe("recoverTicket — robust state-name resolution", () => {
     global.fetch = makeFetchMockWithState({
       teamStates: [{ id: "s-ready", name: "Backlog Ready", type: "unstarted" }, { id: "s-done", name: "Done", type: "completed" }],
     }) as unknown as typeof fetch;
-    await recoverTicket(makeSnapshot("C4"), "igor", { redispatchDbPath: dbPath });
+    await recoverTicket(makeSnapshot("C2"), "igor", { redispatchDbPath: dbPath });
     const fetchMock = global.fetch as ReturnType<typeof jest.fn>;
     const recoverCall = (fetchMock.mock.calls as Array<[string, RequestInit]>).find(([, o]) => JSON.parse((o?.body ?? "{}") as string).query?.includes("RecoverIssue"));
     const recoverBody = JSON.parse((recoverCall![1].body ?? "{}") as string);

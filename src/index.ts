@@ -13,7 +13,7 @@ import { ObservationStore } from "./store/observation-store.js";
 import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
-import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
+import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, StuckDelegateDetector, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus } from "./engagement-status.js";
@@ -229,6 +229,26 @@ export function createApp(options?: CreateAppOptions) {
     const recovery = await recoverTicket(snapshot, stale.agentId, forensicsConfig);
     if (!recovery.success) {
       log.error(`Recovery failed for ${stale.sessionKey}: ${recovery.detail}`);
+    } else if (recovery.rePoke) {
+      // AI-1578 (AC2): C4 first stall — recoverTicket retained the delegate and
+      // changed no state. Re-wake the SAME delegate to resume + run its verb,
+      // rather than letting the ticket sit orphaned.
+      const ticketId = snapshot.metadata.ticketId;
+      const sessionKey = normalizeSessionKey(ticketId);
+      const rePokeMsg =
+        `Your session for ${ticketId.replace(/^linear-/, "")} stalled before producing output. ` +
+        `Resume now and run the pending transition verb to hand off. Do NOT reply HEARTBEAT_OK.`;
+      log.info(`Stale C4 re-poke: re-waking ${stale.agentId} for ${ticketId}`);
+      const delivered = await deliverMessageToAgent(stale.agentId, sessionKey, rePokeMsg, wakeConfigForAgent(stale.agentId));
+      operationalEventStore.append({
+        outcome: delivered.dispatched ? "stale-c4-repoke" : "stale-c4-repoke-failed",
+        agent: stale.agentId,
+        key: sessionKey,
+        sessionKey,
+        deliveryMode: "stale-c4-repoke",
+        attemptCount: 1,
+        errorSummary: delivered.dispatched ? null : "C4 re-poke delivery failed",
+      });
     }
 
     // 7. Re-signal pending tickets (if any)
@@ -334,6 +354,31 @@ export function createApp(options?: CreateAppOptions) {
     { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions, postLinearComment },
   );
   noActivityDetector.start();
+
+  // ── Stuck-delegate detector (AI-1578 / AI-1451) ──────────────────────
+  // Re-prompts delegates who posted a completion comment but never ran the
+  // transition verb — the connector-native signal for "work landed but the
+  // verb is missing" (the connector has no GitHub/PR awareness, so the
+  // delegate's own completion comment is the observable "I'm done" signal).
+  // Retains the delegate and re-pokes rather than orphaning. Per-agent wake
+  // routing (wakeConfigForAgent) so containerized dev agents resolve their
+  // own hooks endpoint.
+  const stuckDelegateDetector = new StuckDelegateDetector({
+    sessionTracker,
+    bag,
+    operationalEventStore,
+    deliveryConfig: wakeConfig,
+    sendWake: async (agentOpenclawName, ticketId, prompt) => {
+      const result = await deliverMessageToAgent(
+        agentOpenclawName,
+        normalizeSessionKey(ticketId),
+        prompt,
+        wakeConfigForAgent(agentOpenclawName),
+      );
+      return result.dispatched;
+    },
+  });
+  stuckDelegateDetector.start();
 
   // ── Managing-state stewardship poller ────────────────────────────────
   // Wakes agents on a cadence to review Managing-state tickets (parent /
