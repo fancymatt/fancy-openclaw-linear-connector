@@ -2205,3 +2205,71 @@ async function issueUpdateDelegateOnly(
     return false;
   }
 }
+
+/**
+ * AI-1584: Enrollment gap repair.
+ *
+ * Detects and heals the dead-on-arrival condition where a ticket carries a `wf:*`
+ * label but no `state:*` label — a gap that occurs when tickets are created via
+ * bulk scripts or the raw Linear API and the entry-state stamp is never applied.
+ *
+ * This function is idempotent: it is a no-op when the ticket already has a
+ * `state:*` label or when no `wf:*` label is present (ad-hoc ticket).
+ *
+ * Called from the webhook inbound path on every Issue event so gaps are healed
+ * within one reconciliation cycle (i.e. the next webhook fire after creation).
+ *
+ * Fail-open: any API or registry failure logs a warning and returns
+ * `{ enrolled: false }` — the inbound path is never blocked by enrollment.
+ */
+export async function enrollIfMissing(
+  issueId: string,
+  authToken: string,
+): Promise<{ enrolled: boolean; entryState?: string }> {
+  const issue = await fetchIssueWithLabels(issueId, authToken);
+  if (!issue) {
+    log.warn(`workflow-gate: enrollIfMissing: failed to fetch labels for ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  const labelNames = issue.labels.map((l) => l.name);
+  const workflowId = getWorkflowId(labelNames);
+  if (!workflowId) return { enrolled: false }; // ad-hoc ticket
+
+  const currentState = getCurrentState(labelNames);
+  if (currentState) return { enrolled: false }; // already enrolled
+
+  // Gap: wf:* present, state:* missing.
+  let def: WorkflowDef | undefined;
+  try {
+    const registry = await loadWorkflowRegistry();
+    def = registry.get(workflowId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: enrollIfMissing: registry load failed for ${issueId}: ${msg} — skipping`);
+    return { enrolled: false };
+  }
+
+  if (!def?.entry_state) {
+    log.warn(`workflow-gate: enrollIfMissing: no entry_state in def for wf:${workflowId} on ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  const entryLabelName = `state:${def.entry_state}`;
+  const entryLabelId = await findOrCreateLabel(issue.teamId, entryLabelName, authToken);
+  if (!entryLabelId) {
+    log.warn(`workflow-gate: enrollIfMissing: could not resolve label '${entryLabelName}' for ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  const existingIds = issue.labels.map((l) => l.id);
+  const newLabelIds = [...existingIds, entryLabelId];
+  const success = await issueUpdateLabels(issue.internalId, newLabelIds, authToken);
+  if (!success) {
+    log.warn(`workflow-gate: enrollIfMissing: label update failed for ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  log.info(`workflow-gate: enrollIfMissing: stamped '${entryLabelName}' on ${issueId} (wf:${workflowId} had no state:*)`);
+  return { enrolled: true, entryState: def.entry_state };
+}

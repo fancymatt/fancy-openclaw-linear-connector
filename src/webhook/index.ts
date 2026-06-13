@@ -15,7 +15,7 @@ import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgent
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing } from "../workflow-gate.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
@@ -228,6 +228,23 @@ export function createWebhookRouter(
       }
 
       acknowledgeAgentAuthoredActivity(event, onAgentActivity);
+
+      // AI-1584: Enrollment gap repair — heal wf:* tickets that lack state:* label.
+      // Fires on every Issue event (create or update). Fail-open: never blocks routing.
+      if (event.type === "Issue") {
+        const enrollToken = process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+        const enrollData = event.data as Record<string, unknown> | null;
+        const enrollIssueId = enrollData?.id as string | undefined;
+        if (enrollToken && enrollIssueId) {
+          enrollIfMissing(enrollIssueId, enrollToken).then((result) => {
+            if (result.enrolled) {
+              log.info(`Enrollment gap healed: stamped state:${result.entryState} on ${enrollIssueId}`);
+            }
+          }).catch((err) => {
+            log.warn(`enrollIfMissing failed for ${enrollIssueId}: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        }
+      }
 
       // AgentSessionEvent — create session for Linear UI widget
       if (event.type === "AgentSessionEvent") {
