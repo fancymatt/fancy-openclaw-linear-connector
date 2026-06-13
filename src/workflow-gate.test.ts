@@ -2199,6 +2199,196 @@ describe("checkRawMutationInterception — AI-1535: delegate-only raw mutations"
 });
 
 
+// ── AI-1579: recovery-actor first-delegate authorization ────────────────────
+// A configured recovery actor (e.g. `ai`) may re-establish a delegate on a
+// governed ticket whose delegate is currently EMPTY (orphaned) at ANY state,
+// including a mid-workflow state whose owner_role it does not fill. This is the
+// authorization counterpart to the stale-session recovery machinery: when a
+// delegate's session dies without advancing the ticket, recovery clears the
+// delegate and must re-dispatch via a raw delegateId write from `ai`. The
+// carve-out is scoped to the empty-delegate path, so it can never steal a live
+// delegate, and every other out-of-role caller stays blocked (AI-1560 parity).
+describe("checkRawMutationInterception — AI-1579: recovery-actor authorization", () => {
+  let ai1579Dir: string;
+  let ai1579OriginalFetch: typeof globalThis.fetch;
+  let originalWorkflowPath: string | undefined;
+  let originalPolicyPath: string | undefined;
+
+  // Policy mirrors TEST_POLICY_YAML but adds `ai` as a known body in an
+  // orchestrator container that fills NO workflow role (parity with prod).
+  const AI_1579_POLICY_YAML = `
+capabilities:
+  - id: linear:transition
+  - id: human:escalate
+  - id: deploy:execute
+
+containers:
+  - id: dev
+    grants: [linear:transition]
+  - id: deployment
+    grants: [linear:transition, deploy:execute]
+  - id: steward
+    grants: [linear:transition, human:escalate]
+  - id: code-review
+    grants: [linear:transition]
+  - id: orchestrator
+    grants: [linear:transition]
+
+roles:
+  - id: dev
+    requires: [linear:transition]
+  - id: deployment
+    requires: [deploy:execute]
+  - id: steward
+    requires: [human:escalate]
+  - id: code-review
+    requires: [linear:transition]
+
+bodies:
+  - id: hanzo
+    container: deployment
+    fills_roles: [deployment]
+  - id: charles
+    container: dev
+    fills_roles: [dev]
+  - id: astrid
+    container: steward
+    fills_roles: [steward]
+  - id: ai
+    container: orchestrator
+    fills_roles: []
+`;
+
+  const WORKFLOW_WITH_RECOVERY = `${TEST_WORKFLOW_YAML.replace(
+    "entry_state: intake\n",
+    "entry_state: intake\nrecovery_actor: ai\n",
+  )}`;
+  // Same workflow, recovery actor NOT configured — `ai` must stay blocked mid-state.
+  const WORKFLOW_NO_RECOVERY = TEST_WORKFLOW_YAML;
+
+  function writeWorkflow(yamlText: string) {
+    const workflowFile = path.join(ai1579Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, yamlText, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+    resetWorkflowCache();
+  }
+
+  beforeAll(() => {
+    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    originalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+  });
+
+  beforeEach(() => {
+    ai1579Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1579-test-"));
+    const policyFile = path.join(ai1579Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, AI_1579_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+    writeWorkflow(WORKFLOW_WITH_RECOVERY);
+    resetPolicyCache();
+    ai1579OriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => { globalThis.fetch = ai1579OriginalFetch; });
+
+  afterAll(() => {
+    if (originalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    if (originalPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+  });
+
+  // A NO-delegate ticket at a mid-workflow state (deployment, owned by `deployment`).
+  const ORPHANED_DEPLOY = {
+    data: { issue: {
+      labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] },
+      delegate: null,
+    } },
+  };
+  // The same state, but a delegate IS live.
+  const LIVE_DELEGATE_DEPLOY = {
+    data: { issue: {
+      labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] },
+      delegate: { id: "live-delegate-uuid" },
+    } },
+  };
+
+  function mockLabelFetch(labelResponse: object) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return async (url: any, init?: RequestInit) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("IssueLabels")) {
+          return new Response(JSON.stringify(labelResponse), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+      return ai1579OriginalFetch(url, init);
+    };
+  }
+
+  const delegateWrite = {
+    query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+    variables: { id: "issue-uuid", input: { delegateId: "new-delegate-uuid" } },
+  };
+
+  // AC: orphaned-mid-state allow — recovery actor re-establishes a delegate.
+  it("ALLOWS the recovery actor (ai) to re-delegate an orphaned ticket at a mid-workflow state", async () => {
+    globalThis.fetch = mockLabelFetch(ORPHANED_DEPLOY);
+    const result = await checkRawMutationInterception(
+      delegateWrite, "issue-uuid", "Bearer tok", "ai", "ai-linear-uuid",
+    );
+    expect(result).toBeNull();
+  });
+
+  // AC: active-delegate-steal block — recovery actor cannot yank a live delegate.
+  it("BLOCKS the recovery actor (ai) from stealing a LIVE delegate at a mid-workflow state", async () => {
+    globalThis.fetch = mockLabelFetch(LIVE_DELEGATE_DEPLOY);
+    const result = await checkRawMutationInterception(
+      delegateWrite, "issue-uuid", "Bearer tok", "ai", "ai-linear-uuid",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("not the current delegate");
+  });
+
+  // AC: non-recovery-caller-mid-state block — AI-1560 parity preserved.
+  it("BLOCKS a non-recovery out-of-role caller (charles=dev) from establishing a delegate mid-state", async () => {
+    globalThis.fetch = mockLabelFetch(ORPHANED_DEPLOY);
+    const result = await checkRawMutationInterception(
+      delegateWrite, "issue-uuid", "Bearer tok", "charles", "charles-linear-uuid",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("may not establish a delegate");
+  });
+
+  // The carve-out is config-gated: with no recovery_actor set, even `ai` is blocked.
+  it("BLOCKS the would-be recovery actor when recovery_actor is NOT configured", async () => {
+    writeWorkflow(WORKFLOW_NO_RECOVERY);
+    globalThis.fetch = mockLabelFetch(ORPHANED_DEPLOY);
+    const result = await checkRawMutationInterception(
+      delegateWrite, "issue-uuid", "Bearer tok", "ai", "ai-linear-uuid",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("may not establish a delegate");
+  });
+
+  // Recovery actor still allowed at the ENTRY state (entry-state carve-out path).
+  it("ALLOWS the recovery actor (ai) at the entry state too", async () => {
+    globalThis.fetch = mockLabelFetch({
+      data: { issue: {
+        labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:intake" }] },
+        delegate: null,
+      } },
+    });
+    const result = await checkRawMutationInterception(
+      delegateWrite, "issue-uuid", "Bearer tok", "ai", "ai-linear-uuid",
+    );
+    expect(result).toBeNull();
+  });
+});
+
+
 // ── Phase 5 / B-1: ux-audit workflow definition validation (AI-1438) ────────
 // Validates the canonical ux-audit YAML fixture parses correctly and
 // enforces workflow rules per design.md §14 + §16.0.
