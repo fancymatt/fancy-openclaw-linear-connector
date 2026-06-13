@@ -49,6 +49,7 @@ import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
 import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
+import { recordAppliedState, clearAppliedState } from "./store/applied-state-store.js";
 
 /**
  * Phase 6.5 / H-6: Label read-only projection + override path + drift reconciliation.
@@ -510,11 +511,12 @@ async function fetchTicketContext(issueId: string, authToken: string): Promise<T
 async function fetchIssueWithLabels(
   issueId: string,
   authToken: string,
-): Promise<{ internalId: string; teamId: string; labels: LabelNode[] } | null> {
+): Promise<{ internalId: string; identifier: string; teamId: string; labels: LabelNode[] } | null> {
   const query = `
     query IssueWithLabels($id: String!) {
       issue(id: $id) {
         id
+        identifier
         team { id }
         labels { nodes { id name } }
       }
@@ -530,6 +532,7 @@ async function fetchIssueWithLabels(
       data?: {
         issue?: {
           id: string;
+          identifier: string;
           team: { id: string };
           labels: { nodes: LabelNode[] };
         };
@@ -538,7 +541,7 @@ async function fetchIssueWithLabels(
     const data = (await res.json()) as Resp;
     const issue = data.data?.issue;
     if (!issue) return null;
-    return { internalId: issue.id, teamId: issue.team.id, labels: issue.labels.nodes };
+    return { internalId: issue.id, identifier: issue.identifier, teamId: issue.team.id, labels: issue.labels.nodes };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: issue fetch failed for ${issueId}: ${msg}`);
@@ -1586,6 +1589,9 @@ export async function applyStateTransition(
       .filter((l) => !l.name.startsWith("state:") && !l.name.startsWith("wf:"))
       .map((l) => l.id);
     await issueUpdateLabels(issue.internalId, keepIds, authToken);
+    // AI-1534: ticket left the workflow — drop any cached state so it can't
+    // override a later live read.
+    clearAppliedState(issue.identifier);
     log.info(
       `workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels`,
     );
@@ -1597,6 +1603,9 @@ export async function applyStateTransition(
   // is actually present. If it's missing (CLI partial failure, race condition),
   // re-stamp it. Previously this was a blind no-op, which meant a lost label
   // would never be recovered.
+  // AI-1534: this branch is state-preserving (source === destination), so it
+  // intentionally neither records nor clears the applied-state cache — any
+  // existing entry already holds this same state, and its absence is harmless.
   if (currentStateName === toStateName) {
     const targetLabelName = `state:${toStateName}`;
     const hasTargetLabel = issue.labels.some((l) => l.name === targetLabelName);
@@ -1687,6 +1696,8 @@ export async function applyStateTransition(
       }
       // AC gate passed and dispositionToDone already applied the label swap + comment.
       // Skip the normal atomic swap below — dispositionToDone handled it.
+      // AI-1534: terminal state, no further per-step delivery — drop any cached state.
+      clearAppliedState(issue.identifier);
       log.info(`workflow-gate: B-4 review: ${issueId} review → done (parent AC satisfied)`);
       return;
     } catch (err) {
@@ -1705,6 +1716,9 @@ export async function applyStateTransition(
         // Fall through to normal transition — it'll go to spawning via the standard path
       } else {
         // dispositionToSpawning applied the label swap + comment.
+        // AI-1534: this helper, not the atomic path below, applied the swap —
+        // drop the now-stale cached state rather than leave a wrong override.
+        clearAppliedState(issue.identifier);
         log.info(`workflow-gate: B-4 review: ${issueId} review → spawning (follow-up)`);
         return;
       }
@@ -1940,6 +1954,10 @@ export async function applyStateTransition(
   );
 
   if (applied) {
+    // AI-1534: record the authoritative destination state so the outbound
+    // per-step delivery prefers it over a lag-prone live label read. Keyed by
+    // the human identifier to match build-message's lookup key.
+    recordAppliedState(issue.identifier, toStateName);
     log.info(
       `workflow-gate: B2 apply: ${issueId} state:${currentStateName} → state:${toStateName}` +
       (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
