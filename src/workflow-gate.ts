@@ -927,6 +927,24 @@ export async function checkWorkflowRules(
     );
   }
 
+  // AI-1576 AC3: demote guard — block demote when ticket has in-flight or merged work.
+  // Scoped to wf:dev-impl only: sprint/ux-audit demotes are not gated.
+  // A demote on a dev-impl ticket carrying a pushed branch or open/merged PR silently
+  // drops it off-spine while implementation is already underway. Fail-open on fetch
+  // error so a transient API outage never permanently strands a genuinely-fresh intake.
+  if (intent === "demote" && workflowId === "dev-impl" && !breakGlassOverride) {
+    const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+    if (branchStatus && (branchStatus.hasBranch || branchStatus.hasPR)) {
+      log.warn(`workflow-gate: AI-1576 demote-guard blocked agent=${bodyId} ticket=${issueId} (hasBranch=${branchStatus.hasBranch} hasPR=${branchStatus.hasPR})`);
+      return (
+        `[Proxy] 'demote' blocked on ${issueId}: this ticket has in-flight or merged implementation work ` +
+        `(branch: ${branchStatus.hasBranch}, PR: ${branchStatus.hasPR}). ` +
+        `Demoting would silently drop it off the dev-impl spine while implementation is underway. ` +
+        `Use break-glass ('escape') to override if intentional.`
+      );
+    }
+  }
+
   // AI-1397: delegate-only enforcement at proxy (CLI-version-agnostic).
   // If both the caller's Linear user ID and the ticket's delegate ID are known,
   // block any agent that is not the current delegate. Fails open when either is
