@@ -287,6 +287,98 @@ export async function checkRoleGuardAndWarn(
   return checkRoleGuardAndBlock(targetAgentId, issueIdentifier, ticketLabels, delegateLinearUserIdResolver);
 }
 
+/**
+ * AI-1575 / AC4: Run the role-guard on a label-change webhook event where
+ * `routeEvent` returned null (no delegate field in the event payload).
+ *
+ * When a label-change makes a ticket governed (wf:* + state:* appear), the
+ * current Linear delegate may be a stale/illegal body that the role-router
+ * never had a chance to correct (because there was no delegate in the webhook
+ * payload to route on). This function:
+ *   1. Fetches the ticket's CURRENT delegate from Linear.
+ *   2. Runs `checkRoleGuardEnforced` against the delegate + new labels.
+ *   3. If blocked, posts a comment and corrects the delegate via `checkRoleGuardAndBlock`.
+ *
+ * Returns { fired: false } when the ticket is not governed (no wf:* + state:*),
+ * or when no delegate is found in Linear (nothing to guard against).
+ * Fails open on fetch errors.
+ */
+export async function guardOnLabelChange(opts: {
+  issueIdentifier: string;
+  newLabels: string[];
+  authToken: string;
+  delegateLinearUserIdResolver?: LinearUserIdResolver;
+}): Promise<{ fired: boolean; blocked: boolean; correctedTo?: string }> {
+  const { issueIdentifier, newLabels, authToken, delegateLinearUserIdResolver } = opts;
+
+  // Only fire when the ticket is now governed (has wf:* + state:*).
+  const workflowId = getWorkflowId(newLabels);
+  const currentState = getCurrentState(newLabels);
+  if (!workflowId || !currentState) {
+    return { fired: false, blocked: false };
+  }
+
+  // Fetch the ticket's CURRENT delegate from Linear.
+  // The webhook event payload may not include the delegate field, so we query
+  // Linear directly to get the up-to-date delegate.
+  const query = `
+    query IssueDelegateAndLabels($id: String!) {
+      issue(id: $id) {
+        id
+        delegate { id name }
+        labels { nodes { name } }
+      }
+    }
+  `;
+  let delegateBodyName: string | null = null;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueIdentifier } }),
+    });
+    type Resp = {
+      data?: {
+        issue?: {
+          id: string;
+          delegate?: { id: string; name: string } | null;
+          labels?: { nodes: Array<{ name: string }> };
+        } | null;
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const delegate = data.data?.issue?.delegate;
+    if (delegate?.name) {
+      delegateBodyName = delegate.name.toLowerCase();
+    }
+  } catch (err) {
+    log.warn(
+      `routing-guard: guardOnLabelChange: fetch failed for ${issueIdentifier}: ` +
+      `${err instanceof Error ? err.message : String(err)} — failing open`,
+    );
+    return { fired: false, blocked: false };
+  }
+
+  if (!delegateBodyName) {
+    // No current delegate in Linear — nothing to guard against.
+    return { fired: false, blocked: false };
+  }
+
+  // Run the enforcement guard against the current delegate + new labels.
+  const guardResult = await checkRoleGuardAndBlock(
+    delegateBodyName,
+    issueIdentifier,
+    newLabels,
+    delegateLinearUserIdResolver,
+  );
+
+  return {
+    fired: true,
+    blocked: guardResult.blocked,
+    correctedTo: guardResult.correctedTo,
+  };
+}
+
 // ── Internal helpers ────────────────────────────────────────────────────────
 
 async function resolveIssueId(

@@ -2,6 +2,7 @@ import { Router } from "express";
 import crypto from "node:crypto";
 import { getAgents } from "./agents.js";
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
+import { tryNormalizeSessionKey } from "./session-key.js";
 function bool(value) {
     return typeof value === "string" ? value.length > 0 : Boolean(value);
 }
@@ -421,6 +422,28 @@ export function createAdminRouter(deps) {
     });
     router.get("/api/tasks/:key/events", (req, res) => {
         res.json(deps.operationalEventStore?.snapshot({ key: req.params.key }) ?? { key: req.params.key, lifecycle: [] });
+    });
+    // AC5 (AI-1560): Per-ticket engagement event observability.
+    router.get("/api/engagement/:ticketId", (req, res) => {
+        const { ticketId } = req.params;
+        const normalizedKey = tryNormalizeSessionKey(ticketId);
+        if (!normalizedKey || !deps.operationalEventStore) {
+            res.status(404).json({ ticketId });
+            return;
+        }
+        const events = deps.operationalEventStore.query({ key: normalizedKey, limit: 200 });
+        const engagementEvent = events.find((e) => e.outcome === "engagement-thinking" || e.outcome === "engagement-doing" || e.outcome === "engagement-todo");
+        if (!engagementEvent) {
+            res.status(404).json({ ticketId });
+            return;
+        }
+        res.json({
+            ticketId,
+            lastEvent: {
+                semantic: engagementEvent.outcome.replace("engagement-", ""),
+                agentId: engagementEvent.agent,
+            },
+        });
     });
     router.get("/api/stale-digest", (_req, res) => {
         const daysBack = typeof _req.query.days === "string" ? Number.parseInt(_req.query.days, 10) : 7;
