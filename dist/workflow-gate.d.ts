@@ -268,4 +268,31 @@ export interface ApplyStateTransitionOptions {
     sourceStateOverride?: string;
 }
 export declare function applyStateTransition(intent: string, issueId: string | null, authToken: string, options?: ApplyStateTransitionOptions): Promise<void>;
+/**
+ * AI-1575: First-class atomic enrollment — enroll a ticket onto a workflow spine
+ * in a single mutation (wf:* + state:intake + risk:* labels, steward delegate,
+ * and native stateId). This eliminates the orphaned-delegate window that caused
+ * the AI-1571 collision.
+ *
+ * Unlike the internal `handleEnrollment` (which operates on an already-forwarded
+ * CLI command), this is a standalone public entry point that:
+ *   - Accepts enrollment params (workflow, risk level) directly
+ *   - Builds the label set from scratch (not from existing labels) — AC2 requires
+ *     that old/stale labels are excluded from the enrollment write
+ *   - Returns { success, mutationCount } so callers can assert atomicity
+ *
+ * Fail-closed: returns { success: false, mutationCount: 0 } if any prerequisite
+ * (issue fetch, workflow def, label resolution, native state) cannot be resolved.
+ */
+export declare function applyEnrollment(opts: {
+    issueIdentifier: string;
+    workflow: string;
+    risk: "low" | "medium" | "high";
+    authToken: string;
+    /** Optional: provide directly to skip the Linear user lookup. */
+    stewardLinearUserId?: string;
+}): Promise<{
+    success: boolean;
+    mutationCount: number;
+}>;
 //# sourceMappingURL=workflow-gate.d.ts.map

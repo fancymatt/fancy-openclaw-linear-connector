@@ -22,7 +22,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "@jest/globals";
+import { jest, describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "@jest/globals";
 
 // ── Mock modules (must precede dynamic imports) ────────────────────────────
 
@@ -31,6 +31,9 @@ const mockResolveBodiesForRole = jest.fn<(role: string) => Promise<string[]>>();
 
 jest.unstable_mockModule("./escalation-gate.js", () => ({
   resolveBodiesForRole: mockResolveBodiesForRole,
+  // workflow-gate imports these; provide stubs so the module links correctly.
+  bodyHasCapability: jest.fn().mockResolvedValue(true),
+  isBodyKnown: jest.fn().mockResolvedValue(true),
 }));
 
 // Partial mock: override loadWorkflowDef but keep the rest of workflow-gate real.
