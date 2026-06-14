@@ -1527,6 +1527,9 @@ export interface ApplyStateTransitionOptions {
    * Falls back to the ticket's current state:* label when undefined.
    */
   sourceStateOverride?: string;
+  /** AI-1594: called after a successful atomic transition so callers can advance
+   *  the state high-water mark tracker with the confirmed new state. */
+  onStateAdvanced?: (issueId: string, newState: string) => void;
 }
 
 export async function applyStateTransition(
@@ -1957,6 +1960,7 @@ export async function applyStateTransition(
       (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
       (resolvedNativeStateId ? ` native=${destNativeState}(${resolvedNativeStateId})` : ``),
     );
+    options?.onStateAdvanced?.(issueId, toStateName);
   } else {
     log.error(
       `workflow-gate: B2 apply: atomic mutation FAILED for ${issueId} — all facets rolled back (no partial state)`,
