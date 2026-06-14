@@ -377,6 +377,126 @@ describe("ObservationStore — validateReasonCode", () => {
     expect(ObservationStore.validateReasonCode("MISSING-TESTS")).toBeNull();
     expect(ObservationStore.validateReasonCode("not-a-code")).toBeNull();
   });
+
+  it("§16.1: accepts 'other' as a valid reason code", () => {
+    expect(ObservationStore.validateReasonCode("other")).toBe("other");
+  });
+});
+
+describe("ObservationStore — validateOtherHasFreeText (§16.1)", () => {
+  it("allows non-'other' categories without free text", () => {
+    expect(ObservationStore.validateOtherHasFreeText("missing-tests")).toBe(true);
+    expect(ObservationStore.validateOtherHasFreeText("style", null)).toBe(true);
+    expect(ObservationStore.validateOtherHasFreeText("correctness", "")).toBe(true);
+  });
+
+  it("rejects 'other' category without free text", () => {
+    expect(ObservationStore.validateOtherHasFreeText("other")).toBe(false);
+    expect(ObservationStore.validateOtherHasFreeText("other", null)).toBe(false);
+    expect(ObservationStore.validateOtherHasFreeText("other", "")).toBe(false);
+    expect(ObservationStore.validateOtherHasFreeText("other", "   ")).toBe(false);
+  });
+
+  it("allows 'other' category with non-empty free text", () => {
+    expect(ObservationStore.validateOtherHasFreeText("other", "some reason")).toBe(true);
+    expect(ObservationStore.validateOtherHasFreeText("other", "needs more investigation")).toBe(true);
+  });
+
+  it("isOtherCategory correctly identifies 'other'", () => {
+    expect(ObservationStore.isOtherCategory("other")).toBe(true);
+    expect(ObservationStore.isOtherCategory("missing-tests")).toBe(false);
+    expect(ObservationStore.isOtherCategory("style")).toBe(false);
+  });
+});
+
+describe("ObservationStore — 'other' category observations (§16.1)", () => {
+  let dbPath: string;
+  let store: ObservationStore;
+
+  beforeEach(() => {
+    dbPath = tmpDbPath();
+    store = new ObservationStore(dbPath);
+  });
+
+  afterEach(() => {
+    store.close();
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+  });
+
+  it("§16.1 AC: 'other'-category feedback is stored and appears in counts", () => {
+    store.append({
+      ticket: "AI-1483",
+      workflow: "dev-impl",
+      step: "code-review",
+      fromBody: "igor",
+      reviewerBody: "charles",
+      reasonCode: "other",
+      freeText: "Unclear requirements — needs product clarification",
+    });
+
+    const rows = store.query({ reasonCode: "other" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].freeText).toBe("Unclear requirements — needs product clarification");
+
+    // The 'other' category appears in the counts / metrics (mining pass)
+    const counts = store.counts({ reasonCode: "other" });
+    expect(counts).toHaveLength(1);
+    expect(counts[0].count).toBe(1);
+
+    const rollup = store.metrics({ reasonCode: "other" });
+    expect(rollup.items).toHaveLength(1);
+    expect(rollup.items[0].exceedsThreshold).toBe(false);
+  });
+
+  it("§16.1 AC: 'other'-category feedback appears in periodic mining pass metrics", () => {
+    // Simulate multiple 'other' observations with free text
+    for (let i = 0; i < 5; i++) {
+      store.append({
+        ticket: `AI-${i}`,
+        workflow: "dev-impl",
+        step: "code-review",
+        fromBody: "igor",
+        reviewerBody: "charles",
+        reasonCode: "other",
+        freeText: `Recurring reason ${i}: unclear API contract`,
+      });
+    }
+
+    const rollup = store.metrics({ workflow: "dev-impl", threshold: 3 });
+    const otherItem = rollup.items.find((i) => i.reasonCode === "other");
+    expect(otherItem).toBeDefined();
+    expect(otherItem!.count).toBe(5);
+    expect(otherItem!.exceedsThreshold).toBe(true);
+  });
+
+  it("'other' observations are queryable with free text", () => {
+    store.append({
+      ticket: "AI-1",
+      workflow: "dev-impl",
+      step: "code-review",
+      fromBody: "igor",
+      reviewerBody: "charles",
+      reasonCode: "other",
+      freeText: "Missing design spec",
+    });
+    store.append({
+      ticket: "AI-2",
+      workflow: "dev-impl",
+      step: "deployment",
+      fromBody: "sage",
+      reviewerBody: "hanzo",
+      reasonCode: "other",
+      freeText: "Environment config mismatch",
+    });
+
+    const allOther = store.query({ reasonCode: "other" });
+    expect(allOther).toHaveLength(2);
+
+    // Verify free text is preserved
+    const freeTexts = allOther.map((r) => r.freeText);
+    expect(freeTexts).toContain("Missing design spec");
+    expect(freeTexts).toContain("Environment config mismatch");
+  });
 });
 
 describe("ObservationStore — auto-creates data directory", () => {

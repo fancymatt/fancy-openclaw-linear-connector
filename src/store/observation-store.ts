@@ -19,13 +19,19 @@ import { componentLogger, createLogger } from "../logger.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "observation-store");
 
-/** The validated reason codes from the workflow definition. */
+/** The validated reason codes from the workflow definition.
+ *
+ *  §16.1: 'other' is the catch-all category — it REQUIRES accompanying free_text
+ *  so the periodic mining pass (§8.2) can surface recurring reasons that warrant
+ *  promotion to a first-class category.
+ */
 export const REASON_CODES = [
   "missing-tests",
   "style",
   "scope-creep",
   "correctness",
   "ac-mismatch",
+  "other",
 ] as const;
 
 export type ReasonCode = (typeof REASON_CODES)[number];
@@ -151,6 +157,24 @@ export class ObservationStore {
       return value as ReasonCode;
     }
     return null;
+  }
+
+  /**
+   * §16.1: Check whether a reason code is 'other', which REQUIRES free text.
+   * Used by the proxy to enforce the other-requires-free-text rule at write time.
+   */
+  static isOtherCategory(code: ReasonCode | string): boolean {
+    return code === "other";
+  }
+
+  /**
+   * §16.1: Validate that 'other'-category feedback includes free text.
+   * Returns true when the feedback is valid (either not 'other', or 'other' with non-empty freeText).
+   * Returns false when 'other' is used without free text.
+   */
+  static validateOtherHasFreeText(reasonCode: ReasonCode | string, freeText?: string | null): boolean {
+    if (reasonCode !== "other") return true;
+    return typeof freeText === "string" && freeText.trim().length > 0;
   }
 
   /**

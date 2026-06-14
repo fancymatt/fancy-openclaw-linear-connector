@@ -117,6 +117,7 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+            - other           # §16.1: catch-all; REQUIRES free text for mining pass
 
   - id: deployment
     owner_role: deployment      # filled by Hanzo; the deployment container (§16.2)
@@ -150,6 +151,7 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+            - other           # §16.1: catch-all; REQUIRES free text for mining pass
 
   - id: host-deploy
     owner_role: host-deploy     # filled by Grover; host-side on Nakazawa (§16.2)

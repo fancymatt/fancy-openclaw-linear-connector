@@ -108,6 +108,7 @@ function buildDescription(workflow: string, step: string, reasonCode: string, co
     "scope-creep": "scope creep",
     "correctness": "correctness issues",
     "ac-mismatch": "AC mismatch",
+    "other": "other (free-text reasons)",
   };
   const label = reasonLabels[reasonCode] ?? `"${reasonCode}"`;
   const desc = `${workflow}/${step}: ${label} rejected ${count}× — add checklist + update docs`;

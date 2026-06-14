@@ -47,6 +47,7 @@ import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
 import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
+import { incrementCycle, removeCycleRecord } from "./cycle-counter.js";
 /**
  * Phase 6.5 / H-6: Label read-only projection + override path + drift reconciliation.
  *
@@ -1371,10 +1372,12 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
     if (toStateName === "escape" || toStateName === "__ad_hoc__") {
         removeArtifact(issueId);
         await removeAcRecord(issueId);
+        await removeCycleRecord(issueId);
     }
-    // Clean up implementer record on terminal states
+    // Clean up implementer record and cycle counter on terminal states
     if (isTerminal) {
         await removeImplementer(issueId);
+        await removeCycleRecord(issueId);
     }
     // ── Phase 5 / B-2: Fan-out edge (spawning 1→N) ──────────────────────
     // After a successful state transition to `managing` via the `spawn` command
@@ -1383,6 +1386,23 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
     // AC3: parent auto-transitions to managing once children are minted (the
     // state transition to `managing` has already been applied above; the fan-out
     // creates the children and links them to the parent).
+    //
+    // §14b: For sprint (Archetype C), increment the oscillation cycle counter
+    // when the transition goes validating → spawning (rework loop).
+    if (applied && toStateName === 'spawning' && currentStateName === 'validating' && workflowId === 'sprint') {
+        try {
+            const newCycleCount = await incrementCycle(issueId, workflowId);
+            log.info(`workflow-gate: §14b cycle counter: ${issueId} spawning cycle ${newCycleCount}`);
+            // If the cycle count is getting high, log a warning for observability.
+            if (newCycleCount >= 3) {
+                log.warn(`workflow-gate: §14b HIGH CYCLE COUNT: ${issueId} has re-spawned ${newCycleCount} times — sprint may be failing its own integrated AC`);
+            }
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.warn(`workflow-gate: §14b cycle counter failed for ${issueId}: ${msg}`);
+        }
+    }
     if (applied && shouldTriggerFanout(workflowId, currentStateName, intent)) {
         try {
             log.info(`workflow-gate: B-2 fan-out: triggering fan-out for ${issueId} (spawning → managing)`);
@@ -1412,6 +1432,10 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
             const validatedReason = ObservationStore.validateReasonCode(options.feedback.reasonCode);
             if (!validatedReason) {
                 log.warn(`workflow-gate: P4-1: invalid reason code '${options.feedback.reasonCode}' — observation skipped for ${issueId}`);
+            }
+            else if (!ObservationStore.validateOtherHasFreeText(validatedReason, options.feedback.freeText)) {
+                // §16.1: 'other' category REQUIRES free text for the mining pass (§8.2).
+                log.warn(`workflow-gate: P4-1: 'other' category requires free text — observation skipped for ${issueId}`);
             }
             else if (!options.feedback.fromBody) {
                 // The implementer body ID must be provided (via X-Openclaw-From-Body header from
