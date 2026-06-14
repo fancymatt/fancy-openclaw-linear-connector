@@ -948,19 +948,29 @@ export async function checkWorkflowRules(
   // AI-1400 B2: additionally fail-closed when the caller identity is unknown
   // (no linearUserId in agents.json) but the ticket has a known delegate — an
   // unverifiable caller must not be allowed to mutate a delegated ticket.
-  if (!callerLinearUserId && delegateId) {
-    log.warn(`workflow-gate: unknown-caller block agent=${bodyId} intent=${intent} ticket=${issueId}`);
-    return (
-      `[Proxy] '${intent}' blocked: caller '${bodyId}' cannot be verified and the ticket has a known delegate. ` +
-      `Register the agent in agents.json with a linearUserId to proceed.`
-    );
-  }
-  if (callerLinearUserId && delegateId && callerLinearUserId !== delegateId) {
-    log.warn(`workflow-gate: delegate-only block agent=${bodyId} intent=${intent} ticket=${issueId}`);
-    return (
-      `[Proxy] '${intent}' blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
-      `Only the ticket delegate may mutate its state.`
-    );
+  // AI-1583: steward carve-out — the workflow steward (break_glass.owner_role)
+  // may transition any ticket regardless of the current delegate, mirroring the
+  // refuse-work exemption. Without this, a stale or bulk-created delegateId
+  // spuriously blocks the steward's accept at state:intake (false-negative gate).
+  {
+    const stewardRole = def.break_glass?.owner_role;
+    const isSteward = stewardRole
+      ? (await resolveBodiesForRole(stewardRole)).includes(bodyId)
+      : false;
+    if (!callerLinearUserId && delegateId && !isSteward) {
+      log.warn(`workflow-gate: unknown-caller block agent=${bodyId} intent=${intent} ticket=${issueId}`);
+      return (
+        `[Proxy] '${intent}' blocked: caller '${bodyId}' cannot be verified and the ticket has a known delegate. ` +
+        `Register the agent in agents.json with a linearUserId to proceed.`
+      );
+    }
+    if (callerLinearUserId && delegateId && callerLinearUserId !== delegateId && !isSteward) {
+      log.warn(`workflow-gate: delegate-only block agent=${bodyId} intent=${intent} ticket=${issueId}`);
+      return (
+        `[Proxy] '${intent}' blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
+        `Only the ticket delegate may mutate its state.`
+      );
+    }
   }
 
   const currentState = getCurrentState(labels);

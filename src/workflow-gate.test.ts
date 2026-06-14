@@ -535,6 +535,87 @@ describe("checkWorkflowRules — AI-1574: refuse-work caller-gating", () => {
   });
 });
 
+// ── AI-1583: proxy gate false-negative / steward delegate-only carve-out ──
+//
+// Root cause: the delegate-only guard (AI-1397) had no steward exemption.
+// When a ticket's delegateId was set to a non-steward body (stale delegate,
+// bulk-create artifact), the steward's accept at state:intake got spuriously
+// blocked — a false-negative that fired even though the transition was legal.
+// Fix: add the same steward carve-out used in refuse-work (AI-1574) to both
+// delegate-only conditions so the steward is never locked out by a stale
+// delegate value.
+//
+// AC3: steward accept from any state with a non-matching delegate → allowed.
+// AC4: blocked response → non-steward non-delegate is still correctly blocked.
+// AC2: block ⇒ no mutation is guaranteed by proxy.ts early-return; tested here
+//      at the checkWorkflowRules level (null ≠ blocked).
+
+describe("checkWorkflowRules — AI-1583: steward delegate-only carve-out", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  function makeDelegateAndLabelFetch(labelNames: string[], delegateId: string | null): typeof globalThis.fetch {
+    return async (_url, _init) => new Response(JSON.stringify({
+      data: {
+        issue: {
+          labels: { nodes: labelNames.map((n) => ({ name: n })) },
+          delegate: delegateId ? { id: delegateId } : null,
+        },
+      },
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+
+  // AC3: steward accept at intake with null delegate → allowed (baseline, no fix needed)
+  it("AC3: steward accept at state:intake with null delegate is allowed", async () => {
+    globalThis.fetch = makeDelegateAndLabelFetch(["wf:dev-impl", "state:intake"], null);
+    const result = await checkWorkflowRules("accept", "issue-uuid", "Bearer tok", "astrid", null, "astrid-uid");
+    expect(result).toBeNull();
+  });
+
+  // AC3 (core fix): steward accept at intake when delegate is already set to TDD agent.
+  // Without fix: delegate-only block fires → "not the current delegate".
+  // With fix: steward carve-out allows.
+  it("AC3: steward accept at state:intake with stale non-steward delegate is allowed (steward carve-out)", async () => {
+    globalThis.fetch = makeDelegateAndLabelFetch(["wf:dev-impl", "state:intake"], "tdd-agent-uid");
+    const result = await checkWorkflowRules("accept", "issue-uuid", "Bearer tok", "astrid", null, "astrid-uid");
+    expect(result).toBeNull();
+  });
+
+  // AC3: steward carve-out works across states — here steward advances write-tests
+  // even though TDD agent holds the delegate (stale/wrong delegateId).
+  it("AC3: steward tests-ready at state:write-tests with non-matching delegate is allowed", async () => {
+    globalThis.fetch = makeDelegateAndLabelFetch(["wf:dev-impl", "state:write-tests"], "some-other-uid");
+    const result = await checkWorkflowRules("tests-ready", "issue-uuid", "Bearer tok", "astrid", null, "astrid-uid");
+    expect(result).toBeNull();
+  });
+
+  // AC4 regression: non-delegate, non-steward caller is still correctly blocked.
+  it("AC4: non-delegate non-steward accept at state:write-tests with delegate set is blocked", async () => {
+    globalThis.fetch = makeDelegateAndLabelFetch(["wf:dev-impl", "state:write-tests"], "real-delegate-uid");
+    const result = await checkWorkflowRules("accept", "issue-uuid", "Bearer tok", "charles", null, "charles-uid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("not the current delegate");
+  });
+
+  // AC4 regression: unknown-caller + known delegate → still blocked (non-steward).
+  it("AC4: unknown-caller (no linearUserId) with known delegate is blocked for non-steward", async () => {
+    globalThis.fetch = makeDelegateAndLabelFetch(["wf:dev-impl", "state:implementation"], "real-delegate-uid");
+    const result = await checkWorkflowRules("accept", "issue-uuid", "Bearer tok", "charles", null, null);
+    expect(result).not.toBeNull();
+    expect(result).toContain("cannot be verified");
+  });
+
+  // AC4 regression: unknown-caller steward is still allowed even without linearUserId.
+  it("AC4: steward with no linearUserId bypasses unknown-caller block when delegate is set", async () => {
+    globalThis.fetch = makeDelegateAndLabelFetch(["wf:dev-impl", "state:intake"], "tdd-agent-uid");
+    // astrid is the steward in TEST_POLICY_YAML; callerLinearUserId = null (not configured)
+    const result = await checkWorkflowRules("accept", "issue-uuid", "Bearer tok", "astrid", null, null);
+    expect(result).toBeNull();
+  });
+});
+
 // ── Per-state legal / illegal commands ────────────────────────────────────
 
 describe("checkWorkflowRules — intake state", () => {
