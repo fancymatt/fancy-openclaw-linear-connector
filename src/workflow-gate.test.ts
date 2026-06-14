@@ -5446,6 +5446,41 @@ describe("enrollIfMissing — enrollment gap repair", () => {
     expect(vars.labelIds).toContain("risk-lbl");
   });
 
+  it("AI-1585/AC2: invokes the onHeal audit hook with workflow + entry-state info on a heal", async () => {
+    const { fetch } = makeEnrollFetch({
+      labels: [{ id: "wf-lbl", name: "wf:dev-impl" }, { id: "risk-lbl", name: "risk:low" }],
+    });
+    globalThis.fetch = fetch;
+
+    const heals: Array<{ issueId: string; internalId: string; workflowId: string; entryState: string }> = [];
+    const result = await enrollIfMissing("issue-uuid", "Bearer tok", (info) => heals.push(info));
+
+    expect(result.enrolled).toBe(true);
+    expect(heals).toHaveLength(1);
+    expect(heals[0]).toEqual({
+      issueId: "issue-uuid",
+      internalId: "internal-uuid",
+      workflowId: "dev-impl",
+      entryState: "intake",
+    });
+  });
+
+  it("AI-1585/AC2: does NOT invoke the onHeal audit hook when no heal occurs (already enrolled)", async () => {
+    const { fetch } = makeEnrollFetch({
+      labels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:intake" },
+      ],
+    });
+    globalThis.fetch = fetch;
+
+    const heals: unknown[] = [];
+    const result = await enrollIfMissing("issue-uuid", "Bearer tok", (info) => heals.push(info));
+
+    expect(result.enrolled).toBe(false);
+    expect(heals).toHaveLength(0);
+  });
+
   it("no-op when state:* label is already present (already enrolled)", async () => {
     const { fetch, calls } = makeEnrollFetch({
       labels: [

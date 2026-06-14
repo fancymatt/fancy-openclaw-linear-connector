@@ -241,7 +241,17 @@ export function createWebhookRouter(
         const enrollData = event.data as Record<string, unknown> | null;
         const enrollIssueId = enrollData?.id as string | undefined;
         if (enrollToken && enrollIssueId) {
-          enrollIfMissing(enrollIssueId, enrollToken).then((result) => {
+          const enrollIdentifier = (enrollData?.identifier as string | undefined) ?? enrollIssueId;
+          enrollIfMissing(enrollIssueId, enrollToken, (heal) => {
+            // AI-1585 / AC2: structured audit event for the reconciliation heal.
+            appendOperationalEvent(operationalEventStore, {
+              outcome: "enrollment-healed",
+              type: event.type,
+              key: enrollIdentifier,
+              sessionKey: normalizeSessionKey(enrollIdentifier),
+              detail: { workflowId: heal.workflowId, entryState: heal.entryState },
+            });
+          }).then((result) => {
             if (result.enrolled) {
               log.info(`Enrollment gap healed: stamped state:${result.entryState} on ${enrollIssueId}`);
             }

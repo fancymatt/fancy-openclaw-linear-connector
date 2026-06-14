@@ -2227,9 +2227,21 @@ async function issueUpdateDelegateOnly(
  * Fail-open: any API or registry failure logs a warning and returns
  * `{ enrolled: false }` — the inbound path is never blocked by enrollment.
  */
+export interface EnrollHealInfo {
+  /** Display identifier or UUID the caller passed in. */
+  issueId: string;
+  /** Linear internal issue UUID the label write was applied to. */
+  internalId: string;
+  /** Resolved workflow id (e.g. "dev-impl"). */
+  workflowId: string;
+  /** Entry state stamped (e.g. "intake"). */
+  entryState: string;
+}
+
 export async function enrollIfMissing(
   issueId: string,
   authToken: string,
+  onHeal?: (info: EnrollHealInfo) => void,
 ): Promise<{ enrolled: boolean; entryState?: string }> {
   const issue = await fetchIssueWithLabels(issueId, authToken);
   if (!issue) {
@@ -2276,5 +2288,12 @@ export async function enrollIfMissing(
   }
 
   log.info(`workflow-gate: enrollIfMissing: stamped '${entryLabelName}' on ${issueId} (wf:${workflowId} had no state:*)`);
+  // AI-1585 / AC2: emit a structured audit signal so a reconciliation heal is
+  // observable in the operational event store, not only in logs.
+  try {
+    onHeal?.({ issueId, internalId: issue.internalId, workflowId, entryState: def.entry_state });
+  } catch (err) {
+    log.warn(`workflow-gate: enrollIfMissing: onHeal audit hook threw for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
   return { enrolled: true, entryState: def.entry_state };
 }
