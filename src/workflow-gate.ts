@@ -38,6 +38,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger } from "./logger.js";
+import { defaultWorkflowDefPath } from "./instance-config.js";
 import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
 import { ObservationStore, type ReasonCode } from "./store/observation-store.js";
 import { isBodyKnown } from "./escalation-gate.js";
@@ -74,17 +75,9 @@ const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "work
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
-/**
- * Path to the dev-impl workflow definition YAML. Override via env for tests.
- * Canonical source lives in the vault; this default is absolute so the path is
- * stable regardless of process cwd.
- */
-const DEFAULT_WORKFLOW_DEF_PATH =
-  "/home/fancymatt/obsidian-vault/ai-systems/projects/fleet-orchestration-redesign/workflows/dev-impl.yaml";
-
 /** Resolve the workflow def path dynamically (reads env each call so test beforeAll works). */
 function workflowDefPath(): string {
-  return process.env.WORKFLOW_DEF_PATH ?? DEFAULT_WORKFLOW_DEF_PATH;
+  return process.env.WORKFLOW_DEF_PATH ?? defaultWorkflowDefPath();
 }
 
 // ── YAML schema types ──────────────────────────────────────────────────────
