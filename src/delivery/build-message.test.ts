@@ -15,6 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { resetWorkflowCache } from "../workflow-gate.js";
+import { resetPolicyCache } from "../escalation-gate.js";
 
 // ── Test workflow YAML ─────────────────────────────────────────────────────
 
@@ -121,9 +122,84 @@ function makeLabelFetch(labels: string[]): typeof globalThis.fetch {
     );
 }
 
+// ── Minimal capability policy fixture ────────────────────────────────────
+// Mirrors the fleet's real policy structure; covers only bodies/roles used
+// by TEST_WORKFLOW_YAML (steward/dev/code-review/deployment).
+
+const TEST_CAPABILITY_POLICY_YAML = `
+capabilities:
+  - id: deploy:execute
+    description: Execute deployment operations
+    exclusive: true
+  - id: repo:read
+    description: Read GitHub repos
+  - id: repo:write
+    description: Push branches, open PRs
+  - id: linear:transition
+    description: Run Linear semantic CLI commands
+  - id: human:escalate
+    description: Escalate directly to a human
+    exclusive: true
+  - id: vault:read
+    description: Read the Obsidian vault
+
+containers:
+  - id: deployment
+    grants: [repo:read, deploy:execute, linear:transition, vault:read]
+  - id: dev
+    grants: [repo:read, repo:write, linear:transition, vault:read]
+  - id: dev-backend
+    grants: [repo:read, repo:write, linear:transition, vault:read]
+  - id: steward
+    grants: [linear:transition, human:escalate, vault:read]
+
+roles:
+  - id: dev
+    requires: [repo:write]
+  - id: code-review
+    requires: [repo:read]
+    exclusive: true
+  - id: deployment
+    requires: [deploy:execute]
+    exclusive: true
+  - id: steward
+    requires: [human:escalate]
+
+bodies:
+  - id: felix
+    persona: person
+    container: dev
+    fills_roles: [dev]
+  - id: noah
+    persona: person
+    container: dev
+    fills_roles: [dev]
+  - id: sage
+    persona: person
+    container: dev
+    fills_roles: [dev]
+  - id: igor
+    persona: person
+    container: dev-backend
+    fills_roles: [dev]
+  - id: charles
+    persona: person
+    container: dev
+    fills_roles: [code-review]
+  - id: hanzo
+    persona: functionary
+    container: deployment
+    fills_roles: [deployment]
+  - id: astrid
+    persona: person
+    container: steward
+    fills_roles: [steward]
+`;
+
 // ── Setup / teardown ──────────────────────────────────────────────────────
 
 let tmpYamlPath: string;
+let tmpPolicyPath: string;
 let tmpGuidanceDir: string;
 let originalFetch: typeof globalThis.fetch;
 
@@ -131,14 +207,18 @@ beforeAll(() => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "build-message-test-"));
   tmpYamlPath = path.join(dir, "dev-impl.yaml");
   fs.writeFileSync(tmpYamlPath, TEST_WORKFLOW_YAML, "utf8");
+  tmpPolicyPath = path.join(dir, "capability-policy.yaml");
+  fs.writeFileSync(tmpPolicyPath, TEST_CAPABILITY_POLICY_YAML, "utf8");
   tmpGuidanceDir = path.join(dir, "guidance");
   fs.mkdirSync(path.join(tmpGuidanceDir, "dev-impl"), { recursive: true });
 });
 
 beforeEach(() => {
   resetWorkflowCache();
+  resetPolicyCache();
   process.env.WORKFLOW_DEF_PATH = tmpYamlPath;
   process.env.WORKFLOW_GUIDANCE_DIR = tmpGuidanceDir;
+  process.env.CAPABILITY_POLICY_PATH = tmpPolicyPath;
   originalFetch = globalThis.fetch;
 });
 
@@ -146,6 +226,7 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
   delete process.env.WORKFLOW_DEF_PATH;
   delete process.env.WORKFLOW_GUIDANCE_DIR;
+  delete process.env.CAPABILITY_POLICY_PATH;
   // Remove any guidance files written by tests
   for (const f of fs.readdirSync(path.join(tmpGuidanceDir, "dev-impl"))) {
     fs.rmSync(path.join(tmpGuidanceDir, "dev-impl", f));
