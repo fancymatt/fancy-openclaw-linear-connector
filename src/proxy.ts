@@ -290,14 +290,40 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.error(`upstream request failed: ${msg}`);
-    res
-      .status(502)
-      .json({ errors: [{ message: `Linear API unreachable: ${msg}` }] });
+    res.status(200).json({
+      errors: [{
+        message: `Linear API unreachable: ${msg}. No state was changed.`,
+        extensions: { code: "UPSTREAM_TIMEOUT" },
+      }],
+    });
     return;
   }
 
   const responseText = await upstreamRes.text();
   log.info(`response agent=${agentId} op=${opName} status=${upstreamRes.status}`);
+
+  if (!upstreamRes.ok) {
+    const status = upstreamRes.status;
+    log.warn(`upstream-error agent=${agentId} op=${opName}${ticketCtx} status=${status}`);
+    if (status === 429) {
+      const retryAfterHeader = upstreamRes.headers.get("Retry-After");
+      const retryAfterSeconds = retryAfterHeader ? parseInt(retryAfterHeader, 10) : 60;
+      res.status(200).json({
+        errors: [{
+          message: `Linear rate limit exceeded. No state was changed. Retry after ${retryAfterSeconds}s.`,
+          extensions: { code: "UPSTREAM_RATE_LIMITED", retryAfterSeconds },
+        }],
+      });
+    } else {
+      res.status(200).json({
+        errors: [{
+          message: `Linear API returned ${status}. No state was changed.`,
+          extensions: { code: "UPSTREAM_ERROR", httpStatus: status },
+        }],
+      });
+    }
+    return;
+  }
 
   // Phase 3 B2: apply state:* label transition after a successful forward.
   // Phase 4 / P4-1: record feedback observation for feedback transitions.
