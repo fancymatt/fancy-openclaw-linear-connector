@@ -496,7 +496,7 @@ async function fetchTicketContext(issueId: string, authToken: string): Promise<T
  * Used by B2 to build the label set for the atomic state swap mutation.
  * Returns null on any error — caller fails open.
  */
-async function fetchIssueWithLabels(
+export async function fetchIssueWithLabels(
   issueId: string,
   authToken: string,
 ): Promise<{ internalId: string; teamId: string; labels: LabelNode[] } | null> {
@@ -539,7 +539,7 @@ async function fetchIssueWithLabels(
  * Find an existing label by name in the team, or create it if absent.
  * Returns the label ID, or null if both lookup and creation fail.
  */
-async function findOrCreateLabel(
+export async function findOrCreateLabel(
   teamId: string,
   labelName: string,
   authToken: string,
@@ -2067,7 +2067,7 @@ async function postFanoutSummaryComment(
  *
  * @param delegateId - Linear user ID for the new delegate, or null to skip delegate update.
  */
-async function issueUpdateAtomic(
+export async function issueUpdateAtomic(
   internalId: string,
   labelIds: string[],
   authToken: string,

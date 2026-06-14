@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express, { Request, Response, NextFunction } from "express";
 import { createWebhookRouter } from "./webhook/index.js";
 import { handleProxyRequest } from "./proxy.js";
+import { handleSetStateRequest } from "./set-state.js";
 import { startTokenRefresh } from "./token-refresh.js";
 import { getAgents, watchAgentsFile } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
@@ -125,6 +126,7 @@ export function createApp(options?: CreateAppOptions) {
   // for now. Future phases add per-step instruction injection and command
   // validation. ILL fleet runs the main branch and is unaffected.
   app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, { observationStore }));
+  app.post("/proxy/set-state", (req, res) => handleSetStateRequest(req, res));
 
   // Health check
   app.get("/health", (_req: Request, res: Response) => {
