@@ -15,6 +15,7 @@ import { resignalPendingTickets } from "../bag/index.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { isLinearIssueStillRoutedToAgent, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
 import { onChildTerminal } from "../barrier.js";
+import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
 const log = componentLogger(createLogger(), "webhook");
 export { verifyLinearSignature } from "./signature.js";
 export { normalizeLinearEvent } from "./normalize.js";
@@ -210,6 +211,25 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
             }
             catch (err) {
                 log.error(`Failed to create agent session: ${err instanceof Error ? err.message : String(err)}`);
+            }
+        }
+        // ── Pre-routing: workflow bootstrap hook (AI-1565) ─────────────────────
+        // Fires before the delegate-based router so a wf:* label-add with no
+        // delegate can bootstrap the ticket into its entry state and set the
+        // first-owner delegate — which then fires the normal dispatch path.
+        const bootstrapToken = process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+        if (bootstrapToken) {
+            try {
+                const bootstrapResult = await maybeBootstrapWorkflow(event, bootstrapToken);
+                if (bootstrapResult) {
+                    log.info(`Workflow bootstrap: ${bootstrapResult.action} (wf:${bootstrapResult.workflowId ?? "unknown"})`);
+                    const bootstrapOutcome = bootstrapResult.action === "bootstrapped" ? "bootstrap-bootstrapped" : "bootstrap-demoted";
+                    appendOperationalEvent(operationalEventStore, { outcome: bootstrapOutcome, type: event.type });
+                    return;
+                }
+            }
+            catch (err) {
+                log.warn(`Workflow bootstrap failed (fail-safe): ${err instanceof Error ? err.message : String(err)}`);
             }
         }
         const route = routeEvent(event);

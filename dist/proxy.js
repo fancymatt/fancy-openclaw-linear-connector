@@ -218,7 +218,9 @@ export async function handleProxyRequest(req, res, deps) {
         // Layer 2 (AI-1387): intercept raw status/assignee mutations on workflow tickets.
         // When no intent header is present but the mutation touches stateId or assigneeId,
         // the agent is bypassing workflow commands — reject with the legal verb set.
-        const rawRejection = await checkRawMutationInterception(body, issueId, authorization, agentId);
+        // AI-1535: callerLinearUserId lets the interceptor apply delegate-only semantics
+        // to raw delegateId writes (a non-delegate must not yank the delegate).
+        const rawRejection = await checkRawMutationInterception(body, issueId, authorization, agentId, callerLinearUserId);
         if (rawRejection) {
             log.warn(`raw-mutation-block agent=${agentId}${ticketCtx}: ${rawRejection}`);
             res.status(200).json({ errors: [{ message: rawRejection }] });
