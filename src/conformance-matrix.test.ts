@@ -898,3 +898,181 @@ describe("buildConformanceMatrix — canonical dev-impl fixture (v8)", () => {
     expect(cells.length).toBeGreaterThan(200);
   });
 });
+
+// ── G-13 / AC1: every illegal-cell rejection names the legal command set ──
+// Regardless of blockReason (wrong-state, cap-missing, wrong-delegate,
+// human-signoff, unknown-caller), a rejection must name every legal command
+// for the current state. A blocked move must not become a stalled ticket
+// because the caller has no signal about what to do next.
+//
+// The wrong-state case is already covered above; this section adds explicit
+// coverage for the remaining blockReasons so the generator's assertion suite
+// is complete.
+
+describe("G-13 / AC1: every illegal-cell rejection names the correct legal command set", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  // All block cells whose blockReason is NOT wrong-state — these are the
+  // cap-missing, wrong-delegate, human-signoff, and unknown-caller paths
+  // that the existing AC2 section did not check for legal-set presence.
+  const nonWrongStateIllegalCells = buildConformanceMatrix(testDef, testPolicy).filter(
+    (c) =>
+      c.expected === "block" &&
+      c.blockReason !== "wrong-state" &&
+      c.legalCommands.length > 0,
+  );
+
+  it("at least one non-wrong-state illegal cell with a non-empty legal set exists", () => {
+    expect(nonWrongStateIllegalCells.length).toBeGreaterThan(0);
+  });
+
+  it.each(nonWrongStateIllegalCells)(
+    "G-13 AC1 — $blockReason rejection names legal set: state=$state cmd=$command caller=$caller.bodyId stakes=$flags.stakeLabel",
+    async (cell) => {
+      globalThis.fetch = makeCellFetch(
+        testDef.id,
+        cell.state,
+        cell.flags.delegateLinearUserId ?? null,
+        cell.flags.stakeLabel,
+      );
+      const result = await checkWorkflowRules(
+        cell.command,
+        "issue-uuid",
+        "Bearer tok",
+        cell.caller.bodyId,
+        null,
+        cell.caller.linearUserId ?? null,
+      );
+      expect(result).not.toBeNull();
+      // Guard: the generator cell must carry a non-empty legal set to be meaningful.
+      expect(cell.legalCommands.length).toBeGreaterThan(0);
+      // AC1: every legal command for this state must appear in the rejection message.
+      for (const legalCmd of cell.legalCommands) {
+        expect(result).toContain(legalCmd);
+      }
+    },
+  );
+});
+
+// ── G-13 / AC2: regression — stale or empty legal set is caught ───────────
+// Proves that the assertions above ARE strict enough to catch a rejection
+// message that carries a wrong or empty legal set.
+//
+// One concrete live test (non-synthetic) is included: the wrong-delegate
+// path on the intake state currently returns a message that omits the legal
+// command set. The test asserts the message must contain every legal command
+// for that state ("accept", "demote", "escape"). This test is RED until the
+// implementation is updated to include the legal set in wrong-delegate
+// rejections, and it acts as the standing regression guard thereafter.
+
+describe("G-13 / AC2: regression — stale/empty legal set is caught by assertions", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("wrong-delegate rejection on intake must name all legal commands (accept, demote, escape)", async () => {
+    // intake state: delegate = igor-linear, caller = charles (non-delegate same role)
+    // Legal commands for intake: accept, demote, escape
+    globalThis.fetch = makeCellFetch("dev-impl", "intake", "igor-linear", null);
+    const result = await checkWorkflowRules(
+      "accept",
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+      null,
+      "charles-linear", // not the delegate (igor-linear)
+    );
+    expect(result).not.toBeNull();
+    // All legal commands for the intake state must be named in the rejection.
+    expect(result).toContain("accept");
+    expect(result).toContain("demote");
+    expect(result).toContain("escape");
+  });
+
+  it("cap-missing rejection on deployment must name all legal commands (deploy, reject, escape)", async () => {
+    // deployment state: igor (dev role, no deploy:execute cap) tries to deploy
+    // Legal commands for deployment: deploy, reject, escape
+    globalThis.fetch = makeCellFetch("dev-impl", "deployment", "igor-linear", null);
+    const result = await checkWorkflowRules(
+      "deploy",
+      "issue-uuid",
+      "Bearer tok",
+      "igor",
+      null,
+      "igor-linear", // igor IS the delegate here
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("deploy");
+    expect(result).toContain("reject");
+    expect(result).toContain("escape");
+  });
+
+  it("assertion mechanism: catches a rejection message where a legal command is omitted (stale set)", () => {
+    // Synthetic proof that the per-legal-cmd assertion would catch a stale set.
+    const referenceCell = buildConformanceMatrix(testDef, testPolicy).find(
+      (c) =>
+        c.expected === "block" &&
+        c.blockReason === "wrong-state" &&
+        c.legalCommands.length >= 2,
+    );
+    expect(referenceCell).toBeDefined();
+
+    const omittedCmd = referenceCell!.legalCommands[0];
+    const staleSet = referenceCell!.legalCommands.slice(1).join(", ");
+    const staleMessage =
+      `[Proxy] '${referenceCell!.command}' is not a legal command in state '${referenceCell!.state}'. ` +
+      `Legal moves: ${staleSet}.`;
+
+    // The omitted command is genuinely absent from the stale message.
+    expect(staleMessage).not.toContain(omittedCmd);
+
+    // The assertion WOULD catch it (throws rather than passing).
+    let assertionCaughtIt = false;
+    try {
+      expect(staleMessage).toContain(omittedCmd);
+    } catch {
+      assertionCaughtIt = true;
+    }
+    expect(assertionCaughtIt).toBe(true);
+  });
+
+  it("assertion mechanism: catches a rejection message with an empty legal set", () => {
+    // Synthetic proof that the per-legal-cmd assertion catches an entirely empty set.
+    const referenceCell = buildConformanceMatrix(testDef, testPolicy).find(
+      (c) =>
+        c.expected === "block" &&
+        c.blockReason === "wrong-state" &&
+        c.legalCommands.length > 0,
+    );
+    expect(referenceCell).toBeDefined();
+
+    const emptyLegalSetMessage =
+      `[Proxy] '${referenceCell!.command}' is not a legal command in state '${referenceCell!.state}'. ` +
+      `Legal moves: .`;
+
+    // For every legal command, the assertion catches the empty set.
+    for (const legalCmd of referenceCell!.legalCommands) {
+      let caught = false;
+      try {
+        expect(emptyLegalSetMessage).toContain(legalCmd);
+      } catch {
+        caught = true;
+      }
+      expect(caught).toBe(true);
+    }
+  });
+
+  it("every wrong-state block cell carries a non-empty legalCommands array (guard)", () => {
+    // Ensures the generator never emits a wrong-state block cell with zero
+    // legal commands — which would cause the per-cell loop to pass vacuously.
+    const wrongStateCells = buildConformanceMatrix(testDef, testPolicy).filter(
+      (c) => c.expected === "block" && c.blockReason === "wrong-state",
+    );
+    expect(wrongStateCells.length).toBeGreaterThan(0);
+    for (const cell of wrongStateCells) {
+      expect(cell.legalCommands.length).toBeGreaterThan(0);
+    }
+  });
+});
