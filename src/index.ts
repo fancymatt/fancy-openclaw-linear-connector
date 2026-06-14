@@ -126,7 +126,7 @@ export function createApp(options?: CreateAppOptions) {
   // Intercepts every Linear CLI call from Nakazawa agents; forwards unchanged
   // for now. Future phases add per-step instruction injection and command
   // validation. ILL fleet runs the main branch and is unaffected.
-  app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, { observationStore }));
+  app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, { observationStore, operationalEventStore }));
 
   // Health check
   app.get("/health", (_req: Request, res: Response) => {

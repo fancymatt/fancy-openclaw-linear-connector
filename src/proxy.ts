@@ -30,9 +30,10 @@
 
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
-import { checkEnforcementRules } from "./escalation-gate.js";
+import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, getCurrentState, type TransitionFeedback } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
+import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
@@ -168,6 +169,8 @@ function isMutationRequest(body: GraphQLRequestBody | null): boolean {
 export interface ProxyDeps {
   /** Optional observation store for recording feedback observations (P4-1). */
   observationStore?: ObservationStore;
+  /** Optional operational event store for recording break-glass audit events (AI-1551). */
+  operationalEventStore?: OperationalEventStore;
 }
 
 export async function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void> {
@@ -249,6 +252,12 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       log.warn(`workflow-block agent=${agentId} intent=${intent}${ticketCtx}: ${p3rejection}`);
       res.status(200).json({ errors: [{ message: p3rejection }] });
       return;
+    }
+
+    // G-13a / AI-1551: emit break-glass-used audit event on every successful steward break-glass.
+    if (breakGlassOverride && deps?.operationalEventStore) {
+      deps.operationalEventStore.append({ outcome: "break-glass-used", agent: agentId, key: issueId ?? undefined });
+      log.info(`break-glass-used agent=${agentId} intent=${intent}${ticketCtx}`);
     }
 
     // AI-1498: snapshot the pre-forward workflow state for applyStateTransition.
