@@ -898,3 +898,121 @@ describe("buildConformanceMatrix — canonical dev-impl fixture (v8)", () => {
     expect(cells.length).toBeGreaterThan(200);
   });
 });
+
+// ── G-13a T-rows: break-glass header identity gate (AI-1551) ──────────────
+//
+// Hand-written adversarial rows for the X-Openclaw-Break-Glass identity gate.
+// The generated matrix covers the `escape` command (the break-glass workflow
+// *intent*). These T-rows cover the separate *header-based* config bypass,
+// which must be identity-gated to steward/human callers only.
+//
+// Matrix property under test:
+//   breakGlassOverride=true + non-steward bodyId → identity gate rejects
+//   breakGlassOverride=true + steward bodyId     → allowed
+
+describe("G-13a T-rows: break-glass header identity gate (AI-1551)", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    resetWorkflowCache();
+    resetPolicyCache();
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    resetWorkflowCache();
+    resetPolicyCache();
+  });
+
+  // Fetch mock: ticket is wf:dev-impl / state:implementation; context fetch
+  // succeeds. Workflow registry load will fail (nonexistent yaml path set per
+  // test). break-glass header bypass is the only way through — but only for
+  // steward callers.
+  function makeBreakGlassFetch(): typeof globalThis.fetch {
+    return async (_url: any, init?: RequestInit) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+      const parsed = bodyText ? JSON.parse(bodyText) as { query?: string } : {};
+      if (
+        parsed.query?.includes("delegate") ||
+        parsed.query?.includes("IssueContext") ||
+        parsed.query?.includes("IssueLabels")
+      ) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] },
+                delegate: { id: "astrid-uuid" },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ data: {} }), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    };
+  }
+
+  it("T-AC1: checkWorkflowRules rejects breakGlassOverride=true from a non-steward body (charles)", async () => {
+    // Break the workflow registry so the request would normally fail-closed.
+    process.env.WORKFLOW_DEF_PATH = "/nonexistent/workflow-bg-test.yaml";
+    resetWorkflowCache();
+    globalThis.fetch = makeBreakGlassFetch();
+
+    // charles is in the dev container (no human:escalate) — break-glass must be denied.
+    const result = await checkWorkflowRules(
+      "submit",
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+      null,
+      "charles-uuid",
+      null,
+      /* breakGlassOverride */ true,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result).toMatch(/break.glass|identity|steward/i);
+  });
+
+  it("T-AC1: checkWorkflowRules rejects breakGlassOverride=true from an unknown caller", async () => {
+    process.env.WORKFLOW_DEF_PATH = "/nonexistent/workflow-bg-test.yaml";
+    resetWorkflowCache();
+    globalThis.fetch = makeBreakGlassFetch();
+
+    const result = await checkWorkflowRules(
+      "submit",
+      "issue-uuid",
+      "Bearer tok",
+      "unknown-unregistered-agent",
+      null,
+      null,
+      null,
+      /* breakGlassOverride */ true,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result).toMatch(/break.glass|identity|steward/i);
+  });
+
+  it("T-AC2: checkWorkflowRules allows breakGlassOverride=true from a steward body (astrid)", async () => {
+    process.env.WORKFLOW_DEF_PATH = "/nonexistent/workflow-bg-test.yaml";
+    resetWorkflowCache();
+    globalThis.fetch = makeBreakGlassFetch();
+
+    // astrid fills the steward role (human:escalate) — break-glass must pass.
+    const result = await checkWorkflowRules(
+      "submit",
+      "issue-uuid",
+      "Bearer tok",
+      "astrid",
+      null,
+      "astrid-uuid",
+      null,
+      /* breakGlassOverride */ true,
+    );
+
+    expect(result).toBeNull();
+  });
+});
