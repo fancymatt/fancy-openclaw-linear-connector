@@ -1332,8 +1332,8 @@ bodies:
     expect(res.status).toBe(401);
   });
 
-  // AC2-PR-8: upstream fetch failure → 502 (proxy.ts line ~260-267)
-  it("returns 502 when the upstream Linear API is unreachable", async () => {
+  // AC2-PR-8: upstream fetch failure → 200 UPSTREAM_TIMEOUT (proxy.ts)
+  it("returns 200 with UPSTREAM_TIMEOUT when the upstream Linear API is unreachable", async () => {
     globalThis.fetch = async () => { throw new Error("ECONNREFUSED"); };
 
     const res = await request(appState.app)
@@ -1341,8 +1341,9 @@ bodies:
       .set("Authorization", "Bearer tok-charles")
       .send({ query: "{ viewer { id } }" });
 
-    expect(res.status).toBe(502);
-    const body = res.body as { errors?: Array<{ message: string }> };
+    expect(res.status).toBe(200);
+    const body = res.body as { errors?: Array<{ message: string; extensions?: { code: string } }> };
+    expect(body.errors?.[0]?.extensions?.code).toBe("UPSTREAM_TIMEOUT");
     expect(body.errors?.[0]?.message).toMatch(/unreachable/i);
   });
 

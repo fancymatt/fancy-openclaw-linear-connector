@@ -229,7 +229,7 @@ describe("proxy /proxy/graphql", () => {
     expect(capturedAuth).toBe("Bearer my-agent-token");
   });
 
-  it("returns 502 when Linear API is unreachable", async () => {
+  it("returns 200 with UPSTREAM_TIMEOUT when Linear API is unreachable", async () => {
     globalThis.fetch = async (url) => {
       if (typeof url === "string" && url.includes("api.linear.app")) {
         throw new Error("ECONNREFUSED");
@@ -242,7 +242,8 @@ describe("proxy /proxy/graphql", () => {
       .set("Authorization", "Bearer test-token")
       .send({ query: "{ viewer { id } }" });
 
-    expect(res.status).toBe(502);
+    expect(res.status).toBe(200);
+    expect(res.body.errors[0].extensions?.code).toBe("UPSTREAM_TIMEOUT");
     expect(res.body.errors[0].message).toContain("ECONNREFUSED");
   });
 });
@@ -1558,7 +1559,7 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
     expect(res.body.data).toBeDefined();
   });
 
-  it("returns 502 when upstream Linear API is unreachable (existing behavior unchanged)", async () => {
+  it("returns 200 with UPSTREAM_TIMEOUT when upstream Linear API is unreachable", async () => {
     globalThis.fetch = async (url) => {
       if (typeof url === "string" && url.includes("api.linear.app")) {
         throw new Error("ECONNREFUSED");
@@ -1571,7 +1572,8 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
       .set("Authorization", "Bearer test-token")
       .send({ query: "{ viewer { id } }" });
 
-    expect(res.status).toBe(502);
+    expect(res.status).toBe(200);
+    expect(res.body.errors[0].extensions?.code).toBe("UPSTREAM_TIMEOUT");
     expect(res.body.errors[0].message).toContain("Linear API unreachable");
   });
 });
