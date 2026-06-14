@@ -15,31 +15,23 @@
  * Design: design.md §4.6, §11, §13.
  */
 import fs from "node:fs/promises";
-import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger } from "./logger.js";
 import { recordSuccess, recordFailure } from "./config-health.js";
+import { defaultCapabilityPolicyPath } from "./instance-config.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "escalation-gate");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
-/**
- * Canonical vault path for the capability policy. Override via env for tests.
- */
-const DEFAULT_POLICY_PATH = path.join(process.env.HOME ?? "/home/fancymatt", "obsidian-vault/ai-systems/projects/fleet-orchestration-redesign/config/capability-policy.yaml");
 /** Resolve the policy path dynamically (reads env each call so test beforeAll works). */
 function policyPath() {
-    return process.env.CAPABILITY_POLICY_PATH ?? DEFAULT_POLICY_PATH;
+    return process.env.CAPABILITY_POLICY_PATH ?? defaultCapabilityPolicyPath();
 }
 /**
- * Phase 2 enforcement rules (slice 1: one rule).
- * Phase 3 will extend this table — adding a rule is config, not code surgery.
+ * Phase 2 enforcement rules. AI-1488: `needs-human` moved to the B1 cross-cutting
+ * allowlist in workflow-gate.ts (any delegate may escalate; the proxy sanitizes the
+ * body so no raw delegate-change reaches Linear). This table is retained as an
+ * extension point — adding a rule here is config, not code surgery.
  */
-export const ENFORCEMENT_RULES = [
-    {
-        intent: "needs-human",
-        requiredCapability: "human:escalate",
-        legalMove: "escalate → steward (Astrid)",
-    },
-];
+export const ENFORCEMENT_RULES = [];
 // ── Policy cache ───────────────────────────────────────────────────────────
 let _policyCache = null;
 async function loadPolicy() {

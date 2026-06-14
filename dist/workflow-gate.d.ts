@@ -196,7 +196,7 @@ export declare function resolveStakesLevel(labels: string[], stakesConfig: Stake
  */
 export declare function checkWorkflowRules(intent: string, issueId: string | null, authToken: string, bodyId: string, target?: string | null, callerLinearUserId?: string | null, artifactRef?: string | null, breakGlassOverride?: boolean): Promise<string | null>;
 /**
- * Detect raw mutations on workflow tickets (AI-1387, expanded in AI-1402).
+ * Detect raw mutations on workflow tickets (AI-1387, expanded in AI-1402, AI-1488).
  *
  * When an agent sends an `issueUpdate` with `stateId`, `assigneeId`, or `labelIds`
  * in the input but WITHOUT the `x-openclaw-linear-intent` header, they're bypassing
@@ -208,6 +208,15 @@ export declare function checkWorkflowRules(intent: string, issueId: string | nul
  * capable as state changes for bypassing workflow state) and adds fail-closed
  * enforcement for unknown callers on workflow tickets.
  *
+ * AI-1488 (default-deny): extended to also intercept:
+ *   - `issueDelete` and `commentDelete` mutations on governed tickets (destroy protection).
+ *   - `issueUpdate` touching `title`, `description`, `priority`, `parentId`, `teamId`
+ *     (spec/AC rewrite and move-out-of-jurisdiction protection).
+ *   - Raw delegate changes by the CURRENT DELEGATE on wf: tickets are now blocked.
+ *     Previously the current delegate could re-route without a workflow command.
+ *     Now the delegate only changes as a side-effect of legal workflow transitions.
+ *     Rejection names `block --blocked-by` and `needs-human` as legal alternatives.
+ *
  * Returns null to allow the request through (non-workflow ticket, non-mutation,
  * or no workflow-affecting fields in input). Returns a rejection string otherwise.
  * Fail-open on any error — missing issueId, label fetch failure, etc.
@@ -217,6 +226,28 @@ export declare function checkRawMutationInterception(body: {
     variables?: Record<string, unknown>;
     operationName?: string;
 } | null, issueId: string | null, authToken: string, bodyId?: string, callerLinearUserId?: string | null): Promise<string | null>;
+/**
+ * Sanitize the forwarded GraphQL request body for specific intents on governed tickets.
+ *
+ * Currently: for `needs-human` on wf: tickets, strip `delegateId` from the mutation
+ * so that the delegate is preserved server-side (blocked-but-keep-owner semantics).
+ * `needs-human` signals "I need a human to act, but I am still the resumption owner."
+ * Stripping `delegateId: null` prevents Linear from clearing the delegate even though
+ * the CLI's `needsHuman` implementation sends `clearDelegate: true`.
+ *
+ * Called by proxy.ts after enforcement passes but before the upstream forward.
+ * Returns the original body unchanged for all other cases.
+ * Fail-open on any error.
+ */
+export declare function applyWorkflowBodySanitization(intent: string, issueId: string | null, authToken: string, body: {
+    query?: string;
+    variables?: Record<string, unknown>;
+    operationName?: string;
+} | null): Promise<{
+    query?: string;
+    variables?: Record<string, unknown>;
+    operationName?: string;
+} | null>;
 /**
  * Generate a legal-verb reminder for the NEW state after a successful transition.
  *
@@ -295,7 +326,17 @@ export declare function applyStateTransition(intent: string, issueId: string | n
  * Fail-open: any API or registry failure logs a warning and returns
  * `{ enrolled: false }` — the inbound path is never blocked by enrollment.
  */
-export declare function enrollIfMissing(issueId: string, authToken: string): Promise<{
+export interface EnrollHealInfo {
+    /** Display identifier or UUID the caller passed in. */
+    issueId: string;
+    /** Linear internal issue UUID the label write was applied to. */
+    internalId: string;
+    /** Resolved workflow id (e.g. "dev-impl"). */
+    workflowId: string;
+    /** Entry state stamped (e.g. "intake"). */
+    entryState: string;
+}
+export declare function enrollIfMissing(issueId: string, authToken: string, onHeal?: (info: EnrollHealInfo) => void): Promise<{
     enrolled: boolean;
     entryState?: string;
 }>;

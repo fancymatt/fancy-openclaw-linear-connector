@@ -20,6 +20,7 @@ import { applyEngagementStatus } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES } from "./bag/stale-session-forensics.js";
 import { registerDistillationCron } from "./cron/p4-metrics-distillation.js";
+import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { getAccessToken, getAgent } from "./agents.js";
 import crypto from "crypto";
@@ -634,6 +635,8 @@ if (isEntryPoint) {
     const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector } = createApp();
     // P4-3: periodic distillation of reject metrics into skill-workshop proposals
     registerDistillationCron(observationStore);
+    // AI-1566: periodic rescue sweep — detect and repair dormant/malformed wf:* tickets
+    registerRescueSweepCron();
     // G-20: scheduled gate-silently-off canary (AI-1552, §5.1)
     registerG20CanaryCron();
     const server = app.listen(PORT, () => {

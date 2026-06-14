@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
-export const OPERATIONAL_EVENT_OUTCOMES = ["received", "signature-rejected", "duplicate", "normalized", "terminal-pruned", "no-route", "routed", "dedup-suppressed", "bag-added", "delivered", "dispatch-accepted", "queued", "delivery-failed", "delivery-unconfirmed", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "no-activity-warn", "no-activity-failed", "deferred-at-capacity", "deferred-capacity-rearm", "stuck-delegate-reprompt", "stale-c4-repoke", "stale-c4-repoke-failed", "engagement-thinking", "engagement-doing", "engagement-todo", "bootstrap-bootstrapped", "bootstrap-demoted"];
+export const OPERATIONAL_EVENT_OUTCOMES = ["received", "signature-rejected", "duplicate", "normalized", "terminal-pruned", "no-route", "routed", "dedup-suppressed", "bag-added", "delivered", "dispatch-accepted", "queued", "delivery-failed", "delivery-unconfirmed", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "no-activity-warn", "no-activity-failed", "deferred-at-capacity", "deferred-capacity-rearm", "stuck-delegate-reprompt", "stale-c4-repoke", "stale-c4-repoke-failed", "engagement-thinking", "engagement-doing", "engagement-todo", "bootstrap-bootstrapped", "bootstrap-demoted", "enrollment-healed"];
 function parseEnvInt(name, defaultVal) {
     const raw = process.env[name];
     const parsed = raw !== undefined ? parseInt(raw, 10) : NaN;
@@ -20,7 +20,7 @@ const SECRET_VALUE_PATTERNS = [
     [/\blin_wh_[A-Za-z0-9_-]+\b/ig, "[REDACTED]"],
     [/\b[^\s,;]*?(?:token|secret|password|authorization|api[-_]?key)[^\s,;]*\b/ig, "[REDACTED]"],
 ];
-const SUCCESS_OUTCOMES = new Set(["received", "normalized", "routed", "bag-added", "delivered", "dispatch-accepted", "queued", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "deferred-capacity-rearm"]);
+const SUCCESS_OUTCOMES = new Set(["received", "normalized", "routed", "bag-added", "delivered", "dispatch-accepted", "queued", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "deferred-capacity-rearm", "enrollment-healed"]);
 const ERROR_OUTCOMES = new Set(["signature-rejected", "delivery-failed", "no-route", "no-activity-warn", "no-activity-failed", "deferred-at-capacity"]);
 function redactText(value) {
     return SECRET_VALUE_PATTERNS.reduce((output, [pattern, replacement]) => output.replace(pattern, replacement), value);

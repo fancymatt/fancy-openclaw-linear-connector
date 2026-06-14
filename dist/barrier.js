@@ -1,0 +1,688 @@
+/**
+ * Phase 5 / B-3 — Managing barrier (N→1) + asymmetric shepherding + stall detection.
+ *
+ * Three subsystems:
+ *
+ *   1. **Barrier (N→1):** Event-driven — when the last linked child reaches a
+ *      terminal state, the engine auto-advances the parent `managing → review`.
+ *      No polling for done-ness (§5.3). Triggered by Linear webhook events.
+ *
+ *   2. **Asymmetric shepherding (§5.3):** Parent (researcher/engine) shepherds
+ *      *down* — nudge/escalate stuck children; children never look *up*.
+ *      The asymmetry is structural: children run `wf:dev-impl`, parents run
+ *      `wf:ux-audit`. A dev-impl ticket has no legal command to address its
+ *      parent. The parent's managing-wake already includes child-status checks;
+ *      this module enriches it with stall-surface logic.
+ *
+ *   3. **Stall detection (§5.5 / §16.1):** Engine-owns-detection, parent-owns-response.
+ *      Each state carries an optional time-in-state SLA (from workflow def YAML).
+ *      When an outstanding child breaches its SLA, the engine emits a structured
+ *      **StallEvent** against that child and its ancestor chain. The parent agent's
+ *      managing-wake delivers the stall event — the parent decides the qualitative
+ *      response (nudge, guidance, or escalation via barrier-level break-glass, §5.3).
+ *
+ *      **At-capacity ≠ stall.** A legitimately deferred/at-capacity child has its
+ *      waiting time attributed up the ancestor SLA accounting as **known deferral**,
+ *      so an overloaded-but-healthy subtree doesn't trip stall escalation while a
+ *      genuinely stuck leaf still does.
+ *
+ * Design: design.md §5.3, §5.5, §14, §16.1.
+ *
+ * ACs:
+ *   - Last child terminal → parent auto-moves managing → review (no manual nudge).
+ *   - A deliberately stalled leaf produces a stall event to its parent.
+ *   - An at-capacity-but-healthy subtree does NOT trip stall escalation.
+ *   - Children cannot address the parent (asymmetry enforced).
+ */
+import { componentLogger, createLogger } from "./logger.js";
+import { loadWorkflowDef, getWorkflowId, getCurrentState } from "./workflow-gate.js";
+import { LINEAR_API_URL, findOrCreateLabel, postComment, resolveInternalId, issueUpdateLabels, fetchIssueWithLabels, } from "./linear-helpers.js";
+const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "barrier");
+/**
+ * Parse a per-state SLA duration string into milliseconds.
+ * Accepts `<n>h`, `<n>m`, `<n>s`, or a bare millisecond number (e.g. "24h",
+ * "90m", "3600000"). Returns null when the value can't be parsed.
+ */
+function parseSlaToMs(sla) {
+    const m = /^\s*(\d+(?:\.\d+)?)\s*(h|m|s|ms)?\s*$/i.exec(sla);
+    if (!m)
+        return null;
+    const n = parseFloat(m[1]);
+    if (!Number.isFinite(n))
+        return null;
+    switch ((m[2] ?? "ms").toLowerCase()) {
+        case "h": return n * 60 * 60 * 1000;
+        case "m": return n * 60 * 1000;
+        case "s": return n * 1000;
+        default: return n; // bare number = ms
+    }
+}
+// ── Types ─────────────────────────────────────────────────────────────────
+/** Terminal states that satisfy the parent barrier. */
+const TERMINAL_WORKFLOW_STATES = new Set(["done", "escape"]);
+const DEFAULT_STALL_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
+const DEFAULT_POLL_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+/**
+ * In-memory accounting of known-deferral time per (agent, ticket).
+ *
+ * When a child is at-capacity (legitimately deferred, per AI-1339), its
+ * waiting time is tracked here so the stall detection can subtract it from
+ * the SLA clock. An overloaded-but-healthy subtree does NOT trip stall
+ * escalation while a genuinely stuck leaf still does.
+ */
+export class DeferralAccountant {
+    constructor() {
+        this.deferrals = new Map();
+    }
+    /** Start tracking deferral for a child. */
+    startDeferral(childIdentifier, now = Date.now()) {
+        const key = childIdentifier;
+        const existing = this.deferrals.get(key);
+        if (existing) {
+            // Already deferring — accumulate what we have and restart
+            existing.accumulatedMs += now - existing.startedAt;
+            existing.startedAt = now;
+        }
+        else {
+            this.deferrals.set(key, { startedAt: now, accumulatedMs: 0 });
+        }
+    }
+    /** Stop tracking deferral for a child (e.g., when it becomes active again). */
+    stopDeferral(childIdentifier, now = Date.now()) {
+        const key = childIdentifier;
+        const entry = this.deferrals.get(key);
+        if (!entry)
+            return 0;
+        const total = entry.accumulatedMs + (now - entry.startedAt);
+        this.deferrals.delete(key);
+        return total;
+    }
+    /** Get the total known-deferral time for a child (ms). */
+    getDeferralMs(childIdentifier, now = Date.now()) {
+        const entry = this.deferrals.get(childIdentifier);
+        if (!entry)
+            return 0;
+        return entry.accumulatedMs + (now - entry.startedAt);
+    }
+    /** Check if a child is currently in deferral. */
+    isDeferring(childIdentifier) {
+        return this.deferrals.has(childIdentifier);
+    }
+    /** Clear all deferral state. */
+    clearAll() {
+        this.deferrals.clear();
+    }
+}
+// Global singleton — survives across poll cycles within a single connector process.
+export const deferralAccountant = new DeferralAccountant();
+// ── Helpers ───────────────────────────────────────────────────────────────
+/**
+ * Is a child in a terminal state based on its labels?
+ * Terminal states: done, escape (from the ux-audit and dev-impl workflow defs).
+ * Also checks if the child has a `state:*` label matching a terminal state.
+ */
+export function isChildTerminal(labels) {
+    const state = getCurrentState(labels);
+    if (!state)
+        return false;
+    return TERMINAL_WORKFLOW_STATES.has(state);
+}
+/**
+ * Determine if a workflow state is terminal.
+ */
+export function isTerminalState(stateName) {
+    return TERMINAL_WORKFLOW_STATES.has(stateName);
+}
+// ── Linear API helpers ────────────────────────────────────────────────────
+/**
+ * Fetch the parent issue's identifier for a given child issue.
+ * Returns null if the child has no parent.
+ */
+export async function fetchParentIdentifier(childIdentifier, authToken) {
+    const query = `
+    query ChildParent($id: String!) {
+      issue(id: $id) {
+        parent { identifier }
+      }
+    }
+  `;
+    try {
+        const res = await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authToken },
+            body: JSON.stringify({ query, variables: { id: childIdentifier } }),
+        });
+        const data = (await res.json());
+        return data.data?.issue?.parent?.identifier ?? null;
+    }
+    catch (err) {
+        log.error(`barrier: failed to fetch parent for ${childIdentifier}: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+    }
+}
+/**
+ * Fetch all children of a parent issue with their labels.
+ * Returns the children's identifiers and label names.
+ */
+export async function fetchChildren(parentIdentifier, authToken) {
+    const query = `
+    query ParentChildren($id: String!) {
+      issue(id: $id) {
+        children {
+          nodes {
+            identifier
+            labels { nodes { name } }
+          }
+        }
+      }
+    }
+  `;
+    try {
+        const res = await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authToken },
+            body: JSON.stringify({ query, variables: { id: parentIdentifier } }),
+        });
+        const data = (await res.json());
+        const nodes = data.data?.issue?.children?.nodes ?? [];
+        return nodes.map((node) => {
+            const labels = (node.labels?.nodes ?? []).map((l) => l.name);
+            return {
+                identifier: node.identifier,
+                labels,
+                isTerminal: isChildTerminal(labels),
+                workflowState: getCurrentState(labels),
+            };
+        });
+    }
+    catch (err) {
+        log.error(`barrier: failed to fetch children for ${parentIdentifier}: ${err instanceof Error ? err.message : String(err)}`);
+        return [];
+    }
+}
+/**
+ * Fetch the parent issue's labels to determine its current workflow state.
+ */
+async function fetchParentState(parentIdentifier, authToken) {
+    const query = `
+    query ParentState($id: String!) {
+      issue(id: $id) {
+        id
+        team { id }
+        labels { nodes { id name } }
+      }
+    }
+  `;
+    try {
+        const res = await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authToken },
+            body: JSON.stringify({ query, variables: { id: parentIdentifier } }),
+        });
+        const data = (await res.json());
+        const issue = data.data?.issue;
+        if (!issue)
+            return null;
+        return {
+            labels: issue.labels.nodes.map((l) => l.name),
+            internalId: issue.id,
+            teamId: issue.team.id,
+        };
+    }
+    catch (err) {
+        log.error(`barrier: failed to fetch parent state for ${parentIdentifier}: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+    }
+}
+// ── Public API: Barrier ───────────────────────────────────────────────────
+/**
+ * Evaluate whether the barrier is satisfied for a parent in `managing` state.
+ *
+ * Fetches all children of the parent and checks if every one has reached
+ * a terminal workflow state. Returns the evaluation result.
+ *
+ * This is a pure evaluation — it does not mutate anything.
+ */
+export async function evaluateBarrier(parentIdentifier, authToken) {
+    const children = await fetchChildren(parentIdentifier, authToken);
+    if (children.length === 0) {
+        return { allTerminal: false, totalChildren: 0, terminalCount: 0, children: [] };
+    }
+    const terminalCount = children.filter((c) => c.isTerminal).length;
+    return {
+        allTerminal: terminalCount === children.length,
+        totalChildren: children.length,
+        terminalCount,
+        children,
+    };
+}
+/**
+ * Attempt to auto-advance the parent from `managing → review` when the
+ * barrier is satisfied (all children terminal).
+ *
+ * Steps:
+ *   1. Evaluate the barrier — are all children terminal?
+ *   2. Verify the parent is in `managing` state.
+ *   3. Atomically swap state:managing → state:review.
+ *   4. Post a barrier-summary comment on the parent.
+ *
+ * Returns the result of the transition attempt.
+ * Fail-open: any error is logged and returned — callers should not retry.
+ *
+ * AC1: Last child terminal → parent auto-moves managing → review with no
+ *      manual nudge.
+ */
+export async function attemptBarrierTransition(parentIdentifier, authToken, workflowDef, prefetchedParentState) {
+    const result = {
+        transitioned: false,
+        parentIdentifier,
+        terminalCount: 0,
+        totalChildren: 0,
+    };
+    // 1. Evaluate barrier
+    const barrier = await evaluateBarrier(parentIdentifier, authToken);
+    result.terminalCount = barrier.terminalCount;
+    result.totalChildren = barrier.totalChildren;
+    if (barrier.totalChildren === 0) {
+        log.info(`barrier: no children for ${parentIdentifier} — skipping`);
+        result.error = "No children found — barrier requires at least one child";
+        return result;
+    }
+    if (!barrier.allTerminal) {
+        log.info(`barrier: not all children terminal for ${parentIdentifier} — ` +
+            `${barrier.terminalCount}/${barrier.totalChildren} done`);
+        return result; // Not an error — just not ready yet
+    }
+    // 2. Verify parent is in managing state
+    //    Use pre-fetched state if provided (avoids redundant API call)
+    const parentState = prefetchedParentState ?? await fetchParentState(parentIdentifier, authToken);
+    if (!parentState) {
+        result.error = "Failed to fetch parent state";
+        return result;
+    }
+    const workflowId = getWorkflowId(parentState.labels);
+    // Phase 6 / C-3 (AI-1473): generalized from ux-audit-only to archetype-agnostic.
+    // Both ux-audit (managing → review) and sprint (managing → validating) use the
+    // same barrier pattern: all children terminal → auto-advance.
+    const isOrchestrator = workflowId === "ux-audit";
+    const isFeatureInitiative = workflowId === "sprint";
+    if (!isOrchestrator && !isFeatureInitiative) {
+        log.info(`barrier: parent ${parentIdentifier} is not an orchestrator or feature-initiative (wf:${workflowId}) — skipping`);
+        result.error = `Parent workflow is '${workflowId}', expected 'ux-audit' or 'sprint'`;
+        return result;
+    }
+    const currentState = getCurrentState(parentState.labels);
+    if (currentState !== "managing") {
+        log.info(`barrier: parent ${parentIdentifier} is in '${currentState}', not 'managing' — skipping`);
+        result.error = `Parent state is '${currentState}', expected 'managing'`;
+        return result;
+    }
+    // 3. Atomic label swap: state:managing → state:review
+    // We need the label IDs, not just the names — re-fetch with IDs
+    const parentWithLabels = await fetchParentWithLabelIds(parentIdentifier, authToken);
+    if (!parentWithLabels) {
+        result.error = "Failed to fetch parent label IDs";
+        return result;
+    }
+    const managingLabelNode = parentWithLabels.labels.find((l) => l.name === "state:managing");
+    if (!managingLabelNode) {
+        result.error = "No state:managing label found on parent";
+        return result;
+    }
+    // Phase 6 / C-3: ux-audit advances to 'review', sprint advances to 'validating'.
+    const barrierTarget = isOrchestrator ? "review" : "validating";
+    const reviewLabelId = await findOrCreateLabel(parentWithLabels.teamId, `state:${barrierTarget}`, authToken);
+    if (!reviewLabelId) {
+        result.error = "Failed to resolve state:review label";
+        return result;
+    }
+    const newLabelIds = [
+        ...parentWithLabels.labels.filter((l) => l.id !== managingLabelNode.id).map((l) => l.id),
+        reviewLabelId,
+    ];
+    const updated = await issueUpdateLabels(parentWithLabels.internalId, newLabelIds, authToken);
+    if (!updated) {
+        result.error = "Label swap mutation returned non-success";
+        return result;
+    }
+    // 4. Post barrier-summary comment
+    const childSummary = barrier.children
+        .map((c) => `- ${c.identifier}: ${c.workflowState ?? "unknown"}`)
+        .join("\n");
+    const commentBody = `[Barrier] All ${barrier.totalChildren} child(ren) reached terminal state. ` +
+        `Auto-advancing parent managing → ${barrierTarget}.\n\n${childSummary}`;
+    await postComment(parentWithLabels.internalId, commentBody, authToken);
+    result.transitioned = true;
+    log.info(`barrier: ${parentIdentifier} managing → ${barrierTarget} ` +
+        `(${barrier.terminalCount}/${barrier.totalChildren} children terminal)`);
+    return result;
+}
+/**
+ * Main entry point for the webhook-driven barrier check.
+ *
+ * Call this when a child issue reaches a terminal state. It:
+ *   1. Finds the parent issue.
+ *   2. If the parent is in `managing` state on `ux-audit` workflow,
+ *      evaluates the barrier.
+ *   3. If all children are terminal, auto-transitions to `review`.
+ *
+ * Returns true if a barrier transition was attempted (whether successful or not).
+ * Returns false if the barrier was not applicable (no parent, not managing, etc.)
+ */
+export async function onChildTerminal(childIdentifier, authToken) {
+    // 1. Find the parent
+    const parentIdentifier = await fetchParentIdentifier(childIdentifier, authToken);
+    if (!parentIdentifier) {
+        log.info(`barrier: ${childIdentifier} has no parent — skipping barrier check`);
+        return null;
+    }
+    // 2. Check if parent is in managing state on ux-audit
+    const parentState = await fetchParentState(parentIdentifier, authToken);
+    if (!parentState)
+        return null;
+    const workflowId = getWorkflowId(parentState.labels);
+    // Phase 6 / C-3: support both ux-audit and sprint archetypes.
+    if (workflowId !== "ux-audit" && workflowId !== "sprint")
+        return null;
+    const currentState = getCurrentState(parentState.labels);
+    if (currentState !== "managing") {
+        log.info(`barrier: parent ${parentIdentifier} in '${currentState}' (not managing) — skipping`);
+        return null;
+    }
+    // 3. Attempt the barrier transition, passing pre-fetched parent state
+    log.info(`barrier: child ${childIdentifier} terminal, checking barrier for parent ${parentIdentifier}`);
+    return attemptBarrierTransition(parentIdentifier, authToken, undefined, parentState);
+}
+/**
+ * Fetch parent issue with label IDs.
+ * Delegates to the shared fetchIssueWithLabels from linear-helpers.
+ */
+async function fetchParentWithLabelIds(parentIdentifier, authToken) {
+    return fetchIssueWithLabels(parentIdentifier, authToken);
+}
+// ── Public API: Asymmetric shepherding ────────────────────────────────────
+/**
+ * Build a shepherding message for the parent's owner about child status.
+ *
+ * The parent (researcher/engine) shepherds DOWN — nudges/escalates stuck
+ * children. Children never look UP (§5.3). The asymmetry is structural:
+ * children run wf:dev-impl which has no command to address the parent.
+ *
+ * This function builds the message surfaced to the parent owner during
+ * a stewardship wake, listing child states and surfacing any stalled ones.
+ */
+export function buildShepherdingMessage(parentIdentifier, children, stalledChildren) {
+    const lines = [
+        `[Shepherding] Parent ${parentIdentifier} — child status summary:`,
+        "",
+    ];
+    for (const child of children) {
+        const state = child.workflowState ?? "no state";
+        const marker = child.isTerminal ? "✓" : "●";
+        lines.push(`  ${marker} ${child.identifier}: ${state}`);
+    }
+    if (stalledChildren.length > 0) {
+        lines.push("");
+        lines.push("⚠️ Stall event(s) (§5.5 / §16.1 — engine-detected SLA breach):");
+        for (const stalled of stalledChildren) {
+            const timeInStateMin = Math.round(stalled.timeInStateMs / 60000);
+            const slaMin = stalled.stateSlaMs ? Math.round(stalled.stateSlaMs / 60000) : null;
+            const slaInfo = slaMin ? ` (SLA: ${slaMin}m)` : "";
+            const deferralInfo = stalled.knownDeferralMs > 0
+                ? ` [deferral accounted: ${Math.round(stalled.knownDeferralMs / 60000)}m]`
+                : "";
+            lines.push(`  - ${stalled.identifier}: ${stalled.currentState ?? "unknown"} ` +
+                `(${timeInStateMin}m in state${slaInfo}${deferralInfo})`);
+        }
+        lines.push("");
+        lines.push("Action: nudge or escalate stalled children. Run `linear nudge <child-id>` or reassign.");
+    }
+    return lines.join("\n");
+}
+/**
+ * Enforce asymmetry: check if a given issue is a child of a ux-audit parent.
+ * Returns true if the issue is a child that should NOT be able to address
+ * its parent. Used by the workflow-gate to block upward-directed commands.
+ *
+ * §5.3: children never look up. A child running wf:dev-impl cannot issue
+ * commands targeting the parent's ux-audit workflow.
+ */
+export async function isChildOfUxAuditParent(issueIdentifier, authToken) {
+    const parentIdentifier = await fetchParentIdentifier(issueIdentifier, authToken);
+    if (!parentIdentifier)
+        return false;
+    const parentState = await fetchParentState(parentIdentifier, authToken);
+    if (!parentState)
+        return false;
+    const workflowId = getWorkflowId(parentState.labels);
+    return workflowId === "ux-audit";
+}
+// ── Public API: Stall detection ───────────────────────────────────────────
+/**
+ * Fetch the last activity timestamp for a child issue.
+ * Uses the updatedAt field as a proxy for activity.
+ */
+async function fetchChildLastActivity(childIdentifier, authToken) {
+    const query = `
+    query ChildActivity($id: String!) {
+      issue(id: $id) {
+        updatedAt
+      }
+    }
+  `;
+    try {
+        const res = await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authToken },
+            body: JSON.stringify({ query, variables: { id: childIdentifier } }),
+        });
+        const data = (await res.json());
+        const updatedAt = data.data?.issue?.updatedAt;
+        if (!updatedAt)
+            return null;
+        return new Date(updatedAt).getTime();
+    }
+    catch (err) {
+        log.error(`barrier: failed to fetch activity for ${childIdentifier}: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+    }
+}
+/**
+ * Fetch the epoch ms when a child entered its current state, by examining
+ * Linear history for the most recent `state:*` label change.
+ *
+ * Returns null if the state-entry time cannot be determined.
+ */
+async function fetchChildStateEnteredAt(childIdentifier, authToken) {
+    const query = `
+    query ChildStateHistory($id: String!) {
+      issue(id: $id) {
+        labels { nodes { name } }
+        history(first: 100, orderBy: { createdAt: desc }) {
+          nodes {
+            __typename
+            ... on IssueLabelPayload {
+              createdAt
+              fromLabel { name }
+              toLabel { name }
+            }
+          }
+        }
+      }
+    }
+  `;
+    try {
+        const res = await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authToken },
+            body: JSON.stringify({ query, variables: { id: childIdentifier } }),
+        });
+        const data = (await res.json());
+        const issue = data.data?.issue;
+        if (!issue)
+            return null;
+        // Get the current state from labels
+        const labelNames = (issue.labels?.nodes ?? []).map((l) => l.name);
+        const currentState = getCurrentState(labelNames);
+        if (!currentState)
+            return null;
+        const stateLabel = `state:${currentState}`;
+        const historyNodes = issue.history?.nodes ?? [];
+        // Find the most recent history event where the state:* label was set to the current state
+        for (const node of historyNodes) {
+            if (node.__typename === "IssueLabelPayload" && node.toLabel?.name === stateLabel && node.createdAt) {
+                return new Date(node.createdAt).getTime();
+            }
+        }
+        return null; // Couldn't determine state entry time
+    }
+    catch (err) {
+        log.error(`barrier: failed to fetch state entry for ${childIdentifier}: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+    }
+}
+/**
+ * Detect stalled children of a parent issue in `managing` state.
+ *
+ * Phase 6.5 / H-3 (AI-1478): Engine-owns-detection split.
+ *
+ * A child is stalled when ALL of the following are true:
+ *   - It is in a non-terminal state.
+ *   - It has been in its current state longer than the per-state SLA
+ *     (from the workflow definition YAML), MINUS any known-deferral time.
+ *   - It is NOT classified as at-capacity (deferred but healthy).
+ *
+ * At-capacity children (§16.1) have their waiting time attributed as
+ * known deferral so they do NOT trip stall escalation. Genuinely stuck
+ * leaves that are NOT at-capacity still do.
+ *
+ * Returns the list of stalled children with StallEvent data.
+ *
+ * AC1: A deliberately stalled leaf produces a stall event to its parent.
+ * AC2: An at-capacity-but-healthy subtree does NOT trip stall escalation.
+ */
+export async function detectStalledChildren(parentIdentifier, authToken, stallThresholdMs = DEFAULT_STALL_THRESHOLD_MS, now = Date.now(), workflowDef, accountant) {
+    const children = await fetchChildren(parentIdentifier, authToken);
+    const stalled = [];
+    // Load workflow def if not provided
+    let def = workflowDef;
+    if (!def) {
+        try {
+            def = await loadWorkflowDef();
+        }
+        catch {
+            // Fallback to legacy flat-threshold behavior if workflow def unavailable
+            log.warn("barrier: workflow def unavailable, using flat stall threshold");
+        }
+    }
+    const acct = accountant ?? deferralAccountant;
+    for (const child of children) {
+        if (child.isTerminal)
+            continue;
+        const lastActivity = await fetchChildLastActivity(child.identifier, authToken);
+        if (lastActivity === null)
+            continue;
+        const idleDurationMs = now - lastActivity;
+        // Fetch state-entry time for per-state SLA
+        const stateEnteredAt = await fetchChildStateEnteredAt(child.identifier, authToken);
+        const timeInStateMs = stateEnteredAt !== null ? now - stateEnteredAt : idleDurationMs;
+        // Look up per-state SLA from workflow def (duration string → ms)
+        let stateSlaMs = null;
+        if (def && child.workflowState) {
+            const stateDef = def.states.find((s) => s.id === child.workflowState);
+            if (stateDef?.sla) {
+                stateSlaMs = parseSlaToMs(stateDef.sla);
+            }
+        }
+        // Known-deferral accounting (at-capacity, §16.1)
+        const isDeferredAtCapacity = acct.isDeferring(child.identifier);
+        const knownDeferralMs = acct.getDeferralMs(child.identifier, now);
+        // Determine effective threshold: per-state SLA or flat fallback
+        const effectiveThresholdMs = stateSlaMs ?? stallThresholdMs;
+        // Effective time in state = time in state minus known deferral
+        // At-capacity children get their deferral time subtracted so they don't
+        // trip stall escalation (AC2)
+        const effectiveTimeMs = Math.max(0, timeInStateMs - knownDeferralMs);
+        // Skip at-capacity children: they are deferred but healthy (AC2)
+        if (isDeferredAtCapacity) {
+            // Even though they might have a large time-in-state, they are accounted for
+            // and should not trigger stall escalation
+            continue;
+        }
+        if (effectiveTimeMs >= effectiveThresholdMs) {
+            stalled.push({
+                identifier: child.identifier,
+                parentIdentifier,
+                currentState: child.workflowState,
+                lastActivityAt: lastActivity,
+                idleDurationMs,
+                stateEnteredAt,
+                stateSlaMs,
+                timeInStateMs,
+                knownDeferralMs,
+                isDeferredAtCapacity,
+            });
+        }
+    }
+    return stalled;
+}
+/**
+ * Build a StallEvent from a StalledChild.
+ *
+ * The engine emits this structured event; the parent agent decides the response.
+ */
+export function buildStallEvent(child, now = Date.now()) {
+    const slaMs = child.stateSlaMs ?? DEFAULT_STALL_THRESHOLD_MS;
+    return {
+        childIdentifier: child.identifier,
+        parentIdentifier: child.parentIdentifier,
+        currentState: child.currentState ?? "unknown",
+        timeInStateMs: child.timeInStateMs,
+        slaMs,
+        breachMs: Math.max(0, child.timeInStateMs - child.knownDeferralMs - slaMs),
+        knownDeferralMs: child.knownDeferralMs,
+        isDeferredAtCapacity: child.isDeferredAtCapacity,
+        createdAt: now,
+    };
+}
+/**
+ * Surface stalled children by emitting stall events to the parent.
+ *
+ * Phase 6.5 / H-3 (AI-1478): Engine detects stall → emits StallEvent(s) →
+ * parent agent responds via managing-wake flow.
+ *
+ * Posts a tripwire comment on the parent ticket with structured stall data.
+ * Returns the list of StallEvents for downstream delivery (managing-wake).
+ */
+export async function surfaceStalledChildren(parentIdentifier, authToken, stallThresholdMs = DEFAULT_STALL_THRESHOLD_MS) {
+    const stalled = await detectStalledChildren(parentIdentifier, authToken, stallThresholdMs);
+    if (stalled.length === 0)
+        return { surfaced: 0, events: [] };
+    const events = stalled.map((child) => buildStallEvent(child));
+    const children = await fetchChildren(parentIdentifier, authToken);
+    const message = buildShepherdingMessage(parentIdentifier, children, stalled);
+    const internalId = await resolveInternalId(parentIdentifier, authToken);
+    if (!internalId) {
+        log.error(`barrier: cannot surface stalled children — failed to resolve ${parentIdentifier}`);
+        return { surfaced: 0, events };
+    }
+    const posted = await postComment(internalId, message, authToken);
+    if (posted) {
+        log.info(`barrier: §5.5/§16.1 — emitted ${events.length} stall event(s) on ${parentIdentifier}`);
+    }
+    return { surfaced: events.length, events };
+}
+/**
+ * Parse stall detection config from environment variables.
+ */
+export function parseStallConfig() {
+    const stallThresholdMs = parseInt(process.env.BARRIER_STALL_THRESHOLD_MS ?? "", 10);
+    const pollIntervalMs = parseInt(process.env.BARRIER_STALL_POLL_MS ?? "", 10);
+    return {
+        stallThresholdMs: isNaN(stallThresholdMs) || stallThresholdMs <= 0
+            ? DEFAULT_STALL_THRESHOLD_MS : stallThresholdMs,
+        pollIntervalMs: isNaN(pollIntervalMs) || pollIntervalMs <= 0
+            ? DEFAULT_POLL_INTERVAL_MS : pollIntervalMs,
+    };
+}
+//# sourceMappingURL=barrier.js.map

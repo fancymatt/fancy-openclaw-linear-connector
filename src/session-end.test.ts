@@ -20,15 +20,42 @@ describe("POST /session-end", () => {
   let bag: ReturnType<typeof createApp>["bag"];
   let sessionTracker: ReturnType<typeof createApp>["sessionTracker"];
   let dbPath: string;
+  let originalFetch: typeof globalThis.fetch;
 
   beforeEach(() => {
     process.env.SESSION_END_SECRET = "test-secret-123";
+    // Provide a fake token so checkLinearIssueRouting makes a fetch call (rather than
+    // failing-open and proceeding straight to wakeUp delivery, which spawns a subprocess).
+    process.env.LINEAR_OAUTH_TOKEN = "test-linear-token";
+    // Mock fetch: return a terminal (Done) issue state so pending tickets are pruned as
+    // non-actionable before resignalPendingTickets reaches sendWakeUp. Without this, the
+    // test hangs: the subprocess delivery attempts take 30 s each plus a 5 s retry delay.
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              id: "issue-id",
+              identifier: "AI-100",
+              state: { name: "Done", type: "completed" },
+              delegate: null,
+              assignee: null,
+              relations: { nodes: [] },
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )
+    ) as typeof globalThis.fetch;
     dbPath = tempDb();
     ({ app, bag, sessionTracker } = createApp({ bagDbPath: dbPath }));
   });
 
   afterEach(() => {
     delete process.env.SESSION_END_SECRET;
+    delete process.env.LINEAR_OAUTH_TOKEN;
+    globalThis.fetch = originalFetch;
     bag.close();
     sessionTracker.close();
     fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });

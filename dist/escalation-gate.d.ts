@@ -27,8 +27,10 @@ export interface EnforcementRule {
     legalMove: string;
 }
 /**
- * Phase 2 enforcement rules (slice 1: one rule).
- * Phase 3 will extend this table — adding a rule is config, not code surgery.
+ * Phase 2 enforcement rules. AI-1488: `needs-human` moved to the B1 cross-cutting
+ * allowlist in workflow-gate.ts (any delegate may escalate; the proxy sanitizes the
+ * body so no raw delegate-change reaches Linear). This table is retained as an
+ * extension point — adding a rule here is config, not code surgery.
  */
 export declare const ENFORCEMENT_RULES: EnforcementRule[];
 /** Invalidate the in-process policy cache (used in tests). */
