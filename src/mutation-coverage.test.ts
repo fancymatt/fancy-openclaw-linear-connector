@@ -899,8 +899,13 @@ describe("workflow-gate: checkRawMutationInterception — uncovered branches", (
     expect(result).toMatch(/ticket id could not be resolved/i);
   });
 
-  // AC2-WG-16: raw mutation not touching workflow fields → pass-through (line 1179)
-  it("passes through issueUpdate that only changes title/description (no workflow fields)", async () => {
+  // AC2-WG-16: raw mutation only changing title on a non-wf ticket → pass-through (AI-1488:
+  // title is a blockable field on wf: tickets, but ad-hoc tickets still pass through)
+  it("passes through issueUpdate that only changes title on a non-wf (ad-hoc) ticket", async () => {
+    globalThis.fetch = makeFetch({
+      "X": { data: { issue: { labels: { nodes: [{ name: "bug" }] }, delegate: null } } },
+    });
+
     const result = await checkRawMutationInterception(
       { query: "mutation { issueUpdate(id: \"X\", input: { title: \"new\" }) { success } }", variables: { id: "X" } },
       "X",

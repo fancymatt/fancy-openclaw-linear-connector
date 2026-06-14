@@ -14,6 +14,7 @@ import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { resetWorkflowCache } from "./workflow-gate.js";
 import { resetConfigHealth } from "./config-health.js";
+import { clearProjectionStore } from "./label-projection-store.js";
 
 const TEST_POLICY_YAML = `
 capabilities:
@@ -144,6 +145,10 @@ const WORKFLOW_LABEL_RESPONSE = {
 const NON_WORKFLOW_LABEL_RESPONSE = {
   data: { issue: { labels: { nodes: [{ name: "bug" }] } } },
 };
+
+// AI-1488: clear store before every test so store-keyed detection doesn't bleed
+// across tests when an earlier test's applyStateTransition writes to the store.
+beforeEach(() => { clearProjectionStore(); });
 
 describe("proxy /proxy/graphql", () => {
   let dir: string;
@@ -1214,7 +1219,7 @@ describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
     expect(res.body.data).toBeDefined();
   });
 
-  it("allows raw mutations without stateId/assigneeId on workflow tickets", async () => {
+  it("blocks title-only raw mutation on workflow ticket (AI-1488 default-deny)", async () => {
     globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
 
     const res = await request(appState.app)
@@ -1227,8 +1232,8 @@ describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
       });
 
     expect(res.status).toBe(200);
-    expect(res.body.errors).toBeUndefined();
-    expect(res.body.data).toBeDefined();
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("[Proxy]");
   });
 
   it("allows intent-headed requests through (those use B1 validation, not Layer 2)", async () => {

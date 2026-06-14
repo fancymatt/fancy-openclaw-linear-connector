@@ -41,6 +41,7 @@ import { runTransitionWalk } from "./canary.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
 import { resetConfigHealth } from "./config-health.js";
 import { clearImplementerStore } from "./implementer-store.js";
+import { clearProjectionStore, recordProjection } from "./label-projection-store.js";
 
 // Resolved from the project root (jest cwd) so it works under both the
 // ESM tsc build and the CommonJS ts-jest transpile.
@@ -1381,7 +1382,10 @@ describe("checkRawMutationInterception — Layer 2 (AI-1387)", () => {
     expect(result).toBeNull();
   });
 
-  it("passes through when mutation does not touch stateId or assigneeId", async () => {
+  it("blocks title-only issueUpdate on a workflow ticket (AI-1488 default-deny)", async () => {
+    // AI-1488: default-deny flips the default for wf: tickets.
+    // Previously only state/assignee/label/delegate fields were blocked; now ALL
+    // issueUpdate fields are blocked on wf: tickets without an intent header.
     globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
 
     const body = {
@@ -1390,7 +1394,9 @@ describe("checkRawMutationInterception — Layer 2 (AI-1387)", () => {
     };
 
     const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked on this workflow ticket");
   });
 
   it("passes through when body is not an issueUpdate mutation", async () => {
@@ -1941,7 +1947,9 @@ describe("checkRawMutationInterception — AI-1402: labelIds blocking + unknown-
     expect(result).toBeNull();
   });
 
-  it("passes through title-only mutation on workflow ticket (title is not workflow-affecting)", async () => {
+  it("blocks title-only mutation on workflow ticket (AI-1488 default-deny)", async () => {
+    // AI-1488: title is no longer "not workflow-affecting" on wf: tickets —
+    // all issueUpdate fields are blocked under default-deny.
     globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
 
     const body = {
@@ -1950,7 +1958,9 @@ describe("checkRawMutationInterception — AI-1402: labelIds blocking + unknown-
     };
 
     const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked on this workflow ticket");
   });
 
   it("blocks unknown caller raw mutation on workflow ticket", async () => {
@@ -2094,12 +2104,20 @@ describe("checkRawMutationInterception — AI-1535: delegate-only raw mutations"
     });
   }
 
-  it("ALLOWS a raw delegate write by the CURRENT delegate (legitimate handoff-work)", async () => {
+  it("BLOCKS a raw delegate write by the CURRENT delegate on a wf: ticket (AI-1488 default-deny)", async () => {
+    // AI-1488: even the current delegate cannot do raw delegateId mutations on wf: tickets.
+    // The correct mechanism for routing/blocking is a workflow transition verb (submit/etc.)
+    // or block --blocked-by / needs-human for signaling blocked state.
     globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_WITH_DELEGATE);
     const result = await checkRawMutationInterception(
       delegateBodies["variables.input shape"], "issue-uuid", "Bearer tok", "charles", DELEGATE_USER_ID,
     );
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("Direct delegate change blocked");
+    // Should name the correct alternatives
+    expect(result).toContain("block --blocked-by");
+    expect(result).toContain("needs-human");
   });
 
   it("blocks a raw delegate write by an unverifiable caller when a delegate exists (AI-1400 B2 parity)", async () => {
@@ -5132,7 +5150,9 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     expect(result).toContain("status/assignee/labels");
   });
 
-  it("allows raw non-workflow mutations (title, description, etc.)", async () => {
+  it("blocks raw non-workflow-field mutations (title, description, priority) on wf: tickets (AI-1488)", async () => {
+    // AI-1488: under default-deny, ALL issueUpdate fields are blocked on wf: tickets.
+    // Previously title/description/priority were considered "safe"; now they require intent.
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
     const result = await checkRawMutationInterception(
       { query: "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }", variables: { input: { title: "New title", description: "New description", priority: 1 } } },
@@ -5140,7 +5160,9 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
       "Bearer tok",
       "charles",
     );
-    expect(result).toBeNull(); // Not a workflow-affecting mutation
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked on this workflow ticket");
   });
 
   it("exactly one issueUpdate mutation per transition (no separate native-state write)", async () => {
@@ -5548,5 +5570,472 @@ describe("enrollIfMissing — enrollment gap repair", () => {
     const result = await enrollIfMissing("issue-uuid", "Bearer tok");
 
     expect(result.enrolled).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI-1488: Default-deny command surface
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("AI-1488: default-deny — store-keyed detection (wf: label stripped, store enforces)", () => {
+  let ai1488Dir: string;
+  let ai1488OriginalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    ai1488Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1488-store-"));
+    const policyFile = path.join(ai1488Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai1488Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    clearProjectionStore();
+    ai1488OriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = ai1488OriginalFetch;
+    clearProjectionStore();
+  });
+
+  // Labels API returns no wf: label (simulates drift after manual unlabel).
+  const NO_WF_LABELS = {
+    data: { issue: { labels: { nodes: [{ name: "bug" }] } } },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function mockNoWfLabelFetch() {
+    return async (url: any, init?: RequestInit) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("IssueLabels")) {
+          return new Response(JSON.stringify(NO_WF_LABELS), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+      return ai1488OriginalFetch(url, init);
+    };
+  }
+
+  it("enforces workflow rules when wf: label is absent but store has a record", async () => {
+    await recordProjection("issue-uuid", "dev-impl", "implementation");
+    globalThis.fetch = mockNoWfLabelFetch();
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { stateId: "state-done-uuid" } },
+    };
+
+    // Store-keyed detection: wf: label missing but store entry enforces the block.
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+  });
+
+  it("does not enforce when neither wf: label nor store entry is present", async () => {
+    // No recordProjection call — store is empty.
+    globalThis.fetch = mockNoWfLabelFetch();
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { stateId: "state-done-uuid" } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).toBeNull();
+  });
+});
+
+describe("AI-1488: default-deny — issueDelete blocked on workflow ticket", () => {
+  let ai1488DelDir: string;
+  let ai1488DelOriginalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    ai1488DelDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1488-del-"));
+    const policyFile = path.join(ai1488DelDir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai1488DelDir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    ai1488DelOriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = ai1488DelOriginalFetch;
+  });
+
+  const WORKFLOW_IMPL_LABELS = {
+    data: { issue: { labels: { nodes: [
+      { name: "wf:dev-impl" },
+      { name: "state:implementation" },
+    ] } } },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function mockLabelFetch(labelResponse: object) {
+    return async (url: any, init?: RequestInit) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("IssueLabels")) {
+          return new Response(JSON.stringify(labelResponse), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+      return ai1488DelOriginalFetch(url, init);
+    };
+  }
+
+  it("blocks issueDelete on a workflow ticket", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!) { issueDelete(id: $id) { success } }",
+      variables: { id: "issue-uuid" },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("delete");
+    expect(result).toContain("escape");
+  });
+
+  it("allows issueDelete on a non-workflow (ad-hoc) ticket", async () => {
+    const adHocLabels = {
+      data: { issue: { labels: { nodes: [{ name: "bug" }] } } },
+    };
+    globalThis.fetch = mockLabelFetch(adHocLabels);
+
+    const body = {
+      query: "mutation M($id: String!) { issueDelete(id: $id) { success } }",
+      variables: { id: "issue-uuid" },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).toBeNull();
+  });
+});
+
+describe("AI-1488: default-deny — commentDelete blocked on workflow ticket", () => {
+  let ai1488CdDir: string;
+  let ai1488CdOriginalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    ai1488CdDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1488-cd-"));
+    const policyFile = path.join(ai1488CdDir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai1488CdDir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    ai1488CdOriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = ai1488CdOriginalFetch;
+  });
+
+  const WORKFLOW_IMPL_LABELS = {
+    data: { issue: { labels: { nodes: [
+      { name: "wf:dev-impl" },
+      { name: "state:implementation" },
+    ] } } },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function mockLabelFetch(labelResponse: object) {
+    return async (url: any, init?: RequestInit) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("IssueLabels")) {
+          return new Response(JSON.stringify(labelResponse), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+      return ai1488CdOriginalFetch(url, init);
+    };
+  }
+
+  it("blocks commentDelete on a workflow ticket", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!) { commentDelete(id: $id) { success } }",
+      variables: { id: "issue-uuid" },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("delete-comment");
+    expect(result).toContain("audit trail");
+  });
+
+  it("allows commentDelete on a non-workflow (ad-hoc) ticket", async () => {
+    const adHocLabels = {
+      data: { issue: { labels: { nodes: [{ name: "bug" }] } } },
+    };
+    globalThis.fetch = mockLabelFetch(adHocLabels);
+
+    const body = {
+      query: "mutation M($id: String!) { commentDelete(id: $id) { success } }",
+      variables: { id: "issue-uuid" },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).toBeNull();
+  });
+});
+
+describe("AI-1488: default-deny — teamId (issue-move-team) blocked on workflow ticket", () => {
+  let ai1488TmDir: string;
+  let ai1488TmOriginalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    ai1488TmDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1488-tm-"));
+    const policyFile = path.join(ai1488TmDir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai1488TmDir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    ai1488TmOriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = ai1488TmOriginalFetch;
+  });
+
+  const WORKFLOW_IMPL_LABELS = {
+    data: { issue: { labels: { nodes: [
+      { name: "wf:dev-impl" },
+      { name: "state:implementation" },
+    ] } } },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function mockLabelFetch(labelResponse: object) {
+    return async (url: any, init?: RequestInit) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("IssueLabels")) {
+          return new Response(JSON.stringify(labelResponse), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+      return ai1488TmOriginalFetch(url, init);
+    };
+  }
+
+  it("blocks teamId mutation (issue-move-team) on a workflow ticket", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { teamId: "other-team-uuid" } },
+    };
+
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("team");
+    expect(result).toContain("blocked");
+  });
+});
+
+describe("AI-1488: default-deny — always-allowed intents on workflow ticket", () => {
+  let ai1488AaDir: string;
+  let ai1488AaOriginalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    ai1488AaDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1488-aa-"));
+    const policyFile = path.join(ai1488AaDir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai1488AaDir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    ai1488AaOriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = ai1488AaOriginalFetch;
+  });
+
+  it("allows presence-ping intent on a workflow ticket (always-allowed)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+
+    const result = await checkWorkflowRules(
+      "presence-ping",
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+    );
+    expect(result).toBeNull();
+  });
+
+  it("allows observe-issue intent on a workflow ticket (always-allowed)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+
+    const result = await checkWorkflowRules(
+      "observe-issue",
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+    );
+    expect(result).toBeNull();
+  });
+
+  it("allows note intent on a workflow ticket (always-allowed)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+
+    const result = await checkWorkflowRules(
+      "note",
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+    );
+    expect(result).toBeNull();
+  });
+});
+
+describe("AI-1488: default-deny — undelegate rejected on workflow ticket", () => {
+  let ai1488UdDir: string;
+  let ai1488UdOriginalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    ai1488UdDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1488-ud-"));
+    const policyFile = path.join(ai1488UdDir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai1488UdDir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    ai1488UdOriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = ai1488UdOriginalFetch;
+  });
+
+  it("rejects undelegate with helpful alternatives", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+
+    const result = await checkWorkflowRules(
+      "undelegate",
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("undelegate");
+    expect(result).toContain("block --blocked-by");
+    expect(result).toContain("needs-human");
+  });
+});
+
+describe("AI-1488: default-deny — unknown command rejected (allowlist proof, not block-list)", () => {
+  let ai1488UkDir: string;
+  let ai1488UkOriginalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    ai1488UkDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1488-uk-"));
+    const policyFile = path.join(ai1488UkDir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai1488UkDir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    ai1488UkOriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = ai1488UkOriginalFetch;
+  });
+
+  it("rejects a made-up command on a workflow ticket (not on any allowlist)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+
+    const result = await checkWorkflowRules(
+      "frobnicate",
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+  });
+
+  it("rejects consider-work on a workflow ticket (wrong phase — not in allowlist for active wf)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+
+    const result = await checkWorkflowRules(
+      "consider-work",
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+  });
+
+  it("rejects handoff-work on a workflow ticket (not on any allowlist)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+
+    const result = await checkWorkflowRules(
+      "handoff-work",
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+  });
+
+  it("ad-hoc ticket: handoff-work passes through (no wf: label → not governed)", async () => {
+    // No wf: label → checkWorkflowRules returns null immediately (not a wf: ticket).
+    globalThis.fetch = makeLabelFetch(["bug", "priority:high"]);
+
+    const result = await checkWorkflowRules(
+      "handoff-work",
+      "issue-uuid",
+      "Bearer tok",
+      "charles",
+    );
+    expect(result).toBeNull();
   });
 });

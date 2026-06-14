@@ -20,6 +20,16 @@ import {
 import { resetConfigHealth, recordFailure, recordSuccess } from "./config-health.js";
 
 // Mock fetch for canary tests — controlled via module state.
+//
+// Two modes:
+//   1. Intent-aware (preferred): set mockFetchByIntent to map intent → response. The mock
+//      inspects X-Openclaw-Linear-Intent and returns the mapped response, making the mock
+//      deterministic even when concurrent runCheck() calls race (startCanary fires an initial
+//      check that races with the test's explicit await runCheck()).
+//   2. Queue/fallback (legacy): mockFetchResponseQueue consumed in order; once empty, falls
+//      back to mockFetchResponse. Use only for tests that do NOT use startCanary (no race).
+let mockFetchByIntent: Record<string, { errors?: Array<{ message: string }>; data?: unknown }> | null = null;
+let mockFetchResponseQueue: Array<{ errors?: Array<{ message: string }>; data?: unknown }> = [];
 let mockFetchResponse: { errors?: Array<{ message: string }>; data?: unknown } | null = null;
 let mockFetchShouldThrow = false;
 let mockFetchThrowError = "ECONNREFUSED";
@@ -27,11 +37,24 @@ let mockFetchThrowError = "ECONNREFUSED";
 const originalFetch = globalThis.fetch;
 
 function installMockFetch(): void {
-  globalThis.fetch = async (url, _init) => {
+  globalThis.fetch = async (_url, init) => {
     if (mockFetchShouldThrow) {
       throw new Error(mockFetchThrowError);
     }
-    return new Response(JSON.stringify(mockFetchResponse ?? { data: {} }), {
+    // Intent-aware mode: inspect X-Openclaw-Linear-Intent header for deterministic routing.
+    if (mockFetchByIntent) {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const intent = headers["X-Openclaw-Linear-Intent"] ?? "";
+      const response = mockFetchByIntent[intent] ?? mockFetchByIntent["*"] ?? { data: {} };
+      return new Response(JSON.stringify(response), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    }
+    // Queue/fallback mode.
+    const response = mockFetchResponseQueue.length > 0
+      ? mockFetchResponseQueue.shift()!
+      : (mockFetchResponse ?? { data: {} });
+    return new Response(JSON.stringify(response), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
@@ -46,6 +69,8 @@ describe("canary", () => {
   beforeEach(() => {
     resetCanary();
     resetConfigHealth();
+    mockFetchByIntent = null;
+    mockFetchResponseQueue = [];
     mockFetchResponse = null;
     mockFetchShouldThrow = false;
     mockFetchThrowError = "ECONNREFUSED";
@@ -57,9 +82,12 @@ describe("canary", () => {
   });
 
   it("passes when the proxy correctly rejects an illegal move", async () => {
-    // Proxy returns errors — enforcement is working.
-    mockFetchResponse = {
-      errors: [{ message: "[Proxy] 'deploy' is not a legal command in state 'intake'." }],
+    // Use intent-aware mock so the response is deterministic even when startCanary's
+    // initial async runCheck() races with the explicit await runCheck() below.
+    // Any illegal intent → errors (rejected); presence-ping → success (allowed).
+    mockFetchByIntent = {
+      "deploy": { errors: [{ message: "[Proxy] 'deploy' is not a legal command in state 'intake'." }] },
+      "presence-ping": { data: { issueUpdate: { success: true } } },
     };
     installMockFetch();
 
@@ -74,6 +102,31 @@ describe("canary", () => {
     expect(result.passed).toBe(true);
     expect(result.configHealthy).toBe(true);
     expect(result.error).toBeUndefined();
+  });
+
+  it("fails (clamp-shut) when presence-ping is rejected by the proxy", async () => {
+    // Both illegal intent AND presence-ping are rejected — enforcement is too broad (clamp-shut).
+    // Use intent-aware mock for determinism (startCanary's initial check races with startCanary itself).
+    mockFetchByIntent = {
+      "deploy": { errors: [{ message: "[Proxy] 'deploy' is not a legal command." }] },
+      "presence-ping": { errors: [{ message: "[Proxy] 'presence-ping' is not a legal command." }] },
+    };
+    installMockFetch();
+
+    const alerts: CanaryResult[] = [];
+    onCanaryAlert((result) => alerts.push(result));
+
+    startCanary({
+      authToken: "test-token",
+      agentId: "canary-agent",
+      fixtureTicketId: "AI-CANARY",
+      proxyUrl: "http://localhost:3456",
+    });
+
+    await new Promise((r) => setTimeout(r, 50));
+    expect(alerts.length).toBeGreaterThanOrEqual(1);
+    expect(alerts[0].error).toContain("CRITICAL");
+    expect(alerts[0].error).toContain("clamp-shut");
   });
 
   it("fails when enforcement silently allows an illegal move", async () => {
@@ -121,9 +174,11 @@ describe("canary", () => {
   it("recovers when config health is restored", async () => {
     recordFailure("workflow-def", "file not found");
 
-    mockFetchResponse = {
-      errors: [{ message: "[Proxy] 'deploy' is not a legal command." }],
-    };
+    // When config health recovers, runCheck makes 2 fetch calls (illegal + presence-ping).
+    mockFetchResponseQueue = [
+      { errors: [{ message: "[Proxy] 'deploy' is not a legal command." }] },
+      { data: { issueUpdate: { success: true } } },
+    ];
     installMockFetch();
 
     startCanary({
@@ -182,8 +237,10 @@ describe("canary", () => {
   });
 
   it("getLastResult returns the most recent check result", async () => {
-    mockFetchResponse = {
-      errors: [{ message: "[Proxy] blocked" }],
+    // Use intent-aware mock for determinism (startCanary races with explicit runCheck).
+    mockFetchByIntent = {
+      "deploy": { errors: [{ message: "[Proxy] blocked" }] },
+      "presence-ping": { data: { issueUpdate: { success: true } } },
     };
     installMockFetch();
 
@@ -241,10 +298,11 @@ describe("canary", () => {
     const { onAlert: configOnAlert, recordFailure: configRecordFailure, resetConfigHealth } = await import("./config-health.js");
     resetConfigHealth();
 
-    // Start canary
-    mockFetchResponse = {
-      errors: [{ message: "blocked" }],
-    };
+    // Start canary — initial runCheck makes 2 fetch calls (illegal rejected + ping allowed).
+    mockFetchResponseQueue = [
+      { errors: [{ message: "blocked" }] },
+      { data: { issueUpdate: { success: true } } },
+    ];
     installMockFetch();
     startCanary({
       authToken: "test-token",

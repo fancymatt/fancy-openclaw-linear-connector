@@ -206,7 +206,39 @@ export async function runCheck(): Promise<CanaryResult> {
       return result;
     }
 
-    // The proxy correctly rejected the illegal move — enforcement is working.
+    // The proxy correctly rejected the illegal move — enforcement is not silently open.
+
+    // Step 3: Issue a known-legal intent (presence-ping) and verify the proxy ALLOWS it.
+    // This detects the "clamp-shut" failure mode where enforcement blocks everything.
+    const pingResponse = await fetch(`${proxyUrl}/proxy/graphql`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: config.authToken,
+        "X-Openclaw-Agent": agentId,
+        "X-Openclaw-Linear-Intent": "presence-ping",
+      },
+      body: JSON.stringify({
+        query: "mutation CanaryCheck($id: String!) { issueUpdate(id: $id, input: {}) { success } }",
+        variables: { id: config.fixtureTicketId },
+      }),
+    });
+    const pingData = await pingResponse.json() as { errors?: Array<{ message: string }>; data?: unknown };
+    if (pingData.errors && pingData.errors.length > 0) {
+      const pingError = pingData.errors[0]?.message ?? "unknown";
+      const result: CanaryResult = {
+        passed: false,
+        configHealthy: true,
+        error: `CRITICAL: Canary clamp-shut failure — presence-ping was REJECTED on fixture ticket ${config.fixtureTicketId} (enforcement too broad): ${pingError}`,
+        timestamp,
+      };
+      consecutiveFailures++;
+      lastResult = result;
+      log.error(result.error ?? "unknown canary error");
+      fireCanaryAlerts(result);
+      return result;
+    }
+
     consecutiveFailures = 0;
     const result: CanaryResult = {
       passed: true,
@@ -214,7 +246,7 @@ export async function runCheck(): Promise<CanaryResult> {
       timestamp,
     };
     lastResult = result;
-    log.info(`canary: check passed — '${illegalIntent}' correctly rejected on ${config.fixtureTicketId}`);
+    log.info(`canary: check passed — '${illegalIntent}' correctly rejected, presence-ping correctly allowed on ${config.fixtureTicketId}`);
     return result;
 
   } catch (err) {
