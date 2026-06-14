@@ -18,18 +18,13 @@
  */
 
 import fs from "node:fs";
-import path from "node:path";
 import yaml from "js-yaml";
 import { createLogger, componentLogger } from "./logger.js";
+import { defaultCapabilityPolicyPath } from "./instance-config.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "rescue-sweep");
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
-
-const DEFAULT_POLICY_PATH = path.join(
-  process.env.HOME ?? "/home/fancymatt",
-  "obsidian-vault/ai-systems/projects/fleet-orchestration-redesign/config/capability-policy.yaml",
-);
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -315,7 +310,7 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
   const resolvedPolicyPath =
     capabilityPolicyPath ??
     process.env.CAPABILITY_POLICY_PATH ??
-    DEFAULT_POLICY_PATH;
+    defaultCapabilityPolicyPath();
   const policy = loadCapabilityPolicy(resolvedPolicyPath);
   const roleBodiesForRole = buildRoleResolver(policy);
 
