@@ -15,6 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { resetWorkflowCache } from "../workflow-gate.js";
+import { resetPolicyCache } from "../escalation-gate.js";
 
 // ── Test workflow YAML ─────────────────────────────────────────────────────
 
@@ -121,10 +122,60 @@ function makeLabelFetch(labels: string[]): typeof globalThis.fetch {
     );
 }
 
+// ── Test capability policy YAML ───────────────────────────────────────────
+
+const TEST_POLICY_YAML = `
+capabilities:
+  - id: human:escalate
+  - id: linear:transition
+  - id: deploy:execute
+  - id: repo:read
+
+containers:
+  - id: steward
+    grants: [linear:transition, human:escalate]
+  - id: dev
+    grants: [linear:transition]
+  - id: code-review
+    grants: [linear:transition, repo:read]
+  - id: deployment
+    grants: [linear:transition, deploy:execute]
+  - id: main-agent
+    grants: [linear:transition]
+
+bodies:
+  - id: astrid
+    container: steward
+    fills_roles: [steward]
+  - id: charles
+    container: code-review
+    fills_roles: [code-review]
+  - id: felix
+    container: dev
+    fills_roles: [dev]
+  - id: noah
+    container: dev
+    fills_roles: [dev]
+  - id: sage
+    container: dev
+    fills_roles: [dev]
+  - id: igor
+    container: dev
+    fills_roles: [dev]
+  - id: hanzo
+    container: deployment
+    fills_roles: [deployment]
+  - id: ai
+    openclaw_agent: main
+    container: main-agent
+    fills_roles: []
+`;
+
 // ── Setup / teardown ──────────────────────────────────────────────────────
 
 let tmpYamlPath: string;
 let tmpGuidanceDir: string;
+let tmpPolicyPath: string;
 let originalFetch: typeof globalThis.fetch;
 
 beforeAll(() => {
@@ -133,12 +184,16 @@ beforeAll(() => {
   fs.writeFileSync(tmpYamlPath, TEST_WORKFLOW_YAML, "utf8");
   tmpGuidanceDir = path.join(dir, "guidance");
   fs.mkdirSync(path.join(tmpGuidanceDir, "dev-impl"), { recursive: true });
+  tmpPolicyPath = path.join(dir, "capability-policy.yaml");
+  fs.writeFileSync(tmpPolicyPath, TEST_POLICY_YAML, "utf8");
 });
 
 beforeEach(() => {
   resetWorkflowCache();
+  resetPolicyCache();
   process.env.WORKFLOW_DEF_PATH = tmpYamlPath;
   process.env.WORKFLOW_GUIDANCE_DIR = tmpGuidanceDir;
+  process.env.CAPABILITY_POLICY_PATH = tmpPolicyPath;
   originalFetch = globalThis.fetch;
 });
 
@@ -146,6 +201,8 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
   delete process.env.WORKFLOW_DEF_PATH;
   delete process.env.WORKFLOW_GUIDANCE_DIR;
+  delete process.env.CAPABILITY_POLICY_PATH;
+  resetPolicyCache();
   // Remove any guidance files written by tests
   for (const f of fs.readdirSync(path.join(tmpGuidanceDir, "dev-impl"))) {
     fs.rmSync(path.join(tmpGuidanceDir, "dev-impl", f));
