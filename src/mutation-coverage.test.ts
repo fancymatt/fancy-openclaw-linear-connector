@@ -34,6 +34,7 @@ import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents, upsertAgent, updateTokens, getAccessToken, type AgentConfig } from "./agents.js";
 import { resetConfigHealth } from "./config-health.js";
 import { createApp } from "./index.js";
+import { clearWfTicketStore } from "./wf-ticket-store.js";
 
 // ── Shared minimal workflow/policy fixtures ────────────────────────────────
 
@@ -767,6 +768,9 @@ describe("workflow-gate: checkRawMutationInterception — uncovered branches", (
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "g21-raw-"));
     originalFetch = globalThis.fetch;
+    // AI-1488: isolate the wf-ticket store to prevent cross-test pollution.
+    process.env.WF_TICKET_STORE_PATH = path.join(dir, "wf-ticket-store.json");
+    clearWfTicketStore();
     resetPolicyCache();
     resetWorkflowCache();
     resetConfigHealth();
@@ -777,6 +781,8 @@ describe("workflow-gate: checkRawMutationInterception — uncovered branches", (
     delete process.env.WORKFLOW_DEF_PATH;
     delete process.env.CAPABILITY_POLICY_PATH;
     delete process.env.AGENTS_FILE;
+    delete process.env.WF_TICKET_STORE_PATH;
+    clearWfTicketStore();
     resetPolicyCache();
     resetWorkflowCache();
     resetConfigHealth();
@@ -899,8 +905,21 @@ describe("workflow-gate: checkRawMutationInterception — uncovered branches", (
     expect(result).toMatch(/ticket id could not be resolved/i);
   });
 
-  // AC2-WG-16: raw mutation not touching workflow fields → pass-through (line 1179)
-  it("passes through issueUpdate that only changes title/description (no workflow fields)", async () => {
+  // AC2-WG-16: raw mutation on ad-hoc ticket → pass-through regardless of fields (AI-1488 default-deny
+  // only applies to governed wf: tickets — ad-hoc tickets remain pass-through per §4.6).
+  it("passes through issueUpdate that changes title/description on an ad-hoc (non-wf:) ticket", async () => {
+    // Mock returns no wf:* label → ad-hoc ticket → pass-through even under AI-1488.
+    globalThis.fetch = makeFetch({
+      "X": {
+        data: {
+          issue: {
+            labels: { nodes: [{ name: "bug" }] },
+            delegate: null,
+          },
+        },
+      },
+    });
+
     const result = await checkRawMutationInterception(
       { query: "mutation { issueUpdate(id: \"X\", input: { title: \"new\" }) { success } }", variables: { id: "X" } },
       "X",
@@ -908,6 +927,7 @@ describe("workflow-gate: checkRawMutationInterception — uncovered branches", (
       "charles",
     );
 
+    // Ad-hoc ticket: pass-through (§4.6). AI-1488 default-deny only blocks wf: tickets.
     expect(result).toBeNull();
   });
 

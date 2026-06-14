@@ -50,6 +50,7 @@ import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
 import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
+import { recordWfTicket, isWfTicket, removeWfTicket } from "./wf-ticket-store.js";
 
 /**
  * Phase 6.5 / H-6: Label read-only projection + override path + drift reconciliation.
@@ -924,6 +925,14 @@ export async function checkWorkflowRules(
   // §4.4: break-glass escape is legal from every state — never block it.
   if (intent === breakGlassCommand) return null;
 
+  // AI-1488: Activity/presence ping — allowed on wf: tickets (state-preserving,
+  // no state/delegate/assignee mutation). Observability: the caller records
+  // engagement without corrupting workflow state.
+  if (intent === "begin-work") return null;
+
+  // AI-1488: Read-only observation intents — always allowed, cannot corrupt state.
+  if (intent === "observe-issue" || intent === "note") return null;
+
   // AI-1460/AI-1574: refuse-work is caller-gated. Only the current delegate or
   // the workflow steward (break_glass.owner_role) may refuse on a governed
   // ticket. A non-delegate, non-steward caller is blocked to prevent third-party
@@ -1174,14 +1183,25 @@ export async function checkRawMutationInterception(
 ): Promise<string | null> {
   if (!body) return null;
 
-  // Only intercept issueUpdate mutations.
+  // AI-1488: default-deny allowlist for wf: ticket mutations.
+  // commentCreate is always safe — it's the note command (posting a comment can't corrupt
+  // workflow state). All other mutations are checked against the governed-ticket store.
   const q = body.query ?? "";
-  if (!q.includes("issueUpdate")) return null;
 
-  // Check if the mutation touches any workflow-affecting field.
-  // Blocked: stateId (status), assigneeId (assignee), labelIds (label manipulation).
-  // Allowed: title, description, priority, dueDate, and other non-workflow fields.
-  //
+  // commentCreate is always safe — pass through without checking.
+  if (q.includes("commentCreate") && !q.includes("issueUpdate") && !q.includes("issueDelete")) return null;
+
+  // Only intercept mutations that might corrupt a governed ticket's state.
+  // AI-1488: expanded from issueUpdate-only to also cover issueDelete, commentDelete,
+  // issueArchive, and issueMoveToTeam — previously these were invisible to the gate.
+  const isMutationWeIntercept =
+    q.includes("issueUpdate") ||
+    q.includes("issueDelete") ||
+    q.includes("commentDelete") ||
+    q.includes("issueArchive") ||
+    q.includes("issueMoveToTeam");
+  if (!isMutationWeIntercept) return null;
+
   // AI-1402 follow-up: a field can reach issueUpdate three ways and the old
   // detector only saw the first, so inlining the input literally in the query
   // string (or routing the value through a differently-named scalar variable)
@@ -1213,32 +1233,45 @@ export async function checkRawMutationInterception(
   // guard entirely — a non-delegate could yank the delegate off the rightful owner.
   const hasDelegateChange = touches("delegateId");
 
-  if (!hasStateChange && !hasAssigneeChange && !hasLabelChange && !hasDelegateChange) return null;
+  // AI-1488: DEFAULT-DENY — removed the old `if (!hasState && !hasAssignee && !hasLabel
+  // && !hasDelegate) return null;` escape hatch. Under default-deny, ALL intercepted
+  // mutation types (including title/description/priority issueUpdates, issueDelete,
+  // commentDelete, etc.) are blocked on governed tickets regardless of which fields
+  // they touch. The issueId check below gates whether this matters.
 
-  // AI-1347: this is a raw workflow-affecting mutation but the caller did not
-  // expose the ticket id in a place the proxy could resolve (no id variable, no
-  // inline id in the query). We cannot fetch labels to confirm whether the ticket
-  // is governed, so we cannot prove it is safe. Fail CLOSED: a raw stateId /
-  // assigneeId / labelIds change with no resolvable ticket and no intent header
-  // is exactly the bypass shape this gate exists to stop.
+  // AI-1347: a governed-ticket mutation but the caller did not expose the ticket id
+  // in a place the proxy could resolve. Fail CLOSED.
   if (!issueId) {
-    log.warn(`workflow-gate: raw workflow-field mutation with unresolvable issueId — blocking (fail-closed)`);
+    log.warn(`workflow-gate: raw mutation with unresolvable issueId — blocking (fail-closed)`);
     return (
-      `[Proxy] Direct status/assignee/label changes on workflow tickets must go through ` +
+      `[Proxy] Direct mutations on workflow tickets must go through ` +
       `workflow commands, and the ticket id could not be resolved from this request. ` +
       `Re-issue using the linear CLI workflow commands (or pass the ticket id as a variable).`
     );
   }
 
-  // This is a raw workflow-affecting mutation — check if the ticket is on a workflow.
+  // AI-1488: Check the store first (authoritative, label-drift resistant).
+  // Then fall back to labels from the Linear API.
+  const inStore = await isWfTicket(issueId);
   const { labels, delegateId } = await fetchTicketContext(issueId, authToken);
   const workflowId = getWorkflowId(labels);
-  if (!workflowId) return null; // ad-hoc ticket — pass-through
+
+  // If the store says governed but labels don't show wf:* (label drift), log a warning
+  // and treat as governed (store is authoritative).
+  if (inStore && !workflowId) {
+    log.warn(`workflow-gate: store says ${issueId} is a wf: ticket but no wf:* label found — label drift detected, treating as governed (store authoritative)`);
+  }
+
+  // If neither the store nor labels indicate a workflow ticket, pass through (ad-hoc).
+  if (!inStore && !workflowId) return null;
+
+  // Use the label-derived workflowId if available, otherwise use a sentinel.
+  const effectiveWorkflowId = workflowId ?? "(store-keyed)";
 
   // AI-1402: Fail-closed on unknown caller on governed workflow tickets.
   // If the caller body is not registered in the capability policy, block the mutation.
   if (bodyId && !(await isBodyKnown(bodyId))) {
-    log.warn(`workflow-gate: unknown caller '${bodyId}' raw mutation on wf:${workflowId} ticket ${issueId} — blocking`);
+    log.warn(`workflow-gate: unknown caller '${bodyId}' raw mutation on wf:${effectiveWorkflowId} ticket ${issueId} — blocking`);
     return (
       `[Proxy] Unknown caller '${bodyId}' blocked on workflow ticket. ` +
       `Ensure this agent is registered in the capability policy.`
@@ -1246,118 +1279,68 @@ export async function checkRawMutationInterception(
   }
 
   let def: WorkflowDef | undefined;
-  try {
-    const registry = await loadWorkflowRegistry();
-    def = registry.get(workflowId);
-  } catch {
-    return null; // fail-open
+  if (workflowId) {
+    try {
+      const registry = await loadWorkflowRegistry();
+      def = registry.get(workflowId);
+    } catch {
+      return null; // fail-open
+    }
+    if (!def) return null; // unknown workflow — pass-through (AI-1530)
   }
 
-  if (!def) return null; // unknown workflow — pass-through (AI-1530)
-
-  // AI-1535: a *delegate-only* raw change (delegateId changed, no state/assignee/
-  // label) gets delegate-only semantics rather than the blanket block below. The
-  // delegate-routing meta-commands (handoff-work, undelegate) write delegateId
-  // with no intent header, and they are LEGITIMATE for the current delegate —
-  // blanket-blocking them would break re-routing. But a non-delegate (e.g. a prior
-  // owner's lingering session, as in the AI-1531 dogfood) must not be able to yank
-  // the delegate. Mirror the intent-path delegate-only rule (lines ~912-925):
-  //   - caller IS the current delegate            → allow (legitimate re-route)
-  //   - caller is a known non-delegate            → block
-  //   - caller unverifiable + ticket has delegate → block (AI-1400 B2 parity)
-  //   - no current delegate / no caller+delegate  → fail-open (establishing first delegate)
+  // AI-1488 / AI-1535: Under default-deny, raw delegate changes on wf: tickets are
+  // BLOCKED even for the current delegate. Delegates must use workflow transition
+  // verbs (accept, submit, etc.) or break-glass to change the delegate.
+  // Previously the current delegate could do raw delegate-only changes (handoff-work,
+  // undelegate path). Under AI-1488 this path is closed — all delegate manipulation
+  // must flow through workflow commands.
+  //
+  // Historical note: the old code allowed the current delegate to re-route via raw
+  // delegateId writes. Under default-deny, ALL issueUpdate mutations (including
+  // delegate-only) are blocked on governed tickets. The delegate must use the
+  // workflow verbs or the break-glass escape.
   const delegateOnlyChange =
     hasDelegateChange && !hasStateChange && !hasAssigneeChange && !hasLabelChange;
   if (delegateOnlyChange) {
-    if (callerLinearUserId && delegateId && callerLinearUserId === delegateId) {
-      return null; // current delegate may re-route
-    }
-    if (!callerLinearUserId && delegateId) {
-      log.warn(`workflow-gate: raw delegate unknown-caller block agent=${bodyId} ticket=${issueId}`);
-      return (
-        `[Proxy] Direct delegate change blocked: caller '${bodyId}' cannot be verified and ${issueId} has a known delegate. ` +
-        `Register the agent in agents.json with a linearUserId, or re-route via a workflow command.`
-      );
-    }
-    if (callerLinearUserId && delegateId && callerLinearUserId !== delegateId) {
-      log.warn(`workflow-gate: raw delegate-only block agent=${bodyId} ticket=${issueId} (not current delegate)`);
-      return (
-        `[Proxy] Direct delegate change blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
-        `Only the ticket delegate may re-route it (use handoff-work as the delegate, or advance via a workflow transition verb).`
-      );
-    }
-    // AI-1570: no current delegate, but the ticket is governed. The old code
-    // fail-opened here, letting ANY known body ESTABLISH a delegate — including a
-    // stale out-of-role session (the AI-1560 dogfood: Igor, role `dev`, was sitting
-    // in `deployment` state and re-spawned a duplicate Hanzo by writing the delegate
-    // after it had been cleared). Authorize the first-delegate write by role: the
-    // caller may only set the delegate if it fills the current state's owner_role or
-    // the workflow steward (break-glass owner) role. Fail open only on genuine
-    // resolution failure (no state label, unknown/terminal/ownerless state, or roles
-    // with zero bodies — a policy gap) so legitimate traffic is never blocked.
-    const stateId = getCurrentState(labels);
-    if (!stateId) return null; // no state label — can't determine owner, fail-open
-    // Enrollment carve-out: at the workflow ENTRY state a known orchestrator (e.g.
-    // `ai`, which fills no role) legitimately establishes the first delegate when a
-    // ticket joins the workflow. The routing-guard corrects the target to the legal
-    // state owner on the webhook side, so the worst case is a dispatch to the rightful
-    // owner. The AI-1560 incident was at `deployment` (a mid-workflow state), not the
-    // entry state, so it stays blocked by the role check below. Only applies with a
-    // known caller (unknown bodies were already rejected above, AI-1402).
-    if (bodyId && def.entry_state && stateId === def.entry_state) return null;
-    // AI-1579: recovery-actor carve-out. A configured recovery identity (e.g.
-    // `ai`) may re-establish a delegate on a governed ticket whose delegate is
-    // currently EMPTY (orphaned) at ANY state, including a mid-workflow state
-    // whose owner_role the actor does not fill. This is the authorization
-    // counterpart to the stale-session recovery machinery (StaleSessionForensics
-    // .recoverTicket / NoActivityDetector): when a delegate's session dies without
-    // advancing the ticket, recovery clears the delegate and must re-dispatch by
-    // writing a new delegateId — a raw write from `ai`, which the role check below
-    // would reject (the orchestrator fills no workflow role). Scope:
-    //   - only reachable when the current delegate is empty (every active-delegate
-    //     case returned above) — so this can NEVER steal a live delegate;
-    //   - only the configured recovery actor(s); every other out-of-role caller is
-    //     still blocked by the role check below (the AI-1560 Igor incident at
-    //     `deployment` stays blocked);
-    //   - the routing-guard still corrects the dispatch target to the legal state
-    //     owner on the webhook side, so the worst case is a dispatch to the
-    //     rightful owner.
-    const recoveryActors = Array.isArray(def.recovery_actor)
-      ? def.recovery_actor
-      : def.recovery_actor
-        ? [def.recovery_actor]
-        : [];
-    if (bodyId && recoveryActors.includes(bodyId)) {
-      const ownerRoleForLog = def.states.find((s) => s.id === stateId)?.owner_role ?? "(ownerless)";
-      log.warn(
-        `workflow-gate: recovery-actor first-delegate ALLOW actor=${bodyId} ticket=${issueId} state=${stateId} resolved_owner_role=${ownerRoleForLog} (delegate was empty — orphaned-ticket recovery)`,
-      );
-      return null;
-    }
-    const stateNode = def.states.find((s) => s.id === stateId);
-    const ownerRole = stateNode?.owner_role;
-    if (!ownerRole) return null; // ownerless/terminal state — fail-open
-    const authorized = new Set<string>(await resolveBodiesForRole(ownerRole));
-    const stewardRole = def.break_glass?.owner_role;
-    if (stewardRole) {
-      for (const b of await resolveBodiesForRole(stewardRole)) authorized.add(b);
-    }
-    if (authorized.size === 0) return null; // misconfigured role (no bodies) — fail-open
-    if (!bodyId || !authorized.has(bodyId)) {
-      log.warn(
-        `workflow-gate: raw first-delegate block agent=${bodyId} ticket=${issueId} state=${stateId} owner_role=${ownerRole} (caller is not the state owner or steward)`,
-      );
-      return (
-        `[Proxy] Direct delegate change blocked: '${bodyId}' may not establish a delegate on ${issueId} ` +
-        `(state '${stateId}' is owned by role '${ownerRole}'). ` +
-        `Only the state owner or workflow steward may set the delegate — advance the ticket via a workflow transition verb instead.`
-      );
-    }
-    return null; // caller fills the owning/steward role — allow first-delegate write
+    // AI-1488: block even the current delegate from raw delegate manipulation.
+    // (Previously: allowed if callerLinearUserId === delegateId.)
+    log.warn(`workflow-gate: raw delegate change blocked on wf:${effectiveWorkflowId} ticket ${issueId} (AI-1488 default-deny)`);
+    return (
+      `[Proxy] Direct delegate change blocked on this workflow ticket. ` +
+      `Delegates may only change via workflow transition verbs (accept, submit, etc.) or break-glass. ` +
+      `To signal a blocker while retaining the delegate, use: 'block --blocked-by <id>' or 'needs-human <assignee>'.`
+    );
   }
 
-  const breakGlassCommand = def.break_glass?.command ?? "escape";
+  // AI-1488: The old delegate-only routing path is now closed. We fall through to the
+  // blanket block below for ALL other mutations on governed tickets (including
+  // first-delegate writes, recovery-actor paths, etc.). Those paths must now go
+  // through workflow verbs. The complex first-delegate/recovery-actor logic below
+  // (AI-1570, AI-1579) is retained only for the non-delegate-only case via the
+  // blanket block path, but since delegate-only is handled above, the remaining
+  // mutations always reach the blanket block.
+
+  // AI-1488: placeholder for the old first-delegate / recovery-actor carve-outs.
+  // Under default-deny these are not applicable to the raw mutation path — they
+  // must go through workflow verbs. We skip directly to the blanket block below.
+
+  // (Old AI-1570/AI-1579 first-delegate logic removed under AI-1488 default-deny.)
+
+  // AI-1488: Fall through to blanket block for all remaining mutations on governed tickets.
+  // Build a helpful error message naming the legal workflow verbs for the current state.
+  // When def is not available (store-keyed ticket with no labels), use a generic message.
+  const breakGlassCommand = def?.break_glass?.command ?? "escape";
   const currentState = getCurrentState(labels);
+
+  if (!def) {
+    // Store-keyed ticket but no workflow definition resolvable — generic block.
+    return (
+      `[Proxy] Direct mutation blocked on this governed workflow ticket. ` +
+      `Use workflow commands to advance this ticket. ` +
+      `To exit the workflow, use the break-glass escape command.`
+    );
+  }
 
   if (!currentState) {
     // No state label — can't determine legal moves, but still block with a generic message.
@@ -1378,7 +1361,7 @@ export async function checkRawMutationInterception(
   // Build per-command help strings with assignment info.
   const helpLines = await Promise.all(
     (stateNode.transitions ?? []).map(async (t) => {
-      const { bodies, mode } = await resolveTransitionTargets(t, def);
+      const { bodies, mode } = await resolveTransitionTargets(t, def!);
       let cmd = `linear ${t.command} ${issueId}`;
       if (mode === "required") {
         cmd += ` <${bodies.join("|")}>`;
@@ -1394,11 +1377,39 @@ export async function checkRawMutationInterception(
   if (hasLabelChange) changedFields.push("labels");
   if (hasDelegateChange) changedFields.push("delegate");
 
-  return (
-    `[Proxy] Direct ${changedFields.join("/")} changes are blocked on this workflow ticket ` +
-    `(state: **${currentState}**). Use workflow commands instead:\n\n` +
-    helpLines.join("\n")
-  );
+  // AI-1488: under default-deny, any mutation type (including non-field mutations
+  // like issueDelete, commentDelete) may reach here. Provide appropriate messaging.
+  // Preserve the old "changes are blocked" phrasing for field-level mutations (backward compat).
+  let blockMessage: string;
+  if (q.includes("issueDelete")) {
+    blockMessage = `[Proxy] Direct delete is blocked on this workflow ticket ` +
+      `(state: **${currentState}**). Use workflow commands instead:\n\n` +
+      helpLines.join("\n");
+  } else if (q.includes("commentDelete")) {
+    blockMessage = `[Proxy] Direct comment-delete is blocked on this workflow ticket ` +
+      `(state: **${currentState}**). Use workflow commands instead:\n\n` +
+      helpLines.join("\n");
+  } else if (q.includes("issueArchive")) {
+    blockMessage = `[Proxy] Direct archive is blocked on this workflow ticket ` +
+      `(state: **${currentState}**). Use workflow commands instead:\n\n` +
+      helpLines.join("\n");
+  } else if (q.includes("issueMoveToTeam")) {
+    blockMessage = `[Proxy] Direct team-move is blocked on this workflow ticket ` +
+      `(state: **${currentState}**). Use workflow commands instead:\n\n` +
+      helpLines.join("\n");
+  } else if (changedFields.length > 0) {
+    // Field-level mutations: preserve old wording for backward compatibility.
+    blockMessage = `[Proxy] Direct ${changedFields.join("/")} changes are blocked on this workflow ticket ` +
+      `(state: **${currentState}**). Use workflow commands instead:\n\n` +
+      helpLines.join("\n");
+  } else {
+    // Any other issueUpdate (title, description, priority, etc.) — AI-1488 default-deny.
+    blockMessage = `[Proxy] Direct mutation is blocked on this workflow ticket ` +
+      `(state: **${currentState}**). Use workflow commands instead:\n\n` +
+      helpLines.join("\n");
+  }
+
+  return blockMessage;
 }
 
 // ── Layer 1: Proactive legal-verb re-injection at completion (AI-1387) ────
@@ -1603,6 +1614,8 @@ export async function applyStateTransition(
     log.info(
       `workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels`,
     );
+    // AI-1488: Remove the wf-ticket store record since the ticket is leaving governance.
+    await removeWfTicket(issueId);
     return;
   }
 
@@ -1916,6 +1929,11 @@ export async function applyStateTransition(
     }
   }
 
+  // AI-1488: Record this ticket as a governed wf: ticket in the store.
+  // This ensures the store is authoritative even if the wf:* label is stripped later.
+  // Called on every successful transition (including the initial entry transition).
+  await recordWfTicket(issueId, workflowId);
+
   // Step 4 (AI-1498): Resolve native stateId from YAML native_state field.
   // The proxy is now the SOLE writer of all three facets: label, delegate, AND native state.
   // Fail-closed: if the destination state has a native_state field but we can't resolve
@@ -1991,6 +2009,14 @@ export async function applyStateTransition(
   // Clean up implementer record on terminal states
   if (isTerminal) {
     await removeImplementer(issueId);
+  }
+  // AI-1488: Remove wf-ticket store record on escape or ad-hoc demote (ticket leaves governance).
+  if (toStateName === "escape" || toStateName === "__ad_hoc__") {
+    await removeWfTicket(issueId);
+  }
+  // AI-1488: Remove wf-ticket store record on terminal state (ticket done).
+  if (isTerminal) {
+    await removeWfTicket(issueId);
   }
 
   // ── Phase 5 / B-2: Fan-out edge (spawning 1→N) ──────────────────────

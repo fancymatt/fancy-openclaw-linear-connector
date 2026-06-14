@@ -14,6 +14,7 @@ import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { resetWorkflowCache } from "./workflow-gate.js";
 import { resetConfigHealth } from "./config-health.js";
+import { clearWfTicketStore } from "./wf-ticket-store.js";
 
 const TEST_POLICY_YAML = `
 capabilities:
@@ -1117,6 +1118,9 @@ describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
     process.env.AGENTS_FILE = writeAgents(dir);
     process.env.CAPABILITY_POLICY_PATH = writePolicyFile(dir, TEST_POLICY_WITH_MERGE_YAML);
     writeWorkflowFile(dir);
+    // AI-1488: isolate the wf-ticket store so prior tests cannot pollute this suite.
+    process.env.WF_TICKET_STORE_PATH = path.join(dir, "wf-ticket-store.json");
+    clearWfTicketStore();
     resetPolicyCache();
     resetWorkflowCache();
     reloadAgents();
@@ -1137,6 +1141,7 @@ describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
     appState.watchdog.stop();
     appState.noActivityDetector.stop();
     appState.managingPoller.stop();
+    clearWfTicketStore();
   });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1214,7 +1219,9 @@ describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
     expect(res.body.data).toBeDefined();
   });
 
-  it("allows raw mutations without stateId/assigneeId on workflow tickets", async () => {
+  // AI-1488: Under default-deny, ALL issueUpdate mutations on wf: tickets are blocked,
+  // including title-only mutations. This test now verifies the block behavior.
+  it("AI-1488: blocks raw mutations without stateId/assigneeId on workflow tickets (default-deny)", async () => {
     globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
 
     const res = await request(appState.app)
@@ -1226,9 +1233,10 @@ describe("proxy — Layer 2 raw mutation interception (AI-1387)", () => {
         variables: { id: "issue-uuid", input: { title: "Updated title" } },
       });
 
+    // AI-1488: default-deny — title-only mutations on wf: tickets are now blocked.
     expect(res.status).toBe(200);
-    expect(res.body.errors).toBeUndefined();
-    expect(res.body.data).toBeDefined();
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("blocked");
   });
 
   it("allows intent-headed requests through (those use B1 validation, not Layer 2)", async () => {
