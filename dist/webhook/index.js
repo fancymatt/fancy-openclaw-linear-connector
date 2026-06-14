@@ -10,7 +10,7 @@ import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgent
 import { checkAgentLiveness } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock } from "../routing-guard.js";
-import { fetchWorkflowLabels } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing } from "../workflow-gate.js";
 import { resignalPendingTickets } from "../bag/index.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { isLinearIssueStillRoutedToAgent, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
@@ -46,6 +46,11 @@ function appendOperationalEvent(store, input) {
 }
 function acknowledgeAgentAuthoredActivity(event, onAgentActivity) {
     if (!onAgentActivity)
+        return;
+    // Only genuine human-visible authored content (comments, agent session events)
+    // triggers the Doing-flip. Issue state/label updates are connector facet writes
+    // that must not echo back as activity signals (AI-1564).
+    if (event.type !== "Comment" && event.type !== "AgentSessionEvent")
         return;
     const actorId = event.actor?.id;
     if (!actorId)
@@ -186,6 +191,22 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
             return;
         }
         acknowledgeAgentAuthoredActivity(event, onAgentActivity);
+        // AI-1584: Enrollment gap repair — heal wf:* tickets that lack state:* label.
+        // Fires on every Issue event (create or update). Fail-open: never blocks routing.
+        if (event.type === "Issue") {
+            const enrollToken = process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+            const enrollData = event.data;
+            const enrollIssueId = enrollData?.id;
+            if (enrollToken && enrollIssueId) {
+                enrollIfMissing(enrollIssueId, enrollToken).then((result) => {
+                    if (result.enrolled) {
+                        log.info(`Enrollment gap healed: stamped state:${result.entryState} on ${enrollIssueId}`);
+                    }
+                }).catch((err) => {
+                    log.warn(`enrollIfMissing failed for ${enrollIssueId}: ${err instanceof Error ? err.message : String(err)}`);
+                });
+            }
+        }
         // AgentSessionEvent — create session for Linear UI widget
         if (event.type === "AgentSessionEvent") {
             // Create a Linear agent session to show "Agent working" widget

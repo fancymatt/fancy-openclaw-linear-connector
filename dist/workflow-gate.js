@@ -702,25 +702,49 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
     //   - The proxy only validates against the loaded workflow def.
     // AC3 (B-3): Children cannot address the parent — enforced by the absence of
     // any upward-directed command in the dev-impl state machine.
+    const breakGlassCommand = def.break_glass?.command ?? "escape";
     // AI-1402: Fail-closed on unknown caller. When the caller's body is not in the
     // capability policy and the ticket is a governed workflow ticket, block the mutation.
-    // This is consistent with AI-1400 B2: unknown caller + known delegate = block.
-    if (!(await isBodyKnown(bodyId))) {
-        log.warn(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} ticket ${issueId} — blocking`);
-        return (`[Proxy] Unknown caller '${bodyId}' blocked on workflow ticket. ` +
-            `Ensure this agent is registered in the capability policy.`);
+    // Exception: an actual human (unknown to the AI capability policy) must be able to
+    // sign off on stakes-gated high-stakes transitions — see stakes check below.
+    const isCallerKnown = await isBodyKnown(bodyId);
+    if (!isCallerKnown) {
+        // Allow unknown callers through ONLY for the human sign-off path.
+        const preState = getCurrentState(labels);
+        const preNode = preState ? def.states.find((s) => s.id === preState) : undefined;
+        const preTx = preNode?.transitions?.find((t) => t.command === intent);
+        const isHumanSignoffPath = !!(preTx?.requires_human_signoff_above_stakes &&
+            def.stakes &&
+            resolveStakesLevel(labels, def.stakes) >= def.stakes.threshold);
+        if (!isHumanSignoffPath) {
+            log.warn(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} ticket ${issueId} — blocking`);
+            return (`[Proxy] Unknown caller '${bodyId}' blocked on workflow ticket. ` +
+                `Ensure this agent is registered in the capability policy.`);
+        }
+        log.info(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} — human sign-off path, allowing through`);
     }
-    const breakGlassCommand = def.break_glass?.command ?? "escape";
     // §4.4: break-glass escape is legal from every state — never block it.
     if (intent === breakGlassCommand)
         return null;
-    // AI-1460: refuse-work is a meta-command (ownership/routing gesture), not a
-    // workflow transition. A wrongly-dispatched agent must always be able to
-    // decline work regardless of workflow state. Bypasses both state validation
-    // and delegate-only enforcement (the refusal itself clears the delegate).
-    // Still requires a known caller — unknown agents cannot refuse.
-    if (intent === "refuse-work")
-        return null;
+    // AI-1460/AI-1574: refuse-work is caller-gated. Only the current delegate or
+    // the workflow steward (break_glass.owner_role) may refuse on a governed
+    // ticket. A non-delegate, non-steward caller is blocked to prevent third-party
+    // rerouting. When no delegate is set, fail-open (nothing to protect).
+    if (intent === "refuse-work") {
+        if (!delegateId)
+            return null;
+        if (callerLinearUserId && callerLinearUserId === delegateId)
+            return null;
+        const stewardRole = def.break_glass?.owner_role;
+        if (stewardRole) {
+            const stewards = await resolveBodiesForRole(stewardRole);
+            if (stewards.includes(bodyId))
+                return null;
+        }
+        log.warn(`workflow-gate: refuse-work blocked agent=${bodyId} ticket=${issueId} (not delegate or steward)`);
+        return (`[Proxy] 'refuse-work' blocked: '${bodyId}' is not the current delegate or the workflow steward. ` +
+            `Only the assigned delegate or workflow steward may refuse work on a governed ticket.`);
+    }
     // AI-1397: delegate-only enforcement at proxy (CLI-version-agnostic).
     // If both the caller's Linear user ID and the ticket's delegate ID are known,
     // block any agent that is not the current delegate. Fails open when either is
@@ -774,7 +798,8 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
             `Legal moves: ${legalMoves}.`);
     }
     // Capability gate — e.g. deploy:execute is Hanzo-only (§16.2).
-    if (match.requires_capability) {
+    // Unknown callers (humans on the sign-off path) bypass capability checks.
+    if (match.requires_capability && isCallerKnown) {
         const allowed = await bodyHasCapability(bodyId, match.requires_capability);
         if (!allowed) {
             return (`[Proxy] '${intent}' requires the '${match.requires_capability}' capability; ` +
@@ -882,10 +907,7 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
             legalBodies = []; // fail-open
         }
         if (legalBodies.length > 1) {
-            if (!target) {
-                return `[Proxy] '${intent}' requires an assignment target. Legal targets for role '${ownerRole}': ${legalBodies.join(', ')}.`;
-            }
-            if (!legalBodies.includes(target)) {
+            if (target && !legalBodies.includes(target)) {
                 return `[Proxy] '${target}' is not a legal assignment target for '${intent}'. Legal targets for role '${ownerRole}': ${legalBodies.join(', ')}.`;
             }
         }
@@ -1024,7 +1046,73 @@ export async function checkRawMutationInterception(body, issueId, authToken, bod
             return (`[Proxy] Direct delegate change blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
                 `Only the ticket delegate may re-route it (use handoff-work as the delegate, or advance via a workflow transition verb).`);
         }
-        return null; // no current delegate to protect — fail-open
+        // AI-1570: no current delegate, but the ticket is governed. The old code
+        // fail-opened here, letting ANY known body ESTABLISH a delegate — including a
+        // stale out-of-role session (the AI-1560 dogfood: Igor, role `dev`, was sitting
+        // in `deployment` state and re-spawned a duplicate Hanzo by writing the delegate
+        // after it had been cleared). Authorize the first-delegate write by role: the
+        // caller may only set the delegate if it fills the current state's owner_role or
+        // the workflow steward (break-glass owner) role. Fail open only on genuine
+        // resolution failure (no state label, unknown/terminal/ownerless state, or roles
+        // with zero bodies — a policy gap) so legitimate traffic is never blocked.
+        const stateId = getCurrentState(labels);
+        if (!stateId)
+            return null; // no state label — can't determine owner, fail-open
+        // Enrollment carve-out: at the workflow ENTRY state a known orchestrator (e.g.
+        // `ai`, which fills no role) legitimately establishes the first delegate when a
+        // ticket joins the workflow. The routing-guard corrects the target to the legal
+        // state owner on the webhook side, so the worst case is a dispatch to the rightful
+        // owner. The AI-1560 incident was at `deployment` (a mid-workflow state), not the
+        // entry state, so it stays blocked by the role check below. Only applies with a
+        // known caller (unknown bodies were already rejected above, AI-1402).
+        if (bodyId && def.entry_state && stateId === def.entry_state)
+            return null;
+        // AI-1579: recovery-actor carve-out. A configured recovery identity (e.g.
+        // `ai`) may re-establish a delegate on a governed ticket whose delegate is
+        // currently EMPTY (orphaned) at ANY state, including a mid-workflow state
+        // whose owner_role the actor does not fill. This is the authorization
+        // counterpart to the stale-session recovery machinery (StaleSessionForensics
+        // .recoverTicket / NoActivityDetector): when a delegate's session dies without
+        // advancing the ticket, recovery clears the delegate and must re-dispatch by
+        // writing a new delegateId — a raw write from `ai`, which the role check below
+        // would reject (the orchestrator fills no workflow role). Scope:
+        //   - only reachable when the current delegate is empty (every active-delegate
+        //     case returned above) — so this can NEVER steal a live delegate;
+        //   - only the configured recovery actor(s); every other out-of-role caller is
+        //     still blocked by the role check below (the AI-1560 Igor incident at
+        //     `deployment` stays blocked);
+        //   - the routing-guard still corrects the dispatch target to the legal state
+        //     owner on the webhook side, so the worst case is a dispatch to the
+        //     rightful owner.
+        const recoveryActors = Array.isArray(def.recovery_actor)
+            ? def.recovery_actor
+            : def.recovery_actor
+                ? [def.recovery_actor]
+                : [];
+        if (bodyId && recoveryActors.includes(bodyId)) {
+            const ownerRoleForLog = def.states.find((s) => s.id === stateId)?.owner_role ?? "(ownerless)";
+            log.warn(`workflow-gate: recovery-actor first-delegate ALLOW actor=${bodyId} ticket=${issueId} state=${stateId} resolved_owner_role=${ownerRoleForLog} (delegate was empty — orphaned-ticket recovery)`);
+            return null;
+        }
+        const stateNode = def.states.find((s) => s.id === stateId);
+        const ownerRole = stateNode?.owner_role;
+        if (!ownerRole)
+            return null; // ownerless/terminal state — fail-open
+        const authorized = new Set(await resolveBodiesForRole(ownerRole));
+        const stewardRole = def.break_glass?.owner_role;
+        if (stewardRole) {
+            for (const b of await resolveBodiesForRole(stewardRole))
+                authorized.add(b);
+        }
+        if (authorized.size === 0)
+            return null; // misconfigured role (no bodies) — fail-open
+        if (!bodyId || !authorized.has(bodyId)) {
+            log.warn(`workflow-gate: raw first-delegate block agent=${bodyId} ticket=${issueId} state=${stateId} owner_role=${ownerRole} (caller is not the state owner or steward)`);
+            return (`[Proxy] Direct delegate change blocked: '${bodyId}' may not establish a delegate on ${issueId} ` +
+                `(state '${stateId}' is owned by role '${ownerRole}'). ` +
+                `Only the state owner or workflow steward may set the delegate — advance the ticket via a workflow transition verb instead.`);
+        }
+        return null; // caller fills the owning/steward role — allow first-delegate write
     }
     const breakGlassCommand = def.break_glass?.command ?? "escape";
     const currentState = getCurrentState(labels);
@@ -1726,5 +1814,65 @@ async function issueUpdateDelegateOnly(internalId, delegateLinearUserId, authTok
         log.warn(`workflow-gate: delegate-only issueUpdate failed for ${internalId}: ${msg}`);
         return false;
     }
+}
+/**
+ * AI-1584: Enrollment gap repair.
+ *
+ * Detects and heals the dead-on-arrival condition where a ticket carries a `wf:*`
+ * label but no `state:*` label — a gap that occurs when tickets are created via
+ * bulk scripts or the raw Linear API and the entry-state stamp is never applied.
+ *
+ * This function is idempotent: it is a no-op when the ticket already has a
+ * `state:*` label or when no `wf:*` label is present (ad-hoc ticket).
+ *
+ * Called from the webhook inbound path on every Issue event so gaps are healed
+ * within one reconciliation cycle (i.e. the next webhook fire after creation).
+ *
+ * Fail-open: any API or registry failure logs a warning and returns
+ * `{ enrolled: false }` — the inbound path is never blocked by enrollment.
+ */
+export async function enrollIfMissing(issueId, authToken) {
+    const issue = await fetchIssueWithLabels(issueId, authToken);
+    if (!issue) {
+        log.warn(`workflow-gate: enrollIfMissing: failed to fetch labels for ${issueId} — skipping`);
+        return { enrolled: false };
+    }
+    const labelNames = issue.labels.map((l) => l.name);
+    const workflowId = getWorkflowId(labelNames);
+    if (!workflowId)
+        return { enrolled: false }; // ad-hoc ticket
+    const currentState = getCurrentState(labelNames);
+    if (currentState)
+        return { enrolled: false }; // already enrolled
+    // Gap: wf:* present, state:* missing.
+    let def;
+    try {
+        const registry = await loadWorkflowRegistry();
+        def = registry.get(workflowId);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`workflow-gate: enrollIfMissing: registry load failed for ${issueId}: ${msg} — skipping`);
+        return { enrolled: false };
+    }
+    if (!def?.entry_state) {
+        log.warn(`workflow-gate: enrollIfMissing: no entry_state in def for wf:${workflowId} on ${issueId} — skipping`);
+        return { enrolled: false };
+    }
+    const entryLabelName = `state:${def.entry_state}`;
+    const entryLabelId = await findOrCreateLabel(issue.teamId, entryLabelName, authToken);
+    if (!entryLabelId) {
+        log.warn(`workflow-gate: enrollIfMissing: could not resolve label '${entryLabelName}' for ${issueId} — skipping`);
+        return { enrolled: false };
+    }
+    const existingIds = issue.labels.map((l) => l.id);
+    const newLabelIds = [...existingIds, entryLabelId];
+    const success = await issueUpdateLabels(issue.internalId, newLabelIds, authToken);
+    if (!success) {
+        log.warn(`workflow-gate: enrollIfMissing: label update failed for ${issueId} — skipping`);
+        return { enrolled: false };
+    }
+    log.info(`workflow-gate: enrollIfMissing: stamped '${entryLabelName}' on ${issueId} (wf:${workflowId} had no state:*)`);
+    return { enrolled: true, entryState: def.entry_state };
 }
 //# sourceMappingURL=workflow-gate.js.map

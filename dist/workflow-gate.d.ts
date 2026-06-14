@@ -84,6 +84,17 @@ export interface WorkflowDef {
         to?: string;
         owner_role?: string;
     };
+    /**
+     * AI-1579: recovery actor(s) — body id(s) (e.g. `ai`) permitted to re-establish
+     * a delegate on a governed ticket whose delegate is currently EMPTY (orphaned),
+     * at ANY state, even one whose owner_role they do not fill. This is the
+     * authorization counterpart to the stale-session recovery machinery: when a
+     * delegate's session dies without advancing the ticket, recovery clears the
+     * delegate and must re-dispatch by writing a new delegateId — a raw write from
+     * `ai`, which the role-based first-delegate check would otherwise block. Scoped
+     * to the empty-delegate path only, so it can never steal a live delegate.
+     */
+    recovery_actor?: string | string[];
     /** Phase 6.5 / H-7 (AI-1482): stakes-threshold configuration for human sign-off gate. */
     stakes?: StakesLevel;
     states: WorkflowState[];
@@ -268,4 +279,24 @@ export interface ApplyStateTransitionOptions {
     sourceStateOverride?: string;
 }
 export declare function applyStateTransition(intent: string, issueId: string | null, authToken: string, options?: ApplyStateTransitionOptions): Promise<void>;
+/**
+ * AI-1584: Enrollment gap repair.
+ *
+ * Detects and heals the dead-on-arrival condition where a ticket carries a `wf:*`
+ * label but no `state:*` label — a gap that occurs when tickets are created via
+ * bulk scripts or the raw Linear API and the entry-state stamp is never applied.
+ *
+ * This function is idempotent: it is a no-op when the ticket already has a
+ * `state:*` label or when no `wf:*` label is present (ad-hoc ticket).
+ *
+ * Called from the webhook inbound path on every Issue event so gaps are healed
+ * within one reconciliation cycle (i.e. the next webhook fire after creation).
+ *
+ * Fail-open: any API or registry failure logs a warning and returns
+ * `{ enrolled: false }` — the inbound path is never blocked by enrollment.
+ */
+export declare function enrollIfMissing(issueId: string, authToken: string): Promise<{
+    enrolled: boolean;
+    entryState?: string;
+}>;
 //# sourceMappingURL=workflow-gate.d.ts.map

@@ -120,6 +120,13 @@ export interface RecoveryResult {
     success: boolean;
     action: string;
     detail?: string;
+    /**
+     * AI-1578 (AC2): set on a C4 first-stall re-poke. When true, recoverTicket
+     * retained the delegate and changed no state — the caller should re-wake the
+     * SAME delegate for this ticket rather than treating it as orphaned. Only the
+     * second consecutive C4 stall sheds the delegate (existing orphan behavior).
+     */
+    rePoke?: boolean;
 }
 export declare function recoverTicket(snapshot: StaleSnapshot, agentId: string, config?: ForensicsConfig): Promise<RecoveryResult>;
 /**
