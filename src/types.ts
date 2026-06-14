@@ -10,7 +10,7 @@ export interface RouteResult {
   sessionKey: string;
   priority: number;
   event: LinearEvent;
-  routingReason?: "delegate" | "assignee" | "mention" | "body-mention";
+  routingReason?: "delegate" | "assignee" | "mention" | "body-mention" | "department-prefix" | "department-override" | "steward-escalation";
   coalescedCount?: number;
 }
 
