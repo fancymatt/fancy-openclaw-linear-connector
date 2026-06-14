@@ -170,6 +170,10 @@ export interface StallEvent {
   isDeferredAtCapacity: boolean;
   /** When the stall event was created (epoch ms). */
   createdAt: number;
+  /** Epoch ms when the child entered its current state (for breach dedup). */
+  stateEnteredAt: number | null;
+  /** Dead-vs-slow classification from a liveness probe (AC2, G-12). Null until probed. */
+  livenessClassification: "dead" | "slow" | null;
 }
 
 /**
@@ -897,6 +901,8 @@ export function buildStallEvent(
     knownDeferralMs: child.knownDeferralMs,
     isDeferredAtCapacity: child.isDeferredAtCapacity,
     createdAt: now,
+    stateEnteredAt: child.stateEnteredAt,
+    livenessClassification: null,
   };
 }
 
