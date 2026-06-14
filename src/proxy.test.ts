@@ -727,6 +727,51 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
     expect(res.body.errors).toBeUndefined();
   });
 
+  // ── AI-1583: enforcement applies to mutations only ───────────────────────
+  // The CLI sets the intent header for a whole semantic command, so reads issued
+  // mid-command (notably updateIssue()'s trailing getIssue re-fetch) inherit it.
+  // After a transition reassigns the delegate, that read would otherwise trip the
+  // delegate-only guard and surface a spurious "not the current delegate" block
+  // even though the mutation succeeded. A read must never be gated.
+
+  it("AI-1583: does NOT block a read query carrying a workflow intent on a non-delegate ticket", async () => {
+    // Same situation that blocks the mutation above (delegate u99 ≠ charles's u1),
+    // but the operation is a read → it must pass through.
+    const nonDelegateResponse = {
+      data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] }, delegate: { id: "u99" } } },
+    };
+    globalThis.fetch = makeFetch(nonDelegateResponse);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit") // sticky intent inherited by the read
+      .send({ query: "query IssueDetail($id: String!) { issue(id: $id) { id } }", variables: { id: "issue-uuid" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    expect(res.body.data).toBeDefined();
+  });
+
+  it("AI-1583: still blocks a non-delegate MUTATION carrying the same intent (enforcement intact)", async () => {
+    const nonDelegateResponse = {
+      data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] }, delegate: { id: "u99" } } },
+    };
+    globalThis.fetch = makeFetch(nonDelegateResponse);
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("not the current delegate");
+  });
+
   // ── AI-1397: version floor ────────────────────────────────────────────────
 
   it("blocks a CLI below the minimum version on a workflow mutation", async () => {

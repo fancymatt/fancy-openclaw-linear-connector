@@ -84,12 +84,54 @@ export interface WorkflowDef {
         to?: string;
         owner_role?: string;
     };
+    /**
+     * AI-1579: recovery actor(s) — body id(s) (e.g. `ai`) permitted to re-establish
+     * a delegate on a governed ticket whose delegate is currently EMPTY (orphaned),
+     * at ANY state, even one whose owner_role they do not fill. This is the
+     * authorization counterpart to the stale-session recovery machinery: when a
+     * delegate's session dies without advancing the ticket, recovery clears the
+     * delegate and must re-dispatch by writing a new delegateId — a raw write from
+     * `ai`, which the role-based first-delegate check would otherwise block. Scoped
+     * to the empty-delegate path only, so it can never steal a live delegate.
+     */
+    recovery_actor?: string | string[];
     /** Phase 6.5 / H-7 (AI-1482): stakes-threshold configuration for human sign-off gate. */
     stakes?: StakesLevel;
     states: WorkflowState[];
 }
+/**
+ * Legacy single-def accessor. Returns the primary workflow def, derived from the
+ * registry so its cache stays coherent with loadWorkflowRegistry().
+ *   - Single-file mode (no WORKFLOW_DEFS_DIR): the registry holds exactly the
+ *     WORKFLOW_DEF_PATH def — return it (preserving prior behavior and its
+ *     fail-closed-on-load posture, which loadWorkflowRegistry rethrows).
+ *   - Dir mode: return the def named by WORKFLOW_DEF_PATH if present in the
+ *     registry, else the first registered def.
+ */
 export declare function loadWorkflowDef(): Promise<WorkflowDef>;
-/** Invalidate the in-process workflow def cache (used in tests). */
+/**
+ * AI-1530: Load ALL workflow defs into a registry keyed by def.id.
+ *
+ * This is the dispatch source for multi-workflow enforcement: the gate resolves
+ * a ticket's def by its wf:<id> label via this registry, instead of comparing
+ * against a single loaded def. After this lands, dev-impl, ux-audit and sprint
+ * can all be enforced simultaneously by the same connector.
+ *
+ * Directory resolution:
+ *   - If WORKFLOW_DEFS_DIR is set, load every *.yaml in that directory.
+ *   - Otherwise (backwards-compat), load the single WORKFLOW_DEF_PATH file as a
+ *     1-entry registry — preserving the current single-def deploy exactly (AC6).
+ *
+ * Per-def fail-closed (AC2): a def that fails native_state validation (or fails
+ * to parse) is excluded from the registry and surfaced via logs + config-health,
+ * while every other valid def still loads. In single-file mode a load failure
+ * rethrows, preserving the existing fail-closed posture for the primary deploy.
+ *
+ * The result is cached; resetWorkflowCache() clears it (AC5) so a vault edit is
+ * picked up on the next load without a code rebuild.
+ */
+export declare function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>>;
+/** Invalidate the in-process workflow registry cache (used in tests & live-reload). */
 export declare function resetWorkflowCache(): void;
 /**
  * AI-1490 / AI-1498: Validate that every workflow state has a valid native_state field.
@@ -127,14 +169,19 @@ export declare function getCurrentState(labels: string[]): string | null;
 export declare function fetchWorkflowLabels(issueId: string, authToken: string): Promise<string[]>;
 /**
  * Resolve a ticket's numeric stakes level from its labels.
- * Checks for stakes:* labels (e.g. stakes:low, stakes:medium, stakes:high)
- * and maps them to numeric values via the workflow's stakes configuration.
+ * The stakes label namespace is whatever the def's `stakes.levels` map keys on
+ * (currently `risk:*` — `risk:low`/`risk:medium`/`risk:high`; historically
+ * `stakes:*`). Resolution is namespace-agnostic: a label counts as the stakes
+ * label iff it is a key in `stakesConfig.levels`. This avoids the AI-1539 class
+ * of bug where a hardcoded prefix (`/^stakes:/`) silently fails to match the
+ * configured namespace and forces every ticket to fail closed.
  *
- * Fails closed: when no stakes label is present, returns the threshold
- * value itself — unlabeled tickets are treated as high-stakes to prevent
- * a missing label from silently bypassing the human sign-off gate.
- * When the label is present but maps to an unknown level, also returns
- * the threshold (fail-closed on unknown metadata).
+ * Fails OPEN (AI-1539, Matt directive 2026-06-11): when the ticket carries none
+ * of the configured level labels, returns 0 (lowest stakes) — a *missing* tag
+ * must not hold a task up for human review. Only an EXPLICIT high-stakes label
+ * (e.g. risk:high mapping to >= threshold) trips the human sign-off gate.
+ * Tradeoff accepted by the owner: a genuinely high-stakes task left untagged
+ * will deploy without sign-off; tag it risk:high to gate it.
  */
 export declare function resolveStakesLevel(labels: string[], stakesConfig: StakesLevel): number;
 /**
@@ -169,7 +216,7 @@ export declare function checkRawMutationInterception(body: {
     query?: string;
     variables?: Record<string, unknown>;
     operationName?: string;
-} | null, issueId: string | null, authToken: string, bodyId?: string): Promise<string | null>;
+} | null, issueId: string | null, authToken: string, bodyId?: string, callerLinearUserId?: string | null): Promise<string | null>;
 /**
  * Generate a legal-verb reminder for the NEW state after a successful transition.
  *
@@ -232,4 +279,24 @@ export interface ApplyStateTransitionOptions {
     sourceStateOverride?: string;
 }
 export declare function applyStateTransition(intent: string, issueId: string | null, authToken: string, options?: ApplyStateTransitionOptions): Promise<void>;
+/**
+ * AI-1584: Enrollment gap repair.
+ *
+ * Detects and heals the dead-on-arrival condition where a ticket carries a `wf:*`
+ * label but no `state:*` label — a gap that occurs when tickets are created via
+ * bulk scripts or the raw Linear API and the entry-state stamp is never applied.
+ *
+ * This function is idempotent: it is a no-op when the ticket already has a
+ * `state:*` label or when no `wf:*` label is present (ad-hoc ticket).
+ *
+ * Called from the webhook inbound path on every Issue event so gaps are healed
+ * within one reconciliation cycle (i.e. the next webhook fire after creation).
+ *
+ * Fail-open: any API or registry failure logs a warning and returns
+ * `{ enrolled: false }` — the inbound path is never blocked by enrollment.
+ */
+export declare function enrollIfMissing(issueId: string, authToken: string): Promise<{
+    enrolled: boolean;
+    entryState?: string;
+}>;
 //# sourceMappingURL=workflow-gate.d.ts.map
