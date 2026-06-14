@@ -408,10 +408,19 @@ describe("checkWorkflowRules — mode switch", () => {
     expect(result).toContain("unable to fetch ticket context");
   });
 
-  it("allows blocked intent through on fetch failure with break-glass (H-1)", async () => {
+  // G-13a (AI-1551): steward can break-glass on fetch failure; non-steward cannot.
+  it("allows blocked intent through on fetch failure with break-glass — steward caller (H-1 / G-13a)", async () => {
+    globalThis.fetch = async () => { throw new Error("network error"); };
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "astrid", null, null, null, true);
+    expect(result).toBeNull();
+  });
+
+  it("rejects break-glass on fetch failure from non-steward caller (G-13a AC1)", async () => {
     globalThis.fetch = async () => { throw new Error("network error"); };
     const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", null, null, null, true);
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result).toContain("Break-glass rejected");
+    expect(result).toContain("charles");
   });
 
   it("blocks state-advancing intents when no state:* label — fail closed (corrupt projection)", async () => {

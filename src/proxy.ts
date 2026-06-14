@@ -33,6 +33,7 @@ import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, getCurrentState, type TransitionFeedback } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
+import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
@@ -168,6 +169,8 @@ function isMutationRequest(body: GraphQLRequestBody | null): boolean {
 export interface ProxyDeps {
   /** Optional observation store for recording feedback observations (P4-1). */
   observationStore?: ObservationStore;
+  /** Optional operational event store for audit events (G-13a). */
+  operationalEventStore?: OperationalEventStore;
 }
 
 export async function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void> {
@@ -237,6 +240,26 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       log.warn(`version-header-missing agent=${agentId} intent=${intent}${ticketCtx} — update CLI to emit X-Openclaw-Linear-Cli-Version`);
     }
 
+    // G-13a (AI-1551): identity gate — break-glass restricted to steward/human bodies.
+    if (breakGlassOverride) {
+      let isAuthorized = false;
+      try {
+        const { bodyHasCapability } = await import("./escalation-gate.js");
+        isAuthorized = await bodyHasCapability(agentId, "human:escalate");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`break-glass-audit agent=${agentId} authorized=false result=identity-check-failed${ticketCtx} intent=${intent}: ${msg}`);
+        res.status(200).json({ errors: [{ message: `[Proxy] Break-glass rejected: identity check failed (${msg}). Only stewards may use break-glass.` }] });
+        return;
+      }
+      if (!isAuthorized) {
+        log.warn(`break-glass-audit agent=${agentId} authorized=false${ticketCtx} intent=${intent}`);
+        res.status(200).json({ errors: [{ message: `[Proxy] Break-glass rejected: caller '${agentId}' is not a steward or human. Only stewards may use break-glass.` }] });
+        return;
+      }
+      log.warn(`break-glass-audit agent=${agentId} authorized=true${ticketCtx} intent=${intent}`);
+    }
+
     const p2rejection = await checkEnforcementRules(intent, issueId, authorization, agentId);
     if (p2rejection) {
       log.warn(`enforcement-block agent=${agentId} intent=${intent}${ticketCtx}: ${p2rejection}`);
@@ -249,6 +272,11 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       log.warn(`workflow-block agent=${agentId} intent=${intent}${ticketCtx}: ${p3rejection}`);
       res.status(200).json({ errors: [{ message: p3rejection }] });
       return;
+    }
+
+    // G-13a: emit audit event for authorized break-glass use.
+    if (breakGlassOverride) {
+      deps?.operationalEventStore?.append({ outcome: "break-glass-used", agent: agentId, key: issueId ?? undefined });
     }
 
     // AI-1498: snapshot the pre-forward workflow state for applyStateTransition.

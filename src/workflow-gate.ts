@@ -815,6 +815,15 @@ export async function checkWorkflowRules(
   // Harden by deriving issueId from the request body when headers are absent.
   if (!issueId) return null;
 
+  // G-13a (AI-1551): identity gate — break-glass is restricted to steward/human bodies only.
+  if (breakGlassOverride) {
+    const authorized = await bodyHasCapability(bodyId, "human:escalate");
+    if (!authorized) {
+      log.warn(`workflow-gate: break-glass identity gate rejected — '${bodyId}' lacks human:escalate`);
+      return `[Proxy] Break-glass rejected: caller '${bodyId}' is not authorized. Only stewards (human:escalate role) may use break-glass.`;
+    }
+  }
+
   const { labels, delegateId, fetchFailed } = await fetchTicketContext(issueId, authToken);
 
   // Phase 6.5 / H-1: Fail-closed on context-fetch failure.

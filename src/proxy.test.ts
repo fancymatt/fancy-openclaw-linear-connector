@@ -1498,14 +1498,36 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
     expect(res.body.errors[0].message).toContain("could not be loaded");
   });
 
-  // AC4: The break-glass moves a wedged ticket.
-  it("allows break-glass header to bypass enforcement when config is degraded", async () => {
+  // AC2 (G-13a / AI-1551): steward can break-glass to move a wedged ticket.
+  it("allows break-glass header to bypass enforcement when config is degraded (steward caller)", async () => {
     // Break config
     process.env.WORKFLOW_DEF_PATH = path.join(dir, "nonexistent-workflow.yaml");
     resetWorkflowCache();
 
     globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
 
+    // astrid is in the steward container (human:escalate) — must be allowed.
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "astrid")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .set("X-Openclaw-Break-Glass", "true")
+      .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeUndefined();
+    expect(res.body.data).toBeDefined();
+  });
+
+  // G-13a (AI-1551) AC1: non-steward body is rejected when break-glass header is set.
+  it("rejects break-glass from a non-steward body (G-13a AC1)", async () => {
+    process.env.WORKFLOW_DEF_PATH = path.join(dir, "nonexistent-workflow.yaml");
+    resetWorkflowCache();
+
+    globalThis.fetch = makeFetch(DEV_IMPL_IMPLEMENTATION_RESPONSE);
+
+    // charles is in the dev container — no human:escalate → must be rejected.
     const res = await request(appState.app)
       .post("/proxy/graphql")
       .set("Authorization", "Bearer test-token")
@@ -1514,10 +1536,11 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
       .set("X-Openclaw-Break-Glass", "true")
       .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
 
-    // Break-glass should bypass the fail-closed check
     expect(res.status).toBe(200);
-    expect(res.body.errors).toBeUndefined();
-    expect(res.body.data).toBeDefined();
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("[Proxy]");
+    expect(res.body.errors[0].message).toContain("Break-glass rejected");
+    expect(res.body.errors[0].message).toContain("charles");
   });
 
   it("rejects break-glass with value 'false'", async () => {
