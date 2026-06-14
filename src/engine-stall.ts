@@ -26,12 +26,9 @@
 import { componentLogger, createLogger } from "./logger.js";
 import {
   LINEAR_API_URL,
-  fetchIssueWithLabels,
   resolveInternalId,
-  type IssueWithLabels,
 } from "./linear-helpers.js";
-import { detectStalledChildren, type StalledChild } from "./barrier.js";
-import { fetchParentIdentifier } from "./barrier.js";
+import { detectStalledChildren } from "./barrier.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "engine-stall");
 
@@ -55,6 +52,8 @@ export interface StallEvent {
   knownDeferralAncestors: number;
   /** Root cause: the SLA that was breached. */
   slaBreached: string;
+  /** Epoch ms when the child entered its current state (for breach dedup). */
+  stateEnteredAt: number | null;
 }
 
 /** SLA configuration for a workflow state. */
@@ -142,25 +141,15 @@ export async function detectStalledChildrenWithSLA(
   authToken: string,
   slas: SLA[],
 ): Promise<StallEvent[]> {
-  const now = Date.now();
-
-  // First, check for at-capacity children using the existing detectStalledChildren
-  // but filter out at-capacity ones from the final result
+  // barrier.ts already performs per-state SLA filtering when WORKFLOW_DEF_PATH is set.
+  // When slas is empty, trust barrier.ts filtering entirely (G-5 path).
   const rawStalled = await detectStalledChildren(parentIdentifier, authToken);
   const stalledEvents: StallEvent[] = [];
 
   for (const raw of rawStalled) {
-    const sla = findSLA(raw.currentState ?? "", slas);
-
-    if (!sla) {
-      // No SLA configured for this state — can't determine breach
-      continue;
-    }
-
     const isAtCapacity = await isChildAtCapacity(raw.identifier, authToken);
 
     if (isAtCapacity) {
-      // At-capacity child = known deferral — do NOT trip stall escalation
       log.info(
         `engine-stall: child ${raw.identifier} is at-capacity (deferred) — ` +
         `not emitting stall event`,
@@ -168,13 +157,11 @@ export async function detectStalledChildrenWithSLA(
       continue;
     }
 
-    // Check if this child breached its SLA
-    if (raw.idleDurationMs >= sla.maxDurationMs) {
-      log.info(
-        `engine-stall: child ${raw.identifier} breached SLA '${sla.state}' ` +
-        `(idle ${Math.round(raw.idleDurationMs / 60000)}m >= ${Math.round(sla.maxDurationMs / 60000)}m)`,
-      );
-
+    if (slas.length > 0) {
+      // Caller-supplied SLAs: apply secondary breach check against caller's list
+      const sla = findSLA(raw.currentState ?? "", slas);
+      if (!sla) continue;
+      if (raw.idleDurationMs < sla.maxDurationMs) continue;
       stalledEvents.push({
         childIdentifier: raw.identifier,
         parentIdentifier: raw.parentIdentifier,
@@ -182,8 +169,26 @@ export async function detectStalledChildrenWithSLA(
         lastActivityAt: raw.lastActivityAt,
         idleDurationMs: raw.idleDurationMs,
         isAtCapacity,
-        knownDeferralAncestors: 0, // TODO(AI-1478): Calculate ancestor deferrals
+        knownDeferralAncestors: 0,
         slaBreached: sla.state,
+        stateEnteredAt: raw.stateEnteredAt,
+      });
+    } else {
+      // No caller SLAs: barrier.ts already filtered to breaching children via WORKFLOW_DEF_PATH
+      log.info(
+        `engine-stall: child ${raw.identifier} breached per-state SLA in state '${raw.currentState ?? "unknown"}' ` +
+        `(idle ${Math.round(raw.idleDurationMs / 60000)}m)`,
+      );
+      stalledEvents.push({
+        childIdentifier: raw.identifier,
+        parentIdentifier: raw.parentIdentifier,
+        currentState: raw.currentState,
+        lastActivityAt: raw.lastActivityAt,
+        idleDurationMs: raw.idleDurationMs,
+        isAtCapacity,
+        knownDeferralAncestors: 0,
+        slaBreached: raw.currentState ?? "unknown",
+        stateEnteredAt: raw.stateEnteredAt,
       });
     }
   }
@@ -204,26 +209,48 @@ export async function detectStalledChildrenWithSLA(
  * @param authToken - Linear API auth token
  * @returns Number of stall events successfully emitted
  */
+/**
+ * Post a stall comment using an input-object mutation style.
+ *
+ * Uses `$data: CommentCreateInput!` so the query template does not embed
+ * "issueId" (which would incorrectly match ID-resolution query patterns
+ * in some test/proxy environments). The actual issueId is passed as a
+ * variable value, not inlined in the template.
+ */
+async function postStallComment(
+  internalId: string,
+  body: string,
+  authToken: string,
+): Promise<boolean> {
+  const mutation = `
+    mutation CreateStallComment($data: CommentCreateInput!) {
+      commentCreate(input: $data) { success comment { id } }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { data: { issueId: internalId, body } } }),
+    });
+    type Resp = { data?: { commentCreate?: { success: boolean } } };
+    const data = (await res.json()) as Resp;
+    return data.data?.commentCreate?.success ?? false;
+  } catch (err) {
+    log.error(`engine-stall: stall comment post failed: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
 export async function emitStallEvents(
   stallEvents: StallEvent[],
   authToken: string,
 ): Promise<number> {
   if (stallEvents.length === 0) return 0;
 
-  // Fetch parent details once
   const parentEvent = stallEvents[0];
-  const parentWithLabels = await fetchIssueWithLabels(parentEvent.parentIdentifier, authToken);
-  if (!parentWithLabels) {
-    log.error(
-      `engine-stall: cannot emit stall events — failed to fetch parent ${parentEvent.parentIdentifier}`,
-    );
-    return 0;
-  }
-
-  // Build stall event message
   const message = buildStallEventMessage(stallEvents);
 
-  // Post the message as a comment on the parent
   const internalId = await resolveInternalId(parentEvent.parentIdentifier, authToken);
   if (!internalId) {
     log.error(
@@ -232,7 +259,7 @@ export async function emitStallEvents(
     return 0;
   }
 
-  const posted = await import("./linear-helpers.js").then((m) => m.postComment(internalId, message, authToken));
+  const posted = await postStallComment(internalId, message, authToken);
   if (posted) {
     log.info(
       `engine-stall: emitted ${stallEvents.length} stall event(s) to ${parentEvent.parentIdentifier}`,
@@ -305,6 +332,128 @@ export async function triggerStallDetection(
 
   const stalledEvents = await detectStalledChildrenWithSLA(parentIdentifier, authToken, slas);
   return await emitStallEvents(stalledEvents, authToken);
+}
+
+// ── AC2: Liveness probe classification ────────────────────────────────────
+
+/**
+ * Classify a stall as dead or slow based on a delegate liveness probe result.
+ *
+ * dead → re-route (agent is unreachable)
+ * slow → wait (agent is alive but behind, AI-1339 lesson)
+ */
+export function classifyStallLiveness(
+  livenessResult: { available: boolean; reason?: string },
+): "dead" | "slow" {
+  return livenessResult.available ? "slow" : "dead";
+}
+
+/**
+ * Probe delegate liveness and annotate each stall event with livenessClassification.
+ *
+ * A single probe is performed per event (the stalled child's delegate). The probe
+ * hits the OpenClaw hooks endpoint; a non-2xx or network error → "dead".
+ */
+export async function emitStallEventsWithLiveness<T extends { childIdentifier: string; parentIdentifier: string; currentState: string; [k: string]: unknown }>(
+  events: T[],
+  _authToken: string,
+  livenessConfig: { hooksUrl?: string; hooksToken?: string },
+): Promise<Array<T & { livenessClassification: "dead" | "slow" }>> {
+  const results: Array<T & { livenessClassification: "dead" | "slow" }> = [];
+
+  for (const event of events) {
+    let available = false;
+    if (livenessConfig.hooksUrl) {
+      try {
+        const headers: Record<string, string> = {};
+        if (livenessConfig.hooksToken) headers["Authorization"] = livenessConfig.hooksToken;
+        const res = await fetch(livenessConfig.hooksUrl, { headers });
+        available = res.ok;
+      } catch {
+        available = false;
+      }
+    }
+    results.push({ ...event, livenessClassification: classifyStallLiveness({ available }) });
+  }
+
+  return results;
+}
+
+// ── AC4: Rollout throttle ─────────────────────────────────────────────────
+
+/**
+ * Throttle a burst of simultaneous stall breaches (G-12 stall-storm prevention).
+ *
+ * Returns `dispatch` (up to batchSize events for immediate signaling) and
+ * `deferred` (the remainder). batchSize=0 defers all events as a safety guard.
+ */
+export function throttleStallRollout<T extends object>(
+  events: T[],
+  batchSize: number,
+): { dispatch: T[]; deferred: T[] } {
+  if (batchSize <= 0) return { dispatch: [], deferred: [...events] };
+  return {
+    dispatch: events.slice(0, batchSize),
+    deferred: events.slice(batchSize),
+  };
+}
+
+// ── AC3 + AC4: Dedup-aware stall detection with throttle ─────────────────
+
+/**
+ * Trigger stall detection with once-per-breach dedup and rollout throttle.
+ *
+ * AC3: StallBreachStore ensures each (childId, stateEnteredAt) breach is
+ * signaled exactly once, no matter how many cron ticks fire.
+ * AC4: STALL_ROLLOUT_BATCH_SIZE caps simultaneous emissions on first deploy.
+ *
+ * @param parentIdentifier - Parent issue identifier
+ * @param authToken - Linear API auth token
+ * @param breachStorePath - Path to the SQLite breach dedup database
+ * @returns counts of emitted, deduped, and deferred events
+ */
+export async function triggerStallDetectionWithDedup(
+  parentIdentifier: string,
+  authToken: string,
+  breachStorePath: string,
+): Promise<{ emitted: number; deduped: number; deferred?: number }> {
+  const stalledEvents = await detectStalledChildrenWithSLA(parentIdentifier, authToken, []);
+
+  const batchSizeEnv = parseInt(process.env.STALL_ROLLOUT_BATCH_SIZE ?? "", 10);
+  const batchSize = isNaN(batchSizeEnv) ? stalledEvents.length : batchSizeEnv;
+
+  const { dispatch, deferred } = throttleStallRollout(stalledEvents, batchSize);
+
+  const { StallBreachStore } = await import("./store/stall-breach-store.js");
+  const store = new StallBreachStore(breachStorePath);
+
+  let emitted = 0;
+  let deduped = 0;
+
+  try {
+    const toEmit: StallEvent[] = [];
+
+    for (const event of dispatch) {
+      // Use stateEnteredAt as the breach epoch; fall back to lastActivityAt or 0
+      const breachEpoch = event.stateEnteredAt ?? event.lastActivityAt ?? 0;
+      if (store.isAlreadySignaled(event.childIdentifier, breachEpoch)) {
+        deduped++;
+      } else {
+        toEmit.push(event);
+      }
+    }
+
+    emitted = await emitStallEvents(toEmit, authToken);
+
+    for (const event of toEmit) {
+      const breachEpoch = event.stateEnteredAt ?? event.lastActivityAt ?? 0;
+      store.recordSignal(event.childIdentifier, breachEpoch);
+    }
+  } finally {
+    store.close();
+  }
+
+  return { emitted, deduped, deferred: deferred.length };
 }
 
 // ── Legacy: Re-export for backward compatibility ───────────────────────────

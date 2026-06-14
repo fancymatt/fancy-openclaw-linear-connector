@@ -72,6 +72,7 @@ states:
     owner_role: test-author     # TestDrivenDevelopmentAgent; dev container (§16.2)
     kind: normal
     native_state: todo          # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
+    sla: 48h                    # G-5: per-state SLA; breach → stall escalation
     # Adversarial-rigor split (design note a, 2026-06-10): a dedicated agent
     # writes FAILING tests covering all in-scope AC before any implementation,
     # so an implementer can never fudge test robustness to pass their own work.
@@ -85,6 +86,7 @@ states:
     owner_role: dev
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
+    sla: 72h                    # G-5: per-state SLA; longer than code-review (days of work vs 24h review cap)
     # entered from write-tests/tests-ready, code-review/request-changes,
     # deployment/reject, host-deploy/reject, ac-validate/ac-fail — one dev
     # work-phase, no awaiting-vs-doing split. Dev makes the failing tests pass.
@@ -122,6 +124,7 @@ states:
     owner_role: deployment      # filled by Hanzo; the deployment container (§16.2)
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
+    sla: 4h                     # G-5: per-state SLA; deployment is automated/quick
     # Hanzo MERGES the PR (deploy:execute, exclusive). Two exits forward:
     #   - deploy: merge alone is sufficient (CI auto-deploys) → ac-validate.
     #   - handoff-host-deploy: a bare-metal/host action is required (restart
@@ -155,6 +158,7 @@ states:
     owner_role: host-deploy     # filled by Grover; host-side on Nakazawa (§16.2)
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
+    sla: 8h                     # G-5: per-state SLA; host deploy needs more time than CI deploy
     # Bare-metal half of deployment: restart the connector + roll the CLI to
     # agent containers, run migrations, push TestFlight builds — whatever needs
     # host access the deployment container lacks. The merge already happened in
@@ -180,6 +184,7 @@ states:
     owner_role: steward         # the SAME steward (Astrid) who validated AC at intake
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
+    sla: 24h                    # G-5: per-state SLA; final gate validation should complete within a day
     # Final gate (design note, 2026-06-10): re-verify the DEPLOYED artifact
     # satisfies the captured acceptance criteria in real conditions before `done`.
     # Closes the "every step verified the artifact, none verified the outcome" gap.
