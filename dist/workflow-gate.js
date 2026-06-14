@@ -37,6 +37,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger } from "./logger.js";
+import { defaultWorkflowDefPath } from "./instance-config.js";
 import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
 import { ObservationStore } from "./store/observation-store.js";
 import { isBodyKnown } from "./escalation-gate.js";
@@ -69,15 +70,9 @@ import { recordImplementer, getImplementer, removeImplementer } from "./implemen
  */
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-gate");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
-/**
- * Path to the dev-impl workflow definition YAML. Override via env for tests.
- * Canonical source lives in the vault; this default is absolute so the path is
- * stable regardless of process cwd.
- */
-const DEFAULT_WORKFLOW_DEF_PATH = "/home/fancymatt/obsidian-vault/ai-systems/projects/fleet-orchestration-redesign/workflows/dev-impl.yaml";
 /** Resolve the workflow def path dynamically (reads env each call so test beforeAll works). */
 function workflowDefPath() {
-    return process.env.WORKFLOW_DEF_PATH ?? DEFAULT_WORKFLOW_DEF_PATH;
+    return process.env.WORKFLOW_DEF_PATH ?? defaultWorkflowDefPath();
 }
 // ── Workflow def cache & registry ──────────────────────────────────────────
 // AI-1530: a single registry cache is the sole source of truth. loadWorkflowDef
@@ -1815,23 +1810,7 @@ async function issueUpdateDelegateOnly(internalId, delegateLinearUserId, authTok
         return false;
     }
 }
-/**
- * AI-1584: Enrollment gap repair.
- *
- * Detects and heals the dead-on-arrival condition where a ticket carries a `wf:*`
- * label but no `state:*` label — a gap that occurs when tickets are created via
- * bulk scripts or the raw Linear API and the entry-state stamp is never applied.
- *
- * This function is idempotent: it is a no-op when the ticket already has a
- * `state:*` label or when no `wf:*` label is present (ad-hoc ticket).
- *
- * Called from the webhook inbound path on every Issue event so gaps are healed
- * within one reconciliation cycle (i.e. the next webhook fire after creation).
- *
- * Fail-open: any API or registry failure logs a warning and returns
- * `{ enrolled: false }` — the inbound path is never blocked by enrollment.
- */
-export async function enrollIfMissing(issueId, authToken) {
+export async function enrollIfMissing(issueId, authToken, onHeal) {
     const issue = await fetchIssueWithLabels(issueId, authToken);
     if (!issue) {
         log.warn(`workflow-gate: enrollIfMissing: failed to fetch labels for ${issueId} — skipping`);
@@ -1873,6 +1852,103 @@ export async function enrollIfMissing(issueId, authToken) {
         return { enrolled: false };
     }
     log.info(`workflow-gate: enrollIfMissing: stamped '${entryLabelName}' on ${issueId} (wf:${workflowId} had no state:*)`);
+    // AI-1585 / AC2: emit a structured audit signal so a reconciliation heal is
+    // observable in the operational event store, not only in logs.
+    try {
+        onHeal?.({ issueId, internalId: issue.internalId, workflowId, entryState: def.entry_state });
+    }
+    catch (err) {
+        log.warn(`workflow-gate: enrollIfMissing: onHeal audit hook threw for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
     return { enrolled: true, entryState: def.entry_state };
+}
+/**
+ * Atomically re-establish the full workflow triple (state:* label, native Linear
+ * state, delegate) on any governed ticket, including tickets in a terminal state.
+ * No legal-move validation — the caller is the steward and has already been
+ * authenticated at the HTTP layer.
+ *
+ * AC1: atomically sets label + native + delegate; consistency asserted after.
+ * AC3: works from any source state including terminal states.
+ * AC4: issueUpdateAtomic is a single issueUpdate mutation; Linear applies all
+ *      fields atomically or none — no partial state possible on failure.
+ */
+export async function setStateAtomic(ticketIdentifier, targetState, delegate, authToken) {
+    const fail = (error, from = null) => ({ ok: false, ticketId: ticketIdentifier, from, to: targetState, error });
+    // Step 1: Fetch current issue.
+    const issue = await fetchIssueWithLabels(ticketIdentifier, authToken);
+    if (!issue)
+        return fail(`could not fetch issue '${ticketIdentifier}'`);
+    const fromState = getCurrentState(issue.labels.map((l) => l.name)) ?? null;
+    // Step 2: Locate workflow def.
+    const workflowId = getWorkflowId(issue.labels.map((l) => l.name));
+    let def;
+    if (workflowId) {
+        try {
+            const registry = await loadWorkflowRegistry();
+            def = registry.get(workflowId);
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return fail(`could not load workflow registry: ${msg}`, fromState);
+        }
+    }
+    // Step 3: Validate target state exists in the workflow def.
+    if (def) {
+        const stateNode = def.states.find((s) => s.id === targetState);
+        if (!stateNode) {
+            const valid = def.states.map((s) => s.id).join(", ");
+            return fail(`unknown target state '${targetState}' in workflow '${workflowId}'; valid: ${valid}`, fromState);
+        }
+    }
+    // Step 4: Build new label set — strip old state:*, add new state:<target>.
+    const targetLabelName = `state:${targetState}`;
+    const newTargetLabelId = await findOrCreateLabel(issue.teamId, targetLabelName, authToken);
+    if (!newTargetLabelId)
+        return fail(`could not resolve label '${targetLabelName}'`, fromState);
+    const newLabelIds = [
+        ...issue.labels.filter((l) => !l.name.startsWith("state:")).map((l) => l.id),
+        newTargetLabelId,
+    ];
+    // Step 5: Resolve native Linear state id.
+    let resolvedNativeStateId = undefined;
+    if (def) {
+        const destNativeState = def.states.find((s) => s.id === targetState)?.native_state;
+        if (destNativeState) {
+            const nativeId = await resolveNativeStateId(issue.teamId, destNativeState, authToken);
+            if (!nativeId)
+                return fail(`could not resolve native stateId for '${destNativeState}' on team ${issue.teamId}`, fromState);
+            resolvedNativeStateId = nativeId;
+        }
+    }
+    // Step 6: Resolve delegate Linear user id.
+    let resolvedDelegateId = undefined;
+    if (delegate === null) {
+        resolvedDelegateId = null;
+    }
+    else if (typeof delegate === "string") {
+        const agent = getAgent(delegate);
+        if (!agent?.linearUserId) {
+            return fail(`delegate agent '${delegate}' not found or has no linearUserId`, fromState);
+        }
+        resolvedDelegateId = agent.linearUserId;
+    }
+    // Step 7: Atomic write (AC4 — single mutation).
+    const applied = await issueUpdateAtomic(issue.internalId, newLabelIds, authToken, resolvedDelegateId, resolvedNativeStateId);
+    if (!applied)
+        return fail("atomic issueUpdate mutation failed", fromState);
+    log.info(`workflow-gate: set-state (G-6): ${ticketIdentifier} ${fromState ?? "(unknown)"} → ${targetState}` +
+        (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
+        (resolvedNativeStateId ? ` native=${resolvedNativeStateId}` : ``));
+    // Step 8: Consistency assertion (AC1) — re-fetch and confirm state:* label landed.
+    const recheck = await fetchIssueWithLabels(ticketIdentifier, authToken);
+    if (recheck) {
+        const landed = getCurrentState(recheck.labels.map((l) => l.name));
+        if (landed !== targetState) {
+            log.warn(`workflow-gate: set-state: consistency check FAILED for ${ticketIdentifier} — expected state:${targetState}, got state:${landed ?? "(none)"}`);
+            return fail(`consistency check failed: label '${targetLabelName}' not present after mutation (got '${landed ?? "none"}')`, fromState);
+        }
+    }
+    return { ok: true, ticketId: ticketIdentifier, from: fromState, to: targetState };
 }
 //# sourceMappingURL=workflow-gate.js.map

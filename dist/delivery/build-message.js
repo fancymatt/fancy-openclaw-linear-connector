@@ -16,15 +16,15 @@ import path from "node:path";
 import { loadWorkflowDef, fetchWorkflowLabels, getWorkflowId, getCurrentState, resolveTransitionTargets, resolveStakesLevel, } from "../workflow-gate.js";
 import { getAcRecord } from "../ac-record-store.js";
 import { componentLogger, createLogger } from "../logger.js";
+import { defaultGuidanceDir } from "../instance-config.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "build-message");
 /**
- * Default root for vault-resident step guidance files (C5 / AI-1381).
+ * Root for instance-local step guidance files (C5 / AI-1381).
  * Files live at guidance/<workflowId>/<step>.md beside the workflow defs.
  * Override via WORKFLOW_GUIDANCE_DIR for tests.
  */
-const DEFAULT_GUIDANCE_DIR = "/home/fancymatt/obsidian-vault/ai-systems/projects/fleet-orchestration-redesign/guidance";
 function guidanceDir() {
-    return process.env.WORKFLOW_GUIDANCE_DIR ?? DEFAULT_GUIDANCE_DIR;
+    return process.env.WORKFLOW_GUIDANCE_DIR ?? defaultGuidanceDir();
 }
 async function loadStepGuidance(workflowId, step) {
     const filePath = path.join(guidanceDir(), workflowId, `${step}.md`);

@@ -15,19 +15,15 @@
  * Design: design.md §4.6, §11, §13.
  */
 import fs from "node:fs/promises";
-import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger } from "./logger.js";
 import { recordSuccess, recordFailure } from "./config-health.js";
+import { defaultCapabilityPolicyPath } from "./instance-config.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "escalation-gate");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
-/**
- * Canonical vault path for the capability policy. Override via env for tests.
- */
-const DEFAULT_POLICY_PATH = path.join(process.env.HOME ?? "/home/fancymatt", "obsidian-vault/ai-systems/projects/fleet-orchestration-redesign/config/capability-policy.yaml");
 /** Resolve the policy path dynamically (reads env each call so test beforeAll works). */
 function policyPath() {
-    return process.env.CAPABILITY_POLICY_PATH ?? DEFAULT_POLICY_PATH;
+    return process.env.CAPABILITY_POLICY_PATH ?? defaultCapabilityPolicyPath();
 }
 /**
  * Phase 2 enforcement rules (slice 1: one rule).

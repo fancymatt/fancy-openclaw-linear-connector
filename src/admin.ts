@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from "express";
 import crypto from "node:crypto";
-import { getAgents, type AgentConfig } from "./agents.js";
+import { getAgents, getAccessToken, type AgentConfig } from "./agents.js";
 import type { AgentQueue } from "./queue/index.js";
 import type { PendingWorkBag, BagEntry } from "./bag/index.js";
 import type { SessionTracker } from "./bag/index.js";
@@ -10,6 +10,7 @@ import type { OperationalEventStore, OperationalEventOutcome } from "./store/ope
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
+import { setStateAtomic } from "./workflow-gate.js";
 
 interface AdminDeps {
   agentQueue: AgentQueue;
@@ -557,6 +558,50 @@ export function createAdminRouter(deps: AdminDeps): Router {
       threshold,
     }));
   });
+  // AI-1546 / G-6: Steward/human-only atomic set-state.
+  // All admin routes are already protected by adminAuth (ADMIN_SECRET).
+  // AC2: agents cannot call this — they have no ADMIN_SECRET.
+  router.post("/api/set-state", async (req: Request, res: Response) => {
+    let body: Record<string, unknown> | null = null;
+    try {
+      if (Buffer.isBuffer(req.body)) {
+        body = JSON.parse(req.body.toString("utf8")) as Record<string, unknown>;
+      } else if (typeof req.body === "object" && req.body !== null) {
+        body = req.body as Record<string, unknown>;
+      }
+    } catch {
+      res.status(400).json({ ok: false, error: "Malformed JSON body" });
+      return;
+    }
+    const ticketId = typeof body?.ticketId === "string" ? body.ticketId.trim() : "";
+    const targetState = typeof body?.targetState === "string" ? body.targetState.trim() : "";
+    // delegate: string (agent body name) → set; null → clear; absent → leave untouched.
+    const delegateRaw = body && "delegate" in body ? body.delegate : undefined;
+    const delegate: string | null | undefined =
+      delegateRaw === null ? null :
+      typeof delegateRaw === "string" ? delegateRaw :
+      undefined;
+
+    if (!ticketId || !targetState) {
+      res.status(400).json({ ok: false, error: "ticketId and targetState are required" });
+      return;
+    }
+
+    // Resolve a Linear auth token — prefer first agent's OAuth token, fall back to env.
+    const agents = getAgents();
+    const authToken =
+      (agents.length > 0 ? getAccessToken(agents[0].name) : undefined) ??
+      process.env.LINEAR_OAUTH_TOKEN ??
+      process.env.LINEAR_API_KEY;
+    if (!authToken) {
+      res.status(503).json({ ok: false, error: "no Linear auth token available" });
+      return;
+    }
+
+    const result = await setStateAtomic(ticketId, targetState, delegate, authToken);
+    res.status(result.ok ? 200 : 422).json(result);
+  });
+
   router.get(["/", "/agents", "/tasks", "/settings"], (req: Request, res: Response) => {
     const segment = req.path.split("/").filter(Boolean)[0];
     const initialPage = ["agents", "tasks", "settings"].includes(segment) ? segment : "overview";

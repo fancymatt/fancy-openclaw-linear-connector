@@ -2297,3 +2297,123 @@ export async function enrollIfMissing(
   }
   return { enrolled: true, entryState: def.entry_state };
 }
+
+// ── AI-1546 / G-6: Steward/human-only atomic set-state ─────────────────────
+
+export interface SetStateAtomicResult {
+  ok: boolean;
+  ticketId: string;
+  from: string | null;
+  to: string;
+  error?: string;
+}
+
+/**
+ * Atomically re-establish the full workflow triple (state:* label, native Linear
+ * state, delegate) on any governed ticket, including tickets in a terminal state.
+ * No legal-move validation — the caller is the steward and has already been
+ * authenticated at the HTTP layer.
+ *
+ * AC1: atomically sets label + native + delegate; consistency asserted after.
+ * AC3: works from any source state including terminal states.
+ * AC4: issueUpdateAtomic is a single issueUpdate mutation; Linear applies all
+ *      fields atomically or none — no partial state possible on failure.
+ */
+export async function setStateAtomic(
+  ticketIdentifier: string,
+  targetState: string,
+  delegate: string | null | undefined,
+  authToken: string,
+): Promise<SetStateAtomicResult> {
+  const fail = (error: string, from: string | null = null): SetStateAtomicResult =>
+    ({ ok: false, ticketId: ticketIdentifier, from, to: targetState, error });
+
+  // Step 1: Fetch current issue.
+  const issue = await fetchIssueWithLabels(ticketIdentifier, authToken);
+  if (!issue) return fail(`could not fetch issue '${ticketIdentifier}'`);
+
+  const fromState = getCurrentState(issue.labels.map((l) => l.name)) ?? null;
+
+  // Step 2: Locate workflow def.
+  const workflowId = getWorkflowId(issue.labels.map((l) => l.name));
+  let def: WorkflowDef | undefined;
+  if (workflowId) {
+    try {
+      const registry = await loadWorkflowRegistry();
+      def = registry.get(workflowId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return fail(`could not load workflow registry: ${msg}`, fromState);
+    }
+  }
+
+  // Step 3: Validate target state exists in the workflow def.
+  if (def) {
+    const stateNode = def.states.find((s) => s.id === targetState);
+    if (!stateNode) {
+      const valid = def.states.map((s) => s.id).join(", ");
+      return fail(`unknown target state '${targetState}' in workflow '${workflowId}'; valid: ${valid}`, fromState);
+    }
+  }
+
+  // Step 4: Build new label set — strip old state:*, add new state:<target>.
+  const targetLabelName = `state:${targetState}`;
+  const newTargetLabelId = await findOrCreateLabel(issue.teamId, targetLabelName, authToken);
+  if (!newTargetLabelId) return fail(`could not resolve label '${targetLabelName}'`, fromState);
+
+  const newLabelIds = [
+    ...issue.labels.filter((l) => !l.name.startsWith("state:")).map((l) => l.id),
+    newTargetLabelId,
+  ];
+
+  // Step 5: Resolve native Linear state id.
+  let resolvedNativeStateId: string | null | undefined = undefined;
+  if (def) {
+    const destNativeState = def.states.find((s) => s.id === targetState)?.native_state;
+    if (destNativeState) {
+      const nativeId = await resolveNativeStateId(issue.teamId, destNativeState, authToken);
+      if (!nativeId) return fail(`could not resolve native stateId for '${destNativeState}' on team ${issue.teamId}`, fromState);
+      resolvedNativeStateId = nativeId;
+    }
+  }
+
+  // Step 6: Resolve delegate Linear user id.
+  let resolvedDelegateId: string | null | undefined = undefined;
+  if (delegate === null) {
+    resolvedDelegateId = null;
+  } else if (typeof delegate === "string") {
+    const agent = getAgent(delegate);
+    if (!agent?.linearUserId) {
+      return fail(`delegate agent '${delegate}' not found or has no linearUserId`, fromState);
+    }
+    resolvedDelegateId = agent.linearUserId;
+  }
+
+  // Step 7: Atomic write (AC4 — single mutation).
+  const applied = await issueUpdateAtomic(
+    issue.internalId,
+    newLabelIds,
+    authToken,
+    resolvedDelegateId,
+    resolvedNativeStateId,
+  );
+  if (!applied) return fail("atomic issueUpdate mutation failed", fromState);
+
+  log.info(
+    `workflow-gate: set-state (G-6): ${ticketIdentifier} ${fromState ?? "(unknown)"} → ${targetState}` +
+    (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
+    (resolvedNativeStateId ? ` native=${resolvedNativeStateId}` : ``),
+  );
+
+  // Step 8: Consistency assertion (AC1) — re-fetch and confirm state:* label landed.
+  const recheck = await fetchIssueWithLabels(ticketIdentifier, authToken);
+  if (recheck) {
+    const landed = getCurrentState(recheck.labels.map((l) => l.name));
+    if (landed !== targetState) {
+      log.warn(`workflow-gate: set-state: consistency check FAILED for ${ticketIdentifier} — expected state:${targetState}, got state:${landed ?? "(none)"}`);
+      return fail(`consistency check failed: label '${targetLabelName}' not present after mutation (got '${landed ?? "none"}')`, fromState);
+    }
+  }
+
+  return { ok: true, ticketId: ticketIdentifier, from: fromState, to: targetState };
+}

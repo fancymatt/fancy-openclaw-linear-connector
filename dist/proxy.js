@@ -132,6 +132,31 @@ function extractCommentBody(body) {
         return vars.body;
     return null;
 }
+/**
+ * AI-1583: True only when the request's GraphQL operation is a mutation.
+ *
+ * Workflow enforcement (and the B2 state-transition writer) must apply to
+ * mutations only — a read can never change workflow state. But the CLI sets the
+ * X-Openclaw-Linear-Intent header for the whole duration of a semantic command
+ * (client.ts setProxyIntent), so reads issued mid-command inherit the intent.
+ * The worst offender is updateIssue(), which ends with `return getIssue(...)` —
+ * that trailing read carried the intent and was delegate-only blocked *after*
+ * the mutation it just performed reassigned the delegate, surfacing a spurious
+ * "not the current delegate" failure even though the transition succeeded.
+ *
+ * Gating enforcement on the operation type fixes this for every intent-bearing
+ * read path without weakening mutation enforcement: a real state mutation always
+ * uses a `mutation` operation and is still gated.
+ */
+function isMutationRequest(body) {
+    if (!body?.query)
+        return false;
+    // Strip leading whitespace and `# ...` comment lines, then check the operation
+    // keyword. The CLI's mutations all use `mutation <Name>(...)`; reads use
+    // `query <Name>(...)` or anonymous `{ ... }` (both → false).
+    const stripped = body.query.replace(/^(?:\s|#[^\n]*\n?)+/, "");
+    return /^mutation\b/.test(stripped);
+}
 export async function handleProxyRequest(req, res, deps) {
     const rawAuthorization = req.headers["authorization"];
     if (!rawAuthorization) {
@@ -171,8 +196,12 @@ export async function handleProxyRequest(req, res, deps) {
     // post-forward applyStateTransition would otherwise read the destination
     // state and skip the native-stateId write. We snapshot the true source here.
     let sourceStateOverride;
+    // AI-1583: enforcement and the B2 writer apply to mutations only. A read can
+    // never change workflow state, but reads issued mid-command inherit the sticky
+    // intent header — gating them produced spurious delegate-only blocks.
+    const isMutation = isMutationRequest(body);
     // Phase 2 / slice 1 + Phase 3 B1: evaluate enforcement rules before forwarding.
-    if (intent) {
+    if (intent && isMutation) {
         // AI-1397: version floor — reject workflow mutations from stale CLIs.
         if (cliVersion) {
             const minVer = minWorkflowCliVersion();
@@ -214,7 +243,7 @@ export async function handleProxyRequest(req, res, deps) {
             }
         }
     }
-    else {
+    else if (!intent) {
         // Layer 2 (AI-1387): intercept raw status/assignee mutations on workflow tickets.
         // When no intent header is present but the mutation touches stateId or assigneeId,
         // the agent is bypassing workflow commands — reject with the legal verb set.
@@ -251,8 +280,9 @@ export async function handleProxyRequest(req, res, deps) {
     // Phase 3 B2: apply state:* label transition after a successful forward.
     // Phase 4 / P4-1: record feedback observation for feedback transitions.
     // Only runs when the command was validated (intent present, no P2/P3 block).
+    // AI-1583: mutations only — a forwarded read must not re-trigger the writer.
     // Fail-open: errors are logged and never propagate to the agent's response.
-    if (intent && upstreamRes.ok) {
+    if (intent && isMutation && upstreamRes.ok) {
         try {
             // Build feedback context for observation recording.
             let feedback;

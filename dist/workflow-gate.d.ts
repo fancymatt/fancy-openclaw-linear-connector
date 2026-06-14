@@ -295,8 +295,37 @@ export declare function applyStateTransition(intent: string, issueId: string | n
  * Fail-open: any API or registry failure logs a warning and returns
  * `{ enrolled: false }` — the inbound path is never blocked by enrollment.
  */
-export declare function enrollIfMissing(issueId: string, authToken: string): Promise<{
+export interface EnrollHealInfo {
+    /** Display identifier or UUID the caller passed in. */
+    issueId: string;
+    /** Linear internal issue UUID the label write was applied to. */
+    internalId: string;
+    /** Resolved workflow id (e.g. "dev-impl"). */
+    workflowId: string;
+    /** Entry state stamped (e.g. "intake"). */
+    entryState: string;
+}
+export declare function enrollIfMissing(issueId: string, authToken: string, onHeal?: (info: EnrollHealInfo) => void): Promise<{
     enrolled: boolean;
     entryState?: string;
 }>;
+export interface SetStateAtomicResult {
+    ok: boolean;
+    ticketId: string;
+    from: string | null;
+    to: string;
+    error?: string;
+}
+/**
+ * Atomically re-establish the full workflow triple (state:* label, native Linear
+ * state, delegate) on any governed ticket, including tickets in a terminal state.
+ * No legal-move validation — the caller is the steward and has already been
+ * authenticated at the HTTP layer.
+ *
+ * AC1: atomically sets label + native + delegate; consistency asserted after.
+ * AC3: works from any source state including terminal states.
+ * AC4: issueUpdateAtomic is a single issueUpdate mutation; Linear applies all
+ *      fields atomically or none — no partial state possible on failure.
+ */
+export declare function setStateAtomic(ticketIdentifier: string, targetState: string, delegate: string | null | undefined, authToken: string): Promise<SetStateAtomicResult>;
 //# sourceMappingURL=workflow-gate.d.ts.map
