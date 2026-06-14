@@ -32,6 +32,7 @@ import {
   resolveStakesLevel,
   resolveNativeStateId,
   resetNativeStateCache,
+  enrollIfMissing,
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
@@ -208,6 +209,7 @@ entry_state: intake
 
 break_glass:
   command: escape
+  owner_role: steward
 
 states:
   - id: intake
@@ -475,25 +477,60 @@ describe("checkWorkflowRules — AI-1460: refuse-work meta-command", () => {
     expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles")).toBeNull();
   });
 
-  it("refuse-work bypasses delegate-only check (non-delegate can refuse)", async () => {
-    // Simulate a ticket where charles is NOT the delegate (someone else is)
-    // by providing callerLinearUserId that differs from delegateId.
-    // refuse-work should still pass because it bypasses delegate-only.
-    globalThis.fetch = async (_url, _init) => {
-      const body = {
-        data: {
-          issue: {
-            labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:code-review" }] },
-            delegate: { id: "other-user-id" },
-          },
-        },
-      };
-      return new Response(JSON.stringify(body), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    };
-    // charles (callerLinearUserId=charles-uid) is not the delegate (other-user-id)
+});
+
+// ── AI-1574: refuse-work caller-gating hardening ──────────────────────────
+// The line-905 exemption must become conditional:
+//   - delegate (callerLinearUserId === delegateId) → allowed
+//   - steward (bodyId fills the workflow's break_glass.owner_role) → allowed
+//   - all others → blocked
+//
+// Without the fix, line 905 is unconditional and any known caller can refuse
+// work on someone else's governed ticket (third-party reroute hole).
+
+describe("checkWorkflowRules — AI-1574: refuse-work caller-gating", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  function makeDelegateFetch(labelNames: string[], delegateId: string): typeof globalThis.fetch {
+    return async (_url, _init) => new Response(JSON.stringify({
+      data: { issue: { labels: { nodes: labelNames.map((n) => ({ name: n })) }, delegate: { id: delegateId } } },
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+
+  // AC1: the current delegate can always refuse their own work.
+  it("AC1: refuse-work by the current delegate (callerLinearUserId === delegateId) passes through", async () => {
+    globalThis.fetch = makeDelegateFetch(["wf:dev-impl", "state:write-tests"], "delegate-uid");
+    expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "delegate-uid")).toBeNull();
+  });
+
+  it("AC1: delegate can refuse from every governed state", async () => {
+    for (const state of ["intake", "write-tests", "implementation", "code-review", "deployment", "done"]) {
+      globalThis.fetch = makeDelegateFetch(["wf:dev-impl", `state:${state}`], "delegate-uid");
+      expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "delegate-uid")).toBeNull();
+    }
+  });
+
+  // AC2: a non-delegate, non-steward caller must be blocked.
+  it("AC2: refuse-work by a non-delegate, non-steward caller is blocked", async () => {
+    globalThis.fetch = makeDelegateFetch(["wf:dev-impl", "state:implementation"], "real-delegate-uid");
+    // charles (dev role, not steward) provides a different callerLinearUserId
+    const result = await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "charles-uid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+  });
+
+  // Steward exemption: the workflow steward (break_glass.owner_role) may always refuse.
+  it("refuse-work by the workflow steward passes through even when not the delegate", async () => {
+    globalThis.fetch = makeDelegateFetch(["wf:dev-impl", "state:implementation"], "real-delegate-uid");
+    // astrid fills the steward role in TEST_POLICY_YAML
+    expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "astrid", null, "astrid-uid")).toBeNull();
+  });
+
+  // AC3 regression: ad-hoc (ungoverned) tickets must continue to pass through.
+  it("AC3: refuse-work on an ungoverned ticket (no wf:* label) always passes through", async () => {
+    globalThis.fetch = makeDelegateFetch(["bug", "priority:high"], "real-delegate-uid");
     expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "charles-uid")).toBeNull();
   });
 });
@@ -2066,8 +2103,71 @@ describe("checkRawMutationInterception — AI-1535: delegate-only raw mutations"
     expect(result).toContain("cannot be verified");
   });
 
-  it("fails open (allows) a raw delegate write when the ticket has NO current delegate", async () => {
+  // AI-1570: a NO-delegate raw write is no longer a blanket fail-open. The caller
+  // may only ESTABLISH a first delegate if it fills the current state's owner_role
+  // (or the workflow steward / break-glass owner role). charles fills `dev`, which
+  // owns the `implementation` state of WORKFLOW_IMPL_NO_DELEGATE, so this stays allowed.
+  it("ALLOWS a no-delegate raw write by the current state's owner role (charles=dev on implementation)", async () => {
     globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_NO_DELEGATE);
+    const result = await checkRawMutationInterception(
+      delegateBodies["variables.input shape"], "issue-uuid", "Bearer tok", "charles", "some-other-user-uuid",
+    );
+    expect(result).toBeNull();
+  });
+
+  // AI-1570 regression — the AI-1560 dogfood bug. A NO-delegate ticket in `deployment`
+  // state (owner_role `deployment`, filled only by hanzo). A stale `dev`-role session
+  // (charles, standing in for Igor) tries to raw-establish the delegate from a state it
+  // does not own. The old code fail-opened here, letting it re-spawn a duplicate owner.
+  // Now it must be BLOCKED across all three delegateId encodings.
+  const WORKFLOW_DEPLOY_NO_DELEGATE = {
+    data: { issue: {
+      labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] },
+      delegate: null,
+    } },
+  };
+
+  for (const [name, body] of Object.entries(delegateBodies)) {
+    it(`BLOCKS a no-delegate raw write by an out-of-role caller (charles=dev on deployment state) (${name})`, async () => {
+      globalThis.fetch = mockLabelFetch(WORKFLOW_DEPLOY_NO_DELEGATE);
+      const result = await checkRawMutationInterception(
+        body, "issue-uuid", "Bearer tok", "charles", "some-other-user-uuid",
+      );
+      expect(result).not.toBeNull();
+      expect(result).toContain("[Proxy]");
+      expect(result).toContain("may not establish a delegate");
+    });
+  }
+
+  it("ALLOWS a no-delegate raw write by the state owner (hanzo=deployment on deployment state)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_DEPLOY_NO_DELEGATE);
+    const result = await checkRawMutationInterception(
+      delegateBodies["variables.input shape"], "issue-uuid", "Bearer tok", "hanzo", "some-other-user-uuid",
+    );
+    expect(result).toBeNull();
+  });
+
+  it("ALLOWS a no-delegate raw write by the workflow steward (astrid via break-glass owner_role)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_DEPLOY_NO_DELEGATE);
+    const result = await checkRawMutationInterception(
+      delegateBodies["variables.input shape"], "issue-uuid", "Bearer tok", "astrid", "some-other-user-uuid",
+    );
+    expect(result).toBeNull();
+  });
+
+  // AI-1570 enrollment carve-out: at the ENTRY state (intake), a known orchestrator
+  // that fills no owning role may still establish the first delegate (ticket joining
+  // the workflow). charles fills `dev`, not the intake owner `steward`, yet must be
+  // allowed here — the routing-guard corrects the delegate target to astrid downstream.
+  const WORKFLOW_INTAKE_NO_DELEGATE = {
+    data: { issue: {
+      labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:intake" }] },
+      delegate: null,
+    } },
+  };
+
+  it("ALLOWS a no-delegate raw write at the ENTRY state by a non-owner known caller (enrollment)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_INTAKE_NO_DELEGATE);
     const result = await checkRawMutationInterception(
       delegateBodies["variables.input shape"], "issue-uuid", "Bearer tok", "charles", "some-other-user-uuid",
     );
@@ -2096,6 +2196,196 @@ describe("checkRawMutationInterception — AI-1535: delegate-only raw mutations"
     expect(result).toContain("blocked on this workflow ticket");
     expect(result).toContain("status");
     expect(result).toContain("delegate");
+  });
+});
+
+
+// ── AI-1579: recovery-actor first-delegate authorization ────────────────────
+// A configured recovery actor (e.g. `ai`) may re-establish a delegate on a
+// governed ticket whose delegate is currently EMPTY (orphaned) at ANY state,
+// including a mid-workflow state whose owner_role it does not fill. This is the
+// authorization counterpart to the stale-session recovery machinery: when a
+// delegate's session dies without advancing the ticket, recovery clears the
+// delegate and must re-dispatch via a raw delegateId write from `ai`. The
+// carve-out is scoped to the empty-delegate path, so it can never steal a live
+// delegate, and every other out-of-role caller stays blocked (AI-1560 parity).
+describe("checkRawMutationInterception — AI-1579: recovery-actor authorization", () => {
+  let ai1579Dir: string;
+  let ai1579OriginalFetch: typeof globalThis.fetch;
+  let originalWorkflowPath: string | undefined;
+  let originalPolicyPath: string | undefined;
+
+  // Policy mirrors TEST_POLICY_YAML but adds `ai` as a known body in an
+  // orchestrator container that fills NO workflow role (parity with prod).
+  const AI_1579_POLICY_YAML = `
+capabilities:
+  - id: linear:transition
+  - id: human:escalate
+  - id: deploy:execute
+
+containers:
+  - id: dev
+    grants: [linear:transition]
+  - id: deployment
+    grants: [linear:transition, deploy:execute]
+  - id: steward
+    grants: [linear:transition, human:escalate]
+  - id: code-review
+    grants: [linear:transition]
+  - id: orchestrator
+    grants: [linear:transition]
+
+roles:
+  - id: dev
+    requires: [linear:transition]
+  - id: deployment
+    requires: [deploy:execute]
+  - id: steward
+    requires: [human:escalate]
+  - id: code-review
+    requires: [linear:transition]
+
+bodies:
+  - id: hanzo
+    container: deployment
+    fills_roles: [deployment]
+  - id: charles
+    container: dev
+    fills_roles: [dev]
+  - id: astrid
+    container: steward
+    fills_roles: [steward]
+  - id: ai
+    container: orchestrator
+    fills_roles: []
+`;
+
+  const WORKFLOW_WITH_RECOVERY = `${TEST_WORKFLOW_YAML.replace(
+    "entry_state: intake\n",
+    "entry_state: intake\nrecovery_actor: ai\n",
+  )}`;
+  // Same workflow, recovery actor NOT configured — `ai` must stay blocked mid-state.
+  const WORKFLOW_NO_RECOVERY = TEST_WORKFLOW_YAML;
+
+  function writeWorkflow(yamlText: string) {
+    const workflowFile = path.join(ai1579Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, yamlText, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+    resetWorkflowCache();
+  }
+
+  beforeAll(() => {
+    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    originalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+  });
+
+  beforeEach(() => {
+    ai1579Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1579-test-"));
+    const policyFile = path.join(ai1579Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, AI_1579_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+    writeWorkflow(WORKFLOW_WITH_RECOVERY);
+    resetPolicyCache();
+    ai1579OriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => { globalThis.fetch = ai1579OriginalFetch; });
+
+  afterAll(() => {
+    if (originalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    if (originalPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+  });
+
+  // A NO-delegate ticket at a mid-workflow state (deployment, owned by `deployment`).
+  const ORPHANED_DEPLOY = {
+    data: { issue: {
+      labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] },
+      delegate: null,
+    } },
+  };
+  // The same state, but a delegate IS live.
+  const LIVE_DELEGATE_DEPLOY = {
+    data: { issue: {
+      labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] },
+      delegate: { id: "live-delegate-uuid" },
+    } },
+  };
+
+  function mockLabelFetch(labelResponse: object) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return async (url: any, init?: RequestInit) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("IssueLabels")) {
+          return new Response(JSON.stringify(labelResponse), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+      return ai1579OriginalFetch(url, init);
+    };
+  }
+
+  const delegateWrite = {
+    query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+    variables: { id: "issue-uuid", input: { delegateId: "new-delegate-uuid" } },
+  };
+
+  // AC: orphaned-mid-state allow — recovery actor re-establishes a delegate.
+  it("ALLOWS the recovery actor (ai) to re-delegate an orphaned ticket at a mid-workflow state", async () => {
+    globalThis.fetch = mockLabelFetch(ORPHANED_DEPLOY);
+    const result = await checkRawMutationInterception(
+      delegateWrite, "issue-uuid", "Bearer tok", "ai", "ai-linear-uuid",
+    );
+    expect(result).toBeNull();
+  });
+
+  // AC: active-delegate-steal block — recovery actor cannot yank a live delegate.
+  it("BLOCKS the recovery actor (ai) from stealing a LIVE delegate at a mid-workflow state", async () => {
+    globalThis.fetch = mockLabelFetch(LIVE_DELEGATE_DEPLOY);
+    const result = await checkRawMutationInterception(
+      delegateWrite, "issue-uuid", "Bearer tok", "ai", "ai-linear-uuid",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("not the current delegate");
+  });
+
+  // AC: non-recovery-caller-mid-state block — AI-1560 parity preserved.
+  it("BLOCKS a non-recovery out-of-role caller (charles=dev) from establishing a delegate mid-state", async () => {
+    globalThis.fetch = mockLabelFetch(ORPHANED_DEPLOY);
+    const result = await checkRawMutationInterception(
+      delegateWrite, "issue-uuid", "Bearer tok", "charles", "charles-linear-uuid",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("may not establish a delegate");
+  });
+
+  // The carve-out is config-gated: with no recovery_actor set, even `ai` is blocked.
+  it("BLOCKS the would-be recovery actor when recovery_actor is NOT configured", async () => {
+    writeWorkflow(WORKFLOW_NO_RECOVERY);
+    globalThis.fetch = mockLabelFetch(ORPHANED_DEPLOY);
+    const result = await checkRawMutationInterception(
+      delegateWrite, "issue-uuid", "Bearer tok", "ai", "ai-linear-uuid",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("may not establish a delegate");
+  });
+
+  // Recovery actor still allowed at the ENTRY state (entry-state carve-out path).
+  it("ALLOWS the recovery actor (ai) at the entry state too", async () => {
+    globalThis.fetch = mockLabelFetch({
+      data: { issue: {
+        labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:intake" }] },
+        delegate: null,
+      } },
+    });
+    const result = await checkRawMutationInterception(
+      delegateWrite, "issue-uuid", "Bearer tok", "ai", "ai-linear-uuid",
+    );
+    expect(result).toBeNull();
   });
 });
 
@@ -5049,5 +5339,170 @@ describe("applyStateTransition — AI-1521: unescape re-entry", () => {
   it("canonical: unescape is legal from escape state", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:escape"]);
     expect(await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
+});
+
+// ── AI-1584: enrollIfMissing ───────────────────────────────────────────────
+
+describe("enrollIfMissing — enrollment gap repair", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let enrollDir: string;
+  let enrollOrigWorkflowPath: string | undefined;
+  let enrollOrigPolicyPath: string | undefined;
+
+  beforeAll(() => {
+    enrollDir = fs.mkdtempSync(path.join(os.tmpdir(), "enroll-test-"));
+    const policyFile = path.join(enrollDir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    const workflowFile = path.join(enrollDir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    enrollOrigWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    enrollOrigPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+  });
+
+  afterAll(() => {
+    if (enrollOrigWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = enrollOrigWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    if (enrollOrigPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = enrollOrigPolicyPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+  });
+
+  beforeEach(() => { originalFetch = globalThis.fetch; resetWorkflowCache(); });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  function makeEnrollFetch(opts: {
+    labels: Array<{ id: string; name: string }>;
+    teamId?: string;
+    teamLabels?: Array<{ id: string; name: string }>;
+    issueError?: boolean;
+    updateSuccess?: boolean;
+  }): { fetch: typeof globalThis.fetch; calls: Array<{ query: string; variables: Record<string, unknown> }> } {
+    const calls: Array<{ query: string; variables: Record<string, unknown> }> = [];
+    const teamId = opts.teamId ?? "team-uuid";
+    const teamLabels = opts.teamLabels ?? [{ id: "intake-lbl", name: "state:intake" }];
+    const updateSuccess = opts.updateSuccess ?? true;
+
+    const mock: typeof globalThis.fetch = async (_url, init) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
+      calls.push({ query: parsed.query ?? "", variables: parsed.variables ?? {} });
+      const query = parsed.query ?? "";
+
+      if (opts.issueError) throw new Error("simulated fetch error");
+
+      if (query.includes("IssueWithLabels")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "internal-uuid",
+                team: { id: teamId },
+                labels: { nodes: opts.labels },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (query.includes("TeamLabels")) {
+        return new Response(
+          JSON.stringify({ data: { team: { labels: { nodes: teamLabels } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (query.includes("ApplyAtomicTransition")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: updateSuccess } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      throw new Error(`unexpected query in enrollIfMissing test: ${query.slice(0, 80)}`);
+    };
+
+    return { fetch: mock, calls };
+  }
+
+  it("AC3: stamps state:intake when wf:dev-impl is present but no state:* label", async () => {
+    const { fetch, calls } = makeEnrollFetch({
+      labels: [{ id: "wf-lbl", name: "wf:dev-impl" }, { id: "risk-lbl", name: "risk:low" }],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
+
+    expect(result.enrolled).toBe(true);
+    expect(result.entryState).toBe("intake");
+
+    const updateCall = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.variables as { labelIds: string[] };
+    expect(vars.labelIds).toContain("intake-lbl");
+    expect(vars.labelIds).toContain("wf-lbl");
+    expect(vars.labelIds).toContain("risk-lbl");
+  });
+
+  it("no-op when state:* label is already present (already enrolled)", async () => {
+    const { fetch, calls } = makeEnrollFetch({
+      labels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:intake" },
+      ],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
+
+    expect(result.enrolled).toBe(false);
+    expect(calls.find((c) => c.query.includes("ApplyAtomicTransition"))).toBeUndefined();
+  });
+
+  it("no-op for ad-hoc ticket with no wf:* label", async () => {
+    const { fetch, calls } = makeEnrollFetch({
+      labels: [{ id: "bug-lbl", name: "bug" }, { id: "prio-lbl", name: "priority:high" }],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
+
+    expect(result.enrolled).toBe(false);
+    expect(calls.find((c) => c.query.includes("ApplyAtomicTransition"))).toBeUndefined();
+  });
+
+  it("no-op for unknown wf:* id (no matching def) — fail open", async () => {
+    const { fetch, calls } = makeEnrollFetch({
+      labels: [{ id: "wf-lbl", name: "wf:unknown-workflow" }],
+    });
+    globalThis.fetch = fetch;
+
+    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
+
+    expect(result.enrolled).toBe(false);
+    expect(calls.find((c) => c.query.includes("ApplyAtomicTransition"))).toBeUndefined();
+  });
+
+  it("fail-open when IssueWithLabels fetch throws", async () => {
+    const { fetch } = makeEnrollFetch({ labels: [], issueError: true });
+    globalThis.fetch = fetch;
+
+    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
+
+    expect(result.enrolled).toBe(false);
+  });
+
+  it("fail-open when issueUpdate returns non-success", async () => {
+    const { fetch } = makeEnrollFetch({
+      labels: [{ id: "wf-lbl", name: "wf:dev-impl" }],
+      updateSuccess: false,
+    });
+    globalThis.fetch = fetch;
+
+    const result = await enrollIfMissing("issue-uuid", "Bearer tok");
+
+    expect(result.enrolled).toBe(false);
   });
 });

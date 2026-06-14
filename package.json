@@ -20,7 +20,7 @@
     "better-sqlite3": "^12.8.0",
     "dotenv": "^17.4.2",
     "express": "^4.18.2",
-    "fancy-openclaw-linear-skill-cli": "file:../repos/life-os/linear-webhook-fancymatt/node_modules/fancy-openclaw-linear-skill-cli/fancy-openclaw-linear-skill-cli-0.3.0.tgz",
+    "fancy-openclaw-linear-skill-cli": "file:vendor/fancy-openclaw-linear-skill-cli-0.3.0.tgz",
     "js-yaml": "^4.1.0"
   },
   "devDependencies": {
