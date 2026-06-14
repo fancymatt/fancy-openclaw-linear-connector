@@ -666,7 +666,7 @@ if (isEntryPoint) {
 
   // P4-3: periodic distillation of reject metrics into skill-workshop proposals
   registerDistillationCron(observationStore);
-  // AI-1566: periodic rescue sweep for dormant/malformed wf:* tickets
+  // AI-1566: periodic rescue sweep — detect and repair dormant/malformed wf:* tickets
   registerRescueSweepCron();
 
   const server = app.listen(PORT, () => {

@@ -145,6 +145,7 @@ function makeLinearMock(opts: {
       const nodes = (opts.issues ?? []).map((iss) => ({
         id: iss.id,
         identifier: iss.identifier,
+        team: { id: "test-team-id" },
         state: { name: iss.nativeStateName ?? "Doing" }, // native status present but irrelevant
         labels: { nodes: iss.labels.map((name, i) => ({ id: `lbl-${i}`, name })) },
         delegate: iss.delegateId
@@ -158,7 +159,7 @@ function makeLinearMock(opts: {
       );
     }
 
-    // Delegate update
+    // Delegate update or label update
     if (query.includes("UpdateDelegate") || query.includes("issueUpdate")) {
       const vars = parsed.variables as Record<string, unknown> ?? {};
       const issId = vars["id"] as string ?? "";
@@ -587,6 +588,7 @@ describe("AC7 — scenario: malformed ticket gets bootstrapped (entry state + de
     // The label applied in the bootstrap should reference "intake"
     expect(result.rescues[0]?.action).toMatch(/intake/i);
   });
+
 });
 
 describe("AC7 — scenario: healthy ticket is untouched", () => {
@@ -823,6 +825,8 @@ describe("AC4 — each rescue emits an operational event", () => {
     await runRescueSweep({
       authToken: "Bearer test-token",
       workflowRegistry: new Map([["dev-impl", { ...TEST_WORKFLOW_DEF }]]),
+      // capabilityPolicyPath is required so astrid is recognized as filling steward → healthy
+      capabilityPolicyPath: writeCapabilityPolicy(),
       operationalEventStore: store,
     });
 
