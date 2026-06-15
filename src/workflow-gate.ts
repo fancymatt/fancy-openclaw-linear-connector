@@ -913,9 +913,11 @@ export async function checkWorkflowRules(
     );
     if (!isHumanSignoffPath) {
       log.warn(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} ticket ${issueId} — blocking`);
+      const legalMoves = [...(preNode?.transitions?.map((t) => t.command) ?? []), breakGlassCommand].join(", ");
       return (
         `[Proxy] Unknown caller '${bodyId}' blocked on workflow ticket. ` +
-        `Ensure this agent is registered in the capability policy.`
+        `Ensure this agent is registered in the capability policy. ` +
+        `Legal moves: ${legalMoves}.`
       );
     }
     log.info(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} — human sign-off path, allowing through`);
@@ -952,16 +954,24 @@ export async function checkWorkflowRules(
   // unverifiable caller must not be allowed to mutate a delegated ticket.
   if (!callerLinearUserId && delegateId) {
     log.warn(`workflow-gate: unknown-caller block agent=${bodyId} intent=${intent} ticket=${issueId}`);
+    const wcState = getCurrentState(labels);
+    const wcNode = wcState ? def.states.find((s) => s.id === wcState) : undefined;
+    const legalMoves = [...(wcNode?.transitions?.map((t) => t.command) ?? []), breakGlassCommand].join(", ");
     return (
       `[Proxy] '${intent}' blocked: caller '${bodyId}' cannot be verified and the ticket has a known delegate. ` +
-      `Register the agent in agents.json with a linearUserId to proceed.`
+      `Register the agent in agents.json with a linearUserId to proceed. ` +
+      `Legal moves: ${legalMoves}.`
     );
   }
   if (callerLinearUserId && delegateId && callerLinearUserId !== delegateId) {
     log.warn(`workflow-gate: delegate-only block agent=${bodyId} intent=${intent} ticket=${issueId}`);
+    const wdState = getCurrentState(labels);
+    const wdNode = wdState ? def.states.find((s) => s.id === wdState) : undefined;
+    const legalMoves = [...(wdNode?.transitions?.map((t) => t.command) ?? []), breakGlassCommand].join(", ");
     return (
       `[Proxy] '${intent}' blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
-      `Only the ticket delegate may mutate its state.`
+      `Only the ticket delegate may mutate its state. ` +
+      `Legal moves: ${legalMoves}.`
     );
   }
 
@@ -1015,9 +1025,11 @@ export async function checkWorkflowRules(
   if (match.requires_capability && isCallerKnown) {
     const allowed = await bodyHasCapability(bodyId, match.requires_capability);
     if (!allowed) {
+      const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
       return (
         `[Proxy] '${intent}' requires the '${match.requires_capability}' capability; ` +
-        `handoff to the deployment body to proceed.`
+        `handoff to the deployment body to proceed. ` +
+        `Legal moves: ${legalMoves}.`
       );
     }
   }
@@ -1050,10 +1062,11 @@ export async function checkWorkflowRules(
       const isAgent = await isBodyKnown(bodyId);
       if (isAgent) {
         log.warn(`workflow-gate: stakes-threshold gate: ${intent} on ${issueId} blocked — stakes level ${ticketStakesLevel} >= threshold ${def.stakes.threshold}, caller '${bodyId}' is a known AI agent`);
+        const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
         return (
           `[Proxy] '${intent}' blocked: this ticket has elevated stakes (level ${ticketStakesLevel}) ` +
           `and requires human sign-off. AI agent '${bodyId}' cannot self-sign-off on high-stakes work. ` +
-          `Use 'escape' to exit the workflow and escalate to a human, or 'reject' to send back for changes.`
+          `Legal moves: ${legalMoves}.`
         );
       }
       log.info(`workflow-gate: stakes-threshold gate: ${intent} on ${issueId} — stakes level ${ticketStakesLevel} >= threshold ${def.stakes.threshold}, but caller '${bodyId}' is human/unknown — allowing`);
