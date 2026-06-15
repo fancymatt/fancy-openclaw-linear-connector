@@ -233,7 +233,7 @@ function makeCellFetch(
     }
     if (bodyText.includes("IssueBranchAndPR")) {
       return new Response(
-        JSON.stringify({ data: { issue: { branch: { id: "br", name: "feat", updatedAt: "2026-06-12T00:00:00Z" }, pullRequests: { nodes: [{ id: "pr", state: "merged" }] } } } }),
+        JSON.stringify({ data: { issue: { branch: null, pullRequests: { nodes: [] } } } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
