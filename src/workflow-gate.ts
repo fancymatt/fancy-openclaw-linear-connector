@@ -2328,6 +2328,17 @@ export interface SetStateAtomicResult {
   from: string | null;
   to: string;
   error?: string;
+  /** Body name that received the re-dispatch after the state write, if any. */
+  redispatched?: string;
+}
+
+export interface SetStateAtomicOptions {
+  /**
+   * If provided, called after a successful write to send a wake-up signal to
+   * the new state's owner role (AI-1607). Fail-open: errors are logged and
+   * never cause the set-state to return ok:false.
+   */
+  sendWakeUp?: (agentId: string, ticketId: string) => Promise<void>;
 }
 
 /**
@@ -2346,6 +2357,7 @@ export async function setStateAtomic(
   targetState: string,
   delegate: string | null | undefined,
   authToken: string,
+  options?: SetStateAtomicOptions,
 ): Promise<SetStateAtomicResult> {
   const fail = (error: string, from: string | null = null): SetStateAtomicResult =>
     ({ ok: false, ticketId: ticketIdentifier, from, to: targetState, error });
@@ -2437,5 +2449,37 @@ export async function setStateAtomic(
     }
   }
 
-  return { ok: true, ticketId: ticketIdentifier, from: fromState, to: targetState };
+  // Step 9: Re-dispatch to the new state's owner (AI-1607).
+  // Fail-open: errors are logged but never block the set-state result.
+  let redispatched: string | undefined;
+  if (def && options?.sendWakeUp) {
+    const destNode = def.states.find((s) => s.id === targetState);
+    const ownerRole = destNode?.owner_role;
+    const isTerminal = destNode?.kind === "terminal" || !ownerRole;
+    if (!isTerminal && ownerRole) {
+      try {
+        const roleBodies = await resolveBodiesForRole(ownerRole);
+        if (roleBodies.length === 1) {
+          await options.sendWakeUp(roleBodies[0], ticketIdentifier);
+          redispatched = roleBodies[0];
+          log.info(
+            `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${roleBodies[0]}' (role '${ownerRole}') after advancing to '${targetState}'`,
+          );
+        } else if (roleBodies.length > 1) {
+          log.warn(
+            `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has multiple bodies (${roleBodies.join(", ")}); delegate manually`,
+          );
+        } else {
+          log.warn(
+            `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has no bodies`,
+          );
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`workflow-gate: set-state: re-dispatch failed for ${ticketIdentifier}: ${msg} — continuing`);
+      }
+    }
+  }
+
+  return { ok: true, ticketId: ticketIdentifier, from: fromState, to: targetState, ...(redispatched ? { redispatched } : {}) };
 }
