@@ -123,6 +123,7 @@ function makeLinearMock(opts: {
     delegateId: string | null;
     delegateName?: string | null;
     nativeStateName?: string; // deliberately included to verify it is NOT consulted
+    updatedAt?: string;
   }>;
   updateDelegate?: { success: boolean };
   updateLabels?: { success: boolean };
@@ -145,6 +146,7 @@ function makeLinearMock(opts: {
       const nodes = (opts.issues ?? []).map((iss) => ({
         id: iss.id,
         identifier: iss.identifier,
+        updatedAt: iss.updatedAt,
         team: { id: "test-team-id" },
         state: { name: iss.nativeStateName ?? "Doing" }, // native status present but irrelevant
         labels: { nodes: iss.labels.map((name, i) => ({ id: `lbl-${i}`, name })) },
@@ -589,6 +591,93 @@ describe("AC7 — scenario: malformed ticket gets bootstrapped (entry state + de
     expect(result.rescues[0]?.action).toMatch(/intake/i);
   });
 
+});
+
+describe("AI-1608 — rescueMalformed grace window", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("malformed ticket updated within grace window is NOT rescued (deferred to next pass)", async () => {
+    const now = Date.now();
+    const recentlyUpdated = new Date(now - 60_000).toISOString(); // 60 seconds ago
+    const { fetch: mock, labelUpdateCalls, delegateUpdateCalls } = makeLinearMock({
+      issues: [
+        {
+          id: "uuid-grace-skip",
+          identifier: "AI-999",
+          labels: ["wf:dev-impl"],
+          delegateId: null,
+          updatedAt: recentlyUpdated,
+        },
+      ],
+    });
+    globalThis.fetch = mock;
+
+    const result = await runRescueSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: new Map([["dev-impl", { ...TEST_WORKFLOW_DEF }]]),
+      capabilityPolicyPath: writeCapabilityPolicy(),
+      nowMs: now,
+    });
+
+    // Ticket is malformed but within grace window — must not be rescued
+    expect(result.rescued).toBe(0);
+    expect(result.rescues).toHaveLength(0);
+    expect(labelUpdateCalls).not.toContain("uuid-grace-skip");
+    expect(delegateUpdateCalls).not.toContain("uuid-grace-skip");
+    // Still counted in byClassification as malformed (it is malformed — just deferred)
+    expect(result.byClassification?.malformed ?? 0).toBeGreaterThanOrEqual(1);
+  });
+
+  it("malformed ticket updated outside grace window IS rescued normally", async () => {
+    const now = Date.now();
+    const oldUpdate = new Date(now - 10 * 60_000).toISOString(); // 10 minutes ago
+    const { fetch: mock, labelUpdateCalls, delegateUpdateCalls } = makeLinearMock({
+      issues: [
+        {
+          id: "uuid-grace-rescue",
+          identifier: "AI-998",
+          labels: ["wf:dev-impl"],
+          delegateId: null,
+          updatedAt: oldUpdate,
+        },
+      ],
+    });
+    globalThis.fetch = mock;
+
+    const result = await runRescueSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: new Map([["dev-impl", { ...TEST_WORKFLOW_DEF }]]),
+      capabilityPolicyPath: writeCapabilityPolicy(),
+      nowMs: now,
+    });
+
+    expect(result.rescued).toBe(1);
+    expect(labelUpdateCalls).toContain("uuid-grace-rescue");
+    expect(delegateUpdateCalls).toContain("uuid-grace-rescue");
+    expect(result.rescues[0]?.classification).toBe("malformed");
+    expect(result.rescues[0]?.outcome).toBe("rescued");
+  });
+
+  it("malformed ticket with no updatedAt is rescued normally (safe default)", async () => {
+    const { fetch: mock, labelUpdateCalls } = makeLinearMock({
+      issues: [
+        { id: "uuid-no-updated", identifier: "AI-997", labels: ["wf:dev-impl"], delegateId: null },
+      ],
+    });
+    globalThis.fetch = mock;
+
+    const result = await runRescueSweep({
+      authToken: "Bearer test-token",
+      workflowRegistry: new Map([["dev-impl", { ...TEST_WORKFLOW_DEF }]]),
+      capabilityPolicyPath: writeCapabilityPolicy(),
+      nowMs: Date.now(),
+    });
+
+    expect(result.rescued).toBe(1);
+    expect(labelUpdateCalls).toContain("uuid-no-updated");
+  });
 });
 
 describe("AC7 — scenario: healthy ticket is untouched", () => {

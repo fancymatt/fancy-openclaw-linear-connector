@@ -82,6 +82,11 @@ export interface RescueSweepOptions {
    * to build this mapping automatically. Inject in tests for isolation.
    */
   labelNameToId?: (name: string) => string | null;
+  /**
+   * Current time in ms since epoch. Defaults to Date.now(). Override in tests to freeze time
+   * for grace-window assertions.
+   */
+  nowMs?: number;
 }
 
 // ── Internal types ─────────────────────────────────────────────────────────
@@ -104,6 +109,8 @@ interface CapabilityPolicy {
 interface FetchedTicket extends SweepTicket {
   labelNodes: Array<{ id: string; name: string }>;
   teamId: string;
+  /** ISO-8601 timestamp of last modification, used for the rescueMalformed grace window. */
+  updatedAt?: string;
 }
 
 // ── Classification ─────────────────────────────────────────────────────────
@@ -171,6 +178,7 @@ async function fetchWfTickets(authToken: string): Promise<FetchedTicket[]> {
         nodes {
           id
           identifier
+          updatedAt
           state { name }
           labels { nodes { id name } }
           delegate { id name }
@@ -188,6 +196,7 @@ async function fetchWfTickets(authToken: string): Promise<FetchedTicket[]> {
     type IssueNode = {
       id: string;
       identifier: string;
+      updatedAt?: string;
       labels: { nodes: Array<{ id: string; name: string }> };
       delegate: { id: string; name: string } | null;
       team: { id: string } | null;
@@ -197,6 +206,7 @@ async function fetchWfTickets(authToken: string): Promise<FetchedTicket[]> {
     return (data.data?.issues?.nodes ?? []).map((n) => ({
       id: n.id,
       identifier: n.identifier,
+      updatedAt: n.updatedAt,
       labels: n.labels.nodes.map((l) => l.name),
       labelNodes: n.labels.nodes,
       delegateId: n.delegate?.id ?? null,
@@ -294,7 +304,12 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     capabilityPolicyPath,
     operationalEventStore,
     labelNameToId: injectedLabelNameToId,
+    nowMs,
   } = options;
+
+  const graceMsRaw = parseInt(process.env.RESCUE_MALFORMED_GRACE_MS ?? "300000", 10);
+  const graceMs = isNaN(graceMsRaw) ? 300000 : graceMsRaw;
+  const effectiveNow = nowMs ?? Date.now();
 
   const errors: string[] = [];
   const rescues: RescueAction[] = [];
@@ -372,6 +387,17 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
     let rescueAction: RescueAction;
 
     if (classification === "malformed") {
+      // Grace window: skip tickets modified very recently — they may be mid-repair by a steward
+      // who cleared the old state:* label but hasn't written the new one yet.
+      if (ticket.updatedAt) {
+        const ageMs = effectiveNow - new Date(ticket.updatedAt).getTime();
+        if (ageMs < graceMs) {
+          log.info(
+            `rescueMalformed: deferring ${ticket.identifier} — modified ${Math.floor(ageMs / 1000)}s ago, within grace window (${graceMs}ms); will retry on next sweep`,
+          );
+          continue;
+        }
+      }
       rescueAction = await rescueMalformed(ticket, wfDef, roleBodiesForRole, labelNameToId, authToken);
     } else if (classification === "dormant") {
       rescueAction = await rescueDormant(ticket, wfDef, roleBodiesForRole, authToken);
