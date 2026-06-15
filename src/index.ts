@@ -530,7 +530,7 @@ export function createApp(options?: CreateAppOptions) {
   });
 
   // v1 admin dashboard — read-only operational UI and safe JSON API.
-  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, deploymentName: DEPLOYMENT_NAME }));
+  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, deploymentName: DEPLOYMENT_NAME, wakeConfigForAgent }));
 
   app.use("/", createWebhookRouter(
     eventStore,

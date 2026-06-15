@@ -349,6 +349,80 @@ describe("setStateAtomic (AI-1546)", () => {
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/delegate agent.*not found/);
   });
+
+  // ── AI-1607: re-dispatch after set-state ──────────────────────────────────
+
+  it("AI-1607: calls sendWakeUp for the singleton body filling the new state's owner_role", async () => {
+    // Transition to 'intake' — owned by role 'steward', filled by 'astrid' in the policy.
+    // Note: 'astrid' is NOT in writeAgents() by default. We need to add her with a linearUserId
+    // for the role resolution to succeed, but sendWakeUp only needs the agent name string.
+    globalThis.fetch = makeSetStateFetch({
+      fromLabels: ["wf:dev-impl", "state:implementation"],
+      updateSuccess: true,
+      consistencyLabels: ["wf:dev-impl", "state:intake"],
+    });
+
+    const wakeCalls: Array<{ agentId: string; ticketId: string }> = [];
+    const sendWakeUp = async (agentId: string, ticketId: string) => {
+      wakeCalls.push({ agentId, ticketId });
+    };
+
+    const result = await setStateAtomic("AI-9999", "intake", undefined, "Bearer test-token", { sendWakeUp });
+    expect(result.ok).toBe(true);
+    expect(result.to).toBe("intake");
+    // 'astrid' fills the 'steward' role (per writePolicyYaml)
+    expect(wakeCalls).toHaveLength(1);
+    expect(wakeCalls[0].agentId).toBe("astrid");
+    expect(wakeCalls[0].ticketId).toBe("AI-9999");
+    expect(result.redispatched).toBe("astrid");
+  });
+
+  it("AI-1607: does NOT call sendWakeUp when target state is terminal (no owner_role)", async () => {
+    globalThis.fetch = makeSetStateFetch({
+      fromLabels: ["wf:dev-impl", "state:implementation"],
+      updateSuccess: true,
+      consistencyLabels: ["wf:dev-impl", "state:done"],
+    });
+
+    const wakeCalls: Array<{ agentId: string; ticketId: string }> = [];
+    const sendWakeUp = async (agentId: string, ticketId: string) => {
+      wakeCalls.push({ agentId, ticketId });
+    };
+
+    const result = await setStateAtomic("AI-9999", "done", undefined, "Bearer test-token", { sendWakeUp });
+    expect(result.ok).toBe(true);
+    expect(wakeCalls).toHaveLength(0);
+    expect(result.redispatched).toBeUndefined();
+  });
+
+  it("AI-1607: does NOT call sendWakeUp when options.sendWakeUp is absent", async () => {
+    globalThis.fetch = makeSetStateFetch({
+      fromLabels: ["wf:dev-impl", "state:implementation"],
+      updateSuccess: true,
+      consistencyLabels: ["wf:dev-impl", "state:intake"],
+    });
+
+    // No options passed — existing behaviour is fully preserved
+    const result = await setStateAtomic("AI-9999", "intake", undefined, "Bearer test-token");
+    expect(result.ok).toBe(true);
+    expect(result.redispatched).toBeUndefined();
+  });
+
+  it("AI-1607: returns ok:true even when sendWakeUp throws (fail-open)", async () => {
+    globalThis.fetch = makeSetStateFetch({
+      fromLabels: ["wf:dev-impl", "state:implementation"],
+      updateSuccess: true,
+      consistencyLabels: ["wf:dev-impl", "state:intake"],
+    });
+
+    const sendWakeUp = async (_agentId: string, _ticketId: string) => {
+      throw new Error("delivery failure");
+    };
+
+    const result = await setStateAtomic("AI-9999", "intake", undefined, "Bearer test-token", { sendWakeUp });
+    expect(result.ok).toBe(true);
+    expect(result.redispatched).toBeUndefined();
+  });
 });
 
 // ── Integration tests — admin HTTP endpoint ─────────────────────────────────

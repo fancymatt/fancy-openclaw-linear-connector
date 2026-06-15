@@ -11,6 +11,7 @@ import type { ObservationStore, ReasonCode } from "./store/observation-store.js"
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { setStateAtomic } from "./workflow-gate.js";
+import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 
 interface AdminDeps {
   agentQueue: AgentQueue;
@@ -19,6 +20,8 @@ interface AdminDeps {
   operationalEventStore?: OperationalEventStore;
   observationStore?: ObservationStore;
   deploymentName: string;
+  /** If provided, set-state will re-dispatch to the new state's owner role (AI-1607). */
+  wakeConfigForAgent?: (agentId: string) => WakeUpConfig;
 }
 
 type Severity = "green" | "yellow" | "red" | "gray";
@@ -598,7 +601,14 @@ export function createAdminRouter(deps: AdminDeps): Router {
       return;
     }
 
-    const result = await setStateAtomic(ticketId, targetState, delegate, authToken);
+    const sendWakeUp = deps.wakeConfigForAgent
+      ? async (agentId: string, ticketIdentifier: string) => {
+          const config = deps.wakeConfigForAgent!(agentId);
+          await sendWakeUpSignal(agentId, [ticketIdentifier], config);
+        }
+      : undefined;
+
+    const result = await setStateAtomic(ticketId, targetState, delegate, authToken, { sendWakeUp });
     res.status(result.ok ? 200 : 422).json(result);
   });
 
