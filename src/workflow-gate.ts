@@ -1012,6 +1012,28 @@ export async function checkWorkflowRules(
     }
   }
 
+  // AI-1617: steward-takeover bypasses both the delegate-only guard and the
+  // state-machine transition check. The command changes only the delegate field
+  // (no state or label mutations), so state-machine validation is not applicable.
+  // It exists to recover tickets whose delegate is absent — requiring the caller
+  // to already be the delegate contradicts its sole purpose. Allow: current
+  // delegate (who needs no takeover but should not error), workflow steward role.
+  // Block all others to prevent third-party delegate hijacking.
+  if (intent === "steward-takeover") {
+    if (!delegateId) return null;
+    if (callerLinearUserId && callerLinearUserId === delegateId) return null;
+    const stewardRole = def.break_glass?.owner_role;
+    if (stewardRole) {
+      const stewards = await resolveBodiesForRole(stewardRole);
+      if (stewards.includes(bodyId)) return null;
+    }
+    log.warn(`workflow-gate: steward-takeover blocked agent=${bodyId} ticket=${issueId} (not delegate or steward)`);
+    return (
+      `[Proxy] 'steward-takeover' blocked: '${bodyId}' is not the current delegate or the workflow steward. ` +
+      `Only the ticket delegate or a steward may take over a governed ticket.`
+    );
+  }
+
   // AI-1397: delegate-only enforcement at proxy (CLI-version-agnostic).
   // If both the caller's Linear user ID and the ticket's delegate ID are known,
   // block any agent that is not the current delegate. Fails open when either is
