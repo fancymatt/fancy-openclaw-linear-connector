@@ -9,4 +9,5 @@ export { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState
 export { StuckDelegateDetector, PromptCounter, buildRePrompt } from "./stuck-delegate-detector.js";
 export { ManagingPoller, parseManagingInterval, isDue } from "./managing-poller.js";
 export { buildManagingWakeMessage, sendManagingWakeSignal } from "./managing-wake.js";
+export { HoldRetryTracker } from "./hold-retry-tracker.js";
 //# sourceMappingURL=index.js.map

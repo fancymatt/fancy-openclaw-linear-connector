@@ -15,6 +15,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { loadWorkflowDef, fetchWorkflowLabels, getWorkflowId, getCurrentState, resolveTransitionTargets, resolveStakesLevel, } from "../workflow-gate.js";
 import { getAcRecord } from "../ac-record-store.js";
+import { getAppliedState } from "../store/applied-state-store.js";
 import { componentLogger, createLogger } from "../logger.js";
 import { defaultGuidanceDir } from "../instance-config.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "build-message");
@@ -109,7 +110,19 @@ async function tryBuildWorkflowMessage(actionText, identifier, title, authToken)
     }
     if (workflowId !== def.id)
         return null; // unknown workflow — fall back
-    const currentState = getCurrentState(labels);
+    // AI-1534: prefer the connector's just-applied destination state over the live
+    // label read. Linear reads are eventually consistent, so right after a
+    // transition (e.g. accept: intake → write-tests that also reassigns the
+    // delegate) the read above can still return the PRE-transition state, which
+    // would tell the new delegate to run the previous state's verb. The proxy is
+    // the sole writer of transitions, so its recorded post-transition state is
+    // authoritative while fresh.
+    const liveState = getCurrentState(labels);
+    const appliedState = getAppliedState(identifier);
+    const currentState = appliedState ?? liveState;
+    if (appliedState && appliedState !== liveState) {
+        log.info(`build-message: preferring just-applied state '${appliedState}' over live read '${liveState ?? "none"}' for ${identifier} (read-after-write lag guard, AI-1534)`);
+    }
     if (!currentState) {
         log.warn(`build-message: no state:* label on ${identifier} — falling back to generic`);
         return null;

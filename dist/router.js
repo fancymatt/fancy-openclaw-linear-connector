@@ -40,6 +40,18 @@ export function extractAgentTarget(event) {
         target = agentMap[delegateId];
         reason = "delegate";
         log.info(`Routed via delegate: ${delegateId} → ${target}`);
+        // Guard (AI-1573): for Issue update events, only dispatch via delegate when
+        // the delegate field actually changed in this update. If updatedFrom is
+        // present but contains neither "delegateId" nor "delegate", the delegate
+        // was not part of this mutation (same-value re-assert or unrelated-field
+        // edit). Guard checks both key forms Linear may emit.
+        if (event.type === "Issue" && event.action === "update") {
+            const upd = event.updatedFrom;
+            if (upd !== undefined && !("delegateId" in upd) && !("delegate" in upd)) {
+                log.info(`No-change delegate write — skipping dispatch (updatedFrom present, no delegate key)`);
+                target = null;
+            }
+        }
     }
     // 2. Fall back to assignee (for human-user API key tokens)
     if (!target) {

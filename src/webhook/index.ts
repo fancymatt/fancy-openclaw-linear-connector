@@ -14,8 +14,8 @@ import { normalizeSessionKey } from "../session-key.js";
 import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgents } from "../agents.js";
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
-import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing } from "../workflow-gate.js";
+import { checkRoleGuardAndBlock, guardOnLabelChange, type LinearUserIdResolver } from "../routing-guard.js";
+import { enrollIfMissing, fetchWorkflowLabels, getWorkflowId } from "../workflow-gate.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
@@ -311,6 +311,48 @@ export function createWebhookRouter(
       if (!route) {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
         appendOperationalEvent(operationalEventStore, { outcome: "no-route", type: event.type, errorSummary: `No agent target for ${event.type}` });
+
+        // AI-1575 / AC4: routing-guard on governed label-change events.
+        // When routeEvent returns null (no delegate in the event payload), the
+        // ticket's current Linear delegate may still be an illegal/stale body
+        // (the AI-1571 pattern). Run guardOnLabelChange to detect and correct.
+        const noRouteIdentifier = issueIdentifierFromEvent(event);
+        if (noRouteIdentifier) {
+          const labelGuardToken =
+            process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+          if (labelGuardToken) {
+            const authHdr = /^Bearer\s+/i.test(labelGuardToken) ? labelGuardToken : `Bearer ${labelGuardToken}`;
+            try {
+              const currentLabels = await fetchWorkflowLabels(noRouteIdentifier, authHdr);
+              if (getWorkflowId(currentLabels)) {
+                const resolver: LinearUserIdResolver = (bodyName: string) => {
+                  const agent = getAgents().find(
+                    (a) => a.name.toLowerCase() === bodyName.toLowerCase(),
+                  );
+                  return (agent as { linearUserId?: string } | undefined)?.linearUserId ?? null;
+                };
+                const labelGuardResult = await guardOnLabelChange({
+                  issueIdentifier: noRouteIdentifier,
+                  newLabels: currentLabels,
+                  authToken: authHdr,
+                  delegateLinearUserIdResolver: resolver,
+                });
+                if (labelGuardResult.fired) {
+                  log.info(
+                    `routing-guard: label-change guard fired for ${noRouteIdentifier} — ` +
+                    `blocked=${labelGuardResult.blocked} correctedTo=${labelGuardResult.correctedTo ?? "none"}`,
+                  );
+                }
+              }
+            } catch (err) {
+              log.warn(
+                `routing-guard: label-change guard failed for ${noRouteIdentifier}: ` +
+                `${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          }
+        }
+
         return;
       }
 

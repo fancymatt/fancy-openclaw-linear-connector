@@ -1012,6 +1012,14 @@ export async function checkWorkflowRules(
     }
   }
 
+  // AI-1575: enroll is an entry-point command, not a state-machine transition.
+  // It sets the ticket's wf:*, state:intake, risk:*, delegate, and native state
+  // atomically in one proxy-mediated write, bypassing state-machine validation.
+  // The B2 handler (applyStateTransition) applies the full atomic enrollment.
+  // Bypasses delegate-only enforcement: enrollment may override a stale delegate
+  // and must always be allowed for the steward regardless of current delegate.
+  if (intent === "enroll") return null;
+
   // AI-1397: delegate-only enforcement at proxy (CLI-version-agnostic).
   // If both the caller's Linear user ID and the ticket's delegate ID are known,
   // block any agent that is not the current delegate. Fails open when either is
@@ -1654,6 +1662,13 @@ export async function applyStateTransition(
     return;
   }
 
+  // AI-1575: Enrollment is an entry-point command, not a state-machine transition.
+  // Apply the full atomic enrollment (label + delegate + native state) and return.
+  if (intent === "enroll") {
+    await handleEnrollment(issueId, issue, def, authToken);
+    return;
+  }
+
   const breakGlassCommand = def.break_glass?.command ?? "escape";
   let toStateName: string;
   let matchedTransition: WorkflowTransition | undefined;
@@ -2210,6 +2225,98 @@ async function postFanoutSummaryComment(
 }
 
 /**
+ * AI-1575: Apply a full atomic enrollment onto the workflow spine.
+ *
+ * Called from applyStateTransition when intent === "enroll". The CLI has already
+ * written the enrollment labels (wf:*, state:intake, risk:*) to the ticket; this
+ * handler completes the enrollment by writing label + delegate + native state in
+ * ONE issueUpdateAtomic call, eliminating the orphaned-delegate window that caused
+ * the AI-1571 collision.
+ *
+ * Fail-closed: aborts without mutation if entry state, native state, or steward
+ * cannot be resolved. This prevents partial enrollment (governed + wrong/no delegate).
+ */
+async function handleEnrollment(
+  issueId: string,
+  issue: { internalId: string; teamId: string; labels: LabelNode[] },
+  def: WorkflowDef,
+  authToken: string,
+): Promise<void> {
+  // Resolve entry state from workflow def
+  const entryStateName = def.entry_state ?? "intake";
+  const entryState = def.states.find((s) => s.id === entryStateName);
+  if (!entryState) {
+    log.error(`workflow-gate: enroll: entry_state '${entryStateName}' not found in wf:${def.id} def — aborting`);
+    return;
+  }
+
+  // Resolve native state for the entry state (fail-closed: no native_state = abort)
+  const nativeStateName = entryState.native_state;
+  if (!nativeStateName) {
+    log.error(`workflow-gate: enroll: entry state '${entryStateName}' in wf:${def.id} has no native_state — aborting`);
+    return;
+  }
+  const nativeStateId = await resolveNativeStateId(issue.teamId, nativeStateName, authToken);
+  if (!nativeStateId) {
+    log.error(`workflow-gate: enroll: could not resolve native stateId '${nativeStateName}' for ${issueId} — aborting`);
+    return;
+  }
+
+  // Resolve steward delegate from entry state's owner_role (must be singleton)
+  let stewardDelegateId: string | null = null;
+  const ownerRole = entryState.owner_role;
+  if (ownerRole) {
+    let roleBodies: string[];
+    try {
+      roleBodies = await resolveBodiesForRole(ownerRole);
+    } catch (err) {
+      log.error(`workflow-gate: enroll: role resolution failed for '${ownerRole}': ${err instanceof Error ? err.message : String(err)} — aborting`);
+      return;
+    }
+    if (roleBodies.length === 1) {
+      const agent = getAgent(roleBodies[0]);
+      if (agent?.linearUserId) {
+        stewardDelegateId = agent.linearUserId;
+      } else {
+        log.error(`workflow-gate: enroll: singleton body '${roleBodies[0]}' for role '${ownerRole}' has no linearUserId — aborting`);
+        return;
+      }
+    } else if (roleBodies.length > 1) {
+      // Multi-body role: enrollment requires a clear steward. Fail-closed.
+      log.error(`workflow-gate: enroll: role '${ownerRole}' resolves to multiple bodies (${roleBodies.join(", ")}) — cannot auto-assign steward for ${issueId}. Aborting.`);
+      return;
+    } else {
+      log.error(`workflow-gate: enroll: no bodies registered for role '${ownerRole}' in entry state '${entryStateName}' — aborting`);
+      return;
+    }
+  }
+
+  // Build label set from current ticket labels
+  // The CLI already wrote wf:*, state:intake, risk:* — use them as-is.
+  const currentLabelIds = issue.labels.map((l) => l.id);
+
+  // Single atomic write: labels (already set by CLI) + steward delegate + native state.
+  // Overwrites any prior stale/ad-hoc delegate (AC2: re-enrollment hard-resets the delegate).
+  const applied = await issueUpdateAtomic(
+    issue.internalId,
+    currentLabelIds,
+    authToken,
+    stewardDelegateId,
+    nativeStateId,
+  );
+
+  if (applied) {
+    log.info(
+      `workflow-gate: enroll: ${issueId} enrolled on wf:${def.id} state:${entryStateName}` +
+      (stewardDelegateId ? ` delegate=${stewardDelegateId}` : ` delegate=cleared`) +
+      ` native=${nativeStateName}(${nativeStateId})`
+    );
+  } else {
+    log.error(`workflow-gate: enroll: atomic enrollment mutation FAILED for ${issueId}`);
+  }
+}
+
+/**
  * AI-1493: Atomic issue update — sets labels AND delegate in a single mutation.
  * This replaces the separate issueUpdateLabels + issueUpdateDelegate calls
  * so the transition is all-or-nothing: either the full tuple lands or nothing does.
@@ -2261,6 +2368,169 @@ async function issueUpdateAtomic(
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: atomic issueUpdate failed for ${internalId}: ${msg}`);
     return false;
+  }
+}
+
+/**
+ * AI-1575: Resolve a Linear user ID by display name (for steward lookup when
+ * the agent config has no linearUserId). Returns the first matching user's ID,
+ * or null if not found or the lookup fails.
+ */
+async function resolveLinearUserByName(
+  name: string,
+  authToken: string,
+): Promise<string | null> {
+  const query = `
+    query FindUserByName($name: String!) {
+      users(filter: { name: { containsIgnoreCase: $name } }) {
+        nodes { id name }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { name } }),
+    });
+    type Resp = { data?: { users?: { nodes: Array<{ id: string; name: string }> } } };
+    const data = (await res.json()) as Resp;
+    const users = data.data?.users?.nodes ?? [];
+    return users[0]?.id ?? null;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: resolveLinearUserByName: lookup failed for '${name}': ${msg}`);
+    return null;
+  }
+}
+
+/**
+ * AI-1575: First-class atomic enrollment — enroll a ticket onto a workflow spine
+ * in a single mutation (wf:* + state:intake + risk:* labels, steward delegate,
+ * and native stateId). This eliminates the orphaned-delegate window that caused
+ * the AI-1571 collision.
+ *
+ * Unlike the internal `handleEnrollment` (which operates on an already-forwarded
+ * CLI command), this is a standalone public entry point that:
+ *   - Accepts enrollment params (workflow, risk level) directly
+ *   - Builds the label set from scratch (not from existing labels) — AC2 requires
+ *     that old/stale labels are excluded from the enrollment write
+ *   - Returns { success, mutationCount } so callers can assert atomicity
+ *
+ * Fail-closed: returns { success: false, mutationCount: 0 } if any prerequisite
+ * (issue fetch, workflow def, label resolution, native state) cannot be resolved.
+ */
+export async function applyEnrollment(opts: {
+  issueIdentifier: string;
+  workflow: string;
+  risk: "low" | "medium" | "high";
+  authToken: string;
+  /** Optional: provide directly to skip the Linear user lookup. */
+  stewardLinearUserId?: string;
+}): Promise<{ success: boolean; mutationCount: number }> {
+  const { issueIdentifier, workflow, risk, authToken, stewardLinearUserId: stewardOverride } = opts;
+
+  // 1. Fetch issue internal UUID + teamId.
+  const issue = await fetchIssueWithLabels(issueIdentifier, authToken);
+  if (!issue) {
+    log.error(`workflow-gate: applyEnrollment: could not fetch issue ${issueIdentifier} — aborting`);
+    return { success: false, mutationCount: 0 };
+  }
+
+  // 2. Load workflow def.
+  let def: WorkflowDef | undefined;
+  try {
+    const registry = await loadWorkflowRegistry();
+    def = registry.get(workflow);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.error(`workflow-gate: applyEnrollment: registry load failed: ${msg} — aborting`);
+    return { success: false, mutationCount: 0 };
+  }
+  if (!def) {
+    log.error(`workflow-gate: applyEnrollment: workflow '${workflow}' not found — aborting`);
+    return { success: false, mutationCount: 0 };
+  }
+
+  // 3. Resolve entry state.
+  const entryStateName = def.entry_state ?? "intake";
+  const entryState = def.states.find((s) => s.id === entryStateName);
+  if (!entryState) {
+    log.error(`workflow-gate: applyEnrollment: entry_state '${entryStateName}' not found in wf:${workflow} — aborting`);
+    return { success: false, mutationCount: 0 };
+  }
+
+  // 4. Resolve fresh label IDs for wf:*, state:intake, risk:* — AC2 requires that
+  //    we do NOT carry over existing labels (they are replaced atomically).
+  const wfLabelId = await findOrCreateLabel(issue.teamId, `wf:${workflow}`, authToken);
+  const stateLabelId = await findOrCreateLabel(issue.teamId, `state:${entryStateName}`, authToken);
+  const riskLabelId = await findOrCreateLabel(issue.teamId, `risk:${risk}`, authToken);
+  if (!wfLabelId || !stateLabelId || !riskLabelId) {
+    log.error(`workflow-gate: applyEnrollment: could not resolve label IDs for ${issueIdentifier} — aborting`);
+    return { success: false, mutationCount: 0 };
+  }
+  const enrollmentLabelIds = [wfLabelId, stateLabelId, riskLabelId];
+
+  // 5. Resolve native stateId for the entry state.
+  const nativeStateName = entryState.native_state;
+  if (!nativeStateName) {
+    log.error(`workflow-gate: applyEnrollment: entry state '${entryStateName}' has no native_state — aborting`);
+    return { success: false, mutationCount: 0 };
+  }
+  const nativeStateId = await resolveNativeStateId(issue.teamId, nativeStateName, authToken);
+  if (!nativeStateId) {
+    log.error(`workflow-gate: applyEnrollment: could not resolve native stateId '${nativeStateName}' for ${issueIdentifier} — aborting`);
+    return { success: false, mutationCount: 0 };
+  }
+
+  // 6. Resolve steward delegate. If provided, use directly. Otherwise derive from
+  //    the entry state's owner_role: try agents.ts first (cheaper, no API call),
+  //    then fall back to a Linear user name lookup if the agent has no linearUserId.
+  let stewardDelegateId: string | null = stewardOverride ?? null;
+  if (!stewardDelegateId) {
+    const ownerRole = entryState.owner_role;
+    if (ownerRole) {
+      let bodyName: string | null = null;
+      try {
+        const roleBodies = await resolveBodiesForRole(ownerRole);
+        if (Array.isArray(roleBodies) && roleBodies.length === 1) {
+          bodyName = roleBodies[0];
+          // Prefer agents.ts config (no extra API call in production).
+          const agent = getAgent(bodyName);
+          if (agent?.linearUserId) {
+            stewardDelegateId = agent.linearUserId;
+          }
+        }
+      } catch {
+        // fail-open: fall through to name lookup
+      }
+      // If not resolved via agents.ts, query Linear by name.
+      if (!stewardDelegateId) {
+        stewardDelegateId = await resolveLinearUserByName(bodyName ?? ownerRole, authToken);
+      }
+    }
+  }
+
+  // 7. Single atomic mutation — AC1: exactly one issueUpdate with labelIds + delegateId + stateId.
+  const applied = await issueUpdateAtomic(
+    issue.internalId,
+    enrollmentLabelIds,
+    authToken,
+    stewardDelegateId,
+    nativeStateId,
+  );
+
+  if (applied) {
+    log.info(
+      `workflow-gate: applyEnrollment: ${issueIdentifier} enrolled on wf:${workflow} ` +
+      `state:${entryStateName} risk:${risk}` +
+      (stewardDelegateId ? ` delegate=${stewardDelegateId}` : ` delegate=cleared`) +
+      ` native=${nativeStateName}(${nativeStateId})`,
+    );
+    return { success: true, mutationCount: 1 };
+  } else {
+    log.error(`workflow-gate: applyEnrollment: atomic enrollment mutation FAILED for ${issueIdentifier}`);
+    return { success: false, mutationCount: 0 };
   }
 }
 

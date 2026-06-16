@@ -9,8 +9,8 @@ import { normalizeSessionKey } from "../session-key.js";
 import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgents } from "../agents.js";
 import { checkAgentLiveness } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
-import { checkRoleGuardAndBlock } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing } from "../workflow-gate.js";
+import { checkRoleGuardAndBlock, guardOnLabelChange } from "../routing-guard.js";
+import { enrollIfMissing, fetchWorkflowLabels, getWorkflowId } from "../workflow-gate.js";
 import { resignalPendingTickets } from "../bag/index.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { isLinearIssueStillRoutedToAgent, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
@@ -267,6 +267,40 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
         if (!route) {
             log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
             appendOperationalEvent(operationalEventStore, { outcome: "no-route", type: event.type, errorSummary: `No agent target for ${event.type}` });
+            // AI-1575 / AC4: routing-guard on governed label-change events.
+            // When routeEvent returns null (no delegate in the event payload), the
+            // ticket's current Linear delegate may still be an illegal/stale body
+            // (the AI-1571 pattern). Run guardOnLabelChange to detect and correct.
+            const noRouteIdentifier = issueIdentifierFromEvent(event);
+            if (noRouteIdentifier) {
+                const labelGuardToken = process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+                if (labelGuardToken) {
+                    const authHdr = /^Bearer\s+/i.test(labelGuardToken) ? labelGuardToken : `Bearer ${labelGuardToken}`;
+                    try {
+                        const currentLabels = await fetchWorkflowLabels(noRouteIdentifier, authHdr);
+                        if (getWorkflowId(currentLabels)) {
+                            const resolver = (bodyName) => {
+                                const agent = getAgents().find((a) => a.name.toLowerCase() === bodyName.toLowerCase());
+                                return agent?.linearUserId ?? null;
+                            };
+                            const labelGuardResult = await guardOnLabelChange({
+                                issueIdentifier: noRouteIdentifier,
+                                newLabels: currentLabels,
+                                authToken: authHdr,
+                                delegateLinearUserIdResolver: resolver,
+                            });
+                            if (labelGuardResult.fired) {
+                                log.info(`routing-guard: label-change guard fired for ${noRouteIdentifier} — ` +
+                                    `blocked=${labelGuardResult.blocked} correctedTo=${labelGuardResult.correctedTo ?? "none"}`);
+                            }
+                        }
+                    }
+                    catch (err) {
+                        log.warn(`routing-guard: label-change guard failed for ${noRouteIdentifier}: ` +
+                            `${err instanceof Error ? err.message : String(err)}`);
+                    }
+                }
+            }
             return;
         }
         // ── 9a. Stale-route guard ───────────────────────────────────────────

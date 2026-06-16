@@ -29,10 +29,30 @@
  */
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, getCurrentState } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState } from "./workflow-gate.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
+// G-16/AI-1548: per-ticket command lock (first-wins).
+// Tracks ticket IDs whose commands are currently in-flight. A second concurrent
+// command for the same ticket is rejected immediately — it never reaches B1 and
+// never forwards. The lock is acquired synchronously (before any await) so the
+// in-flight flag is visible to all other handlers that enter handleProxyRequest
+// before the first command yields to the event loop.
+const inFlightTickets = new Set();
+async function runWithTicketLock(ticketId, fn, onConflict) {
+    if (inFlightTickets.has(ticketId)) {
+        onConflict();
+        return;
+    }
+    inFlightTickets.add(ticketId);
+    try {
+        await fn();
+    }
+    finally {
+        inFlightTickets.delete(ticketId);
+    }
+}
 /**
  * Minimum CLI version required to issue workflow mutations (AI-1397).
  * CLIs below this version lack proxy-side delegate guards and advancement
@@ -105,6 +125,67 @@ function extractIssueId(body) {
         }
     }
     return null;
+}
+/**
+ * True when the mutation is an `issueUpdate` (the only mutation that carries a
+ * label delta / state change). Reads and other mutations are left untouched.
+ */
+function isIssueUpdateMutation(body) {
+    return !!body?.query && /\bissueUpdate\s*\(/.test(body.query);
+}
+/**
+ * AI-1612: strip `state:*` label deltas from a forwarded intent-bearing
+ * `issueUpdate` mutation so the proxy becomes the sole writer of the workflow
+ * state label.
+ *
+ * Governed transition verbs set `omitStateId: true` (no native write) but still
+ * carry the `state:*` flip via `addedLabelIds`/`removedLabelIds`. If that delta
+ * lands upstream and `applyStateTransition` then fail-closes (e.g. it cannot
+ * resolve the next delegate), the result is a half-applied transition: the label
+ * moved but the delegate is stranded. By removing the state-label IDs here,
+ * `applyStateTransition` — which re-derives the full correct label set itself in
+ * one atomic mutation — is the only thing that ever moves the state label, so a
+ * fail-closed transition is a true no-op.
+ *
+ * Only `state:*` label IDs are removed; any non-state label deltas pass through
+ * untouched. Returns the count of stripped IDs (for logging).
+ */
+function issueUpdateInput(body) {
+    const input = body?.variables?.input;
+    return input && typeof input === "object" ? input : undefined;
+}
+/**
+ * True when the mutation carries a non-empty `state:*`-eligible label delta
+ * (`addedLabelIds`/`removedLabelIds`). Used to skip the team-label resolution
+ * round-trip entirely for mutations that have no label delta to strip.
+ */
+function carriesLabelDelta(body) {
+    const input = issueUpdateInput(body);
+    if (!input)
+        return false;
+    return ["addedLabelIds", "removedLabelIds"].some((k) => Array.isArray(input[k]) && input[k].length > 0);
+}
+function stripStateLabelDeltas(body, stateLabelIds) {
+    if (!body || stateLabelIds.size === 0)
+        return 0;
+    const input = issueUpdateInput(body);
+    if (!input)
+        return 0;
+    let stripped = 0;
+    for (const key of ["addedLabelIds", "removedLabelIds"]) {
+        const arr = input[key];
+        if (!Array.isArray(arr))
+            continue;
+        const filtered = arr.filter((id) => !(typeof id === "string" && stateLabelIds.has(id)));
+        stripped += arr.length - filtered.length;
+        if (filtered.length === 0) {
+            delete input[key];
+        }
+        else if (filtered.length !== arr.length) {
+            input[key] = filtered;
+        }
+    }
+    return stripped;
 }
 /**
  * Build the ticket context string for log lines (empty string when no ID found).
@@ -191,11 +272,6 @@ export async function handleProxyRequest(req, res, deps) {
     // AI-1397: resolve caller's Linear user ID from agent config for delegate enforcement.
     const callerLinearUserId = getAgent(agentId)?.linearUserId ?? null;
     log.info(`forward agent=${agentId} op=${opName}${ticketCtx}${intent ? ` intent=${intent}` : ""}${cliVersion ? ` cli=${cliVersion}` : ""}`);
-    // AI-1498: capture the ticket's workflow state BEFORE forwarding. The CLI
-    // advances the state:* label inside its own forwarded mutation, so the
-    // post-forward applyStateTransition would otherwise read the destination
-    // state and skip the native-stateId write. We snapshot the true source here.
-    let sourceStateOverride;
     // AI-1583: enforcement and the B2 writer apply to mutations only. A read can
     // never change workflow state, but reads issued mid-command inherit the sticky
     // intent header — gating them produced spurious delegate-only blocks.
@@ -203,6 +279,7 @@ export async function handleProxyRequest(req, res, deps) {
     // Phase 2 / slice 1 + Phase 3 B1: evaluate enforcement rules before forwarding.
     if (intent && isMutation) {
         // AI-1397: version floor — reject workflow mutations from stale CLIs.
+        // Stateless check; stays outside the per-ticket lock.
         if (cliVersion) {
             const minVer = minWorkflowCliVersion();
             const parsed = parseSemver(cliVersion);
@@ -217,31 +294,185 @@ export async function handleProxyRequest(req, res, deps) {
         else {
             log.warn(`version-header-missing agent=${agentId} intent=${intent}${ticketCtx} — update CLI to emit X-Openclaw-Linear-Cli-Version`);
         }
-        const p2rejection = await checkEnforcementRules(intent, issueId, authorization, agentId);
-        if (p2rejection) {
-            log.warn(`enforcement-block agent=${agentId} intent=${intent}${ticketCtx}: ${p2rejection}`);
-            res.status(200).json({ errors: [{ message: p2rejection }] });
-            return;
-        }
-        const p3rejection = await checkWorkflowRules(intent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride);
-        if (p3rejection) {
-            log.warn(`workflow-block agent=${agentId} intent=${intent}${ticketCtx}: ${p3rejection}`);
-            res.status(200).json({ errors: [{ message: p3rejection }] });
-            return;
-        }
-        // AI-1498: snapshot the pre-forward workflow state for applyStateTransition.
-        // Fail-open: on any fetch error leave it undefined and let applyStateTransition
-        // fall back to the ticket's current state:* label (legacy behavior).
-        if (issueId) {
+        // G-16/AI-1548: per-ticket command serialisation.
+        // The lock must be acquired synchronously (before any await) so a second
+        // concurrent request on the same ticket sees the updated queue tail and waits.
+        // Enforcement (B1), forward, and B2 all run inside the lock so the second
+        // command re-validates against the state written by the first.
+        const runCommand = async () => {
+            // AI-1498: capture the ticket's workflow state BEFORE forwarding.
+            let sourceStateOverride;
+            // G-13a (AI-1551): identity gate — break-glass restricted to steward/human bodies.
+            if (breakGlassOverride) {
+                let isAuthorized = false;
+                try {
+                    const { bodyHasCapability } = await import("./escalation-gate.js");
+                    isAuthorized = await bodyHasCapability(agentId, "human:escalate");
+                }
+                catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    log.warn(`break-glass-audit agent=${agentId} authorized=false result=identity-check-failed${ticketCtx} intent=${intent}: ${msg}`);
+                    res.status(200).json({ errors: [{ message: `[Proxy] Break-glass rejected: identity check failed (${msg}). Only stewards may use break-glass.` }] });
+                    return;
+                }
+                if (!isAuthorized) {
+                    log.warn(`break-glass-audit agent=${agentId} authorized=false${ticketCtx} intent=${intent}`);
+                    res.status(200).json({ errors: [{ message: `[Proxy] Break-glass rejected: caller '${agentId}' is not a steward or human. Only stewards may use break-glass.` }] });
+                    return;
+                }
+                log.warn(`break-glass-audit agent=${agentId} authorized=true${ticketCtx} intent=${intent}`);
+            }
+            const p2rejection = await checkEnforcementRules(intent, issueId, authorization, agentId);
+            if (p2rejection) {
+                log.warn(`enforcement-block agent=${agentId} intent=${intent}${ticketCtx}: ${p2rejection}`);
+                res.status(200).json({ errors: [{ message: p2rejection }] });
+                return;
+            }
+            // G-13a: emit audit event for authorized break-glass use.
+            if (breakGlassOverride) {
+                deps?.operationalEventStore?.append({ outcome: "break-glass-used", agent: agentId, key: issueId ?? undefined });
+            }
+            const p3rejection = await checkWorkflowRules(intent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride);
+            if (p3rejection) {
+                log.warn(`workflow-block agent=${agentId} intent=${intent}${ticketCtx}: ${p3rejection}`);
+                res.status(200).json({ errors: [{ message: p3rejection }] });
+                return;
+            }
+            // AI-1498: snapshot the pre-forward workflow state for applyStateTransition.
+            // Fail-open: on any fetch error leave it undefined and let applyStateTransition
+            // fall back to the ticket's current state:* label (legacy behavior).
+            if (issueId) {
+                try {
+                    const preLabels = await fetchWorkflowLabels(issueId, authorization);
+                    sourceStateOverride = getCurrentState(preLabels) ?? undefined;
+                }
+                catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    log.warn(`source-state snapshot failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+                }
+                // AI-1612: make the proxy the sole writer of the workflow state label.
+                // Strip the `state:*` label delta from the forwarded issueUpdate so the
+                // CLI's pre-write can't land ahead of applyStateTransition. If that apply
+                // later fail-closes, the transition is then a true no-op (state label and
+                // delegate both unchanged) instead of a half-applied stranding.
+                // Fail-open: if the state-label IDs can't be resolved, strip nothing.
+                if (isIssueUpdateMutation(body) && carriesLabelDelta(body)) {
+                    try {
+                        const stateLabelIds = await fetchTeamStateLabelIds(issueId, authorization);
+                        const stripped = stripStateLabelDeltas(body, stateLabelIds);
+                        if (stripped > 0) {
+                            log.info(`state-label-strip agent=${agentId} intent=${intent}${ticketCtx}: stripped ${stripped} state:* label delta(s) — applyStateTransition is sole writer`);
+                        }
+                    }
+                    catch (err) {
+                        const msg = err instanceof Error ? err.message : String(err);
+                        log.warn(`state-label-strip failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg} — forwarding label delta unchanged`);
+                    }
+                }
+            }
+            let upstreamRes;
             try {
-                const preLabels = await fetchWorkflowLabels(issueId, authorization);
-                sourceStateOverride = getCurrentState(preLabels) ?? undefined;
+                upstreamRes = await fetch(LINEAR_API_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", Authorization: authorization },
+                    body: JSON.stringify(body),
+                });
             }
             catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                log.warn(`source-state snapshot failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+                log.error(`upstream request failed: ${msg}`);
+                res.status(200).json({
+                    errors: [{
+                            message: `Linear API unreachable: ${msg}. No state was changed.`,
+                            extensions: { code: "UPSTREAM_TIMEOUT" },
+                        }],
+                });
+                return;
             }
+            const responseText = await upstreamRes.text();
+            log.info(`response agent=${agentId} op=${opName} status=${upstreamRes.status}`);
+            if (!upstreamRes.ok) {
+                const status = upstreamRes.status;
+                log.warn(`upstream-error agent=${agentId} op=${opName}${ticketCtx} status=${status}`);
+                if (status === 429) {
+                    const retryAfterHeader = upstreamRes.headers.get("Retry-After");
+                    const retryAfterSeconds = retryAfterHeader ? parseInt(retryAfterHeader, 10) : 60;
+                    res.status(200).json({
+                        errors: [{
+                                message: `Linear rate limit exceeded. No state was changed. Retry after ${retryAfterSeconds}s.`,
+                                extensions: { code: "UPSTREAM_RATE_LIMITED", retryAfterSeconds },
+                            }],
+                    });
+                }
+                else {
+                    res.status(200).json({
+                        errors: [{
+                                message: `Linear API returned ${status}. No state was changed.`,
+                                extensions: { code: "UPSTREAM_ERROR", httpStatus: status },
+                            }],
+                    });
+                }
+                return;
+            }
+            // Phase 3 B2: apply state:* label transition after a successful forward.
+            // Phase 4 / P4-1: record feedback observation for feedback transitions.
+            // Fail-open: errors are logged and never propagate to the agent's response.
+            if (upstreamRes.ok) {
+                try {
+                    let feedback;
+                    if (feedbackCategoryHeader && (intent === "request-changes" || intent === "reject" || intent === "ac-fail")) {
+                        const fromBodyHeader = req.headers["x-openclaw-from-body"] ?? null;
+                        feedback = {
+                            fromBody: fromBodyHeader,
+                            reasonCode: feedbackCategoryHeader,
+                            freeText: extractCommentBody(body),
+                        };
+                    }
+                    await applyStateTransition(intent, issueId, authorization, {
+                        bodyId: agentId,
+                        observationStore: deps?.observationStore,
+                        feedback,
+                        artifactRef: artifactRefHeader,
+                        sourceStateOverride,
+                    });
+                }
+                catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    log.warn(`state-transition failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+                }
+                // Layer 1 (AI-1387): proactive legal-verb re-injection at completion.
+                let workflowReminder = null;
+                try {
+                    workflowReminder = await buildStateTransitionReminder(intent, issueId, authorization);
+                }
+                catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    log.warn(`reminder-build failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+                }
+                if (workflowReminder) {
+                    try {
+                        const parsedResponse = JSON.parse(responseText);
+                        parsedResponse._workflowReminder = workflowReminder;
+                        res.status(upstreamRes.status).set("Content-Type", "application/json").send(JSON.stringify(parsedResponse));
+                        return;
+                    }
+                    catch {
+                        // If response isn't valid JSON, fall through to send as-is.
+                    }
+                }
+            }
+            res.status(upstreamRes.status).set("Content-Type", "application/json").send(responseText);
+        };
+        if (issueId) {
+            await runWithTicketLock(issueId, runCommand, () => {
+                log.warn(`concurrent-command-block agent=${agentId} intent=${intent}${ticketCtx}`);
+                res.status(200).json({ errors: [{ message: `[Proxy] '${intent}' blocked: another command is currently in-flight for ${issueId}. Retry once it completes.` }] });
+            });
         }
+        else {
+            await runCommand();
+        }
+        return;
     }
     else if (!intent) {
         // Layer 2 (AI-1387): intercept raw status/assignee mutations on workflow tickets.
@@ -256,6 +487,7 @@ export async function handleProxyRequest(req, res, deps) {
             return;
         }
     }
+    // Non-intent forward path (reads and raw non-workflow mutations).
     let upstreamRes;
     try {
         upstreamRes = await fetch(LINEAR_API_URL, {
@@ -270,71 +502,38 @@ export async function handleProxyRequest(req, res, deps) {
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log.error(`upstream request failed: ${msg}`);
-        res
-            .status(502)
-            .json({ errors: [{ message: `Linear API unreachable: ${msg}` }] });
+        res.status(200).json({
+            errors: [{
+                    message: `Linear API unreachable: ${msg}. No state was changed.`,
+                    extensions: { code: "UPSTREAM_TIMEOUT" },
+                }],
+        });
         return;
     }
     const responseText = await upstreamRes.text();
     log.info(`response agent=${agentId} op=${opName} status=${upstreamRes.status}`);
-    // Phase 3 B2: apply state:* label transition after a successful forward.
-    // Phase 4 / P4-1: record feedback observation for feedback transitions.
-    // Only runs when the command was validated (intent present, no P2/P3 block).
-    // AI-1583: mutations only — a forwarded read must not re-trigger the writer.
-    // Fail-open: errors are logged and never propagate to the agent's response.
-    if (intent && isMutation && upstreamRes.ok) {
-        try {
-            // Build feedback context for observation recording.
-            let feedback;
-            if (feedbackCategoryHeader && (intent === "request-changes" || intent === "reject" || intent === "ac-fail")) {
-                const fromBodyHeader = req.headers["x-openclaw-from-body"] ?? null;
-                feedback = {
-                    fromBody: fromBodyHeader,
-                    reasonCode: feedbackCategoryHeader,
-                    freeText: extractCommentBody(body),
-                };
-            }
-            await applyStateTransition(intent, issueId, authorization, {
-                bodyId: agentId,
-                observationStore: deps?.observationStore,
-                feedback,
-                artifactRef: artifactRefHeader,
-                sourceStateOverride,
+    if (!upstreamRes.ok) {
+        const status = upstreamRes.status;
+        log.warn(`upstream-error agent=${agentId} op=${opName}${ticketCtx} status=${status}`);
+        if (status === 429) {
+            const retryAfterHeader = upstreamRes.headers.get("Retry-After");
+            const retryAfterSeconds = retryAfterHeader ? parseInt(retryAfterHeader, 10) : 60;
+            res.status(200).json({
+                errors: [{
+                        message: `Linear rate limit exceeded. No state was changed. Retry after ${retryAfterSeconds}s.`,
+                        extensions: { code: "UPSTREAM_RATE_LIMITED", retryAfterSeconds },
+                    }],
             });
         }
-        catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            log.warn(`state-transition failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+        else {
+            res.status(200).json({
+                errors: [{
+                        message: `Linear API returned ${status}. No state was changed.`,
+                        extensions: { code: "UPSTREAM_ERROR", httpStatus: status },
+                    }],
+            });
         }
-        // Layer 1 (AI-1387): proactive legal-verb re-injection at completion.
-        // After a successful state transition, generate the legal commands for
-        // the NEW state and include in the response body so the agent sees them
-        // at the decision moment — not just at delegation time.
-        // Injected into the response JSON as `_workflowReminder` since HTTP headers
-        // cannot carry newlines.
-        let workflowReminder = null;
-        try {
-            workflowReminder = await buildStateTransitionReminder(intent, issueId, authorization);
-        }
-        catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            log.warn(`reminder-build failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
-        }
-        // If we have a reminder, inject it into the response body.
-        if (workflowReminder) {
-            try {
-                const parsedResponse = JSON.parse(responseText);
-                parsedResponse._workflowReminder = workflowReminder;
-                res
-                    .status(upstreamRes.status)
-                    .set("Content-Type", "application/json")
-                    .send(JSON.stringify(parsedResponse));
-                return;
-            }
-            catch {
-                // If response isn't valid JSON, fall through to send as-is.
-            }
-        }
+        return;
     }
     res
         .status(upstreamRes.status)
