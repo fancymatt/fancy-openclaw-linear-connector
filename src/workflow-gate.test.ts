@@ -544,6 +544,58 @@ describe("checkWorkflowRules — AI-1574: refuse-work caller-gating", () => {
   });
 });
 
+// ── AI-1617: steward-takeover delegate-guard bypass ───────────────────────
+// steward-takeover exists solely to recover tickets whose delegate is absent.
+// The "already-delegate" guard contradicts this purpose: if you were already
+// the delegate you wouldn't need a takeover. Fix: allow the steward role to
+// bypass the delegate-only guard for this specific intent.
+
+describe("checkWorkflowRules — AI-1617: steward-takeover caller-gating", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  function makeDelegateFetch(labelNames: string[], delegateId: string): typeof globalThis.fetch {
+    return async (_url, _init) => new Response(JSON.stringify({
+      data: { issue: { labels: { nodes: labelNames.map((n) => ({ name: n })) }, delegate: { id: delegateId } } },
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+
+  // AC1: steward can take over even when not the delegate.
+  it("AC1: steward-takeover by the workflow steward passes through when not the delegate", async () => {
+    globalThis.fetch = makeDelegateFetch(["wf:dev-impl", "state:deployment"], "hanzo-linear-uuid");
+    // astrid is the steward; hanzo is the delegate
+    expect(await checkWorkflowRules("steward-takeover", "issue-uuid", "Bearer tok", "astrid", null, "astrid-linear-uuid")).toBeNull();
+  });
+
+  // AC2: the current delegate can still invoke steward-takeover (no-op takeover is harmless).
+  it("AC2: steward-takeover by the current delegate passes through", async () => {
+    globalThis.fetch = makeDelegateFetch(["wf:dev-impl", "state:deployment"], "hanzo-linear-uuid");
+    expect(await checkWorkflowRules("steward-takeover", "issue-uuid", "Bearer tok", "hanzo", null, "hanzo-linear-uuid")).toBeNull();
+  });
+
+  // AC3 (the bug): non-steward, non-delegate caller must be blocked.
+  it("AC3: steward-takeover by a non-steward, non-delegate caller is blocked", async () => {
+    globalThis.fetch = makeDelegateFetch(["wf:dev-impl", "state:deployment"], "hanzo-linear-uuid");
+    const result = await checkWorkflowRules("steward-takeover", "issue-uuid", "Bearer tok", "charles", null, "charles-linear-uuid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("steward-takeover");
+  });
+
+  // AC4: ungoverned ticket (no wf:* label) always passes through.
+  it("AC4: steward-takeover on an ungoverned ticket passes through", async () => {
+    globalThis.fetch = makeDelegateFetch(["bug", "priority:high"], "hanzo-linear-uuid");
+    expect(await checkWorkflowRules("steward-takeover", "issue-uuid", "Bearer tok", "charles", null, "charles-linear-uuid")).toBeNull();
+  });
+
+  // AC5: no delegate set — fail-open (nothing to protect against).
+  it("AC5: steward-takeover on a ticket with no delegate passes through", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+    expect(await checkWorkflowRules("steward-takeover", "issue-uuid", "Bearer tok", "charles", null, "charles-linear-uuid")).toBeNull();
+  });
+});
+
 // ── Per-state legal / illegal commands ────────────────────────────────────
 
 describe("checkWorkflowRules — intake state", () => {

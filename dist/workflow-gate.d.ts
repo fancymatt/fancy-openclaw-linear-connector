@@ -151,6 +151,21 @@ export declare function resetNativeStateCache(): void;
  */
 export declare function resolveNativeStateId(teamId: string, semanticName: string, authToken: string): Promise<string | null>;
 /**
+ * Resolve the set of `state:*` label IDs in the team that owns the given issue.
+ *
+ * AI-1612: the proxy is the sole writer of the workflow state label. To enforce
+ * that, it strips `state:*` label deltas from the forwarded CLI mutation before
+ * `applyStateTransition` runs — so a fail-closed transition is a true no-op
+ * rather than a half-applied label move with a stranded delegate. Identifying
+ * which delta IDs are state labels needs the team's full label set (the added
+ * destination label is not yet on the issue), so this queries team labels, not
+ * just the issue's current labels.
+ *
+ * Returns an empty set on any error — the proxy then fails open (strips nothing),
+ * preserving prior behavior rather than risk dropping legitimate non-state labels.
+ */
+export declare function fetchTeamStateLabelIds(issueId: string, authToken: string): Promise<Set<string>>;
+/**
  * Derive legal assignment targets for a transition based on destination state's owner_role.
  * Returns mode=none for terminal states or roles with no bodies.
  * mode=auto when singleton, mode=required when multiple bodies fill the role.
@@ -315,6 +330,16 @@ export interface SetStateAtomicResult {
     from: string | null;
     to: string;
     error?: string;
+    /** Body name that received the re-dispatch after the state write, if any. */
+    redispatched?: string;
+}
+export interface SetStateAtomicOptions {
+    /**
+     * If provided, called after a successful write to send a wake-up signal to
+     * the new state's owner role (AI-1607). Fail-open: errors are logged and
+     * never cause the set-state to return ok:false.
+     */
+    sendWakeUp?: (agentId: string, ticketId: string) => Promise<void>;
 }
 /**
  * Atomically re-establish the full workflow triple (state:* label, native Linear
@@ -327,5 +352,5 @@ export interface SetStateAtomicResult {
  * AC4: issueUpdateAtomic is a single issueUpdate mutation; Linear applies all
  *      fields atomically or none — no partial state possible on failure.
  */
-export declare function setStateAtomic(ticketIdentifier: string, targetState: string, delegate: string | null | undefined, authToken: string): Promise<SetStateAtomicResult>;
+export declare function setStateAtomic(ticketIdentifier: string, targetState: string, delegate: string | null | undefined, authToken: string, options?: SetStateAtomicOptions): Promise<SetStateAtomicResult>;
 //# sourceMappingURL=workflow-gate.d.ts.map
