@@ -320,6 +320,39 @@ describe("AC1/AC2/AC7a: wf:* label-add bootstraps entry state and delegate", () 
     expect(mutationCall?.body).toContain("astrid-linear-id");
   });
 
+  // AI-1550 (G-18): first governance entry stamps the def version (wfver:<N>).
+  it("AI-1550: stamps the def version as a wfver:<N> label at bootstrap", async () => {
+    const WFVER_LABEL_ID = "label-wfver-8-id";
+    const mutationBodies: string[] = [];
+    globalThis.fetch = async (url, init) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+      if (body.includes("issueUpdate") || body.includes("ApplyAtomicTransition")) {
+        mutationBodies.push(body);
+      }
+      return makeBootstrapFetch({
+        currentLabelNames: ["wf:dev-impl"],
+        teamLabels: [
+          { id: STATE_INTAKE_LABEL_ID, name: "state:intake" },
+          { id: WF_LABEL_ID, name: "wf:dev-impl" },
+          { id: WFVER_LABEL_ID, name: "wfver:8" },
+        ],
+      })(url, init);
+    };
+
+    const event = makeIssueUpdateEvent({
+      currentLabelIds: [WF_LABEL_ID],
+      previousLabelIds: [],
+    });
+
+    const result = await maybeBootstrapWorkflow(event, "test-token");
+    expect(result?.action).toBe("bootstrapped");
+
+    // The bootstrap mutation must apply both the entry state AND the version pin.
+    expect(mutationBodies.length).toBeGreaterThan(0);
+    expect(mutationBodies.some((b) => b.includes(STATE_INTAKE_LABEL_ID))).toBe(true);
+    expect(mutationBodies.some((b) => b.includes(WFVER_LABEL_ID))).toBe(true);
+  });
+
   it("AC2: entry_state is taken from workflow def (config-derived, not hardcoded)", async () => {
     globalThis.fetch = makeBootstrapFetch({ currentLabelNames: ["wf:dev-impl"] });
 

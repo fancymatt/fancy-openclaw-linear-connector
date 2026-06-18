@@ -152,6 +152,88 @@ export interface WorkflowDef {
 
 let _registryCache: Map<string, WorkflowDef> | null = null;
 
+// AI-1550 (G-18): version snapshot cache. Keyed by def.id → (version → def).
+// Accumulates every (defId, version) the connector has ever loaded and — unlike
+// _registryCache — DELIBERATELY survives resetWorkflowCache(). The live def on
+// disk only ever holds one version at a time; when a vault edit bumps a def from
+// vN to vN+1 and the registry reloads, the older snapshot is retained here so an
+// in-flight ticket pinned (wfver:N) to the version it entered on can still be
+// resolved coherently after the live def advances (design.md §12).
+const _defSnapshots: Map<string, Map<number, WorkflowDef>> = new Map();
+
+/** Record a def into the version snapshot cache (no-op if it has no version). */
+function recordDefSnapshot(def: WorkflowDef): void {
+  if (typeof def.version !== "number") return;
+  let byVersion = _defSnapshots.get(def.id);
+  if (!byVersion) {
+    byVersion = new Map();
+    _defSnapshots.set(def.id, byVersion);
+  }
+  // First writer wins: never overwrite a previously-snapshotted version. The
+  // version field is a monotonic stamp — the same (id, version) must always
+  // resolve to the same def the ticket entered on.
+  if (!byVersion.has(def.version)) byVersion.set(def.version, def);
+}
+
+/**
+ * AI-1550: retrieve a historical workflow def by (defId, version), or undefined
+ * if that version was never loaded. Used to resolve a version-pinned in-flight
+ * ticket against the def it entered on rather than the live def.
+ */
+export function getDefSnapshot(defId: string, version: number): WorkflowDef | undefined {
+  return _defSnapshots.get(defId)?.get(version);
+}
+
+/**
+ * Test-only: clear the version snapshot cache. NOT called by resetWorkflowCache()
+ * — production code must never drop snapshots, since that would un-pin in-flight
+ * tickets. Tests use it to isolate cases.
+ */
+export function _resetDefSnapshots(): void {
+  _defSnapshots.clear();
+}
+
+// AI-1550: a ticket records the def version it entered on via a `wfver:<N>` label,
+// applied at first governance entry (workflow-bootstrap). This is the per-ticket
+// pin the resolver reads to select a snapshot.
+const PINNED_VERSION_RE = /^wfver:(\d+)$/i;
+
+/** Read the pinned def version (wfver:<N> label) from a ticket's labels, or null. */
+export function getPinnedVersion(labels: string[]): number | null {
+  for (const l of labels) {
+    const m = PINNED_VERSION_RE.exec(l);
+    if (m) return Number(m[1]);
+  }
+  return null;
+}
+
+/**
+ * AI-1550: resolve the def to enforce against for a ticket.
+ *
+ * If the ticket carries a wfver:<N> pin AND a snapshot for that (defId, version)
+ * exists, return the pinned snapshot so an in-flight ticket completes under the
+ * def it started on (AC1). Otherwise return the live def — covering both
+ * unpinned tickets (backwards-compat) and pinned tickets whose snapshot was lost
+ * (e.g. across a connector restart that never loaded the old version). In the
+ * lost-snapshot case the live def governs; if the ticket's state no longer exists
+ * there, the caller's orphan handling (AC2) takes over.
+ */
+export function resolveDefForTicket(
+  workflowId: string,
+  liveDef: WorkflowDef | undefined,
+  labels: string[],
+): WorkflowDef | undefined {
+  const pinned = getPinnedVersion(labels);
+  if (pinned !== null) {
+    const snap = getDefSnapshot(workflowId, pinned);
+    if (snap) return snap;
+    log.warn(
+      `workflow-gate: ticket pinned to ${workflowId} v${pinned} but no snapshot retained — falling back to live def`,
+    );
+  }
+  return liveDef;
+}
+
 /**
  * Read, parse, and validate a single workflow def file. Throws on read/parse
  * failure or if native_state validation fails (AI-1490 / AI-1498 fail-closed
@@ -261,6 +343,7 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
           continue;
         }
         registry.set(def.id, def);
+        recordDefSnapshot(def); // AI-1550: retain this version for in-flight pins.
       } catch (err) {
         // AC2: one bad def fails that def only — exclude it, keep the rest.
         failures++;
@@ -280,6 +363,7 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
     try {
       const def = await loadDefFromFile(workflowDefPath());
       registry.set(def.id, def);
+      recordDefSnapshot(def); // AI-1550: retain this version for in-flight pins.
       recordSuccess("workflow-def");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -935,6 +1019,12 @@ export async function checkWorkflowRules(
   // def remains pass-through (unknown / unenforced workflow).
   if (!def) return null;
 
+  // AI-1550 (G-18): pin to the def version the ticket entered on. If the ticket
+  // carries a wfver:<N> label and we retained that snapshot, enforce against it
+  // instead of the live def — so a ticket started on vN completes under vN even
+  // after the live def advances to vN+1 (including breaking state renames).
+  def = resolveDefForTicket(workflowId, def, labels) ?? def;
+
   // §5.3 Asymmetry enforcement: children running wf:dev-impl have no legal
   // command to address the parent's ux-audit workflow. This is structural:
   //   - The dev-impl workflow def has no 'address-parent' or 'barrier-signal' command.
@@ -1072,8 +1162,28 @@ export async function checkWorkflowRules(
 
   const stateNode = def.states.find((s) => s.id === currentState);
   if (!stateNode) {
-    log.warn(`workflow-gate: unknown state '${currentState}' on ${issueId} — failing open`);
-    return null;
+    // AI-1550 (G-18) AC2: the ticket's current state does not exist in the
+    // resolved def. This is the in-flight migration orphan case — a ticket
+    // sitting in a state that vN+1 renamed or removed, with no retained snapshot
+    // to pin it to its original version. We CANNOT know its legal moves (the
+    // state machine that defined them is gone), so we must not fail open: that
+    // would let any intent through on a ticket whose governance contract no
+    // longer exists. Fail closed and route to the steward via break-glass — the
+    // same orphan-recovery hatch used elsewhere. (escape/refuse-work are already
+    // handled above and remain available.)
+    const pinned = getPinnedVersion(labels);
+    log.warn(
+      `workflow-gate: ORPHANED state '${currentState}' on ${issueId} — not present in resolved def ` +
+      `'${def.id}'${typeof def.version === "number" ? ` v${def.version}` : ""}` +
+      `${pinned !== null ? ` (ticket pinned to v${pinned}, snapshot unavailable)` : ""} — failing closed, routing to break-glass`,
+    );
+    return (
+      `[Proxy] '${intent}' blocked: ${issueId} is in state '${currentState}', which no longer exists in workflow ` +
+      `'${def.id}'. The ticket was likely started on an earlier workflow version that has since been changed ` +
+      `(state renamed or removed) and its original version is no longer available — it is orphaned in an unknown state. ` +
+      `A steward must triage it: use '${breakGlassCommand}' (break-glass) to exit the workflow, then re-accept to ` +
+      `re-establish a valid state.`
+    );
   }
 
   const transitions = stateNode.transitions ?? [];

@@ -100,6 +100,32 @@ export interface WorkflowDef {
     states: WorkflowState[];
 }
 /**
+ * AI-1550: retrieve a historical workflow def by (defId, version), or undefined
+ * if that version was never loaded. Used to resolve a version-pinned in-flight
+ * ticket against the def it entered on rather than the live def.
+ */
+export declare function getDefSnapshot(defId: string, version: number): WorkflowDef | undefined;
+/**
+ * Test-only: clear the version snapshot cache. NOT called by resetWorkflowCache()
+ * — production code must never drop snapshots, since that would un-pin in-flight
+ * tickets. Tests use it to isolate cases.
+ */
+export declare function _resetDefSnapshots(): void;
+/** Read the pinned def version (wfver:<N> label) from a ticket's labels, or null. */
+export declare function getPinnedVersion(labels: string[]): number | null;
+/**
+ * AI-1550: resolve the def to enforce against for a ticket.
+ *
+ * If the ticket carries a wfver:<N> pin AND a snapshot for that (defId, version)
+ * exists, return the pinned snapshot so an in-flight ticket completes under the
+ * def it started on (AC1). Otherwise return the live def — covering both
+ * unpinned tickets (backwards-compat) and pinned tickets whose snapshot was lost
+ * (e.g. across a connector restart that never loaded the old version). In the
+ * lost-snapshot case the live def governs; if the ticket's state no longer exists
+ * there, the caller's orphan handling (AC2) takes over.
+ */
+export declare function resolveDefForTicket(workflowId: string, liveDef: WorkflowDef | undefined, labels: string[]): WorkflowDef | undefined;
+/**
  * Legacy single-def accessor. Returns the primary workflow def, derived from the
  * registry so its cache stays coherent with loadWorkflowRegistry().
  *   - Single-file mode (no WORKFLOW_DEFS_DIR): the registry holds exactly the
@@ -150,6 +176,21 @@ export declare function resetNativeStateCache(): void;
  * Returns null if the state cannot be resolved.
  */
 export declare function resolveNativeStateId(teamId: string, semanticName: string, authToken: string): Promise<string | null>;
+/**
+ * Resolve the set of `state:*` label IDs in the team that owns the given issue.
+ *
+ * AI-1612: the proxy is the sole writer of the workflow state label. To enforce
+ * that, it strips `state:*` label deltas from the forwarded CLI mutation before
+ * `applyStateTransition` runs — so a fail-closed transition is a true no-op
+ * rather than a half-applied label move with a stranded delegate. Identifying
+ * which delta IDs are state labels needs the team's full label set (the added
+ * destination label is not yet on the issue), so this queries team labels, not
+ * just the issue's current labels.
+ *
+ * Returns an empty set on any error — the proxy then fails open (strips nothing),
+ * preserving prior behavior rather than risk dropping legitimate non-state labels.
+ */
+export declare function fetchTeamStateLabelIds(issueId: string, authToken: string): Promise<Set<string>>;
 /**
  * Derive legal assignment targets for a transition based on destination state's owner_role.
  * Returns mode=none for terminal states or roles with no bodies.
@@ -315,6 +356,16 @@ export interface SetStateAtomicResult {
     from: string | null;
     to: string;
     error?: string;
+    /** Body name that received the re-dispatch after the state write, if any. */
+    redispatched?: string;
+}
+export interface SetStateAtomicOptions {
+    /**
+     * If provided, called after a successful write to send a wake-up signal to
+     * the new state's owner role (AI-1607). Fail-open: errors are logged and
+     * never cause the set-state to return ok:false.
+     */
+    sendWakeUp?: (agentId: string, ticketId: string) => Promise<void>;
 }
 /**
  * Atomically re-establish the full workflow triple (state:* label, native Linear
@@ -327,5 +378,5 @@ export interface SetStateAtomicResult {
  * AC4: issueUpdateAtomic is a single issueUpdate mutation; Linear applies all
  *      fields atomically or none — no partial state possible on failure.
  */
-export declare function setStateAtomic(ticketIdentifier: string, targetState: string, delegate: string | null | undefined, authToken: string): Promise<SetStateAtomicResult>;
+export declare function setStateAtomic(ticketIdentifier: string, targetState: string, delegate: string | null | undefined, authToken: string, options?: SetStateAtomicOptions): Promise<SetStateAtomicResult>;
 //# sourceMappingURL=workflow-gate.d.ts.map

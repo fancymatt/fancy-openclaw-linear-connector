@@ -164,6 +164,7 @@ export async function maybeBootstrapWorkflow(
 
   const currentWfLabelNode = issue.labels.find((n) => n.name.startsWith("wf:"));
   const currentStateLabels = issue.labels.filter((n) => n.name.startsWith("state:"));
+  const currentVersionLabels = issue.labels.filter((n) => n.name.startsWith("wfver:"));
 
   // ── Bootstrap path: a wf:* label was newly added ──────────────────────────
   if (addedIds.length > 0 && currentWfLabelNode && addedIds.includes(currentWfLabelNode.id)) {
@@ -220,7 +221,23 @@ export async function maybeBootstrapWorkflow(
       return null;
     }
 
-    const newLabelIds = Array.from(new Set([...currentLabelIds, stateLabelId]));
+    // AI-1550 (G-18): stamp the def version the ticket is entering on. This is
+    // the ticket's first governance entry, so it pins the version for the whole
+    // in-flight lifetime — the gate resolves against this version's snapshot even
+    // after the live def advances. Best-effort: if the version label cannot be
+    // resolved, proceed with state-only bootstrap (the ticket then tracks the
+    // live def, the pre-AI-1550 behavior).
+    const extraLabelIds: string[] = [];
+    if (typeof def.version === "number") {
+      const verLabelId = await findOrCreateLabel(issue.teamId, `wfver:${def.version}`, authToken);
+      if (verLabelId) {
+        extraLabelIds.push(verLabelId);
+      } else {
+        log.warn(`workflow-bootstrap: could not resolve label 'wfver:${def.version}' — bootstrapping without version pin`);
+      }
+    }
+
+    const newLabelIds = Array.from(new Set([...currentLabelIds, stateLabelId, ...extraLabelIds]));
     const success = await issueUpdateAtomic(issue.id, newLabelIds, authToken, delegateLinearUserId);
 
     if (!success) {
@@ -236,13 +253,17 @@ export async function maybeBootstrapWorkflow(
 
   // ── Demote path: wf:* was removed, state:* labels remain ─────────────────
   if (removedIds.length > 0 && !currentWfLabelNode && currentStateLabels.length > 0) {
-    const stateLabelIds = new Set(currentStateLabels.map((n) => n.id));
-    const newLabelIds = currentLabelIds.filter((id) => !stateLabelIds.has(id));
+    // AI-1550: also strip the wfver:* version pin — a demoted ticket leaves the
+    // workflow entirely, so its version stamp must not linger to mis-pin a later
+    // re-entry.
+    const strippedLabels = [...currentStateLabels, ...currentVersionLabels];
+    const strippedIds = new Set(strippedLabels.map((n) => n.id));
+    const newLabelIds = currentLabelIds.filter((id) => !strippedIds.has(id));
 
     await issueUpdateAtomic(issue.id, newLabelIds, authToken);
 
     log.info(
-      `workflow-bootstrap: demoted ${issueEvent.data.id} — removed [${currentStateLabels.map((n) => n.name).join(", ")}]`,
+      `workflow-bootstrap: demoted ${issueEvent.data.id} — removed [${strippedLabels.map((n) => n.name).join(", ")}]`,
     );
     return { action: "demoted" };
   }

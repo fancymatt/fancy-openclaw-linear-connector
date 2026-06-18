@@ -49,6 +49,7 @@ import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
 import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
+import { recordAppliedState, clearAppliedState } from "./store/applied-state-store.js";
 /**
  * Phase 6.5 / H-6: Label read-only projection + override path + drift reconciliation.
  *
@@ -79,6 +80,79 @@ function workflowDefPath() {
 // (the legacy single-def accessor) derives its def from the same registry so the
 // two cannot diverge — resetWorkflowCache() invalidates everything at once.
 let _registryCache = null;
+// AI-1550 (G-18): version snapshot cache. Keyed by def.id → (version → def).
+// Accumulates every (defId, version) the connector has ever loaded and — unlike
+// _registryCache — DELIBERATELY survives resetWorkflowCache(). The live def on
+// disk only ever holds one version at a time; when a vault edit bumps a def from
+// vN to vN+1 and the registry reloads, the older snapshot is retained here so an
+// in-flight ticket pinned (wfver:N) to the version it entered on can still be
+// resolved coherently after the live def advances (design.md §12).
+const _defSnapshots = new Map();
+/** Record a def into the version snapshot cache (no-op if it has no version). */
+function recordDefSnapshot(def) {
+    if (typeof def.version !== "number")
+        return;
+    let byVersion = _defSnapshots.get(def.id);
+    if (!byVersion) {
+        byVersion = new Map();
+        _defSnapshots.set(def.id, byVersion);
+    }
+    // First writer wins: never overwrite a previously-snapshotted version. The
+    // version field is a monotonic stamp — the same (id, version) must always
+    // resolve to the same def the ticket entered on.
+    if (!byVersion.has(def.version))
+        byVersion.set(def.version, def);
+}
+/**
+ * AI-1550: retrieve a historical workflow def by (defId, version), or undefined
+ * if that version was never loaded. Used to resolve a version-pinned in-flight
+ * ticket against the def it entered on rather than the live def.
+ */
+export function getDefSnapshot(defId, version) {
+    return _defSnapshots.get(defId)?.get(version);
+}
+/**
+ * Test-only: clear the version snapshot cache. NOT called by resetWorkflowCache()
+ * — production code must never drop snapshots, since that would un-pin in-flight
+ * tickets. Tests use it to isolate cases.
+ */
+export function _resetDefSnapshots() {
+    _defSnapshots.clear();
+}
+// AI-1550: a ticket records the def version it entered on via a `wfver:<N>` label,
+// applied at first governance entry (workflow-bootstrap). This is the per-ticket
+// pin the resolver reads to select a snapshot.
+const PINNED_VERSION_RE = /^wfver:(\d+)$/i;
+/** Read the pinned def version (wfver:<N> label) from a ticket's labels, or null. */
+export function getPinnedVersion(labels) {
+    for (const l of labels) {
+        const m = PINNED_VERSION_RE.exec(l);
+        if (m)
+            return Number(m[1]);
+    }
+    return null;
+}
+/**
+ * AI-1550: resolve the def to enforce against for a ticket.
+ *
+ * If the ticket carries a wfver:<N> pin AND a snapshot for that (defId, version)
+ * exists, return the pinned snapshot so an in-flight ticket completes under the
+ * def it started on (AC1). Otherwise return the live def — covering both
+ * unpinned tickets (backwards-compat) and pinned tickets whose snapshot was lost
+ * (e.g. across a connector restart that never loaded the old version). In the
+ * lost-snapshot case the live def governs; if the ticket's state no longer exists
+ * there, the caller's orphan handling (AC2) takes over.
+ */
+export function resolveDefForTicket(workflowId, liveDef, labels) {
+    const pinned = getPinnedVersion(labels);
+    if (pinned !== null) {
+        const snap = getDefSnapshot(workflowId, pinned);
+        if (snap)
+            return snap;
+        log.warn(`workflow-gate: ticket pinned to ${workflowId} v${pinned} but no snapshot retained — falling back to live def`);
+    }
+    return liveDef;
+}
 /**
  * Read, parse, and validate a single workflow def file. Throws on read/parse
  * failure or if native_state validation fails (AI-1490 / AI-1498 fail-closed
@@ -186,6 +260,7 @@ export async function loadWorkflowRegistry() {
                     continue;
                 }
                 registry.set(def.id, def);
+                recordDefSnapshot(def); // AI-1550: retain this version for in-flight pins.
             }
             catch (err) {
                 // AC2: one bad def fails that def only — exclude it, keep the rest.
@@ -208,6 +283,7 @@ export async function loadWorkflowRegistry() {
         try {
             const def = await loadDefFromFile(workflowDefPath());
             registry.set(def.id, def);
+            recordDefSnapshot(def); // AI-1550: retain this version for in-flight pins.
             recordSuccess("workflow-def");
         }
         catch (err) {
@@ -389,6 +465,7 @@ async function fetchIssueWithLabels(issueId, authToken) {
     query IssueWithLabels($id: String!) {
       issue(id: $id) {
         id
+        identifier
         team { id }
         labels { nodes { id name } }
       }
@@ -404,12 +481,52 @@ async function fetchIssueWithLabels(issueId, authToken) {
         const issue = data.data?.issue;
         if (!issue)
             return null;
-        return { internalId: issue.id, teamId: issue.team.id, labels: issue.labels.nodes };
+        return { internalId: issue.id, identifier: issue.identifier, teamId: issue.team.id, labels: issue.labels.nodes };
     }
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log.warn(`workflow-gate: issue fetch failed for ${issueId}: ${msg}`);
         return null;
+    }
+}
+/**
+ * Resolve the set of `state:*` label IDs in the team that owns the given issue.
+ *
+ * AI-1612: the proxy is the sole writer of the workflow state label. To enforce
+ * that, it strips `state:*` label deltas from the forwarded CLI mutation before
+ * `applyStateTransition` runs — so a fail-closed transition is a true no-op
+ * rather than a half-applied label move with a stranded delegate. Identifying
+ * which delta IDs are state labels needs the team's full label set (the added
+ * destination label is not yet on the issue), so this queries team labels, not
+ * just the issue's current labels.
+ *
+ * Returns an empty set on any error — the proxy then fails open (strips nothing),
+ * preserving prior behavior rather than risk dropping legitimate non-state labels.
+ */
+export async function fetchTeamStateLabelIds(issueId, authToken) {
+    const query = `
+    query TeamStateLabels($id: String!) {
+      issue(id: $id) {
+        team {
+          labels { nodes { id name } }
+        }
+      }
+    }
+  `;
+    try {
+        const res = await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authToken },
+            body: JSON.stringify({ query, variables: { id: issueId } }),
+        });
+        const data = (await res.json());
+        const nodes = data.data?.issue?.team?.labels?.nodes ?? [];
+        return new Set(nodes.filter((n) => /^state:/i.test(n.name)).map((n) => n.id));
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`workflow-gate: team state-label fetch failed for ${issueId}: ${msg} — failing open`);
+        return new Set();
     }
 }
 /**
@@ -637,6 +754,14 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
     // Harden by deriving issueId from the request body when headers are absent.
     if (!issueId)
         return null;
+    // G-13a (AI-1551): identity gate — break-glass is restricted to steward/human bodies only.
+    if (breakGlassOverride) {
+        const authorized = await bodyHasCapability(bodyId, "human:escalate");
+        if (!authorized) {
+            log.warn(`workflow-gate: break-glass identity gate rejected — '${bodyId}' lacks human:escalate`);
+            return `[Proxy] Break-glass rejected: caller '${bodyId}' is not authorized. Only stewards (human:escalate role) may use break-glass.`;
+        }
+    }
     const { labels, delegateId, fetchFailed } = await fetchTicketContext(issueId, authToken);
     // Phase 6.5 / H-1: Fail-closed on context-fetch failure.
     // When we can't fetch the ticket's labels, we cannot determine whether
@@ -690,6 +815,11 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
     // def remains pass-through (unknown / unenforced workflow).
     if (!def)
         return null;
+    // AI-1550 (G-18): pin to the def version the ticket entered on. If the ticket
+    // carries a wfver:<N> label and we retained that snapshot, enforce against it
+    // instead of the live def — so a ticket started on vN completes under vN even
+    // after the live def advances to vN+1 (including breaking state renames).
+    def = resolveDefForTicket(workflowId, def, labels) ?? def;
     // §5.3 Asymmetry enforcement: children running wf:dev-impl have no legal
     // command to address the parent's ux-audit workflow. This is structural:
     //   - The dev-impl workflow def has no 'address-parent' or 'barrier-signal' command.
@@ -713,8 +843,10 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
             resolveStakesLevel(labels, def.stakes) >= def.stakes.threshold);
         if (!isHumanSignoffPath) {
             log.warn(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} ticket ${issueId} — blocking`);
+            const legalMoves = [...(preNode?.transitions?.map((t) => t.command) ?? []), breakGlassCommand].join(", ");
             return (`[Proxy] Unknown caller '${bodyId}' blocked on workflow ticket. ` +
-                `Ensure this agent is registered in the capability policy.`);
+                `Ensure this agent is registered in the capability policy. ` +
+                `Legal moves: ${legalMoves}.`);
         }
         log.info(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} — human sign-off path, allowing through`);
     }
@@ -740,6 +872,21 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
         return (`[Proxy] 'refuse-work' blocked: '${bodyId}' is not the current delegate or the workflow steward. ` +
             `Only the assigned delegate or workflow steward may refuse work on a governed ticket.`);
     }
+    // AI-1576 AC3: demote guard — block demote when ticket has in-flight or merged work.
+    // Scoped to wf:dev-impl only: sprint/ux-audit demotes are not gated.
+    // A demote on a dev-impl ticket carrying a pushed branch or open/merged PR silently
+    // drops it off-spine while implementation is already underway. Fail-open on fetch
+    // error so a transient API outage never permanently strands a genuinely-fresh intake.
+    if (intent === "demote" && workflowId === "dev-impl" && !breakGlassOverride) {
+        const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+        if (branchStatus && (branchStatus.hasBranch || branchStatus.hasPR)) {
+            log.warn(`workflow-gate: AI-1576 demote-guard blocked agent=${bodyId} ticket=${issueId} (hasBranch=${branchStatus.hasBranch} hasPR=${branchStatus.hasPR})`);
+            return (`[Proxy] 'demote' blocked on ${issueId}: this ticket has in-flight or merged implementation work ` +
+                `(branch: ${branchStatus.hasBranch}, PR: ${branchStatus.hasPR}). ` +
+                `Demoting would silently drop it off the dev-impl spine while implementation is underway. ` +
+                `Use break-glass ('escape') to override if intentional.`);
+        }
+    }
     // AI-1397: delegate-only enforcement at proxy (CLI-version-agnostic).
     // If both the caller's Linear user ID and the ticket's delegate ID are known,
     // block any agent that is not the current delegate. Fails open when either is
@@ -749,13 +896,21 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
     // unverifiable caller must not be allowed to mutate a delegated ticket.
     if (!callerLinearUserId && delegateId) {
         log.warn(`workflow-gate: unknown-caller block agent=${bodyId} intent=${intent} ticket=${issueId}`);
+        const wcState = getCurrentState(labels);
+        const wcNode = wcState ? def.states.find((s) => s.id === wcState) : undefined;
+        const legalMoves = [...(wcNode?.transitions?.map((t) => t.command) ?? []), breakGlassCommand].join(", ");
         return (`[Proxy] '${intent}' blocked: caller '${bodyId}' cannot be verified and the ticket has a known delegate. ` +
-            `Register the agent in agents.json with a linearUserId to proceed.`);
+            `Register the agent in agents.json with a linearUserId to proceed. ` +
+            `Legal moves: ${legalMoves}.`);
     }
     if (callerLinearUserId && delegateId && callerLinearUserId !== delegateId) {
         log.warn(`workflow-gate: delegate-only block agent=${bodyId} intent=${intent} ticket=${issueId}`);
+        const wdState = getCurrentState(labels);
+        const wdNode = wdState ? def.states.find((s) => s.id === wdState) : undefined;
+        const legalMoves = [...(wdNode?.transitions?.map((t) => t.command) ?? []), breakGlassCommand].join(", ");
         return (`[Proxy] '${intent}' blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
-            `Only the ticket delegate may mutate its state.`);
+            `Only the ticket delegate may mutate its state. ` +
+            `Legal moves: ${legalMoves}.`);
     }
     const currentState = getCurrentState(labels);
     if (!currentState) {
@@ -782,8 +937,24 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
     }
     const stateNode = def.states.find((s) => s.id === currentState);
     if (!stateNode) {
-        log.warn(`workflow-gate: unknown state '${currentState}' on ${issueId} — failing open`);
-        return null;
+        // AI-1550 (G-18) AC2: the ticket's current state does not exist in the
+        // resolved def. This is the in-flight migration orphan case — a ticket
+        // sitting in a state that vN+1 renamed or removed, with no retained snapshot
+        // to pin it to its original version. We CANNOT know its legal moves (the
+        // state machine that defined them is gone), so we must not fail open: that
+        // would let any intent through on a ticket whose governance contract no
+        // longer exists. Fail closed and route to the steward via break-glass — the
+        // same orphan-recovery hatch used elsewhere. (escape/refuse-work are already
+        // handled above and remain available.)
+        const pinned = getPinnedVersion(labels);
+        log.warn(`workflow-gate: ORPHANED state '${currentState}' on ${issueId} — not present in resolved def ` +
+            `'${def.id}'${typeof def.version === "number" ? ` v${def.version}` : ""}` +
+            `${pinned !== null ? ` (ticket pinned to v${pinned}, snapshot unavailable)` : ""} — failing closed, routing to break-glass`);
+        return (`[Proxy] '${intent}' blocked: ${issueId} is in state '${currentState}', which no longer exists in workflow ` +
+            `'${def.id}'. The ticket was likely started on an earlier workflow version that has since been changed ` +
+            `(state renamed or removed) and its original version is no longer available — it is orphaned in an unknown state. ` +
+            `A steward must triage it: use '${breakGlassCommand}' (break-glass) to exit the workflow, then re-accept to ` +
+            `re-establish a valid state.`);
     }
     const transitions = stateNode.transitions ?? [];
     const match = transitions.find((t) => t.command === intent);
@@ -797,8 +968,10 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
     if (match.requires_capability && isCallerKnown) {
         const allowed = await bodyHasCapability(bodyId, match.requires_capability);
         if (!allowed) {
+            const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
             return (`[Proxy] '${intent}' requires the '${match.requires_capability}' capability; ` +
-                `handoff to the deployment body to proceed.`);
+                `handoff to the deployment body to proceed. ` +
+                `Legal moves: ${legalMoves}.`);
         }
     }
     // §5.7 item 1 / C-2: Artifact-binding gate.
@@ -826,9 +999,10 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
             const isAgent = await isBodyKnown(bodyId);
             if (isAgent) {
                 log.warn(`workflow-gate: stakes-threshold gate: ${intent} on ${issueId} blocked — stakes level ${ticketStakesLevel} >= threshold ${def.stakes.threshold}, caller '${bodyId}' is a known AI agent`);
+                const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
                 return (`[Proxy] '${intent}' blocked: this ticket has elevated stakes (level ${ticketStakesLevel}) ` +
                     `and requires human sign-off. AI agent '${bodyId}' cannot self-sign-off on high-stakes work. ` +
-                    `Use 'escape' to exit the workflow and escalate to a human, or 'reject' to send back for changes.`);
+                    `Legal moves: ${legalMoves}.`);
             }
             log.info(`workflow-gate: stakes-threshold gate: ${intent} on ${issueId} — stakes level ${ticketStakesLevel} >= threshold ${def.stakes.threshold}, but caller '${bodyId}' is human/unknown — allowing`);
         }
@@ -1272,6 +1446,9 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
             .filter((l) => !l.name.startsWith("state:") && !l.name.startsWith("wf:"))
             .map((l) => l.id);
         await issueUpdateLabels(issue.internalId, keepIds, authToken);
+        // AI-1534: ticket left the workflow — drop any cached state so it can't
+        // override a later live read.
+        clearAppliedState(issue.identifier);
         log.info(`workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels`);
         return;
     }
@@ -1280,6 +1457,9 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
     // is actually present. If it's missing (CLI partial failure, race condition),
     // re-stamp it. Previously this was a blind no-op, which meant a lost label
     // would never be recovered.
+    // AI-1534: this branch is state-preserving (source === destination), so it
+    // intentionally neither records nor clears the applied-state cache — any
+    // existing entry already holds this same state, and its absence is harmless.
     if (currentStateName === toStateName) {
         const targetLabelName = `state:${toStateName}`;
         const hasTargetLabel = issue.labels.some((l) => l.name === targetLabelName);
@@ -1364,6 +1544,8 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
             }
             // AC gate passed and dispositionToDone already applied the label swap + comment.
             // Skip the normal atomic swap below — dispositionToDone handled it.
+            // AI-1534: terminal state, no further per-step delivery — drop any cached state.
+            clearAppliedState(issue.identifier);
             log.info(`workflow-gate: B-4 review: ${issueId} review → done (parent AC satisfied)`);
             return;
         }
@@ -1383,6 +1565,9 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
             }
             else {
                 // dispositionToSpawning applied the label swap + comment.
+                // AI-1534: this helper, not the atomic path below, applied the swap —
+                // drop the now-stale cached state rather than leave a wrong override.
+                clearAppliedState(issue.identifier);
                 log.info(`workflow-gate: B-4 review: ${issueId} review → spawning (follow-up)`);
                 return;
             }
@@ -1579,6 +1764,10 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
     // Step 5: Apply the FULL transition atomically (labels + delegate + native state in one mutation).
     const applied = await issueUpdateAtomic(issue.internalId, newLabelIds, authToken, resolvedDelegateId, resolvedNativeStateId);
     if (applied) {
+        // AI-1534: record the authoritative destination state so the outbound
+        // per-step delivery prefers it over a lag-prone live label read. Keyed by
+        // the human identifier to match build-message's lookup key.
+        recordAppliedState(issue.identifier, toStateName);
         log.info(`workflow-gate: B2 apply: ${issueId} state:${currentStateName} → state:${toStateName}` +
             (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
             (resolvedNativeStateId ? ` native=${destNativeState}(${resolvedNativeStateId})` : ``));
@@ -1873,7 +2062,7 @@ export async function enrollIfMissing(issueId, authToken, onHeal) {
  * AC4: issueUpdateAtomic is a single issueUpdate mutation; Linear applies all
  *      fields atomically or none — no partial state possible on failure.
  */
-export async function setStateAtomic(ticketIdentifier, targetState, delegate, authToken) {
+export async function setStateAtomic(ticketIdentifier, targetState, delegate, authToken, options) {
     const fail = (error, from = null) => ({ ok: false, ticketId: ticketIdentifier, from, to: targetState, error });
     // Step 1: Fetch current issue.
     const issue = await fetchIssueWithLabels(ticketIdentifier, authToken);
@@ -1949,6 +2138,34 @@ export async function setStateAtomic(ticketIdentifier, targetState, delegate, au
             return fail(`consistency check failed: label '${targetLabelName}' not present after mutation (got '${landed ?? "none"}')`, fromState);
         }
     }
-    return { ok: true, ticketId: ticketIdentifier, from: fromState, to: targetState };
+    // Step 9: Re-dispatch to the new state's owner (AI-1607).
+    // Fail-open: errors are logged but never block the set-state result.
+    let redispatched;
+    if (def && options?.sendWakeUp) {
+        const destNode = def.states.find((s) => s.id === targetState);
+        const ownerRole = destNode?.owner_role;
+        const isTerminal = destNode?.kind === "terminal" || !ownerRole;
+        if (!isTerminal && ownerRole) {
+            try {
+                const roleBodies = await resolveBodiesForRole(ownerRole);
+                if (roleBodies.length === 1) {
+                    await options.sendWakeUp(roleBodies[0], ticketIdentifier);
+                    redispatched = roleBodies[0];
+                    log.info(`workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${roleBodies[0]}' (role '${ownerRole}') after advancing to '${targetState}'`);
+                }
+                else if (roleBodies.length > 1) {
+                    log.warn(`workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has multiple bodies (${roleBodies.join(", ")}); delegate manually`);
+                }
+                else {
+                    log.warn(`workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has no bodies`);
+                }
+            }
+            catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                log.warn(`workflow-gate: set-state: re-dispatch failed for ${ticketIdentifier}: ${msg} — continuing`);
+            }
+        }
+    }
+    return { ok: true, ticketId: ticketIdentifier, from: fromState, to: targetState, ...(redispatched ? { redispatched } : {}) };
 }
 //# sourceMappingURL=workflow-gate.js.map
