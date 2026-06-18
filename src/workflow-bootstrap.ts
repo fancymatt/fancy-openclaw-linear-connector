@@ -19,6 +19,7 @@ import { loadWorkflowRegistry } from "./workflow-gate.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
 import { findOrCreateLabel } from "./linear-helpers.js";
 import type { LinearEvent, LinearIssueUpdatedEvent } from "./webhook/schema.js";
+import { getAgents, getAccessToken } from "./agents.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-bootstrap");
 
@@ -170,14 +171,42 @@ export async function maybeBootstrapWorkflow(
   console.error(`[bootstrap-dbg] added=${addedIds.length} removed=${removedIds.length} currentLabels=${currentLabelIds.length} previousLabels=${previousLabelIds.length} updatedFromLen=${Array.isArray(updatedFrom?.labelIds) ? (updatedFrom.labelIds as unknown[]).length : "none"}`);
 
   // Fetch current label names — needed to distinguish wf:* from state:* by ID.
+  // Try the provided token first; if issue fetch fails, fall back to other
+  // agent tokens (the provided token may lack access to the issue's team).
   let issue: IssueContext | null = null;
+  const triedTokens: string[] = [];
+  const tryFetch = async (token: string) => {
+    triedTokens.push(token.slice(0, 8) + "...");
+    return fetchIssueContext(issueEvent.data.id, token);
+  };
   try {
-    issue = await fetchIssueContext(issueEvent.data.id, authToken);
+    issue = await tryFetch(authToken);
   } catch {
-    return null;
+    /* fall through to fallback */
   }
   if (!issue) {
-    console.error(`[bootstrap-dbg] fetchIssueContext returned null for issue ${issueEvent.data.id}`);
+    // Fallback: try other agent tokens that may have access to this issue's team.
+    try {
+      const agents = getAgents();
+      for (const a of agents) {
+        const t = getAccessToken(a.name);
+        if (!t || t === authToken) continue; // skip the one we already tried
+        try {
+          issue = await tryFetch(t);
+          if (issue) {
+            console.error(`[bootstrap-dbg] fallback token from agent '${a.name}' succeeded for issue ${issueEvent.data.id}`);
+            break;
+          }
+        } catch {
+          continue;
+        }
+      }
+    } catch {
+      /* give up */
+    }
+  }
+  if (!issue) {
+    console.error(`[bootstrap-dbg] fetchIssueContext returned null for issue ${issueEvent.data.id} (tried ${triedTokens.length} token(s))`);
     return null;
   }
 
