@@ -302,6 +302,7 @@ export function createWebhookRouter(
         }
         return undefined;
       })();
+      console.error(`[bootstrap-check] token=${bootstrapToken ? "yes" : "no"} agents=${getAgents().length} action=${event.action}`);
       if (bootstrapToken) {
         try {
           const bootstrapResult = await maybeBootstrapWorkflow(event, bootstrapToken);

@@ -163,7 +163,11 @@ export async function maybeBootstrapWorkflow(
   const addedIds = currentLabelIds.filter((id) => !previousSet.has(id));
   const removedIds = previousLabelIds.filter((id) => !currentSet.has(id));
 
-  if (addedIds.length === 0 && removedIds.length === 0) return null;
+  if (addedIds.length === 0 && removedIds.length === 0) {
+    console.error(`[bootstrap-dbg] no label delta: current=${currentLabelIds.length} previous=${previousLabelIds.length} updatedFrom=${!!updatedFrom}`);
+    return null;
+  }
+  console.error(`[bootstrap-dbg] added=${addedIds.length} removed=${removedIds.length} currentLabels=${currentLabelIds.length} previousLabels=${previousLabelIds.length} updatedFromLen=${Array.isArray(updatedFrom?.labelIds) ? (updatedFrom.labelIds as unknown[]).length : "none"}`);
 
   // Fetch current label names — needed to distinguish wf:* from state:* by ID.
   let issue: IssueContext | null = null;
