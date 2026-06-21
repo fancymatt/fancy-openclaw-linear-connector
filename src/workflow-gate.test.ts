@@ -27,6 +27,7 @@ import {
   applyStateTransition,
   checkRawMutationInterception,
   buildStateTransitionReminder,
+  buildNonAdvancingNoteNotice,
   resetWorkflowCache,
   validateNativeStateMappings,
   resolveStakesLevel,
@@ -1539,6 +1540,107 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
     expect(result).not.toBeNull();
     expect(result).toContain("implementation");
     expect(result).toContain("submit");
+  });
+});
+
+// ── AI-1641: delegate comment-only turns are non-advancing in active states ──────
+
+describe("buildNonAdvancingNoteNotice — AI-1641", () => {
+  let noteDir: string;
+  let noteOriginalFetch: typeof globalThis.fetch;
+
+  // Fetch mock that returns a configurable delegate id on the IssueContext query.
+  function makeNoteFetch(labelNames: string[], delegateId: string | null): typeof globalThis.fetch {
+    return async (_url, init) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+      if (bodyText.includes("delegate")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                labels: { nodes: labelNames.map((name) => ({ name })) },
+                delegate: delegateId ? { id: delegateId } : null,
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({ data: { issue: { labels: { nodes: labelNames.map((name) => ({ name })) } } } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    };
+  }
+
+  beforeEach(() => {
+    noteDir = fs.mkdtempSync(path.join(os.tmpdir(), "note-notice-test-"));
+    const policyFile = path.join(noteDir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(noteDir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    noteOriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = noteOriginalFetch;
+  });
+
+  it("flags a delegate note in an active state as non-advancing with legal moves", async () => {
+    globalThis.fetch = makeNoteFetch(["wf:dev-impl", "state:implementation"], "dev-linear-uuid");
+    const result = await buildNonAdvancingNoteNotice("note", "ABC-123", "Bearer tok", "dev-linear-uuid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("did **not** advance");
+    expect(result).toContain("implementation"); // current state named
+    expect(result).toContain("submit"); // legal move from implementation
+    expect(result).toContain("escape"); // break glass always listed
+  });
+
+  it("returns null for a non-delegate commenter (pure side-channel)", async () => {
+    globalThis.fetch = makeNoteFetch(["wf:dev-impl", "state:implementation"], "dev-linear-uuid");
+    const result = await buildNonAdvancingNoteNotice("note", "ABC-123", "Bearer tok", "someone-else-uuid");
+    expect(result).toBeNull();
+  });
+
+  it("returns null when caller id is unknown (can't confirm delegate)", async () => {
+    globalThis.fetch = makeNoteFetch(["wf:dev-impl", "state:implementation"], "dev-linear-uuid");
+    const result = await buildNonAdvancingNoteNotice("note", "ABC-123", "Bearer tok", null);
+    expect(result).toBeNull();
+  });
+
+  it("returns null when the ticket is in a terminal state", async () => {
+    globalThis.fetch = makeNoteFetch(["wf:dev-impl", "state:done"], "dev-linear-uuid");
+    const result = await buildNonAdvancingNoteNotice("note", "ABC-123", "Bearer tok", "dev-linear-uuid");
+    expect(result).toBeNull();
+  });
+
+  it("returns null for ad-hoc tickets (no wf:* label)", async () => {
+    globalThis.fetch = makeNoteFetch(["state:implementation"], "dev-linear-uuid");
+    const result = await buildNonAdvancingNoteNotice("note", "ABC-123", "Bearer tok", "dev-linear-uuid");
+    expect(result).toBeNull();
+  });
+
+  it("returns null for non-note intents", async () => {
+    globalThis.fetch = makeNoteFetch(["wf:dev-impl", "state:implementation"], "dev-linear-uuid");
+    const result = await buildNonAdvancingNoteNotice("submit", "ABC-123", "Bearer tok", "dev-linear-uuid");
+    expect(result).toBeNull();
+  });
+
+  it("returns null when issueId is null", async () => {
+    const result = await buildNonAdvancingNoteNotice("note", null, "Bearer tok", "dev-linear-uuid");
+    expect(result).toBeNull();
+  });
+
+  it("fails open (null) when context fetch fails", async () => {
+    globalThis.fetch = async () => new Response("boom", { status: 500 });
+    const result = await buildNonAdvancingNoteNotice("note", "ABC-123", "Bearer tok", "dev-linear-uuid");
+    expect(result).toBeNull();
   });
 });
 

@@ -256,6 +256,24 @@ export declare function checkRawMutationInterception(body: {
  */
 export declare function buildStateTransitionReminder(intent: string, issueId: string | null, authToken: string): Promise<string | null>;
 /**
+ * AI-1641: A `linear note` is always a legal Linear op, so the connector can't
+ * forbid it. But when the ticket's *delegate* posts a comment-only turn while the
+ * ticket sits in an active (non-terminal) workflow state, a clean success masks
+ * the fact that nothing advanced — the delegate's session closes the loop
+ * believing it progressed the ticket (exactly the AI-1479 jam). This builds a
+ * notice that preserves the comment but strips its false sense of completion:
+ * it states the comment did NOT advance the ticket, names the current state, and
+ * lists the real legal moves.
+ *
+ * Returns null (no notice — note is just a side-channel) when:
+ *   - the intent is not a comment-only note
+ *   - the ticket is ad-hoc / unknown workflow
+ *   - the ticket is in a terminal state
+ *   - the caller is not the current delegate
+ * Fail-open on any error or missing context.
+ */
+export declare function buildNonAdvancingNoteNotice(intent: string, issueId: string | null, authToken: string, callerLinearUserId?: string | null): Promise<string | null>;
+/**
  * Apply the state-label transition triggered by a legal command (AI-1353 / §4.2).
  *
  * Called by proxy.ts after a validated command is successfully forwarded to Linear.

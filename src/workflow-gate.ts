@@ -1574,6 +1574,75 @@ export async function buildStateTransitionReminder(
   );
 }
 
+/**
+ * AI-1641: A `linear note` is always a legal Linear op, so the connector can't
+ * forbid it. But when the ticket's *delegate* posts a comment-only turn while the
+ * ticket sits in an active (non-terminal) workflow state, a clean success masks
+ * the fact that nothing advanced — the delegate's session closes the loop
+ * believing it progressed the ticket (exactly the AI-1479 jam). This builds a
+ * notice that preserves the comment but strips its false sense of completion:
+ * it states the comment did NOT advance the ticket, names the current state, and
+ * lists the real legal moves.
+ *
+ * Returns null (no notice — note is just a side-channel) when:
+ *   - the intent is not a comment-only note
+ *   - the ticket is ad-hoc / unknown workflow
+ *   - the ticket is in a terminal state
+ *   - the caller is not the current delegate
+ * Fail-open on any error or missing context.
+ */
+export async function buildNonAdvancingNoteNotice(
+  intent: string,
+  issueId: string | null,
+  authToken: string,
+  callerLinearUserId?: string | null,
+): Promise<string | null> {
+  if (intent !== "note") return null;
+  if (!issueId) return null;
+
+  const { labels, delegateId, fetchFailed } = await fetchTicketContext(issueId, authToken);
+  if (fetchFailed) return null; // fail-open: can't confirm a violation
+
+  const workflowId = getWorkflowId(labels);
+  if (!workflowId) return null; // ad-hoc ticket — note is not a workflow turn
+
+  // Only the *current delegate's* note masquerades as progress; a non-delegate
+  // comment is a pure side-channel and is unaffected.
+  if (!callerLinearUserId || !delegateId || callerLinearUserId !== delegateId) return null;
+
+  const def = await loadWorkflowDefById(workflowId);
+  if (!def) return null;
+
+  const currentStateId = getCurrentState(labels);
+  if (!currentStateId) return null;
+  const currentState = def.states.find((s) => s.id === currentStateId);
+  if (!currentState) return null;
+
+  // Terminal states are unaffected — there is nothing to advance.
+  if (currentState.kind === "terminal" || !currentState.transitions?.length) return null;
+
+  const breakGlassCommand = def.break_glass?.command ?? "escape";
+  const transitions = currentState.transitions;
+  const helpLines = await Promise.all(
+    transitions.map(async (t) => {
+      const { bodies, mode } = await resolveTransitionTargets(t, def);
+      let cmd = `linear ${t.command} ${issueId}`;
+      if (mode === "required") {
+        cmd += ` <${bodies.join("|")}>`;
+      }
+      return `  - \`${cmd}\` (→ ${t.to})`;
+    }),
+  );
+  helpLines.push(`  - \`linear ${breakGlassCommand} ${issueId}\` (break glass, legal from any state)`);
+
+  return (
+    `[Workflow] Your comment was posted, but it did **not** advance the ticket. ` +
+    `${issueId} is still in state: **${currentState.id}**. ` +
+    `A comment is a valid side-channel, not a workflow step — to advance the ticket, use one of:\n` +
+    helpLines.join("\n")
+  );
+}
+
 // ── B2: Atomic state-label transition application ─────────────────────────
 
 /**
