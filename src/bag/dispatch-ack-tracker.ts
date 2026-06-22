@@ -298,6 +298,33 @@ export class DispatchAckTracker {
   }
 
   /**
+   * Return true if there is a pending/unconfirmed dispatch for (agentId, ticketId)
+   * whose dispatched_at is within the last withinMs milliseconds.
+   *
+   * Used by StuckDelegateDetector (AI-1650) to guard against re-dispatching a
+   * session that is still actively running after a connector restart. The in-memory
+   * SessionTracker is reset on restart, so this persisted check is the only way to
+   * know a session was recently dispatched and may still be in progress.
+   */
+  hasRecentPending(agentId: string, ticketId: string, withinMs: number): boolean {
+    const normalizedId = normalizeSessionKey(ticketId);
+    const cutoff = new Date(Date.now() - withinMs)
+      .toISOString()
+      .replace("T", " ")
+      .replace(/\.\d{3}Z$/, "");
+    const row = this.db
+      .prepare(
+        `SELECT 1 FROM dispatch_acks
+         WHERE agent_id = ? AND ticket_id = ?
+           AND ack_status IN ('pending', 'unconfirmed')
+           AND dispatched_at >= ?
+         LIMIT 1`,
+      )
+      .get(agentId, normalizedId, cutoff);
+    return row !== undefined;
+  }
+
+  /**
    * Prune acknowledged and escalated records older than ttlMs.
    * Called automatically at the end of each watchdog cycle.
    */

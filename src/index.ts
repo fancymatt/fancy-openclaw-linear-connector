@@ -377,6 +377,7 @@ export function createApp(options?: CreateAppOptions) {
   const stuckDelegateDetector = new StuckDelegateDetector({
     sessionTracker,
     bag,
+    ackTracker,
     operationalEventStore,
     deliveryConfig: wakeConfig,
     sendWake: async (agentOpenclawName, ticketId, prompt) => {
@@ -530,7 +531,7 @@ export function createApp(options?: CreateAppOptions) {
   });
 
   // v1 admin dashboard — read-only operational UI and safe JSON API.
-  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, deploymentName: DEPLOYMENT_NAME, wakeConfigForAgent }));
+  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, deploymentName: DEPLOYMENT_NAME }));
 
   app.use("/", createWebhookRouter(
     eventStore,
