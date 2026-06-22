@@ -696,15 +696,12 @@ async function fetchChildStateEnteredAt(
   const query = `
     query ChildStateHistory($id: String!) {
       issue(id: $id) {
-        labels { nodes { name } }
-        history(first: 100, orderBy: { createdAt: desc }) {
+        labels { nodes { id name } }
+        history(first: 100, orderBy: createdAt) {
           nodes {
-            __typename
-            ... on IssueLabelPayload {
-              createdAt
-              fromLabel { name }
-              toLabel { name }
-            }
+            createdAt
+            addedLabelIds
+            removedLabelIds
           }
         }
       }
@@ -717,15 +714,14 @@ async function fetchChildStateEnteredAt(
       body: JSON.stringify({ query, variables: { id: childIdentifier } }),
     });
     type HistoryNode = {
-      __typename: string;
       createdAt?: string;
-      fromLabel?: { name: string } | null;
-      toLabel?: { name: string } | null;
+      addedLabelIds?: string[] | null;
+      removedLabelIds?: string[] | null;
     };
     type Resp = {
       data?: {
         issue?: {
-          labels?: { nodes?: Array<{ name: string }> };
+          labels?: { nodes?: Array<{ id: string; name: string }> };
           history?: { nodes?: HistoryNode[] };
         } | null;
       };
@@ -742,9 +738,17 @@ async function fetchChildStateEnteredAt(
     const stateLabel = `state:${currentState}`;
     const historyNodes = issue.history?.nodes ?? [];
 
-    // Find the most recent history event where the state:* label was set to the current state
+    // Build label-id-to-name lookup from the issue's labels
+    const issueLabelMap = new Map<string, string>();
+    for (const label of (issue.labels?.nodes ?? [])) {
+      issueLabelMap.set(label.id, label.name);
+    }
+
+    // Find the most recent history event where the state:* label was added
     for (const node of historyNodes) {
-      if (node.__typename === "IssueLabelPayload" && node.toLabel?.name === stateLabel && node.createdAt) {
+      const addedIds = node.addedLabelIds ?? [];
+      const matches = addedIds.some((id) => issueLabelMap.get(id) === stateLabel);
+      if (matches && node.createdAt) {
         return new Date(node.createdAt).getTime();
       }
     }

@@ -465,11 +465,12 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
       ) {
         nodes {
           identifier
-          labels { nodes { name } }
+          id
+          labels { nodes { id name } }
           delegate { id }
           updatedAt
           state { name type }
-          comments(first: 20, orderBy: { createdAt: desc }) {
+          comments(first: 20, orderBy: createdAt) {
             nodes {
               id
               createdAt
@@ -479,16 +480,15 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
           }
           history(
             first: 50,
-            orderBy: { createdAt: desc }
+            orderBy: createdAt
           ) {
             nodes {
-              __typename
-              ... on IssueLabelPayload {
-                createdAt
-                fromLabel { name }
-                toLabel { name }
-                actor { id }
-              }
+              createdAt
+              actor { id name }
+              addedLabelIds
+              removedLabelIds
+              fromState { name }
+              toState { name }
             }
           }
         }
@@ -512,7 +512,7 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
         issues?: {
           nodes?: Array<{
             identifier: string;
-            labels: { nodes: Array<{ name: string }> };
+            labels: { nodes: Array<{ id: string; name: string }> };
             delegate: { id: string } | null;
             updatedAt: string;
             state: { name: string; type: string } | null;
@@ -526,11 +526,12 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
             };
             history: {
               nodes: Array<{
-                __typename: string;
                 createdAt?: string;
-                fromLabel?: { name: string } | null;
-                toLabel?: { name: string } | null;
-                actor?: { id: string } | null;
+                actor?: { id: string; name: string } | null;
+                addedLabelIds?: string[] | null;
+                removedLabelIds?: string[] | null;
+                fromState?: { name: string } | null;
+                toState?: { name: string } | null;
               }>;
             };
           }>;
@@ -546,6 +547,14 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
     const issues = body.data?.issues?.nodes ?? [];
     const candidates: StuckCandidate[] = [];
 
+    // Build a label-id-to-name lookup from the issue's current labels
+    const labelIdMap = new Map<string, string>();
+    for (const issue of issues) {
+      for (const label of issue.labels.nodes) {
+        labelIdMap.set(label.id, label.name);
+      }
+    }
+
     for (const issue of issues) {
       const labelNames = issue.labels.nodes.map((l) => l.name);
 
@@ -559,9 +568,20 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
       // Skip terminal states (done, escape)
       if (currentState === "done" || currentState === "escape") continue;
 
+      // Build label-id-to-name lookup from THIS issue's labels
+      const issueLabelMap = new Map<string, string>();
+      for (const label of issue.labels.nodes) {
+        issueLabelMap.set(label.id, label.name);
+      }
+
       // Find when the current state:* label was last set (state entry time)
+      // IssueHistory uses addedLabelIds/removedLabelIds — no IssueLabelPayload.
+      const stateLabelName = `state:${currentState}`;
       const stateEntryEvents = issue.history.nodes
-        .filter((h) => h.__typename === "IssueLabelPayload" && h.toLabel?.name === `state:${currentState}`)
+        .filter((h) => {
+          const addedIds = h.addedLabelIds ?? [];
+          return addedIds.some((id) => issueLabelMap.get(id) === stateLabelName);
+        })
         .sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""));
 
       const stateEnteredAt = stateEntryEvents[0]?.createdAt ?? null;
@@ -577,20 +597,33 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
         .map((c) => ({ id: c.id, createdAt: c.createdAt, body: c.body }));
 
       // Find transitions (state:* label changes) after state entry
+      // A transition is when any state:* label is added that differs from the current one.
       const transitionsAfterEntry = issue.history.nodes
         .filter((h) => {
           if (!stateEnteredAt) return false;
-          if (h.__typename !== "IssueLabelPayload") return false;
-          if (!h.toLabel?.name?.startsWith("state:")) return false;
-          // A transition is a change TO a different state:* label
-          // (the current state:* label being set IS the entry event — skip that)
-          return h.createdAt !== stateEnteredAt;
+          const addedIds = h.addedLabelIds ?? [];
+          const addedState = addedIds
+            .map((id) => issueLabelMap.get(id))
+            .find((name) => name?.startsWith("state:"));
+          if (!addedState || addedState === stateLabelName) return false;
+          // Must be after state entry
+          return (h.createdAt ?? "") > stateEnteredAt;
         })
-        .map((h) => ({
-          from: h.fromLabel?.name?.replace("state:", "") ?? "",
-          to: h.toLabel?.name?.replace("state:", "") ?? "",
-          at: h.createdAt ?? "",
-        }));
+        .map((h) => {
+          const addedIds = h.addedLabelIds ?? [];
+          const removedIds = h.removedLabelIds ?? [];
+          const addedState = addedIds
+            .map((id) => issueLabelMap.get(id))
+            .find((name) => name?.startsWith("state:")) ?? "";
+          const removedState = removedIds
+            .map((id) => issueLabelMap.get(id))
+            .find((name) => name?.startsWith("state:")) ?? "";
+          return {
+            from: removedState.replace("state:", ""),
+            to: addedState.replace("state:", ""),
+            at: h.createdAt ?? "",
+          };
+        });
 
       candidates.push({
         identifier: issue.identifier,
