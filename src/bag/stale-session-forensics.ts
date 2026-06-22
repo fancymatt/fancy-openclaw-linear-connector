@@ -643,7 +643,7 @@ export async function fetchLinearTicketState(
             id
             identifier
             state { name type }
-            comments(first: 1, orderBy: { createdAt: desc }) { nodes { id createdAt } }
+            comments(first: 1, orderBy: createdAt) { nodes { id createdAt } }
           }
         }`,
         variables: { id: identifier },

@@ -505,7 +505,7 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
           delegate { id }
           updatedAt
           state { name type }
-          comments(first: 20, orderBy: { createdAt: desc }) {
+          comments(first: 20, orderBy: createdAt) {
             nodes {
               id
               createdAt
@@ -515,16 +515,16 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
           }
           history(
             first: 50,
-            orderBy: { createdAt: desc }
+            orderBy: createdAt
           ) {
             nodes {
               __typename
-              ... on IssueLabelPayload {
-                createdAt
-                fromLabel { name }
-                toLabel { name }
-                actor { id }
-              }
+              createdAt
+              actor { id }
+              addedLabelIds
+              removedLabelIds
+              fromState { name }
+              toState { name }
             }
           }
         }
@@ -564,9 +564,11 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
               nodes: Array<{
                 __typename: string;
                 createdAt?: string;
-                fromLabel?: { name: string } | null;
-                toLabel?: { name: string } | null;
                 actor?: { id: string } | null;
+                addedLabelIds?: string | null;
+                removedLabelIds?: string | null;
+                fromState?: { name: string } | null;
+                toState?: { name: string } | null;
               }>;
             };
           }>;
@@ -596,11 +598,14 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
       if (currentState === "done" || currentState === "escape") continue;
 
       // Find when the current state:* label was last set (state entry time)
-      const stateEntryEvents = issue.history.nodes
-        .filter((h) => h.__typename === "IssueLabelPayload" && h.toLabel?.name === `state:${currentState}`)
+      // In the new Linear schema, IssueLabelPayload no longer exists as a fragment type.
+      // History entries are flat IssueHistory objects. We use the most recent history
+      // entry as a best-effort state entry timestamp.
+      const historySorted = issue.history.nodes
+        .filter((h) => h.createdAt)
         .sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""));
 
-      const stateEnteredAt = stateEntryEvents[0]?.createdAt ?? null;
+      const stateEnteredAt = historySorted[0]?.createdAt ?? null;
 
       // Find delegate comments after state entry
       const delegateComments = issue.comments.nodes
@@ -616,15 +621,15 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
       const transitionsAfterEntry = issue.history.nodes
         .filter((h) => {
           if (!stateEnteredAt) return false;
-          if (h.__typename !== "IssueLabelPayload") return false;
-          if (!h.toLabel?.name?.startsWith("state:")) return false;
-          // A transition is a change TO a different state:* label
-          // (the current state:* label being set IS the entry event — skip that)
-          return h.createdAt !== stateEnteredAt;
+          if (!h.createdAt) return false;
+          // A transition is a native Linear state change
+          const hasStateChange = h.fromState?.name || h.toState?.name;
+          if (!hasStateChange) return false;
+          return h.createdAt > stateEnteredAt;
         })
         .map((h) => ({
-          from: h.fromLabel?.name?.replace("state:", "") ?? "",
-          to: h.toLabel?.name?.replace("state:", "") ?? "",
+          from: h.fromState?.name ?? "",
+          to: h.toState?.name ?? "",
           at: h.createdAt ?? "",
         }));
 

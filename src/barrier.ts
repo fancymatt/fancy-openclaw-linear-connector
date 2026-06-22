@@ -719,14 +719,14 @@ async function fetchChildStateEnteredAt(
     query ChildStateHistory($id: String!) {
       issue(id: $id) {
         labels { nodes { name } }
-        history(first: 100, orderBy: { createdAt: desc }) {
+        history(first: 100, orderBy: createdAt) {
           nodes {
             __typename
-            ... on IssueLabelPayload {
-              createdAt
-              fromLabel { name }
-              toLabel { name }
-            }
+            createdAt
+            addedLabelIds
+            removedLabelIds
+            fromState { name }
+            toState { name }
           }
         }
       }
@@ -741,8 +741,10 @@ async function fetchChildStateEnteredAt(
     type HistoryNode = {
       __typename: string;
       createdAt?: string;
-      fromLabel?: { name: string } | null;
-      toLabel?: { name: string } | null;
+      addedLabelIds?: string | null;
+      removedLabelIds?: string | null;
+      fromState?: { name: string } | null;
+      toState?: { name: string } | null;
     };
     type Resp = {
       data?: {
@@ -764,9 +766,11 @@ async function fetchChildStateEnteredAt(
     const stateLabel = `state:${currentState}`;
     const historyNodes = issue.history?.nodes ?? [];
 
-    // Find the most recent history event where the state:* label was set to the current state
+    // Find the most recent history entry as a best-effort state entry timestamp.
+    // In the new Linear schema, IssueLabelPayload no longer exists — history entries
+    // are flat IssueHistory objects with fromState/toState for native state changes.
     for (const node of historyNodes) {
-      if (node.__typename === "IssueLabelPayload" && node.toLabel?.name === stateLabel && node.createdAt) {
+      if (node.createdAt) {
         return new Date(node.createdAt).getTime();
       }
     }
