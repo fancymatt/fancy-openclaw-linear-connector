@@ -16,8 +16,10 @@
  */
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { isChildTerminal, isTerminalState, evaluateBarrier, attemptBarrierTransition, onChildTerminal, buildShepherdingMessage, detectStalledChildren, surfaceStalledChildren, parseStallConfig, type ChildState, type StalledChild } from "./barrier.js";
+import { resetWorkflowCache } from "./workflow-gate.js";
 
 // ── isChildTerminal ────────────────────────────────────────────────────────
 
@@ -627,13 +629,26 @@ describe("buildShepherdingMessage", () => {
 
 describe("detectStalledChildren — mocked Linear API", () => {
   let originalFetch: typeof globalThis.fetch;
+  let originalWorkflowDefsDir: string | undefined;
+  let emptyWorkflowDir: string;
 
   beforeEach(() => {
     originalFetch = globalThis.fetch;
+    originalWorkflowDefsDir = process.env.WORKFLOW_DEFS_DIR;
+    emptyWorkflowDir = fs.mkdtempSync(path.join(os.tmpdir(), "barrier-test-"));
+    process.env.WORKFLOW_DEFS_DIR = emptyWorkflowDir;
+    resetWorkflowCache();
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    if (originalWorkflowDefsDir === undefined) {
+      delete process.env.WORKFLOW_DEFS_DIR;
+    } else {
+      process.env.WORKFLOW_DEFS_DIR = originalWorkflowDefsDir;
+    }
+    fs.rmdirSync(emptyWorkflowDir);
+    resetWorkflowCache();
   });
 
   it("detects children idle beyond threshold", async () => {
