@@ -36,7 +36,7 @@
  */
 
 import { componentLogger, createLogger } from "./logger.js";
-import { loadWorkflowDefById, loadWorkflowRegistry, getWorkflowId, getCurrentState, type WorkflowDef } from "./workflow-gate.js";
+import { loadWorkflowDef, getWorkflowId, getCurrentState, type WorkflowDef } from "./workflow-gate.js";
 import {
   LINEAR_API_URL,
   findOrCreateLabel,
@@ -809,13 +809,16 @@ export async function detectStalledChildren(
   const children = await fetchChildren(parentIdentifier, authToken);
   const stalled: StalledChild[] = [];
 
-  // Load workflow registry once for per-child def resolution
-  let registry: Awaited<ReturnType<typeof loadWorkflowRegistry>> | null = null;
-  const getDef = async (wfId: string | null): Promise<WorkflowDef | null> => {
-    if (!wfId) return null;
-    if (!registry) registry = await loadWorkflowRegistry();
-    return registry.get(wfId) ?? null;
-  };
+  // Load workflow def if not provided
+  let def = workflowDef;
+  if (!def) {
+    try {
+      def = await loadWorkflowDef();
+    } catch {
+      // Fallback to legacy flat-threshold behavior if workflow def unavailable
+      log.warn("barrier: workflow def unavailable, using flat stall threshold");
+    }
+  }
 
   const acct = accountant ?? deferralAccountant;
 
@@ -831,12 +834,10 @@ export async function detectStalledChildren(
     const stateEnteredAt = await fetchChildStateEnteredAt(child.identifier, authToken);
     const timeInStateMs = stateEnteredAt !== null ? now - stateEnteredAt : idleDurationMs;
 
-    // Look up per-state SLA from the child's workflow def
-    const childWfId = getWorkflowId(child.labels);
-    const childDef = childWfId ? await getDef(childWfId) : workflowDef ?? null;
+    // Look up per-state SLA from workflow def (duration string → ms)
     let stateSlaMs: number | null = null;
-    if (childDef && child.workflowState) {
-      const stateDef = childDef.states.find((s) => s.id === child.workflowState);
+    if (def && child.workflowState) {
+      const stateDef = def.states.find((s) => s.id === child.workflowState);
       if (stateDef?.sla) {
         stateSlaMs = parseSlaToMs(stateDef.sla);
       }
