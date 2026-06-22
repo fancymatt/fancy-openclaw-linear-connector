@@ -373,7 +373,7 @@ export function createWebhookRouter(
         }
       }
 
-      const route = routeEvent(event);
+      const route = await routeEvent(event);
       if (!route) {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
         appendOperationalEvent(operationalEventStore, { outcome: "no-route", type: event.type, errorSummary: `No agent target for ${event.type}` });
@@ -393,20 +393,26 @@ export function createWebhookRouter(
 
       // ── 9b. Nudge deduplication + coalescing ─────────────────────────────
       // Suppress rapid-fire duplicate events for the same agent+ticket.
+      // Fail-open: nudge store errors (e.g. closed DB in tests) must not
+      // crash the webhook handler — dedup is best-effort.
       if (NUDGE_DEDUP_WINDOW_MS > 0 && nudgeStore) {
-        const info = nudgeStore.getCoalesceInfo(route.agentId, ticketId, NUDGE_DEDUP_WINDOW_MS);
-        if (info.suppressed) {
-          log.info(`Nudge dedup: coalescing delivery for ${route.agentId} [${ticketId}] — within ${NUDGE_DEDUP_WINDOW_MS}ms window`);
-          nudgeStore.recordCoalesced(route.agentId, ticketId, event.type, "action" in event ? event.action : undefined);
-          appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "nudge-dedup" });
-          return;
-        }
-        // Window expired — drain coalesced count before delivering
-        const coalescedCount = nudgeStore.drainCoalescedCount(route.agentId, ticketId);
-        nudgeStore.recordNudge(route.agentId, ticketId);
-        if (coalescedCount > 0) {
-          log.info(`Nudge dedup: delivering for ${route.agentId} [${ticketId}] with ${coalescedCount} coalesced event(s)`);
-          route.coalescedCount = coalescedCount;
+        try {
+          const info = nudgeStore.getCoalesceInfo(route.agentId, ticketId, NUDGE_DEDUP_WINDOW_MS);
+          if (info.suppressed) {
+            log.info(`Nudge dedup: coalescing delivery for ${route.agentId} [${ticketId}] — within ${NUDGE_DEDUP_WINDOW_MS}ms window`);
+            nudgeStore.recordCoalesced(route.agentId, ticketId, event.type, "action" in event ? event.action : undefined);
+            appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "nudge-dedup" });
+            return;
+          }
+          // Window expired — drain coalesced count before delivering
+          const coalescedCount = nudgeStore.drainCoalescedCount(route.agentId, ticketId);
+          nudgeStore.recordNudge(route.agentId, ticketId);
+          if (coalescedCount > 0) {
+            log.info(`Nudge dedup: delivering for ${route.agentId} [${ticketId}] with ${coalescedCount} coalesced event(s)`);
+            route.coalescedCount = coalescedCount;
+          }
+        } catch (nudgeErr) {
+          log.warn(`Nudge dedup: store error (fail-open, skipping dedup): ${nudgeErr instanceof Error ? nudgeErr.message : String(nudgeErr)}`);
         }
       }
 
@@ -449,7 +455,7 @@ export function createWebhookRouter(
         );
         // No delivery was sent — roll back the dedup priming so a later genuine
         // dispatch to this agent+ticket inside the window is not swallowed (AI-1538).
-        nudgeStore?.clearNudge(route.agentId, ticketId);
+        try { nudgeStore?.clearNudge(route.agentId, ticketId); } catch { /* fail-open */ }
         // Do NOT deliver — return immediately.
         return;
       }
@@ -496,7 +502,7 @@ export function createWebhookRouter(
             // No delivery was sent — roll back the dedup priming so the genuine
             // dispatch to the agent that legitimately becomes the delegate is not
             // swallowed as a "duplicate" of this blocked attempt (AI-1538).
-            nudgeStore?.clearNudge(route.agentId, ticketId);
+            try { nudgeStore?.clearNudge(route.agentId, ticketId); } catch { /* fail-open */ }
             return;
           }
         } catch (err) {

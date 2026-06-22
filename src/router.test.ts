@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { extractAgentTarget, routeEvent } from "./router.js";
 import { reloadAgents } from "./agents.js";
+import { resetRosterCache } from "./department-roster.js";
 import type { LinearEvent } from "./webhook/schema.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -164,10 +165,13 @@ describe("extractAgentTarget", () => {
     expect(result).toBeNull();
   });
 
-  it("suppresses self-triggered events (actor is the target agent)", () => {
+  it("returns the target even for self-triggered events (filtering moved to routeEvent)", () => {
+    // AI-1479: extractAgentTarget no longer suppresses self-triggers.
+    // Filtering is handled by the async routeEvent() after consulting the roster.
     const event = makeIssueEvent({ actorId: CHARLES_ID, delegateId: CHARLES_ID });
     const result = extractAgentTarget(event);
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result?.name).toBe("charles");
   });
 
   it("allows agent-to-agent delegation (actor is agent A, target is agent B)", () => {
@@ -274,30 +278,34 @@ describe("routeEvent", () => {
     agentsFile = makeTempAgentsFile(BASE_AGENTS);
     process.env.AGENTS_FILE = agentsFile;
     reloadAgents();
+    // No roster loaded — tests use agent-map routing.
+    delete process.env.DEPARTMENT_ROSTER_PATH;
+    resetRosterCache();
   });
 
   afterEach(() => {
     delete process.env.AGENTS_FILE;
     fs.rmSync(path.dirname(agentsFile), { recursive: true, force: true });
+    resetRosterCache();
   });
 
-  it("returns a RouteResult with correct agentId and sessionKey", () => {
+  it("returns a RouteResult with correct agentId and sessionKey", async () => {
     const event = makeIssueEvent({ delegateId: CHARLES_ID, identifier: "AI-393" });
-    const result = routeEvent(event);
+    const result = await routeEvent(event);
     expect(result).not.toBeNull();
     expect(result?.agentId).toBe("charles");
     expect(result?.sessionKey).toContain("AI-393");
   });
 
-  it("extracts identifier from nested issue object (Comment event)", () => {
+  it("extracts identifier from nested issue object (Comment event)", async () => {
     const event = makeIssueEvent({ delegateId: CHARLES_ID, commentBody: "hello" });
     // Comment events nest identifier under data.issue.identifier
-    const result = routeEvent(event);
+    const result = await routeEvent(event);
     expect(result).not.toBeNull();
     expect(result?.sessionKey).toBe("linear-AI-1");
   });
 
-  it("extracts identifier from deeply nested agentSession path", () => {
+  it("extracts identifier from deeply nested agentSession path", async () => {
     const event: LinearEvent = {
       type: "AgentSessionEvent",
       action: "create",
@@ -311,12 +319,12 @@ describe("routeEvent", () => {
       },
       raw: {},
     };
-    const result = routeEvent(event);
+    const result = await routeEvent(event);
     expect(result).not.toBeNull();
     expect(result?.sessionKey).toBe("linear-SAK-50");
   });
 
-  it("extracts identifier from notification.issue path", () => {
+  it("extracts identifier from notification.issue path", async () => {
     const event: LinearEvent = {
       type: "IssueNotification",
       action: "mentioned",
@@ -330,12 +338,12 @@ describe("routeEvent", () => {
       },
       raw: {},
     };
-    const result = routeEvent(event);
+    const result = await routeEvent(event);
     expect(result).not.toBeNull();
     expect(result?.sessionKey).toBe("linear-ILL-68");
   });
 
-  it("uses deep recursive search for unknown nested shapes", () => {
+  it("uses deep recursive search for unknown nested shapes", async () => {
     const event: LinearEvent = {
       type: "SomeNewEventType",
       action: "create",
@@ -353,12 +361,12 @@ describe("routeEvent", () => {
       },
       raw: {},
     };
-    const result = routeEvent(event);
+    const result = await routeEvent(event);
     expect(result).not.toBeNull();
     expect(result?.sessionKey).toBe("linear-FCY-42");
   });
 
-  it("falls back to timestamp key only when no identifier found anywhere", () => {
+  it("falls back to timestamp key only when no identifier found anywhere", async () => {
     const before = Date.now();
     const event: LinearEvent = {
       type: "MysteryEvent",
@@ -370,7 +378,7 @@ describe("routeEvent", () => {
       },
       raw: {},
     };
-    const result = routeEvent(event);
+    const result = await routeEvent(event);
     expect(result).not.toBeNull();
     expect(result?.sessionKey).toMatch(/^linear-MysteryEvent-\d+$/);
     const ts = parseInt(result!.sessionKey.split("-").pop()!, 10);
@@ -378,9 +386,131 @@ describe("routeEvent", () => {
     expect(ts).toBeLessThanOrEqual(Date.now());
   });
 
-  it("returns null when no agent target found", () => {
+  it("returns null when no agent target found", async () => {
     const event = makeIssueEvent({});
-    const result = routeEvent(event);
+    const result = await routeEvent(event);
+    // With no roster, no delegate/assignee/mention, and no department match,
+    // the functionary escalates to steward. But since there's no roster and
+    // no agent matching the steward in the test agents, it routes to "astrid".
+    // In the test setup, astrid IS configured as an agent, so it should route.
+    expect(result).not.toBeNull();
+    expect(result?.agentId).toBe("astrid");
+    expect(result?.routingReason).toBe("steward-escalation");
+  });
+
+  it("suppresses self-triggered events (actor is delegate, no roster)", async () => {
+    const event = makeIssueEvent({ actorId: CHARLES_ID, delegateId: CHARLES_ID });
+    const result = await routeEvent(event);
+    // Actor is charles, delegate is charles — self-trigger, suppressed.
     expect(result).toBeNull();
+  });
+
+  it("suppresses self-triggered events when actor is agent with no target", async () => {
+    const event = makeIssueEvent({ actorId: CHARLES_ID }); // no delegate/assignee/mention
+    const result = await routeEvent(event);
+    // Actor is an agent (charles), no mechanical target — self-trigger suppressed.
+    expect(result).toBeNull();
+  });
+
+  it("allows agent-to-agent delegation through routeEvent", async () => {
+    const event = makeIssueEvent({ actorId: ASTRID_ID, delegateId: CHARLES_ID });
+    const result = await routeEvent(event);
+    expect(result).not.toBeNull();
+    expect(result?.agentId).toBe("charles");
+  });
+});
+
+// ── routeEvent + department roster integration ───────────────────────────────
+
+describe("routeEvent with department roster — self-trigger suppression", () => {
+  let agentsFile: string;
+  let rosterFile: string;
+
+  // Roster: AI → charles, ILL → astrid, steward → astrid
+  const ROSTER_YAML = `
+version: 1
+steward: astrid
+departments:
+  AI:
+    name: AI Team
+    defaultTarget: charles
+  ILL:
+    name: ILL Team
+    defaultTarget: astrid
+`;
+
+  beforeEach(() => {
+    agentsFile = makeTempAgentsFile(BASE_AGENTS);
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+
+    const dir = path.dirname(agentsFile);
+    rosterFile = path.join(dir, "department-roster.yaml");
+    fs.writeFileSync(rosterFile, ROSTER_YAML);
+    process.env.DEPARTMENT_ROSTER_PATH = rosterFile;
+    resetRosterCache();
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTS_FILE;
+    delete process.env.DEPARTMENT_ROSTER_PATH;
+    fs.rmSync(path.dirname(agentsFile), { recursive: true, force: true });
+    resetRosterCache();
+  });
+
+  it("agent actor with no mechanical target routes via department prefix (not suppressed)", async () => {
+    // Igor (not in BASE_AGENTS, so use charles as the actor) comments on ILL-42.
+    // No delegate/assignee/mention. Roster routes ILL → astrid.
+    // This should NOT be suppressed — astrid != charles (the actor).
+    const event = makeIssueEvent({
+      actorId: CHARLES_ID,
+      identifier: "ILL-42",
+      commentBody: "some comment",
+    });
+    const result = await routeEvent(event);
+    expect(result).not.toBeNull();
+    expect(result?.agentId).toBe("astrid");
+    expect(result?.routingReason).toBe("department-prefix");
+  });
+
+  it("agent actor with no mechanical target still suppressed when no department match", async () => {
+    // Charles comments on XYZ-99. No department for XYZ, no mechanical target.
+    // Should suppress (self-trigger, nowhere to route that isn't the actor).
+    const event = makeIssueEvent({
+      actorId: CHARLES_ID,
+      identifier: "XYZ-99",
+      commentBody: "some comment",
+    });
+    const result = await routeEvent(event);
+    expect(result).toBeNull();
+  });
+
+  it("agent actor on own-department issue with no mechanical target is suppressed", async () => {
+    // Charles comments on AI-100. Roster routes AI → charles. Charles IS the actor.
+    // This should suppress — department target is the actor itself.
+    const event = makeIssueEvent({
+      actorId: CHARLES_ID,
+      identifier: "AI-100",
+      commentBody: "some comment",
+    });
+    const result = await routeEvent(event);
+    // The !mechanicalTarget branch checks roster. AI → charles, actor is charles.
+    // department match but target == actor → still suppressed.
+    expect(result).toBeNull();
+  });
+
+  it("mechanical target self-trigger still routes via department when target differs", async () => {
+    // Charles is both actor and delegate on ILL-42.
+    // The mechanicalTarget branch runs first, finds self-trigger,
+    // but the roster routes ILL → astrid (not charles) → dispatch.
+    const event = makeIssueEvent({
+      actorId: CHARLES_ID,
+      delegateId: CHARLES_ID,
+      identifier: "ILL-42",
+    });
+    const result = await routeEvent(event);
+    expect(result).not.toBeNull();
+    expect(result?.agentId).toBe("astrid");
+    expect(result?.routingReason).toBe("department-prefix");
   });
 });
