@@ -298,6 +298,30 @@ export class DispatchAckTracker {
   }
 
   /**
+   * Return true if there is a pending/unconfirmed dispatch for (agentId, ticketId)
+   * whose last_signal_at is MORE RECENT than withinMs milliseconds ago.
+   * Used by StuckDelegateDetector to avoid re-dispatching actively-running sessions
+   * after a connector restart (when the in-memory SessionTracker is empty).
+   */
+  hasRecentPending(agentId: string, ticketId: string, withinMs: number): boolean {
+    const normalizedId = normalizeSessionKey(ticketId);
+    const cutoff = new Date(Date.now() - withinMs)
+      .toISOString()
+      .replace("T", " ")
+      .replace(/\.\d{3}Z$/, "");
+    const row = this.db
+      .prepare(
+        `SELECT 1 FROM dispatch_acks
+         WHERE agent_id = ? AND ticket_id = ?
+           AND ack_status IN ('pending', 'unconfirmed')
+           AND last_signal_at > ?
+         LIMIT 1`,
+      )
+      .get(agentId, normalizedId, cutoff);
+    return row != null;
+  }
+
+  /**
    * Prune acknowledged and escalated records older than ttlMs.
    * Called automatically at the end of each watchdog cycle.
    */
