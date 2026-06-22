@@ -24,6 +24,7 @@ import {
   buildRePrompt,
   type StuckCandidate,
 } from "./stuck-delegate-detector.js";
+import { DispatchAckTracker } from "./dispatch-ack-tracker.js";
 import type { WorkflowDef } from "../workflow-gate.js";
 import type { AgentConfig } from "../agents.js";
 
@@ -91,8 +92,9 @@ function setupDeps(dir: string) {
   const bag = new PendingWorkBag(path.join(dir, "bag.db"), 60_000);
   const sessionTracker = new SessionTracker(30_000);
   const operationalEventStore = new OperationalEventStore(path.join(dir, "events.db"));
+  const ackTracker = new DispatchAckTracker(path.join(dir, "dispatch-acks.db"));
   const deliveryConfig = { nodeBin: "node", hooksUrl: "", hooksToken: "" };
-  return { bag, sessionTracker, operationalEventStore, deliveryConfig };
+  return { bag, sessionTracker, operationalEventStore, ackTracker, deliveryConfig };
 }
 
 describe("StuckDelegateDetector", () => {
@@ -207,7 +209,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
-          loadDefById: async () => TEST_WORKFLOW_DEF,
+          loadDef: async () => TEST_WORKFLOW_DEF,
           sendWake: async (agent, ticket, prompt) => {
             wakeCalls.push({ agent, ticket, prompt });
             return true;
@@ -275,7 +277,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
-          loadDefById: async () => TEST_WORKFLOW_DEF,
+          loadDef: async () => TEST_WORKFLOW_DEF,
           sendWake: async (agent, ticket, prompt) => {
             wakeCalls.push({ agent, ticket, prompt });
             return true;
@@ -334,7 +336,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
-          loadDefById: async () => TEST_WORKFLOW_DEF,
+          loadDef: async () => TEST_WORKFLOW_DEF,
           sendWake: async () => true,
         },
         { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
@@ -380,7 +382,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
-          loadDefById: async () => TEST_WORKFLOW_DEF,
+          loadDef: async () => TEST_WORKFLOW_DEF,
           sendWake: async () => true,
         },
         { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
@@ -421,7 +423,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
-          loadDefById: async () => TEST_WORKFLOW_DEF,
+          loadDef: async () => TEST_WORKFLOW_DEF,
           sendWake: async () => true,
         },
         { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
@@ -465,7 +467,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
-          loadDefById: async () => TEST_WORKFLOW_DEF,
+          loadDef: async () => TEST_WORKFLOW_DEF,
           now: () => mockNow,
           sendWake: async (agent, ticket, prompt) => {
             wakeCalls.push({ agent, ticket, prompt });
@@ -528,7 +530,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => candidates,
-          loadDefById: async () => TEST_WORKFLOW_DEF,
+          loadDef: async () => TEST_WORKFLOW_DEF,
           sendWake: async () => true,
         },
         { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
@@ -659,7 +661,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [igor, noah],
           fetchStuckCandidates: async (agent) => candidateMap.get(agent) ?? [],
-          loadDefById: async () => TEST_WORKFLOW_DEF,
+          loadDef: async () => TEST_WORKFLOW_DEF,
           sendWake: async (agent, ticket, _prompt) => {
             wakeCalls.push({ agent, ticket });
             return true;
@@ -686,7 +688,7 @@ describe("StuckDelegateDetector", () => {
       operationalEventStore.close();
     });
 
-    test("handles workflow def load failure gracefully (per-candidate)", async () => {
+    test("handles workflow def load failure gracefully", async () => {
       const { bag, sessionTracker, operationalEventStore, deliveryConfig } = setupDeps(dir);
 
       const detector = new StuckDelegateDetector(
@@ -696,18 +698,7 @@ describe("StuckDelegateDetector", () => {
           operationalEventStore,
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
-          fetchStuckCandidates: async () => [
-            {
-              identifier: "AI-999",
-              currentState: "implementation",
-              labels: ["wf:dev-impl", "state:implementation"],
-              delegateId: TEST_AGENT.linearUserId,
-              stateEnteredAt: "2026-01-01T00:00:00.000Z",
-              delegateComments: [{ id: "c1", createdAt: "2026-01-01T00:01:00.000Z", body: "done" }],
-              transitionsAfterEntry: [],
-            },
-          ],
-          loadDefById: async () => { throw new Error("YAML parse error"); },
+          loadDef: async () => { throw new Error("YAML parse error"); },
           sendWake: async () => true,
         },
         { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
@@ -735,7 +726,7 @@ describe("StuckDelegateDetector", () => {
           deliveryConfig,
           listAgents: () => [TEST_AGENT],
           fetchStuckCandidates: async () => { throw new Error("API error"); },
-          loadDefById: async () => TEST_WORKFLOW_DEF,
+          loadDef: async () => TEST_WORKFLOW_DEF,
           sendWake: async () => true,
         },
         { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
@@ -762,7 +753,7 @@ describe("StuckDelegateDetector", () => {
           operationalEventStore,
           deliveryConfig,
           listAgents: () => [],
-          loadDefById: async () => TEST_WORKFLOW_DEF,
+          loadDef: async () => TEST_WORKFLOW_DEF,
           sendWake: async () => true,
         },
         { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
@@ -778,6 +769,276 @@ describe("StuckDelegateDetector", () => {
       bag.close();
       sessionTracker.close();
       operationalEventStore.close();
+    });
+
+    // ── AI-1650: DispatchAckTracker guard ──────────────────────────────
+
+    test("AI-1650: skips re-prompt when ack tracker has recent pending dispatch", async () => {
+      const { bag, sessionTracker, operationalEventStore, ackTracker, deliveryConfig } = setupDeps(dir);
+      const wakeCalls: Array<{ agent: string; ticket: string }> = [];
+
+      // Simulate a dispatch that was recorded but not yet acknowledged
+      ackTracker.recordDispatch("igor", "AI-1650");
+
+      const candidates: StuckCandidate[] = [
+        {
+          identifier: "AI-1650",
+          currentState: "implementation",
+          labels: ["wf:dev-impl", "state:implementation"],
+          delegateId: "linear-user-igor",
+          stateEnteredAt: "2026-06-22T15:00:00.000Z",
+          delegateComments: [
+            { id: "c1", createdAt: "2026-06-22T15:30:00.000Z", body: "Done" },
+          ],
+          transitionsAfterEntry: [],
+        },
+      ];
+
+      const detector = new StuckDelegateDetector(
+        {
+          sessionTracker,
+          bag,
+          operationalEventStore,
+          deliveryConfig,
+          ackTracker,
+          listAgents: () => [TEST_AGENT],
+          fetchStuckCandidates: async () => candidates,
+          loadDef: async () => TEST_WORKFLOW_DEF,
+          sendWake: async (agent, ticket, _prompt) => {
+            wakeCalls.push({ agent, ticket });
+            return true;
+          },
+        },
+        { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2, sessionActiveThresholdMs: 10 * 60 * 1000 },
+      );
+
+      const result = await detector.runCycle();
+
+      // Should skip — pending dispatch means session likely still active
+      expect(result.stuckFound).toBe(0);
+      expect(result.rePromptsSent).toBe(0);
+      expect(result.skippedSessionActive).toBe(1);
+      expect(wakeCalls).toHaveLength(0);
+
+      detector.stop();
+      bag.close();
+      sessionTracker.close();
+      operationalEventStore.close();
+      ackTracker.close();
+    });
+
+    test("AI-1650: allows re-prompt when no pending dispatch in ack tracker", async () => {
+      const { bag, sessionTracker, operationalEventStore, ackTracker, deliveryConfig } = setupDeps(dir);
+      const wakeCalls: Array<{ agent: string; ticket: string }> = [];
+
+      // No dispatch recorded — ack tracker has nothing for this agent+ticket
+      const candidates: StuckCandidate[] = [
+        {
+          identifier: "AI-1451",
+          currentState: "implementation",
+          labels: ["wf:dev-impl", "state:implementation"],
+          delegateId: "linear-user-igor",
+          stateEnteredAt: "2026-06-08T19:00:00.000Z",
+          delegateComments: [
+            { id: "c1", createdAt: "2026-06-08T20:00:00.000Z", body: "Complete" },
+          ],
+          transitionsAfterEntry: [],
+        },
+      ];
+
+      const detector = new StuckDelegateDetector(
+        {
+          sessionTracker,
+          bag,
+          operationalEventStore,
+          deliveryConfig,
+          ackTracker,
+          listAgents: () => [TEST_AGENT],
+          fetchStuckCandidates: async () => candidates,
+          loadDef: async () => TEST_WORKFLOW_DEF,
+          sendWake: async (agent, ticket, _prompt) => {
+            wakeCalls.push({ agent, ticket });
+            return true;
+          },
+        },
+        { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2, sessionActiveThresholdMs: 10 * 60 * 1000 },
+      );
+
+      const result = await detector.runCycle();
+
+      // No pending dispatch — should re-prompt normally
+      expect(result.stuckFound).toBe(1);
+      expect(result.rePromptsSent).toBe(1);
+      expect(result.skippedSessionActive).toBe(0);
+      expect(wakeCalls).toHaveLength(1);
+
+      detector.stop();
+      bag.close();
+      sessionTracker.close();
+      operationalEventStore.close();
+      ackTracker.close();
+    });
+
+    test("AI-1650: allows re-prompt when pending dispatch exceeds threshold", async () => {
+      const { bag, sessionTracker, operationalEventStore, ackTracker, deliveryConfig } = setupDeps(dir);
+      const wakeCalls: Array<{ agent: string; ticket: string }> = [];
+
+      // Record a dispatch and then simulate it being old by using a very
+      // short threshold so it falls outside the window
+      ackTracker.recordDispatch("igor", "AI-1650");
+
+      const candidates: StuckCandidate[] = [
+        {
+          identifier: "AI-1650",
+          currentState: "implementation",
+          labels: ["wf:dev-impl", "state:implementation"],
+          delegateId: "linear-user-igor",
+          stateEnteredAt: "2026-06-22T15:00:00.000Z",
+          delegateComments: [
+            { id: "c1", createdAt: "2026-06-22T15:30:00.000Z", body: "Done" },
+          ],
+          transitionsAfterEntry: [],
+        },
+      ];
+
+      // 1ms threshold — any real dispatch will be older than this
+      const detector = new StuckDelegateDetector(
+        {
+          sessionTracker,
+          bag,
+          operationalEventStore,
+          deliveryConfig,
+          ackTracker,
+          listAgents: () => [TEST_AGENT],
+          fetchStuckCandidates: async () => candidates,
+          loadDef: async () => TEST_WORKFLOW_DEF,
+          sendWake: async (agent, ticket, _prompt) => {
+            wakeCalls.push({ agent, ticket });
+            return true;
+          },
+        },
+        { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2, sessionActiveThresholdMs: 1 },
+      );
+
+      // Wait 50ms so the dispatch is definitively older than 1ms threshold
+      await new Promise((r) => setTimeout(r, 50));
+
+      const result = await detector.runCycle();
+
+      // Dispatch is older than threshold — should re-prompt
+      expect(result.stuckFound).toBe(1);
+      expect(result.rePromptsSent).toBe(1);
+      expect(result.skippedSessionActive).toBe(0);
+      expect(wakeCalls).toHaveLength(1);
+
+      detector.stop();
+      bag.close();
+      sessionTracker.close();
+      operationalEventStore.close();
+      ackTracker.close();
+    });
+
+    test("AI-1650: backward compat — works without ackTracker", async () => {
+      const { bag, sessionTracker, operationalEventStore, deliveryConfig } = setupDeps(dir);
+      const wakeCalls: Array<{ agent: string; ticket: string }> = [];
+
+      const candidates: StuckCandidate[] = [
+        {
+          identifier: "AI-1451",
+          currentState: "implementation",
+          labels: ["wf:dev-impl", "state:implementation"],
+          delegateId: "linear-user-igor",
+          stateEnteredAt: "2026-06-08T19:00:00.000Z",
+          delegateComments: [
+            { id: "c1", createdAt: "2026-06-08T20:00:00.000Z", body: "Complete" },
+          ],
+          transitionsAfterEntry: [],
+        },
+      ];
+
+      // No ackTracker provided — should fall through to existing behavior
+      const detector = new StuckDelegateDetector(
+        {
+          sessionTracker,
+          bag,
+          operationalEventStore,
+          deliveryConfig,
+          listAgents: () => [TEST_AGENT],
+          fetchStuckCandidates: async () => candidates,
+          loadDef: async () => TEST_WORKFLOW_DEF,
+          sendWake: async (agent, ticket, _prompt) => {
+            wakeCalls.push({ agent, ticket });
+            return true;
+          },
+        },
+        { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2, sessionActiveThresholdMs: 10 * 60 * 1000 },
+      );
+
+      const result = await detector.runCycle();
+
+      // No ackTracker — guard is skipped, normal detection
+      expect(result.stuckFound).toBe(1);
+      expect(result.rePromptsSent).toBe(1);
+      expect(result.skippedSessionActive).toBe(0);
+
+      detector.stop();
+      bag.close();
+      sessionTracker.close();
+      operationalEventStore.close();
+    });
+
+    test("AI-1650: sessionActiveThresholdMs=0 disables ack tracker guard", async () => {
+      const { bag, sessionTracker, operationalEventStore, ackTracker, deliveryConfig } = setupDeps(dir);
+      const wakeCalls: Array<{ agent: string; ticket: string }> = [];
+
+      // Record a pending dispatch — would normally cause a skip
+      ackTracker.recordDispatch("igor", "AI-1650");
+
+      const candidates: StuckCandidate[] = [
+        {
+          identifier: "AI-1650",
+          currentState: "implementation",
+          labels: ["wf:dev-impl", "state:implementation"],
+          delegateId: "linear-user-igor",
+          stateEnteredAt: "2026-06-22T15:00:00.000Z",
+          delegateComments: [
+            { id: "c1", createdAt: "2026-06-22T15:30:00.000Z", body: "Done" },
+          ],
+          transitionsAfterEntry: [],
+        },
+      ];
+
+      // threshold=0 disables the guard
+      const detector = new StuckDelegateDetector(
+        {
+          sessionTracker,
+          bag,
+          operationalEventStore,
+          deliveryConfig,
+          ackTracker,
+          listAgents: () => [TEST_AGENT],
+          fetchStuckCandidates: async () => candidates,
+          loadDef: async () => TEST_WORKFLOW_DEF,
+          sendWake: async (agent, ticket, _prompt) => {
+            wakeCalls.push({ agent, ticket });
+            return true;
+          },
+        },
+        { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2, sessionActiveThresholdMs: 0 },
+      );
+
+      const result = await detector.runCycle();
+
+      // Guard disabled — should re-prompt even with pending dispatch
+      expect(result.stuckFound).toBe(1);
+      expect(result.rePromptsSent).toBe(1);
+      expect(result.skippedSessionActive).toBe(0);
+
+      detector.stop();
+      bag.close();
+      sessionTracker.close();
+      operationalEventStore.close();
+      ackTracker.close();
     });
   });
 });

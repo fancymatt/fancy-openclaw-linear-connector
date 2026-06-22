@@ -379,6 +379,7 @@ export function createApp(options?: CreateAppOptions) {
     bag,
     operationalEventStore,
     deliveryConfig: wakeConfig,
+    ackTracker,
     sendWake: async (agentOpenclawName, ticketId, prompt) => {
       const result = await deliverMessageToAgent(
         agentOpenclawName,

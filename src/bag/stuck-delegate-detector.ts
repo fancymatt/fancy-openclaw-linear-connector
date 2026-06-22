@@ -36,7 +36,7 @@
 
 import { createLogger, componentLogger } from "../logger.js";
 import { getAccessToken, getAgents, isAgentLocal, type AgentConfig } from "../agents.js";
-import { loadWorkflowDefById, getCurrentState, getWorkflowId, type WorkflowDef } from "../workflow-gate.js";
+import { loadWorkflowDef, getCurrentState, getWorkflowId, type WorkflowDef } from "../workflow-gate.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
 import type { SessionTracker } from "./session-tracker.js";
 import type { PendingWorkBag } from "./pending-work-bag.js";
@@ -48,6 +48,7 @@ const log = componentLogger(createLogger(), "stuck-delegate-detector");
 const DEFAULT_POLL_MS = 5 * 60 * 1000;       // 5 minutes
 const DEFAULT_IDLE_GRACE_MS = 3 * 60 * 1000;  // 3 minutes
 const DEFAULT_MAX_PROMPTS = 2;
+const DEFAULT_SESSION_ACTIVE_MS = 10 * 60 * 1000; // 10 minutes
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -58,6 +59,13 @@ export interface StuckDelegateConfig {
   idleGraceMs: number;
   /** Max re-prompts per ticket. Default: 2. */
   maxPrompts: number;
+  /**
+   * Treat a dispatch as still-active if its ack tracker entry is pending
+   * within this threshold. Protects against re-prompting sessions that are
+   * still running but haven't announced completion (AI-1650).
+   * Set to 0 to disable. Default: 10 min.
+   */
+  sessionActiveThresholdMs: number;
 }
 
 // ── Dependencies ─────────────────────────────────────────────────────────────
@@ -68,6 +76,16 @@ export interface StuckDelegateDeps {
   operationalEventStore: OperationalEventStore;
   /** Delivery config for sending re-prompt messages to agents. */
   deliveryConfig: DeliveryConfig;
+  /**
+   * Persisted dispatch-ack tracker (SQLite). Used to check whether a dispatch
+   * is still pending/unacknowledged — meaning the agent session is likely
+   * still running even if SessionTracker doesn't know about it (e.g. after
+   * a connector restart). Optional for backward compatibility.
+   */
+  ackTracker?: {
+    getPendingTimedOut: (timeoutMs: number) => Array<{ agentId: string; ticketId: string; ackStatus: string }>;
+    getActivePending: (maxAgeMs: number) => Array<{ agentId: string; ticketId: string; ackStatus: string }>;
+  };
   /** Deliver a re-prompt wake signal to the agent. */
   sendWake?: (agentOpenclawName: string, ticketId: string, prompt: string) => Promise<boolean>;
   /** Overridable for testing. */
@@ -76,8 +94,8 @@ export interface StuckDelegateDeps {
   now?: () => number;
   /** Overridable for testing. */
   fetchStuckCandidates?: (agent: AgentConfig) => Promise<StuckCandidate[]>;
-  /** Overridable for testing — loads workflow def by id. */
-  loadDefById?: (workflowId: string) => Promise<WorkflowDef | null>;
+  /** Overridable for testing — loads workflow def. */
+  loadDef?: () => Promise<WorkflowDef>;
 }
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -101,6 +119,8 @@ export interface StuckDelegateCycleResult {
   stuckFound: number;
   rePromptsSent: number;
   skippedAlreadyPrompted: number;
+  /** Candidates skipped because the ack tracker shows a recent pending dispatch (session likely still active). */
+  skippedSessionActive: number;
   errors: number;
 }
 
@@ -206,17 +226,19 @@ export class StuckDelegateDetector {
       pollMs: config?.pollMs ?? parseEnvInt("STUCK_DELEGATE_POLL_MS", DEFAULT_POLL_MS),
       idleGraceMs: config?.idleGraceMs ?? parseEnvInt("STUCK_DELEGATE_IDLE_GRACE_MS", DEFAULT_IDLE_GRACE_MS),
       maxPrompts: config?.maxPrompts ?? parseEnvInt("STUCK_DELEGATE_MAX_PROMPTS", DEFAULT_MAX_PROMPTS),
+      sessionActiveThresholdMs: config?.sessionActiveThresholdMs ?? parseEnvInt("STUCK_DELEGATE_SESSION_ACTIVE_MS", DEFAULT_SESSION_ACTIVE_MS),
     };
     this.deps = {
       sessionTracker: deps.sessionTracker,
       bag: deps.bag,
       operationalEventStore: deps.operationalEventStore,
       deliveryConfig: deps.deliveryConfig,
+      ackTracker: deps.ackTracker ?? { getPendingTimedOut: () => [], getActivePending: () => [] },
       sendWake: deps.sendWake ?? defaultSendWakeFactory(deps.deliveryConfig),
       listAgents: deps.listAgents ?? (() => getAgents().filter(isAgentLocal)),
       now: deps.now ?? (() => Date.now()),
       fetchStuckCandidates: deps.fetchStuckCandidates ?? defaultFetchStuckCandidates,
-      loadDefById: deps.loadDefById ?? loadWorkflowDefById,
+      loadDef: deps.loadDef ?? loadWorkflowDef,
     };
     this.promptCounter = new PromptCounter();
   }
@@ -225,7 +247,8 @@ export class StuckDelegateDetector {
     if (this.timer) return;
     log.info(
       `Stuck-delegate detector started — poll=${this.config.pollMs}ms ` +
-      `idleGrace=${this.config.idleGraceMs}ms maxPrompts=${this.config.maxPrompts}`,
+      `idleGrace=${this.config.idleGraceMs}ms maxPrompts=${this.config.maxPrompts} ` +
+      `sessionActiveThreshold=${this.config.sessionActiveThresholdMs}ms`,
     );
     this.timer = setInterval(() => {
       this.runCycle().catch((err) => {
@@ -258,7 +281,7 @@ export class StuckDelegateDetector {
    * and re-prompts as needed.
    */
   async runCycle(): Promise<StuckDelegateCycleResult> {
-    const { listAgents, fetchStuckCandidates, loadDefById, sessionTracker, bag, operationalEventStore, sendWake, now: getNow } = this.deps;
+    const { listAgents, fetchStuckCandidates, loadDef, sessionTracker, bag, operationalEventStore, sendWake, now: getNow } = this.deps;
     const agents = listAgents();
     const result: StuckDelegateCycleResult = {
       agentsChecked: 0,
@@ -266,10 +289,18 @@ export class StuckDelegateDetector {
       stuckFound: 0,
       rePromptsSent: 0,
       skippedAlreadyPrompted: 0,
+      skippedSessionActive: 0,
       errors: 0,
     };
 
-    let def: WorkflowDef | null;
+    let def: WorkflowDef;
+    try {
+      def = await loadDef();
+    } catch (err) {
+      log.error(`Failed to load workflow def: ${err instanceof Error ? err.message : String(err)}`);
+      result.errors++;
+      return result;
+    }
 
     for (const agent of agents) {
       result.agentsChecked++;
@@ -296,6 +327,26 @@ export class StuckDelegateDetector {
           // Session is active — clear any stale "ended at" tracking
           this.sessionEndedAt.delete(`${openclawAgent}:${sessionKey}`);
           continue;
+        }
+
+        // AI-1650: Also check the persisted DispatchAckTracker. After a connector
+        // restart, SessionTracker is empty — but a dispatch that hasn't been
+        // acknowledged means the agent session is likely still running. Skip
+        // re-prompting to avoid spawning duplicate sessions.
+        if (this.config.sessionActiveThresholdMs > 0 && this.deps.ackTracker) {
+          const active = this.deps.ackTracker.getActivePending(this.config.sessionActiveThresholdMs);
+          const hasRecentPending = active.some(
+            (e) => e.agentId === openclawAgent && e.ticketId === sessionKey,
+          );
+          if (hasRecentPending) {
+            result.skippedSessionActive++;
+            log.info(
+              `Stuck-delegate: skipping ${ticketId} — recent active dispatch in ack tracker ` +
+              `(agent=${openclawAgent}, threshold=${this.config.sessionActiveThresholdMs}ms). ` +
+              `Session likely still active.`,
+            );
+            continue;
+          }
         }
 
         // Apply idle grace period: if the session recently ended, wait
@@ -339,21 +390,6 @@ export class StuckDelegateDetector {
           log.info(
             `Stuck-delegate: skipping ${ticketId} — already prompted ${promptCount} times (max=${this.config.maxPrompts})`,
           );
-          continue;
-        }
-
-        // Resolve the correct workflow def for this candidate
-        const candidateWorkflowId = getWorkflowId(candidate.labels);
-        try {
-          def = candidateWorkflowId ? await loadDefById(candidateWorkflowId) : null;
-        } catch (err) {
-          log.error(`Stuck-delegate: failed to load def for wf:${candidateWorkflowId} on ${ticketId}: ${err instanceof Error ? err.message : String(err)}`);
-          result.errors++;
-          continue;
-        }
-        if (!def) {
-          log.warn(`Stuck-delegate: skipping ${ticketId} — no workflow def for wf:${candidateWorkflowId}`);
-          result.errors++;
           continue;
         }
 

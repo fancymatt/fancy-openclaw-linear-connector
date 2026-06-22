@@ -210,6 +210,47 @@ export class DispatchAckTracker {
   }
 
   /**
+   * Return pending/unconfirmed entries dispatched within the last maxAgeMs.
+   * Used by StuckDelegateDetector (AI-1650) to detect sessions that are still
+   * likely running — a fresh dispatch means the agent hasn't finished yet.
+   */
+  getActivePending(maxAgeMs: number): DispatchAckEntry[] {
+    const cutoff = new Date(Date.now() - maxAgeMs)
+      .toISOString()
+      .replace("T", " ")
+      .replace(/\.\d{3}Z$/, "");
+    const rows = this.db
+      .prepare(
+        `SELECT id, agent_id, ticket_id, dispatched_at, last_signal_at,
+                ack_status, attempt_count
+         FROM dispatch_acks
+         WHERE ack_status IN ('pending', 'unconfirmed')
+           AND last_signal_at > ?
+         ORDER BY last_signal_at DESC
+         LIMIT 100`,
+      )
+      .all(cutoff) as Array<{
+      id: number;
+      agent_id: string;
+      ticket_id: string;
+      dispatched_at: string;
+      last_signal_at: string;
+      ack_status: string;
+      attempt_count: number;
+    }>;
+
+    return rows.map((r) => ({
+      id: r.id,
+      agentId: r.agent_id,
+      ticketId: r.ticket_id,
+      dispatchedAt: r.dispatched_at,
+      lastSignalAt: r.last_signal_at,
+      ackStatus: r.ack_status as AckStatus,
+      attemptCount: r.attempt_count,
+    }));
+  }
+
+  /**
    * Update a dispatch record after a watchdog re-signal attempt.
    * Sets status to 'unconfirmed', bumps attempt_count, resets last_signal_at.
    */

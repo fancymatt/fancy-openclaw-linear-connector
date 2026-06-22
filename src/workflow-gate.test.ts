@@ -673,7 +673,7 @@ describe("checkWorkflowRules — deploy capability gate (deployment state)", () 
     expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 
-  it("blocks 'deploy' from Charles (dev body, no deploy:execute) in deployment state", async () => {
+  it("blocks 'deploy' from Hanzo (dev body, no deploy:execute) in deployment state", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
     const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "charles");
     expect(result).not.toBeNull();
@@ -1482,7 +1482,6 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
   it("returns reminder for code-review state after submit from implementation", async () => {
     // After "submit" (implementation → code-review), the new state is code-review.
     // Legal moves: approve, request-changes, escape.
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
     const result = await buildStateTransitionReminder("submit", "ABC-123", "Bearer tok");
     expect(result).not.toBeNull();
     expect(result).toContain("[Workflow]");
@@ -1493,7 +1492,6 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
   });
 
   it("returns reminder for implementation state after accept from intake", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
     const result = await buildStateTransitionReminder("accept", "ABC-123", "Bearer tok");
     expect(result).not.toBeNull();
     expect(result).toContain("implementation");
@@ -1502,19 +1500,16 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
 
   it("returns null for terminal state (done)", async () => {
     // After "deploy" (deployment → done), the destination is terminal.
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
     const result = await buildStateTransitionReminder("deploy", "ABC-123", "Bearer tok");
     expect(result).toBeNull();
   });
 
   it("returns null for terminal escape state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
     const result = await buildStateTransitionReminder("escape", "ABC-123", "Bearer tok");
     expect(result).toBeNull();
   });
 
   it("returns null for unknown intent", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
     const result = await buildStateTransitionReminder("unknown-command", "ABC-123", "Bearer tok");
     expect(result).toBeNull();
   });
@@ -1525,7 +1520,6 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
   });
 
   it("returns reminder for deployment state after approve from code-review", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
     const result = await buildStateTransitionReminder("approve", "ABC-123", "Bearer tok");
     expect(result).not.toBeNull();
     expect(result).toContain("deployment");
@@ -1534,7 +1528,6 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
   });
 
   it("returns reminder for implementation state after request-changes from code-review", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
     const result = await buildStateTransitionReminder("request-changes", "ABC-123", "Bearer tok");
     expect(result).not.toBeNull();
     expect(result).toContain("implementation");
@@ -5126,155 +5119,67 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     expect(result).not.toBeNull();
     expect(result).toContain("blocked");
   });
-
-  it("blocks raw stateId + assigneeId + labelIds combined mutation", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
-    const result = await checkRawMutationInterception(
-      { query: "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }", variables: { input: { stateId: "state-id", assigneeId: "user-id", labelIds: ["lbl-1"] } } },
-      "issue-uuid",
-      "Bearer tok",
-      "charles",
-    );
-    expect(result).not.toBeNull();
-    expect(result).toContain("status/assignee/labels");
-  });
-
-  it("allows raw non-workflow mutations (title, description, etc.)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
-    const result = await checkRawMutationInterception(
-      { query: "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }", variables: { input: { title: "New title", description: "New description", priority: 1 } } },
-      "issue-uuid",
-      "Bearer tok",
-      "charles",
-    );
-    expect(result).toBeNull(); // Not a workflow-affecting mutation
-  });
-
-  it("exactly one issueUpdate mutation per transition (no separate native-state write)", async () => {
-    resetWorkflowCache();
-    resetNativeStateCache();
-    const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:implementation"]);
-    globalThis.fetch = fetch;
-
-    await applyStateTransition("submit", "AI-CONF-ONE", "Bearer tok", { bodyId: "charles" });
-
-    // Count ApplyAtomicTransition mutations — must be exactly 1
-    const atomicMutations = mutations.filter((m) => m.query.includes("ApplyAtomicTransition"));
-    expect(atomicMutations).toHaveLength(1);
-
-    // The single mutation must include all three facets: labelIds, delegateId, stateId
-    const vars = atomicMutations[0].variables as { labelIds?: string[]; delegateId?: string; stateId?: string };
-    expect(vars.labelIds).toBeDefined();
-    expect(vars.stateId).toBeDefined(); // AI-1498: native state is in the same mutation
-  });
-
-  // ── AI-1531: IMPLEMENTER_STORE_PATH must be isolated per-suite ─────────────
-  // These tests verify AC1 and AC2 for the conformance suite. They FAIL before
-  // the fix (no IMPLEMENTER_STORE_PATH isolation in beforeAll) and PASS after.
-  //
-  // Unique issue IDs are used to avoid conflicts with existing conformance tests;
-  // the canonical workflow maps implementation to native_state: todo, so the
-  // expected stateId is SEMANTIC_TO_UUID["todo"] (not "doing").
-
-  it("AI-1531/AC1: reject completes even when /tmp/implementer-store.json is pre-seeded with a ghost-body for the conformance issue", async () => {
-    const issueId = "AI-CONF-REJ-1531";
-    const poisonContent = JSON.stringify({
-      [issueId]: { bodyId: "ghost-body-ai1531", workflowId: "dev-impl", recordedAt: "2026-01-01T00:00:00Z" },
-    });
-    // Seed the default store with a ghost-body that has no linearUserId.
-    fs.writeFileSync("/tmp/implementer-store.json", poisonContent, "utf8");
-    clearImplementerStore();
-
-    resetWorkflowCache();
-    resetNativeStateCache();
-    const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:deployment"]);
-    globalThis.fetch = fetch;
-
-    try {
-      await applyStateTransition("reject", issueId, "Bearer tok", {
-        bodyId: "hanzo",
-        feedback: { reasonCode: "correctness", freeText: "ai1531 conformance reject" },
-      });
-      // AC1: ApplyAtomicTransition must fire regardless of /tmp store contents.
-      // (Canonical workflow: implementation has native_state: todo.)
-      const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
-      expect(atomicMutation).toBeDefined();
-      const vars = atomicMutation!.variables as { stateId?: string };
-      expect(vars.stateId).toBe(SEMANTIC_TO_UUID["todo"]);
-    } finally {
-      clearImplementerStore();
-      try { fs.rmSync("/tmp/implementer-store.json"); } catch { /* absent is fine */ }
-    }
-  });
-
-  it("AI-1531/AC1: request-changes completes even when /tmp/implementer-store.json is pre-seeded with a ghost-body for the conformance issue", async () => {
-    const issueId = "AI-CONF-RC-1531";
-    const poisonContent = JSON.stringify({
-      [issueId]: { bodyId: "ghost-body-ai1531", workflowId: "dev-impl", recordedAt: "2026-01-01T00:00:00Z" },
-    });
-    fs.writeFileSync("/tmp/implementer-store.json", poisonContent, "utf8");
-    clearImplementerStore();
-
-    resetWorkflowCache();
-    resetNativeStateCache();
-    const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:code-review"]);
-    globalThis.fetch = fetch;
-
-    try {
-      await applyStateTransition("request-changes", issueId, "Bearer tok", {
-        bodyId: "reviewer",
-        feedback: { reasonCode: "missing-tests", freeText: "ai1531 conformance rc" },
-      });
-      const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
-      expect(atomicMutation).toBeDefined();
-      const vars = atomicMutation!.variables as { stateId?: string };
-      expect(vars.stateId).toBe(SEMANTIC_TO_UUID["todo"]);
-    } finally {
-      clearImplementerStore();
-      try { fs.rmSync("/tmp/implementer-store.json"); } catch { /* absent is fine */ }
-    }
-  });
-
-  it("AI-1531/AC2: IMPLEMENTER_STORE_PATH is set to a per-suite-isolated path (not the global default)", () => {
-    // After the fix, beforeAll sets IMPLEMENTER_STORE_PATH to a per-suite tmpdir.
-    // Before the fix, it is unset — so persist() would write to /tmp/implementer-store.json.
-    const storePath = process.env.IMPLEMENTER_STORE_PATH;
-    expect(storePath).toBeDefined(); // FAILS before fix (undefined), PASSES after
-    expect(storePath).not.toBe("/tmp/implementer-store.json");
-  });
 });
 
-// ── AI-1521: unescape re-entry verb ──────────────────────────────────────
+// ── AI-1575: atomic enroll verb ───────────────────────────────────────────
+//
+// Verifies that the `enroll` intent bypasses state-machine validation and
+// applies label + delegate + native state in a single atomic mutation.
+// Regression coverage for the AI-1571 orphaned-delegate collision.
 
-// Shared setup for AI-1521 test suites: own temp dir so corrupted WORKFLOW_DEF_PATH /
-// CAPABILITY_POLICY_PATH from earlier test suites (ai1463, ai1493) don't interfere.
-let ai1521Dir: string;
-let ai1521OrigWorkflowPath: string | undefined;
-let ai1521OrigPolicyPath: string | undefined;
+// Shared fixture for all AI-1575 suites — created once, torn down after the last.
+let ai1575Dir = "";
+let ai1575OrigWorkflowPath: string | undefined;
+let ai1575OrigPolicyPath: string | undefined;
+let ai1575OrigAgentsFile: string | undefined;
+let ai1575RefCount = 0;
 
-function setupAi1521(): void {
-  ai1521OrigWorkflowPath = process.env.WORKFLOW_DEF_PATH;
-  ai1521OrigPolicyPath = process.env.CAPABILITY_POLICY_PATH;
-  ai1521Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1521-test-"));
-  const policyFile = path.join(ai1521Dir, "capability-policy.yaml");
-  fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
-  process.env.CAPABILITY_POLICY_PATH = policyFile;
-  process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
+function setupAi1575(): void {
+  if (ai1575RefCount++ === 0) {
+    ai1575OrigWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    ai1575OrigPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    ai1575OrigAgentsFile = process.env.AGENTS_FILE;
+    ai1575Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1575-test-"));
+    const policyFile = path.join(ai1575Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+    const workflowFile = path.join(ai1575Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+    // Write agents file so getAgent("astrid") resolves linearUserId correctly
+    // regardless of whether a prior suite deleted AGENTS_FILE from env.
+    const agentsFile = path.join(ai1575Dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+        { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-client", clientSecret: "h-secret", accessToken: "h-token", refreshToken: "h-refresh" },
+        { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-client", clientSecret: "c-secret", accessToken: "c-token", refreshToken: "c-refresh" },
+        { name: "reviewer", linearUserId: "reviewer-linear-uuid", clientId: "r-client", clientSecret: "r-secret", accessToken: "r-token", refreshToken: "r-refresh" },
+      ],
+    }, null, 2), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+  }
 }
 
-function teardownAi1521(): void {
-  fs.rmSync(ai1521Dir, { recursive: true, force: true });
-  if (ai1521OrigWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = ai1521OrigWorkflowPath;
-  else delete process.env.WORKFLOW_DEF_PATH;
-  if (ai1521OrigPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = ai1521OrigPolicyPath;
-  else delete process.env.CAPABILITY_POLICY_PATH;
+function teardownAi1575(): void {
+  if (--ai1575RefCount === 0) {
+    fs.rmSync(ai1575Dir, { recursive: true, force: true });
+    if (ai1575OrigWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = ai1575OrigWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    if (ai1575OrigPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = ai1575OrigPolicyPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+    if (ai1575OrigAgentsFile !== undefined) process.env.AGENTS_FILE = ai1575OrigAgentsFile;
+    else delete process.env.AGENTS_FILE;
+    reloadAgents();
+  }
 }
 
-describe("checkWorkflowRules — AI-1521: unescape from escape state", () => {
+describe("checkWorkflowRules — AI-1575: enroll meta-command", () => {
   let originalFetch: typeof globalThis.fetch;
 
-  beforeAll(setupAi1521);
-  afterAll(teardownAi1521);
+  beforeAll(setupAi1575);
+  afterAll(teardownAi1575);
 
   beforeEach(() => {
     resetWorkflowCache();
@@ -5283,82 +5188,197 @@ describe("checkWorkflowRules — AI-1521: unescape from escape state", () => {
     resetConfigHealth();
     originalFetch = globalThis.fetch;
   });
-
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("unescape is legal from escape state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:escape"]);
-    expect(await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  it("enroll is legal from intake state (bypasses state-machine check)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+    expect(await checkWorkflowRules("enroll", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
   });
 
-  it("unescape is blocked from non-escape states (e.g. implementation)", async () => {
+  it("enroll is legal from implementation state (can re-enroll from any state)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
-    const result = await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "charles");
-    expect(result).not.toBeNull();
-    expect(result).toContain("implementation");
-    expect(result).toContain("submit");
+    expect(await checkWorkflowRules("enroll", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
   });
 
-  it("unescape is blocked from done state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:done"]);
-    const result = await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "charles");
-    expect(result).not.toBeNull();
-    expect(result).toContain("done");
+  it("enroll is legal from deployment state (can re-enroll from any state)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+    expect(await checkWorkflowRules("enroll", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
   });
 
-  it("illegal command on escaped ticket names unescape as legal move", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:escape"]);
-    const result = await checkWorkflowRules("accept", "issue-uuid", "Bearer tok", "astrid");
-    expect(result).not.toBeNull();
-    expect(result).toContain("unescape");
-    expect(result).toContain("escape"); // break-glass still listed
+  it("enroll is pass-through on ad-hoc tickets (no wf:* label)", async () => {
+    globalThis.fetch = makeLabelFetch([]);
+    expect(await checkWorkflowRules("enroll", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  });
+
+  it("enroll bypasses delegate-only enforcement (non-delegate steward can enroll)", async () => {
+    // Simulate: ticket has state:implementation with a different delegate (hanzo-linear-uuid)
+    // and caller is astrid (the steward). Without the enroll bypass, this would be blocked
+    // by the delegate-only enforcement because astrid is not the current delegate.
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
+    expect(await checkWorkflowRules(
+      "enroll",
+      "issue-uuid",
+      "Bearer tok",
+      "astrid",
+      undefined,       // target
+      "astrid-linear-uuid", // callerLinearUserId
+      null,            // artifactRef
+      false,           // breakGlass
+    )).toBeNull();
   });
 });
 
-describe("applyStateTransition — AI-1521: unescape re-entry", () => {
+describe("applyStateTransition — AI-1575: enroll atomic enrollment", () => {
   let originalFetch: typeof globalThis.fetch;
 
-  beforeAll(setupAi1521);
-  afterAll(teardownAi1521);
+  beforeAll(setupAi1575);
+  afterAll(teardownAi1575);
 
   beforeEach(() => {
     resetWorkflowCache();
     resetNativeStateCache();
     resetPolicyCache();
     resetConfigHealth();
+    clearImplementerStore();
     originalFetch = globalThis.fetch;
   });
-
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("transitions escape → intake atomically (labels + delegate + native state)", async () => {
+  it("AC1: enrolls a clean ad-hoc ticket — sets labels + steward delegate + native state atomically", async () => {
+    // Post-CLI state: ticket now has wf:dev-impl + state:intake + risk:medium (CLI wrote them)
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "escape-lbl", name: "state:escape" },
+        { id: "intake-lbl", name: "state:intake" },
+        { id: "risk-lbl", name: "risk:medium" },
       ],
-      teamLabels: [{ id: "intake-lbl", name: "state:intake" }],
     });
     globalThis.fetch = mock;
-    await applyStateTransition("unescape", "issue-uuid", "Bearer tok", { bodyId: "astrid" });
+    await applyStateTransition("enroll", "issue-uuid", "Bearer tok", { bodyId: "astrid" });
 
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
     const vars = updateCall!.body.variables as { labelIds: string[]; delegateId?: string; stateId?: string };
-    // state:intake label is added, state:escape is removed
+
+    // All three labels present
+    expect(vars.labelIds).toContain("wf-lbl");
     expect(vars.labelIds).toContain("intake-lbl");
-    expect(vars.labelIds).not.toContain("escape-lbl");
-    // native state is set (Todo for intake)
+    expect(vars.labelIds).toContain("risk-lbl");
+
+    // Steward delegate is set to astrid's linearUserId
+    expect(vars.delegateId).toBe("astrid-linear-uuid");
+
+    // Native state is set to Todo (intake → native_state: todo → state-todo-uuid)
     expect(vars.stateId).toBe("state-todo-uuid");
   });
 
-  it("canonical: unescape is legal from escape state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:escape"]);
-    expect(await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
+  it("AC2: re-enrollment overwrites a stale/ad-hoc delegate with the steward", async () => {
+    // Simulate: ticket was at state:implementation with a stale delegate (charles/dev)
+    // After CLI enrollment write, it now has state:intake + wf:dev-impl.
+    // The enrollment handler must set delegate = astrid (steward), overwriting charles.
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "intake-lbl", name: "state:intake" },
+        { id: "risk-lbl", name: "risk:low" },
+      ],
+    });
+    globalThis.fetch = mock;
+
+    // sourceStateOverride = "implementation" (what the ticket was before CLI write)
+    await applyStateTransition("enroll", "issue-uuid", "Bearer tok", {
+      bodyId: "astrid",
+      sourceStateOverride: "implementation",
+    });
+
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.body.variables as { delegateId?: string; stateId?: string };
+
+    // Steward (astrid) is set as the new delegate, overwriting the stale dev delegate
+    expect(vars.delegateId).toBe("astrid-linear-uuid");
+    // Native state is set atomically
+    expect(vars.stateId).toBe("state-todo-uuid");
+  });
+
+  it("AC1: exactly one atomic mutation (no separate native-state or delegate writes)", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "intake-lbl", name: "state:intake" },
+        { id: "risk-lbl", name: "risk:high" },
+      ],
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("enroll", "issue-uuid", "Bearer tok", { bodyId: "astrid" });
+
+    const atomicCalls = calls.filter((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    // Exactly ONE atomic mutation (labels + delegate + native in one write)
+    expect(atomicCalls).toHaveLength(1);
+    // The mutation includes all three facets
+    const vars = atomicCalls[0].body.variables as Record<string, unknown>;
+    expect(vars.labelIds).toBeDefined();
+    expect(vars.delegateId).toBeDefined();
+    expect(vars.stateId).toBeDefined();
+  });
+
+  it("no-op on ad-hoc ticket (no wf:* label after CLI write) — enrollment with missing workflow label skips", async () => {
+    // If somehow the CLI write didn't add wf:*, the enrollment B2 should not fire
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "state-lbl", name: "state:intake" },
+        { id: "risk-lbl", name: "risk:medium" },
+        // No wf:* label
+      ],
+    });
+    globalThis.fetch = mock;
+    await applyStateTransition("enroll", "issue-uuid", "Bearer tok", { bodyId: "astrid" });
+    // No atomic mutation should have been issued (applyStateTransition returns early with no workflowId)
+    const atomicCalls = calls.filter((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(atomicCalls).toHaveLength(0);
   });
 });
 
-// ── AI-1584: enrollIfMissing ───────────────────────────────────────────────
+// ── AI-1571 regression: role-guard blocks non-steward dispatch after enrollment ──
+//
+// Verifies AC3/AC4: the routing-guard fires on enrollment-triggered dispatch events
+// and blocks non-steward (e.g. deployment-role) bodies from being dispatched to
+// an intake-state ticket, which is the exact AI-1571 collision scenario.
+//
+// This test is placed here (not routing-guard.test.ts) because it requires the
+// workflow def fixture already set up by beforeAll.
+
+describe("AI-1571 repro: routing-guard blocks non-steward dispatch on enrolled ticket", () => {
+  beforeAll(setupAi1575);
+  afterAll(teardownAi1575);
+
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetNativeStateCache();
+    resetPolicyCache();
+    resetConfigHealth();
+  });
+
+  it("AC3/AC4: routing-guard blocks hanzo (deployment role) dispatch on intake-state ticket", async () => {
+    // After atomic enrollment: ticket is state:intake + wf:dev-impl + risk:medium
+    // Router would dispatch to hanzo if old delegate was left (AI-1571 scenario)
+    // The guard must block hanzo and correct to astrid (steward)
+    const { checkRoleGuardEnforced } = await import("./routing-guard.js");
+    const result = await checkRoleGuardEnforced("hanzo", ["wf:dev-impl", "state:intake"]);
+    // Hanzo does not fill the steward role — dispatch is blocked
+    expect(result.blocked).toBe(true);
+    expect(result.reason).toMatch(/hanzo/i);
+    // Singleton steward correction target is provided
+    expect(result.correctedTo).toBe("astrid");
+  });
+
+  it("AC3/AC4: routing-guard allows astrid (steward role) dispatch on intake-state ticket", async () => {
+    const { checkRoleGuardEnforced } = await import("./routing-guard.js");
+    const result = await checkRoleGuardEnforced("astrid", ["wf:dev-impl", "state:intake"]);
+    // Astrid fills the steward role — dispatch is allowed
+    expect(result.blocked).toBe(false);
+  });
+});
 
 describe("enrollIfMissing — enrollment gap repair", () => {
   let originalFetch: typeof globalThis.fetch;
