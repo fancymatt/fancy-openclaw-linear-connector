@@ -4,6 +4,7 @@ import { sendWakeUpSignal, MENTION_TICKET_TEMPLATE, type WakeUpConfig } from "./
 import { PendingWorkBag } from "./pending-work-bag.js";
 import { SessionTracker } from "./session-tracker.js";
 import { isLinearIssueActionable, isLinearIssueStillRoutedToAgent, checkLinearIssueRouting } from "../linear-actionable.js";
+import { getAccessToken } from "../agents.js";
 
 const log = componentLogger(createLogger(), "resignal");
 
@@ -103,9 +104,17 @@ export async function resignalPendingTickets(
       // Use a mention-specific wake message so the agent knows to observe, not own.
       const storedReason = bag.getTicketRoutingReason(agentId, ticketId);
       const isMention = storedReason === "mention" || storedReason === "body-mention";
-      const ticketWakeConfig = isMention
+
+      // AI-1659: resolve the agent's access token so the wake-up path can
+      // fetch workflow context and prepend a state + legal-verb preamble.
+      const rawToken = getAccessToken(agentId);
+      const authToken = rawToken
+        ? /^Bearer\s+/i.test(rawToken) ? rawToken : `Bearer ${rawToken}`
+        : undefined;
+
+      const ticketWakeConfig: WakeUpConfig = isMention
         ? { ...wakeConfig, signalTemplate: MENTION_TICKET_TEMPLATE }
-        : wakeConfig;
+        : { ...wakeConfig, ...(authToken ? { authToken } : {}) };
 
       // Record intent before delivery — prevents double-dispatch even on failure;
       // stale session detection handles cleanup if delivery never completes.

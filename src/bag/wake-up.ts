@@ -10,17 +10,36 @@
  * `linear-ILL-148`) so that the wake-up session shares context with any
  * subsequent webhook events for the same ticket. For multi-ticket wake-ups,
  * the first ticket's identifier is used as the key.
+ *
+ * AI-1659: For single-ticket wake-ups of governed workflow tickets, a preamble
+ * listing the current state and legal verb set is prepended to the thin message.
+ * This ensures agents start with workflow context before running consider-work.
  */
 
 import { deliverMessageToAgent, type DeliveryConfig, type DeliveryResult } from "../delivery/index.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
+import {
+  fetchWorkflowLabels,
+  getWorkflowId,
+  loadWorkflowDefById,
+  getCurrentState,
+  resolveTransitionTargets,
+} from "../workflow-gate.js";
 
 const log = componentLogger(createLogger(), "wakeup");
 
 export interface WakeUpConfig extends DeliveryConfig {
   /** Signal message template. {count} and {tickets} are replaced. */
   signalTemplate?: string;
+  /**
+   * AI-1659: Linear OAuth token for the agent receiving the wake-up.
+   * When provided for a single-ticket wake-up, the connector fetches workflow
+   * context and prepends a state + legal-verb preamble to the thin message.
+   * Format: "Bearer <token>" or raw token (normalized internally).
+   * Omit to send the thin template unchanged (non-workflow or no-auth case).
+   */
+  authToken?: string;
 }
 
 export const SINGLE_TICKET_TEMPLATE =
@@ -54,17 +73,95 @@ export function buildWakeUpMessage(ticketIds: string[], signalTemplate?: string)
 }
 
 /**
+ * AI-1659: Build a workflow preamble for a single governed ticket.
+ *
+ * Returns a block listing the current workflow state and legal verb set, or
+ * null when the ticket is ad-hoc, has no state label, or any fetch fails
+ * (fail-open — callers fall back to the thin template).
+ *
+ * The verb list is derived from the same workflow YAML that proxy enforcement
+ * uses, so the two stay in sync automatically.
+ */
+export async function buildWorkflowPreamble(
+  identifier: string,
+  authToken: string,
+): Promise<string | null> {
+  let labels: string[];
+  try {
+    labels = await fetchWorkflowLabels(identifier, authToken);
+  } catch {
+    return null;
+  }
+
+  const workflowId = getWorkflowId(labels);
+  if (!workflowId) return null;
+
+  const def = await loadWorkflowDefById(workflowId);
+  if (!def) return null;
+
+  const currentState = getCurrentState(labels);
+  if (!currentState) return null;
+
+  const stateNode = def.states.find((s) => s.id === currentState);
+  if (!stateNode) return null;
+
+  const transitions = stateNode.transitions ?? [];
+  if (transitions.length === 0 && stateNode.kind === "terminal") return null;
+
+  const breakGlassCommand = def.break_glass?.command ?? "escape";
+
+  const stepLines = await Promise.all(
+    transitions.map(async (t) => {
+      const { bodies, mode } = await resolveTransitionTargets(t, def);
+      let cmd = `linear ${t.command} ${identifier}`;
+      if (mode === "required") {
+        cmd += ` <${bodies.join("|")}>`;
+      }
+      if (t.feedback?.required) {
+        cmd += ` --comment "<feedback>"`;
+      }
+      return `- \`${cmd}\` (→ ${t.to})`;
+    }),
+  );
+  stepLines.push(
+    `- \`linear ${breakGlassCommand} ${identifier}\` (break glass, legal from any state)`,
+  );
+
+  return [
+    `⚠️ This is a [${def.id}] governed workflow ticket. Normal Linear CLI commands are restricted.`,
+    `Current state: **${currentState}**. Legal action(s) for this state:`,
+    ...stepLines,
+    "",
+  ].join("\n");
+}
+
+/**
  * Send a wake-up signal to an agent.
  *
  * The signal is intentionally thin — just tells the agent how many tickets
  * are pending and their IDs. The agent re-queries Linear for full details.
+ *
+ * AI-1659: For single-ticket wake-ups with authToken set, a workflow preamble
+ * is prepended when the ticket is a governed workflow ticket.
  */
 export async function sendWakeUpSignal(
   agentId: string,
   ticketIds: string[],
   config: WakeUpConfig,
 ): Promise<{ runId?: string } | void> {
-  const message = buildWakeUpMessage(ticketIds, config.signalTemplate);
+  let message: string;
+
+  if (ticketIds.length === 1 && config.authToken) {
+    const plainId = ticketIds[0].replace(STRIP_LINEAR_PREFIX, "");
+    const normalizedToken = /^Bearer\s+/i.test(config.authToken)
+      ? config.authToken
+      : `Bearer ${config.authToken}`;
+    const preamble = await buildWorkflowPreamble(plainId, normalizedToken).catch(() => null);
+    const base = buildWakeUpMessage(ticketIds, config.signalTemplate);
+    message = preamble ? `${preamble}\n${base}` : base;
+  } else {
+    message = buildWakeUpMessage(ticketIds, config.signalTemplate);
+  }
 
   // Normalize to strip any legacy prefixes and enforce uppercase.
   // Result is always exactly `linear-<TEAM>-<NUMBER>`.
