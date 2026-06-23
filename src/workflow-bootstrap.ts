@@ -18,7 +18,7 @@ import { componentLogger, createLogger } from "./logger.js";
 import { loadWorkflowRegistry } from "./workflow-gate.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
 import { findOrCreateLabel } from "./linear-helpers.js";
-import type { LinearEvent, LinearIssueUpdatedEvent } from "./webhook/schema.js";
+import type { LinearEvent, LinearIssueCreatedEvent, LinearIssueUpdatedEvent } from "./webhook/schema.js";
 import { getAgents, getAccessToken } from "./agents.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-bootstrap");
@@ -152,11 +152,13 @@ export async function maybeBootstrapWorkflow(
   event: LinearEvent,
   authToken: string,
 ): Promise<BootstrapResult | null> {
-  if (event.type !== "Issue" || event.action !== "update") return null;
-  const issueEvent = event as LinearIssueUpdatedEvent;
+  if (event.type !== "Issue" || (event.action !== "update" && event.action !== "create")) return null;
+  // For create events updatedFrom is absent — previousLabelIds will be [] and all current labels
+  // are treated as "added", which is exactly what we want for pre-attached wf: labels.
+  const issueEvent = event as LinearIssueUpdatedEvent | LinearIssueCreatedEvent;
 
   const currentLabelIds: string[] = issueEvent.data.labelIds ?? [];
-  const updatedFrom = issueEvent.updatedFrom as Record<string, unknown> | undefined;
+  const updatedFrom = (issueEvent as LinearIssueUpdatedEvent).updatedFrom as Record<string, unknown> | undefined;
   const previousLabelIds: string[] = (updatedFrom?.labelIds as string[] | undefined) ?? [];
 
   const currentSet = new Set(currentLabelIds);
