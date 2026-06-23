@@ -1270,9 +1270,75 @@ export async function checkRawMutationInterception(
 ): Promise<string | null> {
   if (!body) return null;
 
-  // Only intercept issueUpdate mutations.
+  // Intercept issueUpdate mutations and commentCreate mutations on governed tickets.
+  // AI-1658 AC2: commentCreate bypassed the "issueUpdate-only" guard, letting agents
+  // post free-form comments on governed tickets without an intent header.
   const q = body.query ?? "";
-  if (!q.includes("issueUpdate")) return null;
+  const isIssueUpdate = q.includes("issueUpdate");
+  const isCommentCreate = !isIssueUpdate && q.includes("commentCreate");
+  if (!isIssueUpdate && !isCommentCreate) return null;
+
+  // AC2: commentCreate on governed tickets must use approved semantic verbs — a raw
+  // comment breaks the one-comment-per-step rule and allows meta-commentary outside
+  // the approved verb set.
+  if (isCommentCreate) {
+    if (!issueId) {
+      log.warn(`workflow-gate: raw commentCreate with unresolvable issueId — blocking (fail-closed)`);
+      return (
+        `[Proxy] Direct commentCreate on workflow tickets must go through workflow commands, ` +
+        `and the ticket id could not be resolved from this request. ` +
+        `Re-issue using the linear CLI workflow commands.`
+      );
+    }
+    const { labels: ccLabels } = await fetchTicketContext(issueId, authToken);
+    const ccWorkflowId = getWorkflowId(ccLabels);
+    if (!ccWorkflowId) return null; // ad-hoc ticket — pass-through
+
+    let ccDef: WorkflowDef | undefined;
+    try {
+      const registry = await loadWorkflowRegistry();
+      ccDef = registry.get(ccWorkflowId);
+    } catch {
+      return null; // fail-open
+    }
+    if (!ccDef) return null; // unknown workflow — pass-through
+
+    const ccBreakGlass = ccDef.break_glass?.command ?? "escape";
+    const ccState = getCurrentState(ccLabels);
+
+    if (!ccState) {
+      const allCmds = new Set<string>();
+      for (const s of ccDef.states) {
+        for (const t of s.transitions ?? []) allCmds.add(t.command);
+      }
+      allCmds.add(ccBreakGlass);
+      return (
+        `[Proxy] Direct commentCreate is blocked on this workflow ticket (state unknown). ` +
+        `Use workflow commands instead: ${[...allCmds].join(", ")}.`
+      );
+    }
+
+    const ccStateNode = ccDef.states.find((s) => s.id === ccState);
+    if (!ccStateNode) return null;
+
+    const ccHelpLines = await Promise.all(
+      (ccStateNode.transitions ?? []).map(async (t) => {
+        const { bodies, mode } = await resolveTransitionTargets(t, ccDef!);
+        let cmd = `linear ${t.command} ${issueId}`;
+        if (mode === "required") cmd += ` <${bodies.join("|")}>`;
+        return `  - \`${cmd}\` (→ ${t.to})`;
+      }),
+    );
+    ccHelpLines.push(
+      `  - \`linear ${ccBreakGlass} ${issueId}\` (break glass → ${ccDef.break_glass?.to ?? "escape"}, legal from any state)`,
+    );
+
+    return (
+      `[Proxy] Direct commentCreate is blocked on this workflow ticket ` +
+      `(state: **${ccState}**). Use workflow commands instead:\n\n` +
+      ccHelpLines.join("\n")
+    );
+  }
 
   // Check if the mutation touches any workflow-affecting field.
   // Blocked: stateId (status), assigneeId (assignee), labelIds (label manipulation).
@@ -1302,7 +1368,9 @@ export async function checkRawMutationInterception(
 
   const hasStateChange = touches("stateId");
   const hasAssigneeChange = touches("assigneeId");
-  const hasLabelChange = touches("labelIds");
+  // AI-1658 AC1: also intercept addedLabelIds/removedLabelIds — additive/subtractive
+  // label mutations that the old check missed, letting agents bypass Layer 2 via these fields.
+  const hasLabelChange = touches("labelIds") || touches("addedLabelIds") || touches("removedLabelIds");
   // AI-1535: delegate is a distinct field from assignee. App-user delegates are
   // written via `delegateId` (assigneeId is omitted for them, AI-1395), so a raw
   // delegate write was invisible to this detector and bypassed the delegate-only
