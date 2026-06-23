@@ -121,6 +121,10 @@ export interface WorkflowState {
    *  inherit the global default. Use for states with known-slow sub-processes
    *  (e.g. image generation) to avoid spurious failure re-dispatches. */
   noActivityTimeout?: number;
+  /** When true, the delivery message for this state will include the most recent ticket
+   *  comment as inline context. Useful for states where the previous step's output
+   *  (e.g. a brief) must be immediately visible to the incoming delegate. */
+  deliverLastComment?: boolean;
   transitions?: WorkflowTransition[];
 }
 

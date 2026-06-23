@@ -120,6 +120,38 @@ async function buildDelegationMessage(
   return buildGenericDelegationMessage(actionText, identifier, title);
 }
 
+/** Fetch the most recent comment on a ticket. Returns null on any failure. */
+async function fetchLastComment(
+  identifier: string,
+  authToken: string,
+): Promise<{ body: string; authorName: string } | null> {
+  const query = `
+    query LastComment($identifier: String!) {
+      issue(id: $identifier) {
+        comments(last: 1, orderBy: createdAt) {
+          nodes { body user { name } }
+        }
+      }
+    }
+  `;
+  try {
+    const res = await fetch("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: authToken },
+      body: JSON.stringify({ query, variables: { identifier } }),
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as {
+      data?: { issue?: { comments?: { nodes?: Array<{ body: string; user?: { name?: string } }> } } };
+    };
+    const node = json.data?.issue?.comments?.nodes?.[0];
+    if (!node) return null;
+    return { body: node.body, authorName: node.user?.name ?? "unknown" };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Attempt to build a workflow-aware per-step instruction block.
  * Returns null to signal "fall back to generic" on any error or ad-hoc ticket.
@@ -175,7 +207,7 @@ async function tryBuildWorkflowMessage(
   const breakGlassCommand = def.break_glass?.command ?? "escape";
   const transitions = stateNode.transitions ?? [];
 
-  const [stepLines, guidance] = await Promise.all([
+  const [stepLines, guidance, lastComment] = await Promise.all([
     Promise.all(transitions.map(async (t) => {
       const { bodies, mode } = await resolveTransitionTargets(t, def);
 
@@ -210,6 +242,7 @@ async function tryBuildWorkflowMessage(
       return `- Run \`${cmd}\`${arrow}${note}`;
     })),
     loadStepGuidance(def.id, currentState),
+    stateNode.deliverLastComment ? fetchLastComment(identifier, authToken) : Promise.resolve(null),
   ]);
 
   // Always-available break-glass escape (§4.4)
@@ -217,6 +250,18 @@ async function tryBuildWorkflowMessage(
 
   const guidanceBlock: string[] = guidance
     ? ["", "---", "**Step guidance (accumulated lessons for this state):**", "", guidance.trim(), "---"]
+    : [];
+
+  // deliverLastComment: inject the most recent ticket comment inline (e.g. brief for generating state).
+  const lastCommentBlock: string[] = lastComment
+    ? [
+        "",
+        "---",
+        `**Most recent comment (from ${lastComment.authorName} — your context for this step):**`,
+        "",
+        lastComment.body,
+        "---",
+      ]
     : [];
 
   // Phase 6.5 / H-7 (AI-1482): Include verbatim AC record if captured.
@@ -252,6 +297,7 @@ async function tryBuildWorkflowMessage(
     "",
     `This is a [${def.id}] workflow ticket in state: **${currentState}**`,
     ...stakesBlock,
+    ...lastCommentBlock,
     "",
     "Your legal action(s) for this state:",
     ...stepLines,
