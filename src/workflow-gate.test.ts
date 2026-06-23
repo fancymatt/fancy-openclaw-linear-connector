@@ -1393,12 +1393,13 @@ describe("checkRawMutationInterception — Layer 2 (AI-1387)", () => {
     expect(result).toBeNull();
   });
 
-  it("passes through when body is not an issueUpdate mutation", async () => {
+  it("passes through when body is not an issueUpdate or commentCreate mutation", async () => {
     globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
 
+    // attachmentCreate is an unintercepted mutation type — it must always pass through.
     const body = {
-      query: "mutation M($input: CommentCreateInput!) { commentCreate(input: $input) { success } }",
-      variables: { input: { issueId: "issue-uuid", body: "comment text" } },
+      query: "mutation M($input: AttachmentCreateInput!) { attachmentCreate(input: $input) { success } }",
+      variables: { input: { issueId: "issue-uuid", url: "https://example.com/file.pdf" } },
     };
 
     const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok");
