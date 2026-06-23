@@ -660,4 +660,198 @@ describe("NoActivityDetector", () => {
     ackTracker.close();
     operationalEventStore.close();
   });
+
+  // ── AI-1664: proxy calls count as evidence of agent starting ─────────────
+  //
+  // Problem: Emi made proxy calls against ticket e6ef9813 at T+6s after delivery
+  // (clearly started and working). The no-activity detector still declared failure
+  // at T+308s and re-dispatched her into a new context.
+  //
+  // Root cause: proxy calls are handled by a separate code path and are not
+  // tracked by the detector's evidence accumulator. Only webhook-side signals
+  // (state transitions, comments, session-end) counted as evidence.
+  //
+  // Fix: expose NoActivityDetector.recordProxyActivity(agentId, ticketId) and
+  // call it from the proxy endpoint on every ticket-matched proxy call.
+  //
+  // AC1  Proxy call against the dispatched ticket prevents failure declaration.
+  // AC2  Existing webhook-based evidence detection works unchanged (regression).
+  // AC3  Non-ticket proxy calls do not affect the no-activity timer.
+  // AC4  Regression: proxy call at T+100s prevents failure declaration at T+308s.
+
+  describe("AI-1664: proxy calls as activity evidence", () => {
+    test("proxy call against dispatched ticket prevents failure declaration [AC1]", async () => {
+      const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+      const dispatchedTickets: string[] = [];
+
+      bag.add("emi", "linear-AI-1658", "Issue");
+      sessionTracker.startSession("emi", "linear-AI-1658");
+      ackTracker.recordDispatch("emi", "linear-AI-1658");
+
+      const detector = new NoActivityDetector(
+        {
+          sessionTracker,
+          ackTracker,
+          bag,
+          operationalEventStore,
+          wakeConfig,
+          resignalOptions: {
+            isTicketActionable: () => true,
+            sendWakeUp: async (_agentId, ticketIds) => { dispatchedTickets.push(...ticketIds); },
+          },
+        },
+        { warnMs: 0, failMs: 0, pollMs: 60_000 }, // failMs=0 → fires immediately without evidence
+      );
+
+      // Proxy call with matching ticket ID — evidence the agent started and is working.
+      // NoActivityDetector does not yet expose recordProxyActivity → RED until implemented.
+      detector.recordProxyActivity("emi", "linear-AI-1658");
+
+      const result = await detector.runCycle();
+
+      // Proxy evidence must prevent failure declaration.
+      expect(result.failed).toBe(0);
+      expect(dispatchedTickets).toHaveLength(0);
+      const failEvents = operationalEventStore.query({ outcome: "no-activity-failed" });
+      expect(failEvents).toHaveLength(0);
+
+      detector.stop();
+      bag.close();
+      sessionTracker.close();
+      ackTracker.close();
+      operationalEventStore.close();
+    });
+
+    test("proxy call without matching ticket ID does not prevent failure [AC3]", async () => {
+      const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+      const dispatchedTickets: string[] = [];
+
+      bag.add("emi", "linear-AI-1658", "Issue");
+      sessionTracker.startSession("emi", "linear-AI-1658");
+      ackTracker.recordDispatch("emi", "linear-AI-1658");
+
+      const detector = new NoActivityDetector(
+        {
+          sessionTracker,
+          ackTracker,
+          bag,
+          operationalEventStore,
+          wakeConfig,
+          resignalOptions: {
+            isTicketActionable: () => true,
+            sendWakeUp: async (_agentId, ticketIds) => { dispatchedTickets.push(...ticketIds); },
+          },
+        },
+        { warnMs: 0, failMs: 0, pollMs: 60_000 },
+      );
+
+      // Proxy call for a completely different ticket — must NOT reset the timer for AI-1658.
+      // recordProxyActivity does not exist yet → RED; once implemented, the non-matching
+      // ticket must be silently ignored so AI-1658 still fails.
+      detector.recordProxyActivity("emi", "linear-AI-9999");
+
+      const result = await detector.runCycle();
+
+      // No evidence for linear-AI-1658 — failure must still fire.
+      expect(result.failed).toBe(1);
+      expect(dispatchedTickets).toContain("linear-AI-1658");
+
+      detector.stop();
+      bag.close();
+      sessionTracker.close();
+      ackTracker.close();
+      operationalEventStore.close();
+    });
+
+    test("regression: proxy call at T+100s prevents failure declaration at T+308s [AC4]", async () => {
+      // Canonical Emi scenario (AI-1664 description):
+      //   T+0s   — dispatch delivered, ack entry created
+      //   T+6s   — Emi makes proxy calls (agent clearly started)
+      //   T+308s — no-activity detector fires, re-dispatches into a new context (bug)
+      //
+      // We model this as failMs=0 (any dispatch is immediately past threshold) and
+      // verify that recordProxyActivity suppresses the failure.  Post-fix, the proxy
+      // call acknowledges the ack entry so getPendingTimedOut no longer returns it
+      // and runCycle skips it entirely.
+      const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+      const dispatchedTickets: string[] = [];
+
+      bag.add("emi", "linear-AI-1658", "Issue");
+      sessionTracker.startSession("emi", "linear-AI-1658");
+      ackTracker.recordDispatch("emi", "linear-AI-1658");
+
+      const detector = new NoActivityDetector(
+        {
+          sessionTracker,
+          ackTracker,
+          bag,
+          operationalEventStore,
+          wakeConfig,
+          resignalOptions: {
+            isTicketActionable: () => true,
+            sendWakeUp: async (_agentId, ticketIds) => { dispatchedTickets.push(...ticketIds); },
+          },
+        },
+        { warnMs: 0, failMs: 0, pollMs: 60_000 }, // failMs=0 → fires immediately
+      );
+
+      // T+100s: proxy call arrives with ticket identifier. Agent clearly started.
+      detector.recordProxyActivity("emi", "linear-AI-1658");
+
+      // T+308s: detector cycle runs — must NOT declare failure.
+      const result = await detector.runCycle();
+
+      expect(result.failed).toBe(0);
+      expect(dispatchedTickets).toHaveLength(0);
+
+      const failEvents = operationalEventStore.query({ outcome: "no-activity-failed" });
+      expect(failEvents).toHaveLength(0);
+
+      detector.stop();
+      bag.close();
+      sessionTracker.close();
+      ackTracker.close();
+      operationalEventStore.close();
+    });
+
+    test("webhook-based evidence detection unchanged when no proxy call is made [AC2 regression]", async () => {
+      // No proxy call made — detector must still fire for sessions that produce
+      // no evidence. Existing behavior must not be regressed by the proxy-evidence feature.
+      const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+      const dispatchedTickets: string[] = [];
+
+      bag.add("felix", "linear-AI-9001", "Issue");
+      sessionTracker.startSession("felix", "linear-AI-9001");
+      ackTracker.recordDispatch("felix", "linear-AI-9001");
+
+      const detector = new NoActivityDetector(
+        {
+          sessionTracker,
+          ackTracker,
+          bag,
+          operationalEventStore,
+          wakeConfig,
+          resignalOptions: {
+            isTicketActionable: () => true,
+            sendWakeUp: async (_agentId, ticketIds) => { dispatchedTickets.push(...ticketIds); },
+          },
+        },
+        { warnMs: 0, failMs: 0, pollMs: 60_000 },
+      );
+
+      // No proxy call — no evidence of agent starting.
+      const result = await detector.runCycle();
+
+      expect(result.failed).toBe(1);
+      expect(dispatchedTickets).toContain("linear-AI-9001");
+      const failEvents = operationalEventStore.query({ outcome: "no-activity-failed" });
+      expect(failEvents).toHaveLength(1);
+
+      detector.stop();
+      bag.close();
+      sessionTracker.close();
+      ackTracker.close();
+      operationalEventStore.close();
+    });
+  });
 });

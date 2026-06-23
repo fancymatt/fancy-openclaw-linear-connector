@@ -1802,3 +1802,97 @@ describe("proxy — Phase 6.5 fail-closed (AI-1476)", () => {
     expect(res.body.errors[0].message).toContain("Linear API unreachable");
   });
 });
+
+// ── AI-1664: proxy calls count as no-activity evidence ──────────────────────
+//
+// When an agent makes a proxy call that includes a ticket identifier, the connector
+// must inform the no-activity detector so it does not re-dispatch a session that is
+// clearly alive and working.
+//
+// AC1  Proxy call with identifier variable acknowledges the ack entry (via
+//      notifyProxyActivity → detector.recordProxyActivity → ackTracker.acknowledge).
+// AC3  Proxy call without a ticket identifier does not affect any ack entry.
+
+describe("proxy — AI-1664: proxy call triggers no-activity evidence callback", () => {
+  let dir: string;
+  let appState: ReturnType<typeof createApp>;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-1664-test-"));
+    process.env.AGENTS_FILE = writeAgents(dir);
+    process.env.CAPABILITY_POLICY_PATH = writePolicyFile(dir);
+    writeWorkflowFile(dir);
+    resetPolicyCache();
+    resetWorkflowCache();
+    reloadAgents();
+    appState = createApp({
+      bagDbPath: path.join(dir, "bag.db"),
+      agentQueueDbPath: path.join(dir, "queue.db"),
+      operationalEventsDbPath: path.join(dir, "events.db"),
+    });
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        return new Response(JSON.stringify(MOCK_RESPONSE), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return originalFetch(url, init);
+    };
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    appState.bag.close();
+    appState.sessionTracker.close();
+    appState.agentQueue.close();
+    appState.operationalEventStore.close();
+    appState.watchdog.stop();
+    appState.noActivityDetector.stop();
+    appState.managingPoller.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("AI-1664 AC1: proxy call with ticket identifier acknowledges the no-activity ack entry", async () => {
+    // Set up a pending dispatch entry as if the connector just delivered to charles.
+    appState.sessionTracker.startSession("charles", "linear-AI-1664");
+    appState.ackTracker.recordDispatch("charles", "linear-AI-1664");
+
+    // Verify it is pending before the proxy call.
+    expect(appState.ackTracker.getPendingTimedOut(0)).toHaveLength(1);
+
+    // charles makes a proxy call that includes the ticket identifier in variables.
+    // ProxyDeps currently has no notifyProxyActivity field → the ack entry stays
+    // pending → test is RED until the full wiring is implemented (AC1).
+    await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .send({
+        query: "query IssueQuery($identifier: String!) { issue(id: $identifier) { id title } }",
+        variables: { identifier: "AI-1664" },
+      });
+
+    // After the proxy call the ack entry must be acknowledged (no longer pending).
+    const pending = appState.ackTracker.getPendingTimedOut(0);
+    expect(pending.filter((e) => e.ticketId === "linear-AI-1664")).toHaveLength(0);
+  });
+
+  it("AI-1664 AC3: proxy call without ticket identifier leaves ack entry pending", async () => {
+    // A bare query with no identifier variable must not affect any dispatch.
+    appState.sessionTracker.startSession("charles", "linear-AI-1664");
+    appState.ackTracker.recordDispatch("charles", "linear-AI-1664");
+
+    await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .send({ query: "{ viewer { id } }" }); // no ticket identifier
+
+    // Entry must remain pending — a non-ticket query is not evidence of starting.
+    const pending = appState.ackTracker.getPendingTimedOut(0);
+    expect(pending.filter((e) => e.ticketId === "linear-AI-1664")).toHaveLength(1);
+  });
+});
