@@ -274,8 +274,11 @@ const capMissingCells = allCells.filter(
   (c) => c.expected === "block" && c.blockReason === "cap-missing",
 );
 
+const breakGlassCommand = testDef.break_glass?.command ?? "escape";
 const wrongDelegateCells = allCells.filter(
-  (c) => c.expected === "block" && c.blockReason === "wrong-delegate",
+  // AI-1668: escape uses a caller-auth block (not a legal-moves message), so exclude
+  // break-glass cells from the legal-set check — same pattern as refuse-work.
+  (c) => c.expected === "block" && c.blockReason === "wrong-delegate" && c.command !== breakGlassCommand,
 );
 
 const humanSignoffCells = allCells.filter(

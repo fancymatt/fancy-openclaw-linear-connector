@@ -826,7 +826,8 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
     expect(res.body.errors).toBeUndefined();
   });
 
-  it("escape (break-glass) bypasses the delegate-only check even for a non-delegate agent", async () => {
+  it("AI-1668: escape (break-glass) is blocked for a non-delegate, non-steward agent", async () => {
+    // charles (linearUserId "u1") is not the delegate (u99) and not the steward.
     const nonDelegateResponse = {
       data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] }, delegate: { id: "u99" } } },
     };
@@ -840,7 +841,9 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
       .send({ query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }", variables: { id: "issue-uuid" } });
 
     expect(res.status).toBe(200);
-    expect(res.body.errors).toBeUndefined();
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toMatch(/\[Proxy\]/);
+    expect(res.body.errors[0].message).toMatch(/delegate|steward/i);
   });
 
   it("blocks an agent not registered in agents.json when ticket has a known delegate (AI-1400 B2 fail-closed)", async () => {

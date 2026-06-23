@@ -988,8 +988,31 @@ export async function checkWorkflowRules(
     log.info(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} — human sign-off path, allowing through`);
   }
 
-  // §4.4: break-glass escape is legal from every state — never block it.
-  if (intent === breakGlassCommand) return null;
+  // §4.4 / AI-1668: break-glass escape is caller-gated.
+  // The delegate can always escape their own ticket; the workflow steward
+  // (break_glass.owner_role) can escape any ticket. All other known agents
+  // are blocked. Fail-open when no delegate is set or caller identity is
+  // unknown (preserves existing behaviour for no-delegate / legacy callers).
+  if (intent === breakGlassCommand) {
+    if (!delegateId) return null;
+    if (!callerLinearUserId) return null;
+    if (callerLinearUserId === delegateId) return null;
+    const stewardRole = def.break_glass?.owner_role;
+    if (stewardRole) {
+      const stewards = await resolveBodiesForRole(stewardRole);
+      if (stewards.includes(bodyId)) return null;
+    }
+    log.warn(`workflow-gate: escape blocked agent=${bodyId} ticket=${issueId} (not delegate or steward)`);
+    const escapeCurrentState = getCurrentState(labels);
+    const escapeNode = escapeCurrentState ? def.states.find((s) => s.id === escapeCurrentState) : undefined;
+    const escapeLegalMoves = [...(escapeNode?.transitions?.map((t) => t.command) ?? []), breakGlassCommand].join(", ");
+    return (
+      `[Proxy] 'escape' blocked: '${bodyId}' is not the current delegate or the workflow steward. ` +
+      `Only the assigned delegate or a workflow steward may use break-glass on a governed ticket. ` +
+      `Contact the current delegate or escalate to a steward to escape. ` +
+      `Legal moves: ${escapeLegalMoves}.`
+    );
+  }
 
   // AI-1460/AI-1574: refuse-work is caller-gated. Only the current delegate or
   // the workflow steward (break_glass.owner_role) may refuse on a governed

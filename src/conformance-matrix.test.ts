@@ -444,13 +444,19 @@ describe("buildConformanceMatrix — AC1: cross-product completeness", () => {
     }
   });
 
-  it("break-glass command is always 'allow' for known callers (§4.4)", () => {
+  it("AI-1668: break-glass is 'allow' for delegate/steward/wrong-role, 'block' for non-delegate-same-role", () => {
+    // §4.4 was unconditional allow; AI-1668 restricts to delegate or steward.
+    // wrong-role caller has no delegate set → fail-open → allow.
     const cells = buildConformanceMatrix(testDef, testPolicy);
     const bgCmd = testDef.break_glass?.command ?? "escape";
     const bgCells = cells.filter((c) => c.command === bgCmd && c.caller.kind !== "human");
     expect(bgCells.length).toBeGreaterThan(0);
     for (const cell of bgCells) {
-      expect(cell.expected).toBe("allow");
+      if (cell.caller.kind === "non-delegate-same-role") {
+        expect(cell.expected).toBe("block");
+      } else {
+        expect(cell.expected).toBe("allow");
+      }
     }
   });
 });

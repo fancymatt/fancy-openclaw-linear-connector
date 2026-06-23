@@ -211,9 +211,15 @@ function resolveExpected(
     return { expected: 'block', blockReason: 'unknown-caller' };
   }
 
-  // 2. Break-glass — always allow for known bodies (§4.4)
+  // 2. Break-glass — AI-1668: caller-gated (delegate or steward only).
+  // Fail-open when no delegate set or caller identity unknown (§4.4 preserved for those cases).
   if (command === breakGlassCommand) {
-    return { expected: 'allow' };
+    if (!spec.delegateLinearUserId) return { expected: 'allow' };
+    if (!spec.linearUserId) return { expected: 'allow' };
+    if (spec.linearUserId === spec.delegateLinearUserId) return { expected: 'allow' };
+    const stewardBodyId = findStewardBody(policy);
+    if (stewardBodyId && spec.bodyId === stewardBodyId) return { expected: 'allow' };
+    return { expected: 'block', blockReason: 'wrong-delegate' };
   }
 
   // 3. Delegate-only enforcement (AI-1397)
