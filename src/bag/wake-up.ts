@@ -112,10 +112,15 @@ export async function buildWorkflowPreamble(
 
   const stepLines = await Promise.all(
     transitions.map(async (t) => {
-      const { bodies, mode } = await resolveTransitionTargets(t, def);
       let cmd = `linear ${t.command} ${identifier}`;
-      if (mode === "required") {
-        cmd += ` <${bodies.join("|")}>`;
+      try {
+        const { bodies, mode } = await resolveTransitionTargets(t, def);
+        if (mode === "required") {
+          cmd += ` <${bodies.join("|")}>`;
+        }
+      } catch {
+        // fail open — body resolution unavailable (e.g. capability-policy not loaded);
+        // show the verb without the required-body placeholder
       }
       if (t.feedback?.required) {
         cmd += ` --comment "<feedback>"`;
@@ -136,32 +141,49 @@ export async function buildWorkflowPreamble(
 }
 
 /**
+ * AI-1665: Build the full wake-up message, with workflow context prepended for
+ * governed single-ticket wake-ups.
+ *
+ * For multi-ticket or no-authToken callers, delegates straight to buildWakeUpMessage.
+ * Falls back to the generic message when the ticket is ad-hoc or any fetch fails.
+ */
+export async function buildWorkflowAwareWakeUpMessage(
+  ticketIds: string[],
+  authToken?: string,
+): Promise<string> {
+  if (ticketIds.length !== 1 || !authToken) {
+    return buildWakeUpMessage(ticketIds);
+  }
+
+  const plainId = ticketIds[0].replace(STRIP_LINEAR_PREFIX, "");
+  const normalizedToken = /^Bearer\s+/i.test(authToken) ? authToken : `Bearer ${authToken}`;
+
+  try {
+    const preamble = await buildWorkflowPreamble(plainId, normalizedToken);
+    const base = buildWakeUpMessage(ticketIds);
+    return preamble ? `${preamble}\n${base}` : base;
+  } catch {
+    return buildWakeUpMessage(ticketIds);
+  }
+}
+
+/**
  * Send a wake-up signal to an agent.
  *
  * The signal is intentionally thin — just tells the agent how many tickets
  * are pending and their IDs. The agent re-queries Linear for full details.
  *
- * AI-1659: For single-ticket wake-ups with authToken set, a workflow preamble
- * is prepended when the ticket is a governed workflow ticket.
+ * AI-1659/AI-1665: When authToken is set, delegates to buildWorkflowAwareWakeUpMessage
+ * to prepend workflow context for governed single-ticket wake-ups.
  */
 export async function sendWakeUpSignal(
   agentId: string,
   ticketIds: string[],
   config: WakeUpConfig,
 ): Promise<{ runId?: string } | void> {
-  let message: string;
-
-  if (ticketIds.length === 1 && config.authToken) {
-    const plainId = ticketIds[0].replace(STRIP_LINEAR_PREFIX, "");
-    const normalizedToken = /^Bearer\s+/i.test(config.authToken)
-      ? config.authToken
-      : `Bearer ${config.authToken}`;
-    const preamble = await buildWorkflowPreamble(plainId, normalizedToken).catch(() => null);
-    const base = buildWakeUpMessage(ticketIds, config.signalTemplate);
-    message = preamble ? `${preamble}\n${base}` : base;
-  } else {
-    message = buildWakeUpMessage(ticketIds, config.signalTemplate);
-  }
+  const message = config.authToken
+    ? await buildWorkflowAwareWakeUpMessage(ticketIds, config.authToken)
+    : buildWakeUpMessage(ticketIds, config.signalTemplate);
 
   // Normalize to strip any legacy prefixes and enforce uppercase.
   // Result is always exactly `linear-<TEAM>-<NUMBER>`.
