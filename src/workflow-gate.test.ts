@@ -2005,6 +2005,238 @@ describe("checkRawMutationInterception — AI-1402: labelIds blocking + unknown-
 });
 
 
+// ── AI-1658: addedLabelIds/removedLabelIds + commentCreate intercepts ────────
+//
+// Three enforcement gaps in checkRawMutationInterception:
+//
+// 1. AC1 — addedLabelIds/removedLabelIds bypass: the gate checks touches("labelIds")
+//    (full-replace) but not the additive/subtractive fields. An agent can add or
+//    remove state:* labels via these fields without triggering Layer 2.
+//
+// 2. AC2 — commentCreate not intercepted: the gate only intercepts `issueUpdate`
+//    mutations. Agents can post free-form comments on governed tickets with no
+//    intent header, violating the one-comment-per-step rule.
+//
+// All tests in this block are RED against the current implementation:
+//   - addedLabelIds/removedLabelIds: gate returns null (passes through) instead of blocking
+//   - commentCreate: gate returns null (passes through) instead of blocking
+//
+// Tests map to AI-1658 AC1 (addedLabelIds/removedLabelIds) and AC2 (commentCreate).
+
+describe("checkRawMutationInterception — AI-1658: addedLabelIds/removedLabelIds + commentCreate", () => {
+  let ai1658Dir: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let ai1658OriginalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    ai1658Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1658-test-"));
+    const policyFile = path.join(ai1658Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai1658Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    ai1658OriginalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = ai1658OriginalFetch;
+  });
+
+  const WORKFLOW_IMPL_LABELS = {
+    data: { issue: { labels: { nodes: [
+      { name: "wf:dev-impl" },
+      { name: "state:implementation" },
+    ] }, delegate: null } },
+  };
+
+  const AD_HOC_LABELS = {
+    data: { issue: { labels: { nodes: [{ name: "bug" }] }, delegate: null } },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function mockLabelFetch(labelResponse: object): (url: any, init?: RequestInit) => Promise<Response> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return async (url: any, init?: RequestInit) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("IssueLabels")) {
+          return new Response(JSON.stringify(labelResponse), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+      return ai1658OriginalFetch(url, init);
+    };
+  }
+
+  // ── AC1: addedLabelIds blocked (all 3 encoding shapes) ───────────────────
+
+  it("AC1: blocks issueUpdate with addedLabelIds on governed ticket (variables.input shape)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { addedLabelIds: ["lbl-state-code-review"] } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked on this workflow ticket");
+    expect(result).toContain("implementation");
+  });
+
+  it("AC1: blocks issueUpdate with addedLabelIds on governed ticket (inline $var shape)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+    const body = {
+      query: "mutation M($id: String!, $addedLabelIds: [String!]) { issueUpdate(id: $id, input: { addedLabelIds: $addedLabelIds }) { success } }",
+      variables: { id: "issue-uuid", addedLabelIds: ["lbl-state-code-review"] },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked on this workflow ticket");
+  });
+
+  it("AC1: blocks issueUpdate with addedLabelIds on governed ticket (inline literal shape)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+    const body = {
+      query: 'mutation M($id: String!) { issueUpdate(id: $id, input: { addedLabelIds: ["lbl-state-code-review"] }) { success } }',
+      variables: { id: "issue-uuid" },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked on this workflow ticket");
+  });
+
+  // ── AC1: removedLabelIds blocked (all 3 encoding shapes) ─────────────────
+
+  it("AC1: blocks issueUpdate with removedLabelIds on governed ticket (variables.input shape)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { removedLabelIds: ["lbl-state-implementation"] } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked on this workflow ticket");
+    expect(result).toContain("implementation");
+  });
+
+  it("AC1: blocks issueUpdate with removedLabelIds on governed ticket (inline $var shape)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+    const body = {
+      query: "mutation M($id: String!, $removedLabelIds: [String!]) { issueUpdate(id: $id, input: { removedLabelIds: $removedLabelIds }) { success } }",
+      variables: { id: "issue-uuid", removedLabelIds: ["lbl-state-implementation"] },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked on this workflow ticket");
+  });
+
+  it("AC1: blocks issueUpdate with removedLabelIds on governed ticket (inline literal shape)", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+    const body = {
+      query: 'mutation M($id: String!) { issueUpdate(id: $id, input: { removedLabelIds: ["lbl-state-implementation"] }) { success } }',
+      variables: { id: "issue-uuid" },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked on this workflow ticket");
+  });
+
+  // ── AC1 + AC4: addedLabelIds/removedLabelIds pass through on ad-hoc ──────
+
+  it("AC4: addedLabelIds passes through on ad-hoc (non-workflow) ticket", async () => {
+    globalThis.fetch = mockLabelFetch(AD_HOC_LABELS);
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { addedLabelIds: ["lbl-some-tag"] } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).toBeNull();
+  });
+
+  it("AC4: removedLabelIds passes through on ad-hoc (non-workflow) ticket", async () => {
+    globalThis.fetch = mockLabelFetch(AD_HOC_LABELS);
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { removedLabelIds: ["lbl-some-tag"] } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).toBeNull();
+  });
+
+  it("AC1: rejection for addedLabelIds includes current state and legal verbs", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+    const body = {
+      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+      variables: { id: "issue-uuid", input: { addedLabelIds: ["lbl-state-code-review"] } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("implementation");
+    expect(result).toContain("submit");
+    expect(result).toContain("escape");
+  });
+
+  // ── AC2: commentCreate blocked on governed ticket ─────────────────────────
+
+  it("AC2: blocks commentCreate on governed ticket when no intent header is present", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+    const body = {
+      query: "mutation M($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }",
+      variables: { input: { issueId: "issue-uuid", body: "here is a status update" } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+  });
+
+  it("AC2: commentCreate rejection names legal verbs for current state", async () => {
+    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
+    const body = {
+      query: "mutation M($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }",
+      variables: { input: { issueId: "issue-uuid", body: "posting a comment" } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("submit");
+    expect(result).toContain("escape");
+    expect(result).toContain("implementation");
+  });
+
+  // ── AC4: commentCreate passes through on ad-hoc ticket ───────────────────
+
+  it("AC4: commentCreate passes through on ad-hoc (non-workflow) ticket", async () => {
+    globalThis.fetch = mockLabelFetch(AD_HOC_LABELS);
+    const body = {
+      query: "mutation M($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }",
+      variables: { input: { issueId: "issue-uuid", body: "a comment" } },
+    };
+    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
+    expect(result).toBeNull();
+  });
+
+  it("AC2: commentCreate with unresolvable issueId fails closed", async () => {
+    const body = {
+      query: "mutation M($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }",
+      variables: { input: { body: "a comment without issueId" } },
+    };
+    const result = await checkRawMutationInterception(body, null, "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+  });
+});
+
+
 // ── AI-1535: raw delegateId mutations get delegate-only semantics ───────────
 // A delegate-routing meta-command (handoff-work, undelegate) writes `delegateId`
 // with NO intent header, so it lands in checkRawMutationInterception, not the
