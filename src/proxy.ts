@@ -35,6 +35,8 @@ import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition,
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
+import type { NoActivityDetector } from "./bag/no-activity-detector.js";
+import { tryNormalizeSessionKey } from "./session-key.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
@@ -258,6 +260,8 @@ export interface ProxyDeps {
   observationStore?: ObservationStore;
   /** Optional operational event store for audit events (G-13a). */
   operationalEventStore?: OperationalEventStore;
+  /** AI-1664: Optional no-activity detector — proxy calls with a resolvable ticket ID satisfy the timer. */
+  noActivityDetector?: NoActivityDetector;
 }
 
 export async function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void> {
@@ -298,6 +302,18 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   const callerLinearUserId = getAgent(agentId)?.linearUserId ?? null;
 
   log.info(`forward agent=${agentId} op=${opName}${ticketCtx}${intent ? ` intent=${intent}` : ""}${cliVersion ? ` cli=${cliVersion}` : ""}`);
+
+  // AI-1664: proxy call with a resolvable ticket identifier counts as evidence of agent starting.
+  // Prefer the body issueId if it normalizes (e.g. "AI-1664"); fall back to the Target header.
+  // UUID-only calls (no normalizable ID, no Target header) do not affect the timer.
+  if (deps?.noActivityDetector) {
+    const proxyTicketId = (issueId && tryNormalizeSessionKey(issueId) !== null)
+      ? issueId
+      : (target && tryNormalizeSessionKey(target) !== null ? target : null);
+    if (proxyTicketId) {
+      deps.noActivityDetector.recordProxyActivity(agentId, proxyTicketId);
+    }
+  }
 
   // AI-1583: enforcement and the B2 writer apply to mutations only. A read can
   // never change workflow state, but reads issued mid-command inherit the sticky

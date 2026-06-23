@@ -40,6 +40,7 @@ import type { OperationalEventStore } from "../store/operational-event-store.js"
 import type { WakeUpConfig } from "./wake-up.js";
 import { resignalPendingTickets, type ResignalOptions } from "./resignal.js";
 import { isLinearIssueActionable } from "../linear-actionable.js";
+import { tryNormalizeSessionKey } from "../session-key.js";
 
 const log = componentLogger(createLogger(), "no-activity-detector");
 
@@ -153,6 +154,17 @@ export class NoActivityDetector {
       return;
     }
     this.warnedSessions.delete(`${agentId}:${sessionKey}`);
+  }
+
+  /**
+   * AI-1664: Record a proxy call as evidence that the agent started.
+   * Satisfies the no-activity timer for the matched (agentId, ticketId) dispatch.
+   * Silently ignored when ticketId cannot be normalized to a Linear identifier.
+   */
+  recordProxyActivity(agentId: string, ticketId: string): void {
+    const normalized = tryNormalizeSessionKey(ticketId);
+    if (!normalized) return;
+    this.deps.ackTracker.acknowledge(agentId, normalized);
   }
 
   private getAgentMaxConcurrentValue(agentId: string): number {
