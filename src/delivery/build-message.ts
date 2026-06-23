@@ -321,6 +321,18 @@ async function tryBuildWorkflowMessage(
     }
   }
 
+  const resourcesBlock: string[] = stateNode.resources?.length
+    ? [
+        "",
+        "**Reference documents for this step (read these before acting):**",
+        ...stateNode.resources.map(r =>
+          r.description
+            ? `- \`${r.path}\` — ${r.description}`
+            : `- \`${r.path}\`${r.label ? ` (${r.label})` : ""}`
+        ),
+      ]
+    : [];
+
   return [
     `${actionText}: ${title}`,
     "",
@@ -330,8 +342,7 @@ async function tryBuildWorkflowMessage(
     "",
     "Your legal action(s) for this state:",
     ...stepLines,
-    "",
-    `Run \`linear consider-work ${identifier}\` NOW if you haven't already to review the issue.`,
+    ...resourcesBlock,
     ...guidanceBlock,
     ...acRecordBlock,
     "",

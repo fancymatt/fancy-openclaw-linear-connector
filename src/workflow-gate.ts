@@ -125,6 +125,9 @@ export interface WorkflowState {
    *  comment as inline context. Useful for states where the previous step's output
    *  (e.g. a brief) must be immediately visible to the incoming delegate. */
   deliverLastComment?: boolean;
+  /** Reference documents for this state. Paths are injected into the delivery message
+   *  so the agent knows exactly where to read before acting. */
+  resources?: Array<{ path: string; label?: string; description?: string }>;
   transitions?: WorkflowTransition[];
 }
 
