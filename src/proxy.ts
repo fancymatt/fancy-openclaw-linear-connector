@@ -31,7 +31,7 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, type TransitionFeedback } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, buildNonAdvancingNoteNotice, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, type TransitionFeedback } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
@@ -480,6 +480,20 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           log.warn(`reminder-build failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+        }
+
+        // AI-1641: a delegate's comment-only turn (`note`) in an active state is
+        // legal but non-advancing. buildStateTransitionReminder returns null for
+        // `note` (no transition), so surface a notice that the comment did NOT
+        // advance the ticket + the real legal moves, stripping its false sense of
+        // completion. Only fires for the delegate in a non-terminal workflow state.
+        if (!workflowReminder) {
+          try {
+            workflowReminder = await buildNonAdvancingNoteNotice(intent, issueId, authorization, callerLinearUserId);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.warn(`note-notice-build failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+          }
         }
 
         if (workflowReminder) {
