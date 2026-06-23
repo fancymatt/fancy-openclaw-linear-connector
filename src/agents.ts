@@ -248,6 +248,14 @@ export function getOpenclawAgentName(agentName: string): string {
   return agent?.openclawAgent ?? agentName;
 }
 
+/**
+ * Resolve the Linear user ID for an OpenClaw agent ID (the value returned by
+ * `getOpenclawAgentName`). Returns undefined for unrecognized agents.
+ */
+export function getLinearUserIdForAgent(openclawAgentId: string): string | undefined {
+  return _agents.find((a) => (a.openclawAgent ?? a.name) === openclawAgentId)?.linearUserId;
+}
+
 /** Update tokens for an agent and persist to disk */
 export function updateTokens(
   agentName: string,

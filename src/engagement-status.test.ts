@@ -21,6 +21,8 @@ interface IssueFixture {
   stateName: string;
   stateId: string;
   labels: string[];
+  /** Linear user ID of the current delegate (AI-1660) */
+  delegateLinearUserId?: string;
 }
 
 const SEMANTIC_TO_UUID: Record<string, string> = {
@@ -60,6 +62,7 @@ function makeEngagementFetch(issue: IssueFixture): {
               team: { id: issue.teamId },
               state: { id: issue.stateId, name: issue.stateName },
               labels: { nodes: issue.labels.map((name) => ({ name })) },
+              delegate: issue.delegateLinearUserId ? { id: issue.delegateLinearUserId } : null,
             },
           },
         }),
@@ -267,5 +270,106 @@ describe("applyEngagementStatus (AI-1510)", () => {
     await applyEngagementStatus("linear-AI-1", "thinking", "tok");
 
     expect(issueQueryIds).toContain("AI-1");
+  });
+
+  // AI-1660: delegate guard for "doing" flips
+  it("AI-1660: skips doing flip when authoring agent is NOT the current delegate", async () => {
+    const { fetch, updates } = makeEngagementFetch({
+      id: "issue-uuid",
+      teamId: "team-uuid",
+      stateName: "Thinking",
+      stateId: SEMANTIC_TO_UUID["Thinking"],
+      labels: WF_LABELS,
+      delegateLinearUserId: "linear-user-tdd",
+    });
+    globalThis.fetch = fetch;
+
+    // Astrid posts a handoff comment but TDD is now the delegate
+    await applyEngagementStatus("AI-1", "doing", "tok", "linear-user-astrid");
+
+    expect(updates).toHaveLength(0);
+  });
+
+  it("AI-1660: allows doing flip when authoring agent IS the current delegate", async () => {
+    const { fetch, updates } = makeEngagementFetch({
+      id: "issue-uuid",
+      teamId: "team-uuid",
+      stateName: "Thinking",
+      stateId: SEMANTIC_TO_UUID["Thinking"],
+      labels: WF_LABELS,
+      delegateLinearUserId: "linear-user-tdd",
+    });
+    globalThis.fetch = fetch;
+
+    await applyEngagementStatus("AI-1", "doing", "tok", "linear-user-tdd");
+
+    expect(updates).toHaveLength(1);
+    expect(updates[0].stateId).toBe(SEMANTIC_TO_UUID["Doing"]);
+  });
+
+  it("AI-1660: allows doing flip when no agentLinearUserId provided (backward compat)", async () => {
+    const { fetch, updates } = makeEngagementFetch({
+      id: "issue-uuid",
+      teamId: "team-uuid",
+      stateName: "Thinking",
+      stateId: SEMANTIC_TO_UUID["Thinking"],
+      labels: WF_LABELS,
+      delegateLinearUserId: "linear-user-tdd",
+    });
+    globalThis.fetch = fetch;
+
+    await applyEngagementStatus("AI-1", "doing", "tok");
+
+    expect(updates).toHaveLength(1);
+  });
+
+  it("AI-1660: allows doing flip when issue has no delegate set (fail-open)", async () => {
+    const { fetch, updates } = makeEngagementFetch({
+      id: "issue-uuid",
+      teamId: "team-uuid",
+      stateName: "Thinking",
+      stateId: SEMANTIC_TO_UUID["Thinking"],
+      labels: WF_LABELS,
+    });
+    globalThis.fetch = fetch;
+
+    await applyEngagementStatus("AI-1", "doing", "tok", "linear-user-astrid");
+
+    expect(updates).toHaveLength(1);
+  });
+
+  it("AI-1660: todo (session-end) flip is unaffected by delegate guard", async () => {
+    const { fetch, updates } = makeEngagementFetch({
+      id: "issue-uuid",
+      teamId: "team-uuid",
+      stateName: "Doing",
+      stateId: SEMANTIC_TO_UUID["Doing"],
+      labels: WF_LABELS,
+      delegateLinearUserId: "linear-user-tdd",
+    });
+    globalThis.fetch = fetch;
+
+    // Session-end fired for astrid even though tdd is the delegate
+    await applyEngagementStatus("AI-1", "todo", "tok", "linear-user-astrid");
+
+    expect(updates).toHaveLength(1);
+    expect(updates[0].stateId).toBe(SEMANTIC_TO_UUID["To Do"]);
+  });
+
+  it("AI-1660: thinking (dispatch) flip is unaffected by delegate guard", async () => {
+    const { fetch, updates } = makeEngagementFetch({
+      id: "issue-uuid",
+      teamId: "team-uuid",
+      stateName: "To Do",
+      stateId: SEMANTIC_TO_UUID["To Do"],
+      labels: WF_LABELS,
+      delegateLinearUserId: "linear-user-tdd",
+    });
+    globalThis.fetch = fetch;
+
+    await applyEngagementStatus("AI-1", "thinking", "tok", "linear-user-astrid");
+
+    expect(updates).toHaveLength(1);
+    expect(updates[0].stateId).toBe(SEMANTIC_TO_UUID["Thinking"]);
   });
 });

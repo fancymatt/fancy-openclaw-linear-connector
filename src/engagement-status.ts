@@ -58,6 +58,8 @@ interface IssueShape {
   stateName: string;
   stateId: string;
   labels: string[];
+  /** Linear user ID of the current delegate, if set. */
+  delegateLinearUserId?: string;
 }
 
 async function fetchIssue(identifier: string, authHeader: string): Promise<IssueShape | null> {
@@ -68,6 +70,7 @@ async function fetchIssue(identifier: string, authHeader: string): Promise<Issue
         team { id }
         state { id name }
         labels { nodes { name } }
+        delegate { id }
       }
     }`;
   const res = await fetch(LINEAR_API_URL, {
@@ -82,6 +85,7 @@ async function fetchIssue(identifier: string, authHeader: string): Promise<Issue
         team?: { id: string } | null;
         state?: { id: string; name: string } | null;
         labels?: { nodes: Array<{ name: string }> } | null;
+        delegate?: { id?: string } | null;
       } | null;
     };
   };
@@ -94,6 +98,7 @@ async function fetchIssue(identifier: string, authHeader: string): Promise<Issue
     stateName: issue.state.name,
     stateId: issue.state.id,
     labels: (issue.labels?.nodes ?? []).map((l) => l.name),
+    delegateLinearUserId: issue.delegate?.id ?? undefined,
   };
 }
 
@@ -101,13 +106,17 @@ async function fetchIssue(identifier: string, authHeader: string): Promise<Issue
  * Apply an engagement status to a workflow ticket. No-op for ad-hoc tickets
  * (no `wf:*` label) and for the monotonic thinking-after-doing case.
  *
- * @param ticketRef  `linear-AI-1292` or `AI-1292`
- * @param token      delegate's access token (raw or Bearer-prefixed)
+ * @param ticketRef          `linear-AI-1292` or `AI-1292`
+ * @param token              delegate's access token (raw or Bearer-prefixed)
+ * @param agentLinearUserId  Linear user ID of the authoring agent; when provided,
+ *                           the "doing" flip is skipped if the agent is not the
+ *                           current delegate (AI-1660).
  */
 export async function applyEngagementStatus(
   ticketRef: string,
   semantic: EngagementSemantic,
   token: string | null | undefined,
+  agentLinearUserId?: string | null,
 ): Promise<void> {
   if (!token) return;
   const identifier = ticketRef.replace(/^linear-/i, "");
@@ -125,6 +134,18 @@ export async function applyEngagementStatus(
     // resting end-state (state:done / state:escape). The gate's native write wins;
     // a late agent-authored-activity webhook must not re-drive it to "doing" (AI-1540).
     if (issue.labels.some((l) => TERMINAL_LABELS.has(l.toLowerCase()))) return;
+
+    // AI-1660: delegate guard — only the current delegate may flip to "doing".
+    // A prior-step agent posting a handoff comment must not drive the next agent's
+    // engagement status before that agent has even seen the ticket.
+    if (semantic === "doing" && agentLinearUserId && issue.delegateLinearUserId) {
+      if (agentLinearUserId !== issue.delegateLinearUserId) {
+        log.info(
+          `engagement: ${identifier} → doing skipped — authoring agent (${agentLinearUserId}) is not the delegate (${issue.delegateLinearUserId})`,
+        );
+        return;
+      }
+    }
 
     // Monotonic floor: never downgrade an actively-working ticket back to Thinking.
     if (semantic === "thinking" && DOING_NAMES.has(normalizeName(issue.stateName))) {

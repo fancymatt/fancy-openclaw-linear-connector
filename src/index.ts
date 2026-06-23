@@ -22,7 +22,7 @@ import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState
 import { registerDistillationCron } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
-import { getAccessToken, getAgent } from "./agents.js";
+import { getAccessToken, getAgent, getLinearUserIdForAgent } from "./agents.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
 import path from "path";
@@ -342,7 +342,8 @@ export function createApp(options?: CreateAppOptions) {
    */
   function flipEngagementStatus(agentId: string, ticketId: string, semantic: "thinking" | "doing" | "todo"): void {
     const token = getAccessToken(agentId) ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
-    void applyEngagementStatus(ticketId, semantic, token);
+    const agentLinearUserId = getLinearUserIdForAgent(agentId);
+    void applyEngagementStatus(ticketId, semantic, token, agentLinearUserId);
     const outcomeMap = { thinking: "engagement-thinking", doing: "engagement-doing", todo: "engagement-todo" } as const;
     try {
       operationalEventStore.append({
