@@ -15,6 +15,7 @@
 import { deliverMessageToAgent, type DeliveryConfig, type DeliveryResult } from "../delivery/index.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
+import { fetchWorkflowLabels, getWorkflowId, getCurrentState, loadWorkflowDefById } from "../workflow-gate.js";
 
 const log = componentLogger(createLogger(), "wakeup");
 
@@ -51,6 +52,59 @@ export function buildWakeUpMessage(ticketIds: string[], signalTemplate?: string)
   return (signalTemplate ?? defaultTemplate)
     .replace(/\{count\}/g, String(count))
     .replace(/\{tickets\}/g, tickets);
+}
+
+/**
+ * Build a workflow-aware wake-up message for a single governed ticket.
+ *
+ * For a single ticket with wf:* and state:* labels, fetches the workflow def
+ * and injects the current state name and legal verb set into the message so the
+ * woken agent knows exactly which commands are available without an extra CLI call.
+ *
+ * Falls back to buildWakeUpMessage for multi-ticket, ad-hoc, fetch errors, or
+ * missing authToken (fail-open posture — the agent can still query via consider-work).
+ */
+export async function buildWorkflowAwareWakeUpMessage(
+  ticketIds: string[],
+  authToken?: string,
+): Promise<string> {
+  if (ticketIds.length !== 1 || !authToken) {
+    return buildWakeUpMessage(ticketIds);
+  }
+
+  const rawId = ticketIds[0];
+  const plainId = rawId.replace(STRIP_LINEAR_PREFIX, "");
+
+  try {
+    const labels = await fetchWorkflowLabels(plainId, authToken);
+    const workflowId = getWorkflowId(labels);
+    if (!workflowId) return buildWakeUpMessage(ticketIds);
+
+    const stateName = getCurrentState(labels);
+    if (!stateName) return buildWakeUpMessage(ticketIds);
+
+    const def = await loadWorkflowDefById(workflowId);
+    if (!def) return buildWakeUpMessage(ticketIds);
+
+    const stateNode = def.states.find(s => s.id === stateName);
+    if (!stateNode) return buildWakeUpMessage(ticketIds);
+
+    const legalVerbs = (stateNode.transitions ?? []).map(t => t.command);
+    const breakGlass = def.break_glass?.command ?? "escape";
+
+    const verbLines = [
+      ...legalVerbs.map(v => `  - \`linear ${v} ${plainId}\``),
+      `  - \`linear ${breakGlass} ${plainId}\` (break glass — legal from any state)`,
+    ].join("\n");
+
+    return (
+      `You have 1 pending ticket: ${plainId} (workflow: ${workflowId}, state: ${stateName}).\n` +
+      `Legal commands from state '${stateName}':\n${verbLines}\n` +
+      `Run \`linear consider-work ${plainId}\` to fetch full ticket context.`
+    );
+  } catch {
+    return buildWakeUpMessage(ticketIds);
+  }
 }
 
 /**
