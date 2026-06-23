@@ -35,13 +35,14 @@
  */
 import { createLogger, componentLogger } from "../logger.js";
 import { getAccessToken, getAgents, isAgentLocal } from "../agents.js";
-import { loadWorkflowDefById, getCurrentState, getWorkflowId } from "../workflow-gate.js";
+import { loadWorkflowDef, getCurrentState, getWorkflowId } from "../workflow-gate.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { deliverMessageToAgent } from "../delivery/index.js";
 const log = componentLogger(createLogger(), "stuck-delegate-detector");
 const DEFAULT_POLL_MS = 5 * 60 * 1000; // 5 minutes
 const DEFAULT_IDLE_GRACE_MS = 3 * 60 * 1000; // 3 minutes
 const DEFAULT_MAX_PROMPTS = 2;
+const DEFAULT_SESSION_ACTIVE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
 // ── Prompt-count store (in-memory, reset on restart) ─────────────────────────
 // TODO: If ticket volume grows, persist PromptCounter to the bag DB so counts
 // survive connector restarts. In-memory is fine for v1 — maxPrompts defaults to 2
@@ -116,7 +117,9 @@ export class StuckDelegateDetector {
             pollMs: config?.pollMs ?? parseEnvInt("STUCK_DELEGATE_POLL_MS", DEFAULT_POLL_MS),
             idleGraceMs: config?.idleGraceMs ?? parseEnvInt("STUCK_DELEGATE_IDLE_GRACE_MS", DEFAULT_IDLE_GRACE_MS),
             maxPrompts: config?.maxPrompts ?? parseEnvInt("STUCK_DELEGATE_MAX_PROMPTS", DEFAULT_MAX_PROMPTS),
+            sessionActiveThresholdMs: config?.sessionActiveThresholdMs ?? parseEnvInt("STUCK_DELEGATE_SESSION_ACTIVE_MS", DEFAULT_SESSION_ACTIVE_THRESHOLD_MS),
         };
+        this.ackTracker = deps.ackTracker;
         this.deps = {
             sessionTracker: deps.sessionTracker,
             bag: deps.bag,
@@ -126,7 +129,7 @@ export class StuckDelegateDetector {
             listAgents: deps.listAgents ?? (() => getAgents().filter(isAgentLocal)),
             now: deps.now ?? (() => Date.now()),
             fetchStuckCandidates: deps.fetchStuckCandidates ?? defaultFetchStuckCandidates,
-            loadDefById: deps.loadDefById ?? loadWorkflowDefById,
+            loadDef: deps.loadDef ?? loadWorkflowDef,
         };
         this.promptCounter = new PromptCounter();
     }
@@ -161,7 +164,8 @@ export class StuckDelegateDetector {
      * and re-prompts as needed.
      */
     async runCycle() {
-        const { listAgents, fetchStuckCandidates, loadDefById, sessionTracker, bag, operationalEventStore, sendWake, now: getNow } = this.deps;
+        const { listAgents, fetchStuckCandidates, loadDef, sessionTracker, bag, operationalEventStore, sendWake, now: getNow } = this.deps;
+        const ackTracker = this.ackTracker;
         const agents = listAgents();
         const result = {
             agentsChecked: 0,
@@ -169,9 +173,18 @@ export class StuckDelegateDetector {
             stuckFound: 0,
             rePromptsSent: 0,
             skippedAlreadyPrompted: 0,
+            skippedSessionActive: 0,
             errors: 0,
         };
         let def;
+        try {
+            def = await loadDef();
+        }
+        catch (err) {
+            log.error(`Failed to load workflow def: ${err instanceof Error ? err.message : String(err)}`);
+            result.errors++;
+            return result;
+        }
         for (const agent of agents) {
             result.agentsChecked++;
             let candidates;
@@ -193,6 +206,20 @@ export class StuckDelegateDetector {
                     // Session is active — clear any stale "ended at" tracking
                     this.sessionEndedAt.delete(`${openclawAgent}:${sessionKey}`);
                     continue;
+                }
+                // AI-1650: Persisted dispatch-ack guard. After a connector restart,
+                // the in-memory SessionTracker is empty, so isActiveForTicket() is
+                // always false — even for sessions that are still actively running.
+                // Check the SQLite-backed DispatchAckTracker for a recent pending
+                // dispatch. If one exists within sessionActiveThresholdMs, the session
+                // is likely still in progress — skip to avoid duplicate dispatch.
+                if (ackTracker && this.config.sessionActiveThresholdMs > 0) {
+                    if (ackTracker.hasRecentPending(openclawAgent, sessionKey, this.config.sessionActiveThresholdMs)) {
+                        result.skippedSessionActive++;
+                        log.info(`Stuck-delegate: skipping ${ticketId} — recent pending dispatch within ${this.config.sessionActiveThresholdMs}ms ` +
+                            `suggests session is still active (agent=${openclawAgent})`);
+                        continue;
+                    }
                 }
                 // Apply idle grace period: if the session recently ended, wait
                 // When idleGraceMs is 0 (default for tests and aggressive detection),
@@ -230,21 +257,6 @@ export class StuckDelegateDetector {
                 if (promptCount >= this.config.maxPrompts) {
                     result.skippedAlreadyPrompted++;
                     log.info(`Stuck-delegate: skipping ${ticketId} — already prompted ${promptCount} times (max=${this.config.maxPrompts})`);
-                    continue;
-                }
-                // Resolve the correct workflow def for this candidate
-                const candidateWorkflowId = getWorkflowId(candidate.labels);
-                try {
-                    def = candidateWorkflowId ? await loadDefById(candidateWorkflowId) : null;
-                }
-                catch (err) {
-                    log.error(`Stuck-delegate: failed to load def for wf:${candidateWorkflowId} on ${ticketId}: ${err instanceof Error ? err.message : String(err)}`);
-                    result.errors++;
-                    continue;
-                }
-                if (!def) {
-                    log.warn(`Stuck-delegate: skipping ${ticketId} — no workflow def for wf:${candidateWorkflowId}`);
-                    result.errors++;
                     continue;
                 }
                 // Build re-prompt
@@ -344,7 +356,7 @@ async function defaultFetchStuckCandidates(agent) {
           delegate { id }
           updatedAt
           state { name type }
-          comments(first: 20, orderBy: { createdAt: desc }) {
+          comments(first: 20, orderBy: createdAt) {
             nodes {
               id
               createdAt
@@ -354,16 +366,16 @@ async function defaultFetchStuckCandidates(agent) {
           }
           history(
             first: 50,
-            orderBy: { createdAt: desc }
+            orderBy: createdAt
           ) {
             nodes {
               __typename
-              ... on IssueLabelPayload {
-                createdAt
-                fromLabel { name }
-                toLabel { name }
-                actor { id }
-              }
+              createdAt
+              actor { id }
+              addedLabelIds
+              removedLabelIds
+              fromState { name }
+              toState { name }
             }
           }
         }
@@ -398,10 +410,13 @@ async function defaultFetchStuckCandidates(agent) {
             if (currentState === "done" || currentState === "escape")
                 continue;
             // Find when the current state:* label was last set (state entry time)
-            const stateEntryEvents = issue.history.nodes
-                .filter((h) => h.__typename === "IssueLabelPayload" && h.toLabel?.name === `state:${currentState}`)
+            // In the new Linear schema, IssueLabelPayload no longer exists as a fragment type.
+            // History entries are flat IssueHistory objects. We use the most recent history
+            // entry as a best-effort state entry timestamp.
+            const historySorted = issue.history.nodes
+                .filter((h) => h.createdAt)
                 .sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""));
-            const stateEnteredAt = stateEntryEvents[0]?.createdAt ?? null;
+            const stateEnteredAt = historySorted[0]?.createdAt ?? null;
             // Find delegate comments after state entry
             const delegateComments = issue.comments.nodes
                 .filter((c) => {
@@ -417,17 +432,17 @@ async function defaultFetchStuckCandidates(agent) {
                 .filter((h) => {
                 if (!stateEnteredAt)
                     return false;
-                if (h.__typename !== "IssueLabelPayload")
+                if (!h.createdAt)
                     return false;
-                if (!h.toLabel?.name?.startsWith("state:"))
+                // A transition is a native Linear state change
+                const hasStateChange = h.fromState?.name || h.toState?.name;
+                if (!hasStateChange)
                     return false;
-                // A transition is a change TO a different state:* label
-                // (the current state:* label being set IS the entry event — skip that)
-                return h.createdAt !== stateEnteredAt;
+                return h.createdAt > stateEnteredAt;
             })
                 .map((h) => ({
-                from: h.fromLabel?.name?.replace("state:", "") ?? "",
-                to: h.toLabel?.name?.replace("state:", "") ?? "",
+                from: h.fromState?.name ?? "",
+                to: h.toState?.name ?? "",
                 at: h.createdAt ?? "",
             }));
             candidates.push({

@@ -193,7 +193,9 @@ export class NoActivityDetector {
             const dispatchedAt = new Date(entry.dispatchedAt.replace(' ', 'T') + 'Z').getTime();
             const ageMs = now - dispatchedAt;
             const sessionKeyWarn = `${agentId}:${sessionKey}`;
-            if (ageMs >= this.config.failMs) {
+            // AI-1666: use per-state no-activity timeout when available.
+            const effectiveFailMs = this.deps.getFailMsForTicket?.(agentId, ticketId) ?? this.config.failMs;
+            if (ageMs >= effectiveFailMs) {
                 // Check capacity before deciding: at-capacity → defer; hard-down → escalate
                 const activeCount = sessionTracker.getActiveSessionKeys(agentId).length;
                 const maxConcurrent = this.getAgentMaxConcurrentValue(agentId);
@@ -202,7 +204,7 @@ export class NoActivityDetector {
                     result.deferredAtCapacity++;
                     continue;
                 }
-                // Hard fail — session produced no activity for >failMs and agent is not at capacity
+                // Hard fail — session produced no activity for >effectiveFailMs and agent is not at capacity
                 const deferred = await this.handleFailure(entry, sessionKey);
                 if (deferred) {
                     result.deferredAtCapacity++;
@@ -216,7 +218,7 @@ export class NoActivityDetector {
                 if (!this.warnedSessions.has(sessionKeyWarn)) {
                     this.warnedSessions.add(sessionKeyWarn);
                     log.warn(`No activity detected for ${agentId} [${sessionKey}] ` +
-                        `(${Math.round(ageMs / 1000)}s since dispatch, fail threshold at ${Math.round(this.config.failMs / 1000)}s)`);
+                        `(${Math.round(ageMs / 1000)}s since dispatch, fail threshold at ${Math.round(effectiveFailMs / 1000)}s)`);
                     operationalEventStore.append({
                         outcome: "no-activity-warn",
                         agent: agentId,
@@ -228,7 +230,7 @@ export class NoActivityDetector {
                             dispatchedAt: entry.dispatchedAt,
                             ageMs,
                             warnThresholdMs: this.config.warnMs,
-                            failThresholdMs: this.config.failMs,
+                            failThresholdMs: effectiveFailMs,
                         },
                     });
                     result.warned++;

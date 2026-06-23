@@ -15,6 +15,7 @@ import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
 import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, StuckDelegateDetector, HoldRetryTracker, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
+import { getTicketNoActivityTimeoutMs } from "./workflow-gate.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
@@ -363,7 +364,7 @@ export function createApp(options?: CreateAppOptions) {
   watchdog.start();
 
   const noActivityDetector = new NoActivityDetector(
-    { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions, postLinearComment },
+    { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions, postLinearComment, getFailMsForTicket: (_agentId: string, ticketId: string) => getTicketNoActivityTimeoutMs(ticketId) },
   );
   noActivityDetector.start();
 

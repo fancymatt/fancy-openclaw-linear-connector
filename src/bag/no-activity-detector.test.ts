@@ -660,4 +660,211 @@ describe("NoActivityDetector", () => {
     ackTracker.close();
     operationalEventStore.close();
   });
+
+  // ── AI-1666: per-step noActivityTimeout override ──────────────────────────
+  //
+  // Acceptance criteria (AC):
+  //   AC1  Workflow YAML accepts noActivityTimeout at state level
+  //   AC2  Connector uses per-state timeout when specified, global default otherwise
+  //   AC4  Specific: generating state with 600s timeout does not trigger at 308s
+  //
+  // Interface contract: NoActivityDeps gains an optional
+  //   getFailMsForTicket?(agentId, ticketId): number | undefined
+  // dep. When it returns a number, runCycle uses that instead of config.failMs for
+  // that ticket. When it returns undefined, the global config.failMs applies.
+  //
+  // The real wiring resolves the ticket's current workflow state from the
+  // AppliedStateStore / WorkflowDef and reads noActivityTimeout from there.
+  // Tests inject a direct callback to keep them fast and network-free.
+
+  describe("AI-1666: per-state noActivityTimeout override", () => {
+    test("per-state timeout suppresses failure when below state threshold [AC2, AC4]", async () => {
+      // Simulates: generating state with 600s timeout does not trigger at 308s.
+      // We model this as: globalFailMs=0 (fires immediately for all tickets) but
+      // getFailMsForTicket returns 600_000 for this ticket.
+      // At ~0ms elapsed the per-state 600s is not exceeded → must NOT fail.
+      const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+      const dispatchedTickets: string[] = [];
+
+      bag.add("image-artist", "linear-AI-1050", "Issue");
+      sessionTracker.startSession("image-artist", "linear-AI-1050");
+      ackTracker.recordDispatch("image-artist", "linear-AI-1050");
+
+      const detector = new NoActivityDetector(
+        {
+          sessionTracker,
+          ackTracker,
+          bag,
+          operationalEventStore,
+          wakeConfig,
+          // Per-state 600s override for this ticket.
+          // NoActivityDeps does not yet declare this field (AC2 not implemented).
+          // With isolatedModules the extra key is not a compile error; at runtime
+          // the detector ignores it and fires via failMs=0 → test is RED until implemented.
+          ...(({ getFailMsForTicket: (_a: string, _t: string) => 600_000 }) as Record<string, unknown>),
+          resignalOptions: {
+            isTicketActionable: () => true,
+            sendWakeUp: async (_agentId: string, ticketIds: string[]) => {
+              dispatchedTickets.push(...ticketIds);
+            },
+          },
+        } as Parameters<typeof NoActivityDetector>[0],
+        { warnMs: 0, failMs: 0, pollMs: 60_000 }, // global failMs=0 fires immediately
+      );
+
+      const result = await detector.runCycle();
+
+      // Per-state 600s is not exceeded → must NOT fail.
+      // FAILS currently: detector ignores getFailMsForTicket and uses failMs=0 → result.failed=1.
+      expect(result.failed).toBe(0);
+      expect(dispatchedTickets).toHaveLength(0);
+
+      const failEvents = operationalEventStore.query({ outcome: "no-activity-failed" });
+      expect(failEvents).toHaveLength(0);
+
+      detector.stop();
+      bag.close();
+      sessionTracker.close();
+      ackTracker.close();
+      operationalEventStore.close();
+    });
+
+    test("per-state timeout fires when state threshold is exceeded [AC2]", async () => {
+      // When getFailMsForTicket returns a small value (0), it should fire even
+      // when the global config.failMs is very large (1hr — would never fire).
+      const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+      const dispatchedTickets: string[] = [];
+
+      bag.add("image-artist", "linear-AI-1051", "Issue");
+      sessionTracker.startSession("image-artist", "linear-AI-1051");
+      ackTracker.recordDispatch("image-artist", "linear-AI-1051");
+
+      const detector = new NoActivityDetector(
+        {
+          sessionTracker,
+          ackTracker,
+          bag,
+          operationalEventStore,
+          wakeConfig,
+          // Per-state 0ms override → fires immediately.
+          ...(({ getFailMsForTicket: (_a: string, _t: string) => 0 }) as Record<string, unknown>),
+          resignalOptions: {
+            isTicketActionable: () => true,
+            sendWakeUp: async (_agentId: string, ticketIds: string[]) => {
+              dispatchedTickets.push(...ticketIds);
+            },
+          },
+        } as Parameters<typeof NoActivityDetector>[0],
+        { warnMs: 0, failMs: 3_600_000, pollMs: 60_000 }, // global 1hr — would NOT fire
+      );
+
+      const result = await detector.runCycle();
+
+      // Per-state 0ms is always exceeded → must fail and re-dispatch.
+      // FAILS currently: detector uses global failMs=3_600_000 → does not fire → result.failed=0.
+      expect(result.failed).toBe(1);
+      expect(dispatchedTickets).toContain("linear-AI-1051");
+
+      detector.stop();
+      bag.close();
+      sessionTracker.close();
+      ackTracker.close();
+      operationalEventStore.close();
+    });
+
+    test("per-state timeout is independent per ticket in the same cycle [AC2]", async () => {
+      // ticket-a: per-state 600_000 (should NOT fail despite global=0)
+      // ticket-b: no override (should fail via global=0)
+      // Only ticket-b should appear in failed count.
+      const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+      const dispatchedTickets: string[] = [];
+
+      bag.add("image-artist", "linear-AI-1052", "Issue");
+      sessionTracker.startSession("image-artist", "linear-AI-1052");
+      ackTracker.recordDispatch("image-artist", "linear-AI-1052");
+
+      bag.add("image-artist", "linear-AI-1053", "Issue");
+      sessionTracker.startSession("image-artist", "linear-AI-1053");
+      ackTracker.recordDispatch("image-artist", "linear-AI-1053");
+
+      const detector = new NoActivityDetector(
+        {
+          sessionTracker,
+          ackTracker,
+          bag,
+          operationalEventStore,
+          wakeConfig,
+          ...(({
+            getFailMsForTicket: (_a: string, ticketId: string) => {
+              if (ticketId === "linear-AI-1052") return 600_000; // suppressed
+              return undefined; // ticket-b: use global
+            },
+          }) as Record<string, unknown>),
+          resignalOptions: {
+            isTicketActionable: () => true,
+            sendWakeUp: async (_agentId: string, ticketIds: string[]) => {
+              dispatchedTickets.push(...ticketIds);
+            },
+          },
+        } as Parameters<typeof NoActivityDetector>[0],
+        { warnMs: 0, failMs: 0, pollMs: 60_000 },
+      );
+
+      const result = await detector.runCycle();
+
+      // Only ticket-b (AI-1053) should fail; ticket-a (AI-1052) is suppressed by per-state timeout.
+      // FAILS currently: both tickets fire (global=0 applies to both) → result.failed=2.
+      expect(result.failed).toBe(1);
+      expect(dispatchedTickets).not.toContain("linear-AI-1052");
+      expect(dispatchedTickets).toContain("linear-AI-1053");
+
+      detector.stop();
+      bag.close();
+      sessionTracker.close();
+      ackTracker.close();
+      operationalEventStore.close();
+    });
+
+    test("global failMs applies unchanged when getFailMsForTicket returns undefined [AC2 regression]", async () => {
+      // Verifies existing behavior is not broken: when the callback returns undefined,
+      // the global config.failMs is used.
+      const { bag, sessionTracker, ackTracker, operationalEventStore } = setupDeps(dir);
+      const dispatchedTickets: string[] = [];
+
+      bag.add("image-artist", "linear-AI-1054", "Issue");
+      sessionTracker.startSession("image-artist", "linear-AI-1054");
+      ackTracker.recordDispatch("image-artist", "linear-AI-1054");
+
+      const detector = new NoActivityDetector(
+        {
+          sessionTracker,
+          ackTracker,
+          bag,
+          operationalEventStore,
+          wakeConfig,
+          ...(({ getFailMsForTicket: () => undefined }) as Record<string, unknown>),
+          resignalOptions: {
+            isTicketActionable: () => true,
+            sendWakeUp: async (_agentId: string, ticketIds: string[]) => {
+              dispatchedTickets.push(...ticketIds);
+            },
+          },
+        } as Parameters<typeof NoActivityDetector>[0],
+        { warnMs: 0, failMs: 0, pollMs: 60_000 },
+      );
+
+      const result = await detector.runCycle();
+
+      // Global threshold applies → should fail normally.
+      // This test PASSES currently (no behavioral change needed for this path).
+      expect(result.failed).toBe(1);
+      expect(dispatchedTickets).toContain("linear-AI-1054");
+
+      detector.stop();
+      bag.close();
+      sessionTracker.close();
+      ackTracker.close();
+      operationalEventStore.close();
+    });
+  });
 });

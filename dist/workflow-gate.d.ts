@@ -65,6 +65,11 @@ export interface WorkflowState {
     /** §5.5: per-state SLA as a duration string (e.g. "24h", "90m", "3600000").
      *  Time-in-state beyond this trips stall escalation (parsed to ms by barrier). */
     sla?: string;
+    /** AI-1666: per-state no-activity timeout in seconds. Overrides the global
+     *  NO_ACTIVITY_FAIL_MS for dispatches in this state. Steps with no override
+     *  inherit the global default. Use for states with known-slow sub-processes
+     *  (e.g. image generation) to avoid spurious failure re-dispatches. */
+    noActivityTimeout?: number;
     transitions?: WorkflowTransition[];
 }
 export interface StakesLevel {
@@ -145,6 +150,10 @@ export declare function loadWorkflowDefById(workflowId: string): Promise<Workflo
 export declare function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>>;
 /** Invalidate the in-process workflow registry cache (used in tests & live-reload). */
 export declare function resetWorkflowCache(): void;
+/** Return the per-state no-activity timeout in ms for this ticket, or undefined. */
+export declare function getTicketNoActivityTimeoutMs(ticketId: string): number | undefined;
+/** Test helper — reset the no-activity timeout cache between cases. */
+export declare function _resetNoActivityTimeoutCache(): void;
 /**
  * AI-1490 / AI-1498: Validate that every workflow state has a valid native_state field.
  * AI-1498 hardens this from warn → hard-fail for non-terminal states: a missing or

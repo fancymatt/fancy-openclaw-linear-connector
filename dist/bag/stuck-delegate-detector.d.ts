@@ -39,6 +39,7 @@ import type { OperationalEventStore } from "../store/operational-event-store.js"
 import type { SessionTracker } from "./session-tracker.js";
 import type { PendingWorkBag } from "./pending-work-bag.js";
 import { type DeliveryConfig } from "../delivery/index.js";
+import type { DispatchAckTracker } from "./dispatch-ack-tracker.js";
 export interface StuckDelegateConfig {
     /** How often to check for stuck delegates. Default: 5 min. */
     pollMs: number;
@@ -46,6 +47,13 @@ export interface StuckDelegateConfig {
     idleGraceMs: number;
     /** Max re-prompts per ticket. Default: 2. */
     maxPrompts: number;
+    /**
+     * Treat a ticket as having an active session if a pending dispatch ack exists
+     * within this threshold (ms). Guards against re-dispatching sessions that are
+     * still running but whose in-memory SessionTracker was lost to a restart.
+     * Default: 10 min. Set to 0 to disable.
+     */
+    sessionActiveThresholdMs: number;
 }
 export interface StuckDelegateDeps {
     sessionTracker: SessionTracker;
@@ -53,6 +61,8 @@ export interface StuckDelegateDeps {
     operationalEventStore: OperationalEventStore;
     /** Delivery config for sending re-prompt messages to agents. */
     deliveryConfig: DeliveryConfig;
+    /** Persisted dispatch ack tracker (SQLite). Survives restarts. Optional for backward compat. */
+    ackTracker?: DispatchAckTracker;
     /** Deliver a re-prompt wake signal to the agent. */
     sendWake?: (agentOpenclawName: string, ticketId: string, prompt: string) => Promise<boolean>;
     /** Overridable for testing. */
@@ -61,8 +71,8 @@ export interface StuckDelegateDeps {
     now?: () => number;
     /** Overridable for testing. */
     fetchStuckCandidates?: (agent: AgentConfig) => Promise<StuckCandidate[]>;
-    /** Overridable for testing — loads workflow def by id. */
-    loadDefById?: (workflowId: string) => Promise<WorkflowDef | null>;
+    /** Overridable for testing — loads workflow def. */
+    loadDef?: () => Promise<WorkflowDef>;
 }
 export interface StuckCandidate {
     identifier: string;
@@ -90,6 +100,8 @@ export interface StuckDelegateCycleResult {
     stuckFound: number;
     rePromptsSent: number;
     skippedAlreadyPrompted: number;
+    /** Candidates skipped because a pending dispatch ack suggests the session is still active. */
+    skippedSessionActive: number;
     errors: number;
 }
 /** Tracks how many times each ticket has been re-prompted. */
@@ -112,6 +124,8 @@ export declare class StuckDelegateDetector {
     private timer?;
     private config;
     private deps;
+    /** Persisted ack tracker — optional, stored separately since it has no default fallback. */
+    private ackTracker;
     private promptCounter;
     /** Tracks when sessions ended per (agent, sessionKey) for idle-grace calculation. */
     private sessionEndedAt;

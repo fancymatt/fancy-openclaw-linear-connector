@@ -67,6 +67,11 @@ export interface NoActivityDeps {
     getAgentMaxConcurrent?: (agentId: string) => number;
     /** Optional: per-agent config lookup (used to read maxConcurrent from AgentConfig). */
     getAgentConfig?: (agentId: string) => AgentConfig | undefined;
+    /** AI-1666: optional per-ticket no-activity fail threshold override in ms.
+     *  When provided and returns a number, that value replaces the global failMs
+     *  for this ticket. Return undefined to fall back to the global default.
+     *  Populated by workflow-gate after each state transition. */
+    getFailMsForTicket?: (agentId: string, ticketId: string) => number | undefined;
 }
 export interface NoActivityCycleResult {
     warned: number;

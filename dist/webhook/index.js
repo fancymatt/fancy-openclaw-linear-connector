@@ -248,7 +248,18 @@ export function createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, ses
         // Fires before the delegate-based router so a wf:* label-add with no
         // delegate can bootstrap the ticket into its entry state and set the
         // first-owner delegate — which then fires the normal dispatch path.
-        const bootstrapToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+        const bootstrapToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? (() => {
+            // Fallback: use any agent's OAuth token (needed when there's no
+            // generic service token in the env — e.g. ILL Tokyo deployment).
+            const agents = getAgents();
+            for (const a of agents) {
+                const t = getAccessToken(a.name);
+                if (t)
+                    return t;
+            }
+            return undefined;
+        })();
+        console.error(`[bootstrap-check] token=${bootstrapToken ? "yes" : "no"} agents=${getAgents().length} action=${event.action}`);
         if (bootstrapToken) {
             try {
                 const bootstrapResult = await maybeBootstrapWorkflow(event, bootstrapToken);

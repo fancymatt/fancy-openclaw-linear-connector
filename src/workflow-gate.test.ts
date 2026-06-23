@@ -5988,6 +5988,8 @@ describe("checkWorkflowRules — AI-1576 AC3: demote blocked when ticket has in-
   });
 });
 
+
+
 // ── AI-1658: addedLabelIds / removedLabelIds bypass ───────────────────────────
 // AC1: the gate checks touches("labelIds") for full-replace, but addedLabelIds /
 // removedLabelIds (Linear's additive/subtractive fields) are distinct keys and
@@ -6294,5 +6296,96 @@ describe("checkRawMutationInterception — AI-1658: stateId covers nativeStatus 
     expect(result).not.toBeNull();
     expect(result).toContain("[Proxy]");
     expect(result).toContain("Direct status");
+  });
+});
+
+// ── AI-1666: noActivityTimeout YAML schema (AC1) ──────────────────────────
+//
+// WorkflowState must declare an optional noActivityTimeout?: number field so
+// the no-activity detector can read per-state thresholds from the loaded def.
+//
+// Because js-yaml preserves unknown fields at runtime, the runtime value is
+// accessible even without the TypeScript declaration. The declaration is
+// required so the implementer can write `state.noActivityTimeout` without a
+// tsc error — the full build (npm run build) catches the missing type if it
+// is absent. These tests verify the runtime contract and document AC1.
+
+describe("AI-1666: WorkflowState.noActivityTimeout YAML schema (AC1)", () => {
+  let schemaTestDir: string;
+  let schemaWorkflowFile: string;
+  let schemaOriginalPath: string | undefined;
+
+  beforeEach(() => {
+    schemaTestDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-1666-schema-test-"));
+    schemaOriginalPath = process.env.WORKFLOW_DEF_PATH;
+    resetWorkflowCache();
+  });
+
+  afterEach(() => {
+    fs.rmSync(schemaTestDir, { recursive: true, force: true });
+    process.env.WORKFLOW_DEF_PATH = schemaOriginalPath;
+    resetWorkflowCache();
+  });
+
+  it("noActivityTimeout is preserved when parsing a workflow YAML state (AC1)", async () => {
+    // Write a minimal workflow YAML with noActivityTimeout on one state.
+    schemaWorkflowFile = path.join(schemaTestDir, "wf.yaml");
+    fs.writeFileSync(
+      schemaWorkflowFile,
+      [
+        "id: test-wf",
+        "break_glass:",
+        "  command: escape",
+        "  to: escape",
+        "states:",
+        "  - id: generating",
+        "    owner_role: image-artist",
+        "    native_state: doing",
+        "    noActivityTimeout: 600",
+        "  - id: escape",
+        "    kind: terminal",
+        "    native_state: invalid",
+      ].join("\n"),
+    );
+    process.env.WORKFLOW_DEF_PATH = schemaWorkflowFile;
+
+    // Use the namespace import so a missing export fails at assertion time.
+    const { loadWorkflowDef } = await import("./workflow-gate.js");
+    const def = await loadWorkflowDef();
+
+    const state = def.states.find((s) => s.id === "generating");
+    expect(state).toBeDefined();
+    // AC1: noActivityTimeout must be accessible on the WorkflowState object.
+    // js-yaml preserves the field at runtime; the TypeScript interface must also
+    // declare it (checked by tsc at build time).
+    expect((state as Record<string, unknown>)["noActivityTimeout"]).toBe(600);
+  });
+
+  it("states without noActivityTimeout return undefined for the field (AC1 — no spurious default)", async () => {
+    schemaWorkflowFile = path.join(schemaTestDir, "wf2.yaml");
+    fs.writeFileSync(
+      schemaWorkflowFile,
+      [
+        "id: test-wf2",
+        "break_glass:",
+        "  command: escape",
+        "  to: escape",
+        "states:",
+        "  - id: normal",
+        "    owner_role: dev",
+        "    native_state: doing",
+        "  - id: escape",
+        "    kind: terminal",
+        "    native_state: invalid",
+      ].join("\n"),
+    );
+    process.env.WORKFLOW_DEF_PATH = schemaWorkflowFile;
+
+    const { loadWorkflowDef: loadWf } = await import("./workflow-gate.js");
+    const def2 = await loadWf();
+
+    const state = def2.states.find((s) => s.id === "normal");
+    expect(state).toBeDefined();
+    expect((state as Record<string, unknown>)["noActivityTimeout"]).toBeUndefined();
   });
 });

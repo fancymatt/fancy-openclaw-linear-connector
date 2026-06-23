@@ -35,7 +35,7 @@
  *   - Children cannot address the parent (asymmetry enforced).
  */
 import { componentLogger, createLogger } from "./logger.js";
-import { loadWorkflowRegistry, getWorkflowId, getCurrentState } from "./workflow-gate.js";
+import { loadWorkflowDef, getWorkflowId, getCurrentState } from "./workflow-gate.js";
 import { LINEAR_API_URL, findOrCreateLabel, postComment, resolveInternalId, issueUpdateLabels, fetchIssueWithLabels, } from "./linear-helpers.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "barrier");
 /**
@@ -498,14 +498,14 @@ async function fetchChildStateEnteredAt(childIdentifier, authToken) {
     query ChildStateHistory($id: String!) {
       issue(id: $id) {
         labels { nodes { name } }
-        history(first: 100, orderBy: { createdAt: desc }) {
+        history(first: 100, orderBy: createdAt) {
           nodes {
             __typename
-            ... on IssueLabelPayload {
-              createdAt
-              fromLabel { name }
-              toLabel { name }
-            }
+            createdAt
+            addedLabelIds
+            removedLabelIds
+            fromState { name }
+            toState { name }
           }
         }
       }
@@ -528,9 +528,11 @@ async function fetchChildStateEnteredAt(childIdentifier, authToken) {
             return null;
         const stateLabel = `state:${currentState}`;
         const historyNodes = issue.history?.nodes ?? [];
-        // Find the most recent history event where the state:* label was set to the current state
+        // Find the most recent history entry as a best-effort state entry timestamp.
+        // In the new Linear schema, IssueLabelPayload no longer exists — history entries
+        // are flat IssueHistory objects with fromState/toState for native state changes.
         for (const node of historyNodes) {
-            if (node.__typename === "IssueLabelPayload" && node.toLabel?.name === stateLabel && node.createdAt) {
+            if (node.createdAt) {
                 return new Date(node.createdAt).getTime();
             }
         }
@@ -564,15 +566,17 @@ async function fetchChildStateEnteredAt(childIdentifier, authToken) {
 export async function detectStalledChildren(parentIdentifier, authToken, stallThresholdMs = DEFAULT_STALL_THRESHOLD_MS, now = Date.now(), workflowDef, accountant) {
     const children = await fetchChildren(parentIdentifier, authToken);
     const stalled = [];
-    // Load workflow registry once for per-child def resolution
-    let registry = null;
-    const getDef = async (wfId) => {
-        if (!wfId)
-            return null;
-        if (!registry)
-            registry = await loadWorkflowRegistry();
-        return registry.get(wfId) ?? null;
-    };
+    // Load workflow def if not provided
+    let def = workflowDef;
+    if (!def) {
+        try {
+            def = await loadWorkflowDef();
+        }
+        catch {
+            // Fallback to legacy flat-threshold behavior if workflow def unavailable
+            log.warn("barrier: workflow def unavailable, using flat stall threshold");
+        }
+    }
     const acct = accountant ?? deferralAccountant;
     for (const child of children) {
         if (child.isTerminal)
@@ -584,12 +588,10 @@ export async function detectStalledChildren(parentIdentifier, authToken, stallTh
         // Fetch state-entry time for per-state SLA
         const stateEnteredAt = await fetchChildStateEnteredAt(child.identifier, authToken);
         const timeInStateMs = stateEnteredAt !== null ? now - stateEnteredAt : idleDurationMs;
-        // Look up per-state SLA from the child's workflow def
-        const childWfId = getWorkflowId(child.labels);
-        const childDef = childWfId ? await getDef(childWfId) : workflowDef ?? null;
+        // Look up per-state SLA from workflow def (duration string → ms)
         let stateSlaMs = null;
-        if (childDef && child.workflowState) {
-            const stateDef = childDef.states.find((s) => s.id === child.workflowState);
+        if (def && child.workflowState) {
+            const stateDef = def.states.find((s) => s.id === child.workflowState);
             if (stateDef?.sla) {
                 stateSlaMs = parseSlaToMs(stateDef.sla);
             }

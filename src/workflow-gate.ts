@@ -112,6 +112,11 @@ export interface WorkflowState {
   /** §5.5: per-state SLA as a duration string (e.g. "24h", "90m", "3600000").
    *  Time-in-state beyond this trips stall escalation (parsed to ms by barrier). */
   sla?: string;
+  /** AI-1666: per-state no-activity timeout in seconds. Overrides the global
+   *  NO_ACTIVITY_FAIL_MS for dispatches in this state. Steps with no override
+   *  inherit the global default. Use for states with known-slow sub-processes
+   *  (e.g. image generation) to avoid spurious failure re-dispatches. */
+  noActivityTimeout?: number;
   transitions?: WorkflowTransition[];
 }
 
@@ -311,6 +316,28 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
 /** Invalidate the in-process workflow registry cache (used in tests & live-reload). */
 export function resetWorkflowCache(): void {
   _registryCache = null;
+}
+
+// ── AI-1666: Per-ticket no-activity timeout cache ─────────────────────────
+// Populated by applyStateTransition when a ticket enters a state that declares
+// noActivityTimeout. Keyed by uppercase Linear identifier (e.g. "AI-1234").
+// The no-activity detector reads this to use per-state timeouts instead of the
+// global default. Cleared when the ticket leaves a state with a custom timeout.
+
+const _noActivityTimeoutCache = new Map<string, number>();
+
+function _noActivityTimeoutKey(issueId: string): string {
+  return issueId.replace(/^linear-/i, "").trim().toUpperCase();
+}
+
+/** Return the per-state no-activity timeout in ms for this ticket, or undefined. */
+export function getTicketNoActivityTimeoutMs(ticketId: string): number | undefined {
+  return _noActivityTimeoutCache.get(_noActivityTimeoutKey(ticketId));
+}
+
+/** Test helper — reset the no-activity timeout cache between cases. */
+export function _resetNoActivityTimeoutCache(): void {
+  _noActivityTimeoutCache.clear();
 }
 
 /**
@@ -2157,6 +2184,18 @@ export async function applyStateTransition(
     // per-step delivery prefers it over a lag-prone live label read. Keyed by
     // the human identifier to match build-message's lookup key.
     recordAppliedState(issue.identifier, toStateName);
+
+    // AI-1666: cache per-state no-activity timeout for the newly-entered state.
+    const noActivityTimeoutSecs = destStateNode?.noActivityTimeout;
+    const cacheKey = issue.identifier?.toUpperCase();
+    if (cacheKey) {
+      if (typeof noActivityTimeoutSecs === "number" && noActivityTimeoutSecs > 0) {
+        _noActivityTimeoutCache.set(cacheKey, noActivityTimeoutSecs * 1000);
+      } else {
+        _noActivityTimeoutCache.delete(cacheKey);
+      }
+    }
+
     log.info(
       `workflow-gate: B2 apply: ${issueId} state:${currentStateName} → state:${toStateName}` +
       (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +

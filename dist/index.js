@@ -15,6 +15,7 @@ import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
 import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, StuckDelegateDetector, HoldRetryTracker, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
 import { sendWakeUpSignal } from "./bag/wake-up.js";
+import { getTicketNoActivityTimeoutMs } from "./workflow-gate.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
@@ -309,7 +310,7 @@ export function createApp(options) {
     }
     const watchdog = new DispatchWatchdog({ bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions });
     watchdog.start();
-    const noActivityDetector = new NoActivityDetector({ sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions, postLinearComment });
+    const noActivityDetector = new NoActivityDetector({ sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent, resignalOptions, postLinearComment, getFailMsForTicket: (_agentId, ticketId) => getTicketNoActivityTimeoutMs(ticketId) });
     noActivityDetector.start();
     // ── Stuck-delegate detector (AI-1578 / AI-1451) ──────────────────────
     // Re-prompts delegates who posted a completion comment but never ran the
@@ -322,6 +323,7 @@ export function createApp(options) {
     const stuckDelegateDetector = new StuckDelegateDetector({
         sessionTracker,
         bag,
+        ackTracker,
         operationalEventStore,
         deliveryConfig: wakeConfig,
         sendWake: async (agentOpenclawName, ticketId, prompt) => {
@@ -460,7 +462,7 @@ export function createApp(options) {
         res.json({ ok: true });
     });
     // v1 admin dashboard — read-only operational UI and safe JSON API.
-    app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, deploymentName: DEPLOYMENT_NAME, wakeConfigForAgent }));
+    app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, deploymentName: DEPLOYMENT_NAME }));
     app.use("/", createWebhookRouter(eventStore, nudgeStore, agentQueue, bag, sessionTracker, throttle, operationalEventStore, (agentId, ticketId) => {
         ackTracker.recordDispatch(agentId, ticketId);
         // AI-1510: agent has read the ticket via the connector → Thinking.

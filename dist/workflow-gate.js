@@ -239,6 +239,23 @@ export async function loadWorkflowRegistry() {
 export function resetWorkflowCache() {
     _registryCache = null;
 }
+// ── AI-1666: Per-ticket no-activity timeout cache ─────────────────────────
+// Populated by applyStateTransition when a ticket enters a state that declares
+// noActivityTimeout. Keyed by uppercase Linear identifier (e.g. "AI-1234").
+// The no-activity detector reads this to use per-state timeouts instead of the
+// global default. Cleared when the ticket leaves a state with a custom timeout.
+const _noActivityTimeoutCache = new Map();
+function _noActivityTimeoutKey(issueId) {
+    return issueId.replace(/^linear-/i, "").trim().toUpperCase();
+}
+/** Return the per-state no-activity timeout in ms for this ticket, or undefined. */
+export function getTicketNoActivityTimeoutMs(ticketId) {
+    return _noActivityTimeoutCache.get(_noActivityTimeoutKey(ticketId));
+}
+/** Test helper — reset the no-activity timeout cache between cases. */
+export function _resetNoActivityTimeoutCache() {
+    _noActivityTimeoutCache.clear();
+}
 /**
  * AI-1498: Semantic-to-native mapping — mirrors the CLI's SEMANTIC_STATE_MAP
  * so the proxy can resolve native Linear stateId UUIDs without depending on the CLI.
@@ -1688,6 +1705,17 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
         // per-step delivery prefers it over a lag-prone live label read. Keyed by
         // the human identifier to match build-message's lookup key.
         recordAppliedState(issue.identifier, toStateName);
+        // AI-1666: cache per-state no-activity timeout for the newly-entered state.
+        const noActivityTimeoutSecs = destStateNode?.noActivityTimeout;
+        const cacheKey = issue.identifier?.toUpperCase();
+        if (cacheKey) {
+            if (typeof noActivityTimeoutSecs === "number" && noActivityTimeoutSecs > 0) {
+                _noActivityTimeoutCache.set(cacheKey, noActivityTimeoutSecs * 1000);
+            }
+            else {
+                _noActivityTimeoutCache.delete(cacheKey);
+            }
+        }
         log.info(`workflow-gate: B2 apply: ${issueId} state:${currentStateName} → state:${toStateName}` +
             (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
             (resolvedNativeStateId ? ` native=${destNativeState}(${resolvedNativeStateId})` : ``));

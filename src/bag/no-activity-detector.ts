@@ -81,6 +81,11 @@ export interface NoActivityDeps {
   getAgentMaxConcurrent?: (agentId: string) => number;
   /** Optional: per-agent config lookup (used to read maxConcurrent from AgentConfig). */
   getAgentConfig?: (agentId: string) => AgentConfig | undefined;
+  /** AI-1666: optional per-ticket no-activity fail threshold override in ms.
+   *  When provided and returns a number, that value replaces the global failMs
+   *  for this ticket. Return undefined to fall back to the global default.
+   *  Populated by workflow-gate after each state transition. */
+  getFailMsForTicket?: (agentId: string, ticketId: string) => number | undefined;
 }
 
 export interface NoActivityCycleResult {
@@ -294,7 +299,10 @@ export class NoActivityDetector {
       const ageMs = now - dispatchedAt;
       const sessionKeyWarn = `${agentId}:${sessionKey}`;
 
-      if (ageMs >= this.config.failMs) {
+      // AI-1666: use per-state no-activity timeout when available.
+      const effectiveFailMs = this.deps.getFailMsForTicket?.(agentId, ticketId) ?? this.config.failMs;
+
+      if (ageMs >= effectiveFailMs) {
         // Check capacity before deciding: at-capacity → defer; hard-down → escalate
         const activeCount = sessionTracker.getActiveSessionKeys(agentId).length;
         const maxConcurrent = this.getAgentMaxConcurrentValue(agentId);
@@ -303,7 +311,7 @@ export class NoActivityDetector {
           result.deferredAtCapacity++;
           continue;
         }
-        // Hard fail — session produced no activity for >failMs and agent is not at capacity
+        // Hard fail — session produced no activity for >effectiveFailMs and agent is not at capacity
         const deferred = await this.handleFailure(entry, sessionKey);
         if (deferred) {
           result.deferredAtCapacity++;
@@ -316,7 +324,7 @@ export class NoActivityDetector {
           this.warnedSessions.add(sessionKeyWarn);
           log.warn(
             `No activity detected for ${agentId} [${sessionKey}] ` +
-            `(${Math.round(ageMs / 1000)}s since dispatch, fail threshold at ${Math.round(this.config.failMs / 1000)}s)`,
+            `(${Math.round(ageMs / 1000)}s since dispatch, fail threshold at ${Math.round(effectiveFailMs / 1000)}s)`,
           );
           operationalEventStore.append({
             outcome: "no-activity-warn",
@@ -329,7 +337,7 @@ export class NoActivityDetector {
               dispatchedAt: entry.dispatchedAt,
               ageMs,
               warnThresholdMs: this.config.warnMs,
-              failThresholdMs: this.config.failMs,
+              failThresholdMs: effectiveFailMs,
             },
           });
           result.warned++;

@@ -94,6 +94,16 @@ export declare class DispatchAckTracker {
      */
     getDeferredStale(staleMs: number): DispatchAckEntry[];
     /**
+     * Return true if there is a pending/unconfirmed dispatch for (agentId, ticketId)
+     * whose dispatched_at is within the last withinMs milliseconds.
+     *
+     * Used by StuckDelegateDetector (AI-1650) to guard against re-dispatching a
+     * session that is still actively running after a connector restart. The in-memory
+     * SessionTracker is reset on restart, so this persisted check is the only way to
+     * know a session was recently dispatched and may still be in progress.
+     */
+    hasRecentPending(agentId: string, ticketId: string, withinMs: number): boolean;
+    /**
      * Prune acknowledged and escalated records older than ttlMs.
      * Called automatically at the end of each watchdog cycle.
      */

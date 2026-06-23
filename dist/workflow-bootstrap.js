@@ -17,6 +17,7 @@ import { componentLogger, createLogger } from "./logger.js";
 import { loadWorkflowRegistry } from "./workflow-gate.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
 import { findOrCreateLabel } from "./linear-helpers.js";
+import { getAgents, getAccessToken } from "./agents.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "workflow-bootstrap");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 // ── Agents loader ─────────────────────────────────────────────────────────────
@@ -110,20 +111,59 @@ export async function maybeBootstrapWorkflow(event, authToken) {
     const previousSet = new Set(previousLabelIds);
     const addedIds = currentLabelIds.filter((id) => !previousSet.has(id));
     const removedIds = previousLabelIds.filter((id) => !currentSet.has(id));
-    if (addedIds.length === 0 && removedIds.length === 0)
+    if (addedIds.length === 0 && removedIds.length === 0) {
+        console.error(`[bootstrap-dbg] no label delta: current=${currentLabelIds.length} previous=${previousLabelIds.length} updatedFrom=${!!updatedFrom} dataKeys=${Object.keys(issueEvent.data).join(",")} rawLabelIds=${JSON.stringify(issueEvent.raw?.data?.labelIds ?? "missing")} updatedFromKeys=${updatedFrom ? Object.keys(updatedFrom).join(",") : "none"}`);
         return null;
+    }
+    console.error(`[bootstrap-dbg] added=${addedIds.length} removed=${removedIds.length} currentLabels=${currentLabelIds.length} previousLabels=${previousLabelIds.length} updatedFromLen=${Array.isArray(updatedFrom?.labelIds) ? updatedFrom.labelIds.length : "none"}`);
     // Fetch current label names — needed to distinguish wf:* from state:* by ID.
+    // Try the provided token first; if issue fetch fails, fall back to other
+    // agent tokens (the provided token may lack access to the issue's team).
     let issue = null;
+    let effectiveToken = authToken; // may be replaced by a fallback token
+    const triedTokens = [];
+    const tryFetch = async (token) => {
+        triedTokens.push(token.slice(0, 8) + "...");
+        return fetchIssueContext(issueEvent.data.id, token);
+    };
     try {
-        issue = await fetchIssueContext(issueEvent.data.id, authToken);
+        issue = await tryFetch(authToken);
     }
     catch {
+        /* fall through to fallback */
+    }
+    if (!issue) {
+        // Fallback: try other agent tokens that may have access to this issue's team.
+        try {
+            const agents = getAgents();
+            for (const a of agents) {
+                const t = getAccessToken(a.name);
+                if (!t || t === authToken)
+                    continue; // skip the one we already tried
+                try {
+                    issue = await tryFetch(t);
+                    if (issue) {
+                        console.error(`[bootstrap-dbg] fallback token from agent '${a.name}' succeeded for issue ${issueEvent.data.id}`);
+                        effectiveToken = t;
+                        break;
+                    }
+                }
+                catch {
+                    continue;
+                }
+            }
+        }
+        catch {
+            /* give up */
+        }
+    }
+    if (!issue) {
+        console.error(`[bootstrap-dbg] fetchIssueContext returned null for issue ${issueEvent.data.id} (tried ${triedTokens.length} token(s))`);
         return null;
     }
-    if (!issue)
-        return null;
     const currentWfLabelNode = issue.labels.find((n) => n.name.startsWith("wf:"));
     const currentStateLabels = issue.labels.filter((n) => n.name.startsWith("state:"));
+    console.error(`[bootstrap-dbg] issue=${issue.identifier} labels=[${issue.labels.map(l => l.name).join(",")}] wfLabel=${currentWfLabelNode?.name ?? "none"} stateLabels=${currentStateLabels.length} addedIds=[${addedIds.join(",")}]`);
     // ── Bootstrap path: a wf:* label was newly added ──────────────────────────
     if (addedIds.length > 0 && currentWfLabelNode && addedIds.includes(currentWfLabelNode.id)) {
         // Idempotency: if state:* is already present, this ticket is already in-flight.
@@ -149,9 +189,22 @@ export async function maybeBootstrapWorkflow(event, authToken) {
         // Resolve first-owner delegate from capability policy.
         let delegateLinearUserId;
         let delegateAgentName;
-        if (ownerRole) {
+        let delegateRole = entryStateDef?.owner_role;
+        if (delegateRole) {
             try {
-                const bodies = await resolveBodiesForRole(ownerRole);
+                let bodies = await resolveBodiesForRole(delegateRole);
+                // If the entry role has no bodies (e.g. synthetic "engine" role),
+                // look ahead to the first transition target's owner_role.
+                if (bodies.length === 0 && entryStateDef?.transitions?.length) {
+                    const firstTransTarget = def.states.find((s) => s.id === entryStateDef.transitions[0].to);
+                    const nextRole = firstTransTarget?.owner_role;
+                    if (nextRole && nextRole !== delegateRole) {
+                        console.error(`[bootstrap-dbg] entry role '${delegateRole}' has no bodies — falling through to next state role '${nextRole}'`);
+                        bodies = await resolveBodiesForRole(nextRole);
+                        if (bodies.length > 0)
+                            delegateRole = nextRole;
+                    }
+                }
                 if (bodies.length === 1) {
                     delegateAgentName = bodies[0];
                     const agents = await loadAgents();
@@ -165,17 +218,17 @@ export async function maybeBootstrapWorkflow(event, authToken) {
                 }
             }
             catch (err) {
-                log.warn(`workflow-bootstrap: role resolution failed for '${ownerRole}': ${err instanceof Error ? err.message : String(err)}`);
+                log.warn(`workflow-bootstrap: role resolution failed for '${delegateRole}': ${err instanceof Error ? err.message : String(err)}`);
             }
         }
         // Find or create the entry state label.
-        const stateLabelId = await findOrCreateLabel(issue.teamId, `state:${entryState}`, authToken);
+        const stateLabelId = await findOrCreateLabel(issue.teamId, `state:${entryState}`, effectiveToken);
         if (!stateLabelId) {
             log.warn(`workflow-bootstrap: could not resolve label 'state:${entryState}' — aborting bootstrap`);
             return null;
         }
         const newLabelIds = Array.from(new Set([...currentLabelIds, stateLabelId]));
-        const success = await issueUpdateAtomic(issue.id, newLabelIds, authToken, delegateLinearUserId);
+        const success = await issueUpdateAtomic(issue.id, newLabelIds, effectiveToken, delegateLinearUserId);
         if (!success) {
             log.warn(`workflow-bootstrap: issueUpdate returned non-success for ${issueEvent.data.id}`);
         }
@@ -188,7 +241,7 @@ export async function maybeBootstrapWorkflow(event, authToken) {
     if (removedIds.length > 0 && !currentWfLabelNode && currentStateLabels.length > 0) {
         const stateLabelIds = new Set(currentStateLabels.map((n) => n.id));
         const newLabelIds = currentLabelIds.filter((id) => !stateLabelIds.has(id));
-        await issueUpdateAtomic(issue.id, newLabelIds, authToken);
+        await issueUpdateAtomic(issue.id, newLabelIds, effectiveToken);
         log.info(`workflow-bootstrap: demoted ${issueEvent.data.id} — removed [${currentStateLabels.map((n) => n.name).join(", ")}]`);
         return { action: "demoted" };
     }
