@@ -33,5 +33,7 @@ export function defaultCapabilityPolicyPath(): string {
 }
 
 export function defaultGuidanceDir(): string {
-  return path.join(instanceConfigRoot(), "guidance");
+  // Guidance files live alongside their workflow YAML definitions:
+  // {configRoot}/workflows/{workflowId}/{state}.md
+  return path.join(instanceConfigRoot(), "workflows");
 }
