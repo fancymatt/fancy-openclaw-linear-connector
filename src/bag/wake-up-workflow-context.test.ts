@@ -1,12 +1,14 @@
 /**
- * Tests for AI-1665 — Include workflow context in connector wake-up delivery message.
+ * Tests for AI-1671 — Include workflow context and legal verb set in agent delivery messages (v2).
+ * Re-entry of AI-1659 after escape; test coverage for all 4 AC items.
  *
  * Verifies buildWorkflowAwareWakeUpMessage:
  *   AC1: Governed single-ticket delivery messages include the current state name and
  *        the legal verb set for that state.
  *   AC2: Non-governed (ad-hoc) ticket wake-ups are unchanged.
  *   AC3: The verb list is derived from the workflow YAML, not hardcoded.
- *   AC4: Delivery message for a governed ticket contains the correct verbs for its state.
+ *   AC4: Delivery message for a briefing-state ticket contains brief-ready and does
+ *        not contain unrelated verbs like accept or submit.
  */
 
 import fs from "node:fs";
@@ -92,7 +94,7 @@ states:
     native_state: invalid
 `;
 
-// VOC workflow — distinct verb names to prove verbs derive from YAML (AC3)
+// VOC workflow — distinct verb names to prove verbs derive from YAML (AC3 / AC4)
 const VOC_YAML = `
 id: voc
 version: 1
@@ -199,7 +201,7 @@ describe("AC1 — governed single-ticket delivery message includes state name an
   it("includes the current state name in the message", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:write-tests"]);
 
-    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1665"], "Bearer tok");
+    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1671"], "Bearer tok");
 
     expect(msg).toContain("write-tests");
   });
@@ -207,7 +209,7 @@ describe("AC1 — governed single-ticket delivery message includes state name an
   it("includes the legal verb for write-tests state (tests-ready)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:write-tests"]);
 
-    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1665"], "Bearer tok");
+    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1671"], "Bearer tok");
 
     expect(msg).toContain("tests-ready");
   });
@@ -215,7 +217,7 @@ describe("AC1 — governed single-ticket delivery message includes state name an
   it("includes the break-glass escape verb", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:write-tests"]);
 
-    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1665"], "Bearer tok");
+    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1671"], "Bearer tok");
 
     expect(msg).toContain("escape");
   });
@@ -223,9 +225,9 @@ describe("AC1 — governed single-ticket delivery message includes state name an
   it("still includes consider-work so agent can fetch full ticket context", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:write-tests"]);
 
-    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1665"], "Bearer tok");
+    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1671"], "Bearer tok");
 
-    expect(msg).toContain("linear consider-work AI-1665");
+    expect(msg).toContain("linear consider-work AI-1671");
   });
 
   it("intake state includes accept verb and intake state name", async () => {
@@ -249,10 +251,10 @@ describe("AC1 — governed single-ticket delivery message includes state name an
   it("strips linear- session-key prefix from ticket ID in the message", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:write-tests"]);
 
-    const msg = await buildWorkflowAwareWakeUpMessage(["linear-AI-1665"], "Bearer tok");
+    const msg = await buildWorkflowAwareWakeUpMessage(["linear-AI-1671"], "Bearer tok");
 
-    expect(msg).toContain("AI-1665");
-    expect(msg).not.toContain("linear-AI-1665");
+    expect(msg).toContain("AI-1671");
+    expect(msg).not.toContain("linear-AI-1671");
   });
 });
 
@@ -280,8 +282,8 @@ describe("AC2 — non-governed ticket wake-ups are unchanged", () => {
   it("multi-ticket (2 tickets) → unchanged generic multi-ticket output", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:write-tests"]);
 
-    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1665", "AI-1666"], "Bearer tok");
-    const expected = buildWakeUpMessage(["AI-1665", "AI-1666"]);
+    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1671", "AI-1666"], "Bearer tok");
+    const expected = buildWakeUpMessage(["AI-1671", "AI-1666"]);
 
     expect(msg).toBe(expected);
   });
@@ -293,8 +295,8 @@ describe("AC2 — non-governed ticket wake-ups are unchanged", () => {
       throw new Error("should not be called");
     };
 
-    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1665"]);
-    const expected = buildWakeUpMessage(["AI-1665"]);
+    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1671"]);
+    const expected = buildWakeUpMessage(["AI-1671"]);
 
     expect(msg).toBe(expected);
     expect(fetchCalled).toBe(false);
@@ -305,8 +307,8 @@ describe("AC2 — non-governed ticket wake-ups are unchanged", () => {
       throw new Error("network error");
     };
 
-    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1665"], "Bearer tok");
-    const expected = buildWakeUpMessage(["AI-1665"]);
+    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1671"], "Bearer tok");
+    const expected = buildWakeUpMessage(["AI-1671"]);
 
     expect(msg).toBe(expected);
   });
@@ -318,12 +320,12 @@ describe("AC3 — verb list is derived from the workflow YAML, not hardcoded", (
   it("write-tests state lists tests-ready (from dev-impl YAML), not submit or approve", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:write-tests"]);
 
-    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1665"], "Bearer tok");
+    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1671"], "Bearer tok");
 
     expect(msg).toContain("tests-ready");
     // submit belongs to implementation; approve to code-review — not legal in write-tests
-    expect(msg).not.toContain("linear submit AI-1665");
-    expect(msg).not.toContain("linear approve AI-1665");
+    expect(msg).not.toContain("linear submit AI-1671");
+    expect(msg).not.toContain("linear approve AI-1671");
   });
 
   it("code-review state lists approve and request-changes (from dev-impl YAML)", async () => {
@@ -365,7 +367,7 @@ states:
     kind: normal
     native_state: todo
     transitions:
-      - command: unique-custom-verb-ai1665
+      - command: unique-custom-verb-ai1671
         to: done
         assign: { mode: auto }
 
@@ -377,7 +379,7 @@ states:
     kind: terminal
     native_state: invalid
 `;
-    const customYamlPath = path.join(tmpDir, "custom-ai1665.yaml");
+    const customYamlPath = path.join(tmpDir, "custom-ai1671.yaml");
     fs.writeFileSync(customYamlPath, customYaml, "utf8");
     process.env.WORKFLOW_DEF_PATH = customYamlPath;
     resetWorkflowCache();
@@ -386,49 +388,79 @@ states:
 
     const msg = await buildWorkflowAwareWakeUpMessage(["AI-500"], "Bearer tok");
 
-    expect(msg).toContain("unique-custom-verb-ai1665");
+    expect(msg).toContain("unique-custom-verb-ai1671");
     expect(msg).not.toContain("tests-ready");
     expect(msg).not.toContain("accept");
   });
 });
 
-// ── AC4: Governed ticket contains correct verbs for its state ─────────────
+// ── AC4: Briefing-state ticket contains brief-ready, not accept or submit ──
 
-describe("AC4 — delivery message for a governed ticket contains the correct verbs for its state", () => {
+describe("AC4 — delivery message for a briefing-state ticket contains brief-ready and does not contain unrelated verbs like accept or submit", () => {
+  it("briefing-state ticket includes brief-ready", async () => {
+    process.env.WORKFLOW_DEF_PATH = vocYamlPath;
+    resetWorkflowCache();
+    globalThis.fetch = makeLabelFetch(["wf:voc", "state:briefing"]);
+
+    const msg = await buildWorkflowAwareWakeUpMessage(["VOC-10"], "Bearer tok");
+
+    expect(msg).toContain("brief-ready");
+  });
+
+  it("briefing-state ticket does not contain accept (accept belongs to dev-impl intake, not briefing)", async () => {
+    process.env.WORKFLOW_DEF_PATH = vocYamlPath;
+    resetWorkflowCache();
+    globalThis.fetch = makeLabelFetch(["wf:voc", "state:briefing"]);
+
+    const msg = await buildWorkflowAwareWakeUpMessage(["VOC-10"], "Bearer tok");
+
+    expect(msg).not.toContain("linear accept VOC-10");
+  });
+
+  it("briefing-state ticket does not contain submit (submit belongs to generating, not briefing)", async () => {
+    process.env.WORKFLOW_DEF_PATH = vocYamlPath;
+    resetWorkflowCache();
+    globalThis.fetch = makeLabelFetch(["wf:voc", "state:briefing"]);
+
+    const msg = await buildWorkflowAwareWakeUpMessage(["VOC-10"], "Bearer tok");
+
+    // submit is legal in generating (a later state) but NOT in briefing
+    expect(msg).not.toContain("linear submit VOC-10");
+  });
+
   it("write-tests ticket contains tests-ready (its only forward transition)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:write-tests"]);
 
-    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1665"], "Bearer tok");
+    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1671"], "Bearer tok");
 
-    // tests-ready is the only legal forward move from write-tests
     expect(msg).toContain("tests-ready");
   });
 
   it("intake ticket contains accept but not tests-ready or submit", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
 
-    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1665"], "Bearer tok");
+    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1671"], "Bearer tok");
 
     expect(msg).toContain("accept");
     expect(msg).not.toContain("tests-ready");
-    expect(msg).not.toContain("linear submit AI-1665");
+    expect(msg).not.toContain("linear submit AI-1671");
   });
 
   it("implementation ticket contains submit but not tests-ready or approve", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
 
-    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1665"], "Bearer tok");
+    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1671"], "Bearer tok");
 
     expect(msg).toContain("submit");
     expect(msg).not.toContain("tests-ready");
-    expect(msg).not.toContain("linear approve AI-1665");
+    expect(msg).not.toContain("linear approve AI-1671");
   });
 
   it("unknown state on governed ticket → falls back to generic message", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:nonexistent-state"]);
 
-    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1665"], "Bearer tok");
-    const expected = buildWakeUpMessage(["AI-1665"]);
+    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1671"], "Bearer tok");
+    const expected = buildWakeUpMessage(["AI-1671"]);
 
     expect(msg).toBe(expected);
   });
@@ -436,8 +468,8 @@ describe("AC4 — delivery message for a governed ticket contains the correct ve
   it("governed ticket with missing state:* label → falls back to generic message", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl"]); // no state:* label
 
-    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1665"], "Bearer tok");
-    const expected = buildWakeUpMessage(["AI-1665"]);
+    const msg = await buildWorkflowAwareWakeUpMessage(["AI-1671"], "Bearer tok");
+    const expected = buildWakeUpMessage(["AI-1671"]);
 
     expect(msg).toBe(expected);
   });
