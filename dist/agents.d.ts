@@ -58,6 +58,11 @@ export declare function getAgent(agentName: string): AgentConfig | undefined;
 export declare function getAgentByProxyToken(token: string): AgentConfig | undefined;
 /** Get the OpenClaw agent name for routing */
 export declare function getOpenclawAgentName(agentName: string): string;
+/**
+ * Resolve the Linear user ID for an OpenClaw agent ID (the value returned by
+ * `getOpenclawAgentName`). Returns undefined for unrecognized agents.
+ */
+export declare function getLinearUserIdForAgent(openclawAgentId: string): string | undefined;
 /** Update tokens for an agent and persist to disk */
 export declare function updateTokens(agentName: string, accessToken: string, refreshToken: string): void;
 /** Add or update an agent from OAuth callback */

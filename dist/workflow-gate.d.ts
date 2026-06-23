@@ -53,6 +53,10 @@ export interface WorkflowTransition {
     capture_ac?: boolean;
     /** Phase 6.5 / H-7 (AI-1482): if true, requires human sign-off when stakes >= threshold. */
     requires_human_signoff_above_stakes?: boolean;
+    /** If true, a comment must accompany this transition. Surfaced in delivery messages and enforced by the CLI. */
+    requires_comment?: boolean;
+    /** Generic transition role: 'continue' maps to `linear continue-workflow`, 'revision' maps to `linear request-revision`. */
+    generic?: 'continue' | 'revision';
 }
 export interface WorkflowState {
     id: string;
@@ -221,6 +225,20 @@ export declare function fetchWorkflowLabels(issueId: string, authToken: string):
  */
 export declare function resolveStakesLevel(labels: string[], stakesConfig: StakesLevel): number;
 /**
+ * Resolve a meta-intent (`continue-workflow` or `request-revision`) to the actual
+ * workflow transition command name for the ticket's current state.
+ *
+ * Returns `{ resolved: commandName }` on success, or `{ error: rejectionMessage }` if
+ * the meta-intent cannot be resolved (non-workflow ticket, no matching transition, etc.).
+ *
+ * For non-meta intents, passes through with `{ resolved: intent }`.
+ */
+export declare function resolveMetaIntent(intent: string, issueId: string, authToken: string): Promise<{
+    resolved: string;
+} | {
+    error: string;
+}>;
+/**
  * Evaluate full workflow-def-driven command validation for an inbound proxied request.
  *
  * Returns a rejection message when the command should be blocked, or null to forward.
@@ -252,7 +270,7 @@ export declare function checkRawMutationInterception(body: {
     query?: string;
     variables?: Record<string, unknown>;
     operationName?: string;
-} | null, issueId: string | null, authToken: string, bodyId?: string, callerLinearUserId?: string | null): Promise<string | null>;
+} | null, issueId: string | null, authToken: string, bodyId?: string, callerLinearUserId?: string | null, skipCommentCreate?: boolean): Promise<string | null>;
 /**
  * Generate a legal-verb reminder for the NEW state after a successful transition.
  *

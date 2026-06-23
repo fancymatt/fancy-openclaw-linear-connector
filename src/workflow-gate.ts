@@ -99,6 +99,10 @@ export interface WorkflowTransition {
   capture_ac?: boolean;
   /** Phase 6.5 / H-7 (AI-1482): if true, requires human sign-off when stakes >= threshold. */
   requires_human_signoff_above_stakes?: boolean;
+  /** If true, a comment must accompany this transition. Surfaced in delivery messages and enforced by the CLI. */
+  requires_comment?: boolean;
+  /** Generic transition role: 'continue' maps to `linear continue-workflow`, 'revision' maps to `linear request-revision`. */
+  generic?: 'continue' | 'revision';
 }
 
 export interface WorkflowState {
@@ -884,6 +888,72 @@ export function resolveStakesLevel(labels: string[], stakesConfig: StakesLevel):
 // ── Public enforcement API ─────────────────────────────────────────────────
 
 /**
+ * Resolve a meta-intent (`continue-workflow` or `request-revision`) to the actual
+ * workflow transition command name for the ticket's current state.
+ *
+ * Returns `{ resolved: commandName }` on success, or `{ error: rejectionMessage }` if
+ * the meta-intent cannot be resolved (non-workflow ticket, no matching transition, etc.).
+ *
+ * For non-meta intents, passes through with `{ resolved: intent }`.
+ */
+export async function resolveMetaIntent(
+  intent: string,
+  issueId: string,
+  authToken: string,
+): Promise<{ resolved: string } | { error: string }> {
+  if (intent !== 'continue-workflow' && intent !== 'request-revision') {
+    return { resolved: intent };
+  }
+
+  const { labels, fetchFailed } = await fetchTicketContext(issueId, authToken);
+  if (fetchFailed) {
+    return { error: `[Proxy] '${intent}' blocked: unable to fetch ticket context for ${issueId}.` };
+  }
+
+  const workflowId = getWorkflowId(labels);
+  if (!workflowId) {
+    return { error: `[Proxy] '${intent}' is only valid on workflow tickets (ticket has no wf:* label).` };
+  }
+
+  let def: WorkflowDef;
+  try {
+    const registry = await loadWorkflowRegistry();
+    const d = registry.get(workflowId);
+    if (!d) {
+      return { error: `[Proxy] '${intent}': workflow '${workflowId}' is not registered.` };
+    }
+    def = d;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { error: `[Proxy] '${intent}' blocked: workflow registry unavailable (${msg}).` };
+  }
+
+  const currentState = getCurrentState(labels);
+  if (!currentState) {
+    return { error: `[Proxy] '${intent}' blocked: ticket has no current workflow state label.` };
+  }
+
+  const stateNode = def.states.find((s) => s.id === currentState);
+  if (!stateNode) {
+    return { error: `[Proxy] '${intent}' blocked: current state '${currentState}' not found in workflow definition.` };
+  }
+
+  const genericRole: 'continue' | 'revision' = intent === 'continue-workflow' ? 'continue' : 'revision';
+  const transition = stateNode.transitions?.find((t) => t.generic === genericRole);
+
+  if (!transition) {
+    const available = stateNode.transitions?.map((t) => t.command).join(', ') ?? 'none';
+    return {
+      error:
+        `[Proxy] '${intent}' has no ${genericRole} transition in state '${currentState}' ` +
+        `(wf:${workflowId}). Available named commands: ${available}.`,
+    };
+  }
+
+  return { resolved: transition.command };
+}
+
+/**
  * Evaluate full workflow-def-driven command validation for an inbound proxied request.
  *
  * Returns a rejection message when the command should be blocked, or null to forward.
@@ -1317,6 +1387,7 @@ export async function checkRawMutationInterception(
   authToken: string,
   bodyId?: string,
   callerLinearUserId?: string | null,
+  skipCommentCreate?: boolean,
 ): Promise<string | null> {
   if (!body) return null;
 
@@ -1327,6 +1398,10 @@ export async function checkRawMutationInterception(
   const isIssueUpdate = q.includes("issueUpdate");
   const isCommentCreate = !isIssueUpdate && q.includes("commentCreate");
   if (!isIssueUpdate && !isCommentCreate) return null;
+
+  // When called from the intent path, commentCreate is legitimate — workflow
+  // commands (e.g. brief-ready --comment-file) use it to post their required comment.
+  if (skipCommentCreate && isCommentCreate) return null;
 
   // AC2: commentCreate on governed tickets must use approved semantic verbs — a raw
   // comment breaks the one-comment-per-step rule and allows meta-commentary outside

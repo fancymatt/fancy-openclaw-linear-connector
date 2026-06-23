@@ -23,7 +23,7 @@ import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState
 import { registerDistillationCron } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
-import { getAccessToken, getAgent } from "./agents.js";
+import { getAccessToken, getAgent, getLinearUserIdForAgent } from "./agents.js";
 import crypto from "crypto";
 import path from "path";
 const log = componentLogger(createLogger(), "server");
@@ -104,7 +104,7 @@ export function createApp(options) {
     // Intercepts every Linear CLI call from Nakazawa agents; forwards unchanged
     // for now. Future phases add per-step instruction injection and command
     // validation. ILL fleet runs the main branch and is unaffected.
-    app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, { observationStore, operationalEventStore }));
+    app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, { observationStore, operationalEventStore, noActivityDetector }));
     // Health check
     app.get("/health", (_req, res) => {
         const agents = getAgents();
@@ -294,7 +294,8 @@ export function createApp(options) {
      */
     function flipEngagementStatus(agentId, ticketId, semantic) {
         const token = getAccessToken(agentId) ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
-        void applyEngagementStatus(ticketId, semantic, token);
+        const agentLinearUserId = getLinearUserIdForAgent(agentId);
+        void applyEngagementStatus(ticketId, semantic, token, agentLinearUserId);
         const outcomeMap = { thinking: "engagement-thinking", doing: "engagement-doing", todo: "engagement-todo" };
         try {
             operationalEventStore.append({

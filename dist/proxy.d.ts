@@ -30,11 +30,14 @@
 import type { Request, Response } from "express";
 import type { ObservationStore } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
+import type { NoActivityDetector } from "./bag/no-activity-detector.js";
 export interface ProxyDeps {
     /** Optional observation store for recording feedback observations (P4-1). */
     observationStore?: ObservationStore;
     /** Optional operational event store for audit events (G-13a). */
     operationalEventStore?: OperationalEventStore;
+    /** AI-1664: Optional no-activity detector — proxy calls with a resolvable ticket ID satisfy the timer. */
+    noActivityDetector?: NoActivityDetector;
 }
 export declare function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void>;
 //# sourceMappingURL=proxy.d.ts.map

@@ -31,7 +31,7 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, type TransitionFeedback } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, resolveMetaIntent, type TransitionFeedback } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
@@ -347,6 +347,22 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // AI-1498: capture the ticket's workflow state BEFORE forwarding.
       let sourceStateOverride: string | undefined;
 
+      // Resolve meta-intents (continue-workflow, request-revision) to actual workflow
+      // command names before any enforcement layer sees them. The original intent is
+      // preserved in the header for logging; effectiveIntent drives all validation and
+      // state transition logic.
+      let effectiveIntent = intent!;
+      if ((intent === 'continue-workflow' || intent === 'request-revision') && issueId) {
+        const metaResult = await resolveMetaIntent(intent, issueId, authorization);
+        if ('error' in metaResult) {
+          log.warn(`meta-intent-block agent=${agentId} intent=${intent}${ticketCtx}: ${metaResult.error}`);
+          res.status(200).json({ errors: [{ message: metaResult.error }] });
+          return;
+        }
+        effectiveIntent = metaResult.resolved;
+        log.info(`meta-intent-resolved agent=${agentId} ${intent}→${effectiveIntent}${ticketCtx}`);
+      }
+
       // G-13a (AI-1551): identity gate — break-glass restricted to steward/human bodies.
       if (breakGlassOverride) {
         let isAuthorized = false;
@@ -367,9 +383,9 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         log.warn(`break-glass-audit agent=${agentId} authorized=true${ticketCtx} intent=${intent}`);
       }
 
-      const p2rejection = await checkEnforcementRules(intent, issueId, authorization, agentId);
+      const p2rejection = await checkEnforcementRules(effectiveIntent, issueId, authorization, agentId);
       if (p2rejection) {
-        log.warn(`enforcement-block agent=${agentId} intent=${intent}${ticketCtx}: ${p2rejection}`);
+        log.warn(`enforcement-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p2rejection}`);
         res.status(200).json({ errors: [{ message: p2rejection }] });
         return;
       }
@@ -379,9 +395,9 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         deps?.operationalEventStore?.append({ outcome: "break-glass-used", agent: agentId, key: issueId ?? undefined });
       }
 
-      const p3rejection = await checkWorkflowRules(intent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride);
+      const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride);
       if (p3rejection) {
-        log.warn(`workflow-block agent=${agentId} intent=${intent}${ticketCtx}: ${p3rejection}`);
+        log.warn(`workflow-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p3rejection}`);
         res.status(200).json({ errors: [{ message: p3rejection }] });
         return;
       }
@@ -403,18 +419,37 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // CLI's pre-write can't land ahead of applyStateTransition. If that apply
         // later fail-closes, the transition is then a true no-op (state label and
         // delegate both unchanged) instead of a half-applied stranding.
-        // Fail-open: if the state-label IDs can't be resolved, strip nothing.
+        // Fail-closed: if state-label IDs can't be resolved, block the mutation.
+        // Previously fail-open here meant a strip failure could silently allow
+        // label bypass (labels land in Linear, delegate never updated by applyStateTransition).
         if (isIssueUpdateMutation(body) && carriesLabelDelta(body)) {
           try {
             const stateLabelIds = await fetchTeamStateLabelIds(issueId, authorization);
             const stripped = stripStateLabelDeltas(body, stateLabelIds);
             if (stripped > 0) {
-              log.info(`state-label-strip agent=${agentId} intent=${intent}${ticketCtx}: stripped ${stripped} state:* label delta(s) — applyStateTransition is sole writer`);
+              log.info(`state-label-strip agent=${agentId} intent=${effectiveIntent}${ticketCtx}: stripped ${stripped} state:* label delta(s) — applyStateTransition is sole writer`);
             }
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
-            log.warn(`state-label-strip failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg} — forwarding label delta unchanged`);
+            log.warn(`state-label-strip failed agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg} — blocking (fail-closed)`);
+            res.status(200).json({ errors: [{ message: `[Proxy] '${effectiveIntent}' blocked: workflow label safety check failed (${msg}). Try again or contact a steward.` }] });
+            return;
           }
+        }
+
+        // Layer 2 on intent path: run field-level interception after stripping.
+        // Layer 2 normally runs only when no intent header is present, but an agent
+        // can exploit that gap by piggy-backing label/state fields onto a valid intent
+        // mutation. Running it here — after strip has removed legitimate state:* deltas
+        // — catches anything that survived (strip failure, non-state label manipulation).
+        // commentCreate is excluded: workflow commands legitimately use it.
+        const intentPathRawRejection = await checkRawMutationInterception(
+          body, issueId, authorization, agentId, callerLinearUserId, /* skipCommentCreate */ true
+        );
+        if (intentPathRawRejection) {
+          log.warn(`raw-mutation-block-on-intent-path agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${intentPathRawRejection}`);
+          res.status(200).json({ errors: [{ message: intentPathRawRejection }] });
+          return;
         }
       }
 
@@ -469,7 +504,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       if (upstreamRes.ok) {
         try {
           let feedback: TransitionFeedback | undefined;
-          if (feedbackCategoryHeader && (intent === "request-changes" || intent === "reject" || intent === "ac-fail")) {
+          if (feedbackCategoryHeader && (effectiveIntent === "request-changes" || effectiveIntent === "reject" || effectiveIntent === "ac-fail")) {
             const fromBodyHeader = (req.headers["x-openclaw-from-body"] as string | undefined) ?? null;
             feedback = {
               fromBody: fromBodyHeader,
@@ -477,7 +512,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
               freeText: extractCommentBody(body),
             };
           }
-          await applyStateTransition(intent, issueId, authorization, {
+          await applyStateTransition(effectiveIntent, issueId, authorization, {
             bodyId: agentId,
             observationStore: deps?.observationStore,
             feedback,
@@ -486,16 +521,16 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          log.warn(`state-transition failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+          log.warn(`state-transition failed agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg}`);
         }
 
         // Layer 1 (AI-1387): proactive legal-verb re-injection at completion.
         let workflowReminder: string | null = null;
         try {
-          workflowReminder = await buildStateTransitionReminder(intent, issueId, authorization);
+          workflowReminder = await buildStateTransitionReminder(effectiveIntent, issueId, authorization);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          log.warn(`reminder-build failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+          log.warn(`reminder-build failed agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg}`);
         }
 
         if (workflowReminder) {

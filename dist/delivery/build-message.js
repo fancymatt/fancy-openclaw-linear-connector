@@ -131,16 +131,26 @@ async function tryBuildWorkflowMessage(actionText, identifier, title, authToken)
     const [stepLines, guidance] = await Promise.all([
         Promise.all(transitions.map(async (t) => {
             const { bodies, mode } = await resolveTransitionTargets(t, def);
-            let cmd = `linear ${t.command} ${identifier}`;
+            // Use the generic command name when available (Matt's directive: guidance always
+            // uses generic transitions so agents don't need workflow-specific command names).
+            const commandName = t.generic === 'continue'
+                ? 'continue-workflow'
+                : t.generic === 'revision'
+                    ? 'request-revision'
+                    : t.command;
+            let cmd = `linear ${commandName} ${identifier}`;
             if (mode === 'required') {
                 cmd += ` <${bodies.join('|')}>`;
             }
-            if (t.feedback?.required) {
-                cmd += ` --comment "<feedback>"`;
+            if (t.requires_comment || t.feedback?.required) {
+                cmd += ` --comment-file <path>`;
             }
             const arrow = ` (→ ${t.to})`;
             let note = '';
-            if (mode === 'auto' && bodies.length === 1) {
+            if (t.generic) {
+                note = ` [alias for \`${t.command}\`]`;
+            }
+            else if (mode === 'auto' && bodies.length === 1) {
                 note = ` [auto-assigns to ${bodies[0]}]`;
             }
             else if (mode === 'required' && t.assign?.constraint === 'not-implementer') {

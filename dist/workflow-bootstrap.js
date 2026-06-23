@@ -101,8 +101,10 @@ async function issueUpdateAtomic(internalId, labelIds, authToken, delegateId) {
  * Never throws: all errors are caught and logged, failing safe.
  */
 export async function maybeBootstrapWorkflow(event, authToken) {
-    if (event.type !== "Issue" || event.action !== "update")
+    if (event.type !== "Issue" || (event.action !== "update" && event.action !== "create"))
         return null;
+    // For create events updatedFrom is absent — previousLabelIds will be [] and all current labels
+    // are treated as "added", which is exactly what we want for pre-attached wf: labels.
     const issueEvent = event;
     const currentLabelIds = issueEvent.data.labelIds ?? [];
     const updatedFrom = issueEvent.updatedFrom;

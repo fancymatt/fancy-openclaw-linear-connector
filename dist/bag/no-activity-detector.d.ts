@@ -96,6 +96,12 @@ export declare class NoActivityDetector {
      * or when evidence of activity is observed).
      */
     clearWarned(agentId: string, sessionKey: string): void;
+    /**
+     * AI-1664: Record a proxy call as evidence that the agent started.
+     * Satisfies the no-activity timer for the matched (agentId, ticketId) dispatch.
+     * Silently ignored when ticketId cannot be normalized to a Linear identifier.
+     */
+    recordProxyActivity(agentId: string, ticketId: string): void;
     private getAgentMaxConcurrentValue;
     private handleAtCapacity;
     /**

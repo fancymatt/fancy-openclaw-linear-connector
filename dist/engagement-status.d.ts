@@ -27,8 +27,11 @@ export type EngagementSemantic = "thinking" | "doing" | "todo";
  * Apply an engagement status to a workflow ticket. No-op for ad-hoc tickets
  * (no `wf:*` label) and for the monotonic thinking-after-doing case.
  *
- * @param ticketRef  `linear-AI-1292` or `AI-1292`
- * @param token      delegate's access token (raw or Bearer-prefixed)
+ * @param ticketRef          `linear-AI-1292` or `AI-1292`
+ * @param token              delegate's access token (raw or Bearer-prefixed)
+ * @param agentLinearUserId  Linear user ID of the authoring agent; when provided,
+ *                           the "doing" flip is skipped if the agent is not the
+ *                           current delegate (AI-1660).
  */
-export declare function applyEngagementStatus(ticketRef: string, semantic: EngagementSemantic, token: string | null | undefined): Promise<void>;
+export declare function applyEngagementStatus(ticketRef: string, semantic: EngagementSemantic, token: string | null | undefined, agentLinearUserId?: string | null): Promise<void>;
 //# sourceMappingURL=engagement-status.d.ts.map

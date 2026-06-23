@@ -19,7 +19,20 @@ export interface WakeUpConfig extends DeliveryConfig {
 export declare const SINGLE_TICKET_TEMPLATE = "You have 1 pending ticket: {tickets}. Run `linear consider-work {tickets}` to begin.";
 export declare const MULTI_TICKET_TEMPLATE = "You have {count} pending ticket(s) waiting: {tickets}. Run `linear queue --next` to pick up the highest-priority one, or `linear queue` to see all.";
 export declare const MENTION_TICKET_TEMPLATE = "You have been @mentioned on ticket: {tickets}. Run `linear observe-issue {tickets}` to review.";
-export declare function buildWakeUpMessage(ticketIds: string[], signalTemplate?: string): string;
+/**
+ * Context from the prior delegate's handoff comment, bundled into the wake-up
+ * message so the next agent sees it even if the comment hasn't landed in Linear
+ * yet (fixes the same-second dispatch race documented in AI-1673).
+ */
+export interface HandoffContext {
+    /** Display name of the agent who handed off the ticket. */
+    delegateName: string;
+    /** The handoff comment body. */
+    comment: string;
+    /** Age of the comment in milliseconds at dispatch time (0 = same-second race). */
+    ageMs: number;
+}
+export declare function buildWakeUpMessage(ticketIds: string[], signalTemplate?: string, handoffCtx?: HandoffContext | null): string;
 /**
  * Send a wake-up signal to an agent.
  *
