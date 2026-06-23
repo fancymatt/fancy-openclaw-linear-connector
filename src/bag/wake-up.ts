@@ -22,6 +22,8 @@ const log = componentLogger(createLogger(), "wakeup");
 export interface WakeUpConfig extends DeliveryConfig {
   /** Signal message template. {count} and {tickets} are replaced. */
   signalTemplate?: string;
+  /** Auth token for fetching workflow labels (enables workflow-aware wake-up messages). */
+  authToken?: string;
 }
 
 export const SINGLE_TICKET_TEMPLATE =
@@ -118,7 +120,7 @@ export async function sendWakeUpSignal(
   ticketIds: string[],
   config: WakeUpConfig,
 ): Promise<{ runId?: string } | void> {
-  const message = buildWakeUpMessage(ticketIds, config.signalTemplate);
+  const message = await buildWorkflowAwareWakeUpMessage(ticketIds, config.authToken);
 
   // Normalize to strip any legacy prefixes and enforce uppercase.
   // Result is always exactly `linear-<TEAM>-<NUMBER>`.
