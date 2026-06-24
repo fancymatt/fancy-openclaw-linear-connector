@@ -72,6 +72,31 @@ export async function buildDeliveryMessage(route, authToken) {
     }
     return message;
 }
+/**
+ * Build a workflow-aware per-step delivery message for a single ticket by identifier.
+ * Fetches title and labels from Linear; returns null when the ticket is not a workflow
+ * ticket or on any fetch failure (caller should fall back to a thin message).
+ *
+ * Used by the pending-bag wake-up path so agents get the same rich instruction block
+ * that event-driven delegation produces.
+ */
+export async function buildWorkflowAwareDeliveryMessage(identifier, authToken, actionText = `You have a pending ticket: ${identifier}`) {
+    const query = `query IssueTitle($id: String!) { issue(id: $id) { title labels { nodes { name } } } }`;
+    let title = "";
+    try {
+        const res = await fetch("https://api.linear.app/graphql", {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: authToken },
+            body: JSON.stringify({ query, variables: { id: identifier } }),
+        });
+        const json = (await res.json());
+        title = json.data?.issue?.title ?? "";
+    }
+    catch {
+        return null;
+    }
+    return tryBuildWorkflowMessage(actionText, identifier, title, authToken);
+}
 async function buildDelegationMessage(reason, identifier, title, authToken) {
     const actionText = reason === "delegate"
         ? `You were delegated ${identifier}`
@@ -83,6 +108,35 @@ async function buildDelegationMessage(reason, identifier, title, authToken) {
             return workflowMessage;
     }
     return buildGenericDelegationMessage(actionText, identifier, title);
+}
+/** Fetch the most recent comment on a ticket. Returns null on any failure. */
+async function fetchLastComment(identifier, authToken) {
+    const query = `
+    query LastComment($identifier: String!) {
+      issue(id: $identifier) {
+        comments(last: 1, orderBy: createdAt) {
+          nodes { body user { name } }
+        }
+      }
+    }
+  `;
+    try {
+        const res = await fetch("https://api.linear.app/graphql", {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: authToken },
+            body: JSON.stringify({ query, variables: { identifier } }),
+        });
+        if (!res.ok)
+            return null;
+        const json = (await res.json());
+        const node = json.data?.issue?.comments?.nodes?.[0];
+        if (!node)
+            return null;
+        return { body: node.body, authorName: node.user?.name ?? "unknown" };
+    }
+    catch {
+        return null;
+    }
 }
 /**
  * Attempt to build a workflow-aware per-step instruction block.
@@ -128,7 +182,7 @@ async function tryBuildWorkflowMessage(actionText, identifier, title, authToken)
     }
     const breakGlassCommand = def.break_glass?.command ?? "escape";
     const transitions = stateNode.transitions ?? [];
-    const [stepLines, guidance] = await Promise.all([
+    const [stepLines, guidance, lastComment] = await Promise.all([
         Promise.all(transitions.map(async (t) => {
             const { bodies, mode } = await resolveTransitionTargets(t, def);
             // Use the generic command name when available (Matt's directive: guidance always
@@ -147,10 +201,7 @@ async function tryBuildWorkflowMessage(actionText, identifier, title, authToken)
             }
             const arrow = ` (→ ${t.to})`;
             let note = '';
-            if (t.generic) {
-                note = ` [alias for \`${t.command}\`]`;
-            }
-            else if (mode === 'auto' && bodies.length === 1) {
+            if (mode === 'auto' && bodies.length === 1) {
                 note = ` [auto-assigns to ${bodies[0]}]`;
             }
             else if (mode === 'required' && t.assign?.constraint === 'not-implementer') {
@@ -162,11 +213,21 @@ async function tryBuildWorkflowMessage(actionText, identifier, title, authToken)
             return `- Run \`${cmd}\`${arrow}${note}`;
         })),
         loadStepGuidance(def.id, currentState),
+        stateNode.deliverLastComment ? fetchLastComment(identifier, authToken) : Promise.resolve(null),
     ]);
-    // Always-available break-glass escape (§4.4)
-    stepLines.push(`- Run \`linear ${breakGlassCommand} ${identifier}\` to break glass and hand to steward (→ ${def.break_glass?.to ?? "escape"}, legal from any state)`);
     const guidanceBlock = guidance
         ? ["", "---", "**Step guidance (accumulated lessons for this state):**", "", guidance.trim(), "---"]
+        : [];
+    // deliverLastComment: inject the most recent ticket comment inline (e.g. brief for generating state).
+    const lastCommentBlock = lastComment
+        ? [
+            "",
+            "---",
+            `**Most recent comment (from ${lastComment.authorName} — your context for this step):**`,
+            "",
+            lastComment.body,
+            "---",
+        ]
         : [];
     // Phase 6.5 / H-7 (AI-1482): Include verbatim AC record if captured.
     const acRecordBlock = [];
@@ -182,22 +243,29 @@ async function tryBuildWorkflowMessage(actionText, identifier, title, authToken)
             stakesBlock.push("", `⚠️ **Elevated stakes (level ${ticketStakesLevel}):** This ticket requires human (Matt) sign-off at deploy. AI agents cannot self-sign-off.`);
         }
     }
+    const resourcesBlock = stateNode.resources?.length
+        ? [
+            "",
+            "**Reference documents for this step (read these before acting):**",
+            ...stateNode.resources.map(r => r.description
+                ? `- \`${r.path}\` — ${r.description}`
+                : `- \`${r.path}\`${r.label ? ` (${r.label})` : ""}`),
+        ]
+        : [];
     return [
         `${actionText}: ${title}`,
         "",
         `This is a [${def.id}] workflow ticket in state: **${currentState}**`,
         ...stakesBlock,
+        ...lastCommentBlock,
         "",
         "Your legal action(s) for this state:",
         ...stepLines,
-        "",
-        `Run \`linear consider-work ${identifier}\` NOW if you haven't already to review the issue.`,
+        ...resourcesBlock,
         ...guidanceBlock,
         ...acRecordBlock,
         "",
         "📝 Comment discipline: post one substantive comment — your actual findings or result. Do NOT post a comment that only restates what is already on the ticket or narrates that you have handed it back. If you have no new information to add, do not comment at all — just transition state.",
-        "",
-        "⚠️ Important: do NOT hand off to Matt Henry for review, sign-off, or closure. Use the workflow commands above. Only use break-glass (\`escape\`) for genuine unresolvable blockers that require steward intervention.",
     ].join("\n");
 }
 function buildGenericDelegationMessage(actionText, identifier, title) {

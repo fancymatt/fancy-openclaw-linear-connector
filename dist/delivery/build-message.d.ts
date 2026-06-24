@@ -24,4 +24,13 @@ import type { RouteResult } from "../types.js";
  * When coalescedCount > 0, appends a coalescing note regardless of path.
  */
 export declare function buildDeliveryMessage(route: RouteResult, authToken?: string): Promise<string>;
+/**
+ * Build a workflow-aware per-step delivery message for a single ticket by identifier.
+ * Fetches title and labels from Linear; returns null when the ticket is not a workflow
+ * ticket or on any fetch failure (caller should fall back to a thin message).
+ *
+ * Used by the pending-bag wake-up path so agents get the same rich instruction block
+ * that event-driven delegation produces.
+ */
+export declare function buildWorkflowAwareDeliveryMessage(identifier: string, authToken: string, actionText?: string): Promise<string | null>;
 //# sourceMappingURL=build-message.d.ts.map

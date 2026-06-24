@@ -132,6 +132,18 @@ export class NudgeStore {
   }
 
   /**
+   * Return ticket IDs that have coalesced (suppressed) events waiting for this
+   * agent. Used by session-end to re-signal work that was swallowed inside the
+   * dedup window when the previous session ended before the window expired.
+   */
+  getCoalescedTickets(agentId: string): string[] {
+    const rows = this.db
+      .prepare("SELECT ticket_id FROM nudge_log WHERE agent_id = ? AND coalesced_count > 0")
+      .all(agentId) as { ticket_id: string }[];
+    return rows.map((r) => r.ticket_id);
+  }
+
+  /**
    * Reset suppression for an agent (e.g., after they pull their queue).
    */
   resetSuppression(agentId: string): void {

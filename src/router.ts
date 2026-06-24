@@ -32,6 +32,16 @@ export function extractAgentTarget(event: LinearEvent): { name: string; reason: 
   const actorId = event.actor?.id;
   const isActorOurAgent = actorId ? !!agentMap[actorId] : false;
 
+  // True when this Issue update event represents a genuine workflow state
+  // transition — i.e. the Linear native state (stateId) changed. Used by both
+  // the AI-1573 no-change-delegate guard and the self-trigger filter below to
+  // allow re-dispatch when an agent advances its own ticket to a new step.
+  const isStateTransition = ((): boolean => {
+    if (event.type !== "Issue" || event.action !== "update") return false;
+    const upd = (event as { updatedFrom?: Record<string, unknown> }).updatedFrom;
+    return upd !== undefined && "stateId" in upd;
+  })();
+
   // For AgentSessionEvent, route to the agent that owns the session
   if (event.type === "AgentSessionEvent") {
     // TODO: extract agent from session data if needed
@@ -55,11 +65,19 @@ export function extractAgentTarget(event: LinearEvent): { name: string; reason: 
     // present but contains neither "delegateId" nor "delegate", the delegate
     // was not part of this mutation (same-value re-assert or unrelated-field
     // edit). Guard checks both key forms Linear may emit.
+    //
+    // Exception: state transitions (stateId in updatedFrom) always dispatch even
+    // when the delegate is unchanged — the agent is starting a new step, not
+    // looping on the previous one.
     if (event.type === "Issue" && event.action === "update") {
       const upd = (event as { updatedFrom?: Record<string, unknown> }).updatedFrom;
       if (upd !== undefined && !("delegateId" in upd) && !("delegate" in upd)) {
-        log.info(`No-change delegate write — skipping dispatch (updatedFrom present, no delegate key)`);
-        target = null;
+        if (isStateTransition) {
+          log.info(`No-change delegate but stateId changed — dispatching for same-agent workflow transition`);
+        } else {
+          log.info(`No-change delegate write — skipping dispatch (updatedFrom present, no delegate key, no state change)`);
+          target = null;
+        }
       }
     }
   }
@@ -98,9 +116,11 @@ export function extractAgentTarget(event: LinearEvent): { name: string; reason: 
     }
   }
 
-  // 5. Self-trigger filtering: skip if the actor IS the target agent
-  //    But allow agent-to-agent delegation
-  if (isActorOurAgent) {
+  // 5. Self-trigger filtering: skip if the actor IS the target agent.
+  //    Prevents feedback loops where an agent's own write re-dispatches itself.
+  //    Exception: state transitions always dispatch — the agent advanced to a new
+  //    step and needs to be notified even if it is the same agent in the new step.
+  if (isActorOurAgent && !isStateTransition) {
     if (!target || agentMap[actorId!] === target) {
       log.info(`Skipping self-triggered event from ${actorId}`);
       return null;

@@ -74,6 +74,17 @@ export interface WorkflowState {
      *  inherit the global default. Use for states with known-slow sub-processes
      *  (e.g. image generation) to avoid spurious failure re-dispatches. */
     noActivityTimeout?: number;
+    /** When true, the delivery message for this state will include the most recent ticket
+     *  comment as inline context. Useful for states where the previous step's output
+     *  (e.g. a brief) must be immediately visible to the incoming delegate. */
+    deliverLastComment?: boolean;
+    /** Reference documents for this state. Paths are injected into the delivery message
+     *  so the agent knows exactly where to read before acting. */
+    resources?: Array<{
+        path: string;
+        label?: string;
+        description?: string;
+    }>;
     transitions?: WorkflowTransition[];
 }
 export interface StakesLevel {

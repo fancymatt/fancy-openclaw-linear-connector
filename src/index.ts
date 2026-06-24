@@ -704,10 +704,25 @@ export function createApp(options?: CreateAppOptions) {
       }
     }
 
-    const allPending = [...new Set([...regularPending, ...newHoldIds])];
+    // AI-1574: drain nudge-store coalesced events that were suppressed inside the
+    // dedup window of the session that just ended. These are state-transition
+    // dispatches (e.g. review→filing for the same delegate) that arrived while
+    // the prior session was still within the 120s coalesce window. The session
+    // ended before the window expired, so they were never re-fired. Clear the
+    // nudge record so the re-signal below goes through without hitting the window.
+    const coalescedTickets = nudgeStore
+      ? nudgeStore.getCoalescedTickets(agentId)
+          .filter((t) => !regularPending.includes(t) && !newHoldIds.includes(t))
+      : [];
+    for (const t of coalescedTickets) {
+      nudgeStore!.clearNudge(agentId, t);
+      log.info(`Session-end: clearing coalesced nudge for ${agentId} [${t}] — will re-signal`);
+    }
+
+    const allPending = [...new Set([...regularPending, ...newHoldIds, ...coalescedTickets])];
     operationalEventStore.append({
       outcome: "session-ended", agent: agentId, deliveryMode: "session-end-callback",
-      detail: { queuedTickets: queuedTickets ?? [], bagTickets, regularPending, holdRetry: newHoldIds, allPending }
+      detail: { queuedTickets: queuedTickets ?? [], bagTickets, regularPending, holdRetry: newHoldIds, coalescedTickets, allPending }
     });
 
     if (regularPending.length > 0) {

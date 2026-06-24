@@ -15,6 +15,14 @@ import { type DeliveryConfig } from "../delivery/index.js";
 export interface WakeUpConfig extends DeliveryConfig {
     /** Signal message template. {count} and {tickets} are replaced. */
     signalTemplate?: string;
+    /**
+     * Linear auth token for the agent receiving the wake-up.
+     * When provided and ticketIds.length === 1, the wake-up message is replaced
+     * with the same rich per-step workflow instruction block that event-driven
+     * delegation produces — so agents get full context upfront instead of a thin
+     * "run consider-work" prompt that is blocked on workflow tickets.
+     */
+    linearAuthToken?: string;
 }
 export declare const SINGLE_TICKET_TEMPLATE = "You have 1 pending ticket: {tickets}. Run `linear consider-work {tickets}` to begin.";
 export declare const MULTI_TICKET_TEMPLATE = "You have {count} pending ticket(s) waiting: {tickets}. Run `linear queue --next` to pick up the highest-priority one, or `linear queue` to see all.";
@@ -36,8 +44,10 @@ export declare function buildWakeUpMessage(ticketIds: string[], signalTemplate?:
 /**
  * Send a wake-up signal to an agent.
  *
- * The signal is intentionally thin — just tells the agent how many tickets
- * are pending and their IDs. The agent re-queries Linear for full details.
+ * For single-ticket workflow dispatches where a linearAuthToken is available,
+ * the message is upgraded to the same rich per-step instruction block that
+ * event-driven delegation produces. For multi-ticket dispatches or ad-hoc tickets,
+ * falls back to the thin template.
  */
 export declare function sendWakeUpSignal(agentId: string, ticketIds: string[], config: WakeUpConfig): Promise<{
     runId?: string;

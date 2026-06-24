@@ -104,7 +104,20 @@ export function createApp(options) {
     // Intercepts every Linear CLI call from Nakazawa agents; forwards unchanged
     // for now. Future phases add per-step instruction injection and command
     // validation. ILL fleet runs the main branch and is unaffected.
-    app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, { observationStore, operationalEventStore, noActivityDetector }));
+    app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, {
+        observationStore,
+        operationalEventStore,
+        noActivityDetector,
+        onProxyCall: (agentId, ticketId) => {
+            // Any proxy call = implicit acknowledgment. Prevents the dispatch watchdog from
+            // re-signaling agents that are working silently (e.g. sessions_yield during image gen).
+            const acknowledged = ackTracker.acknowledge(agentId, ticketId);
+            if (acknowledged > 0) {
+                noActivityDetector.clearWarned(agentId, ticketId);
+                log.info(`proxy-auto-ack agent=${agentId} ticket=${ticketId}`);
+            }
+        },
+    }));
     // Health check
     app.get("/health", (_req, res) => {
         const agents = getAgents();
@@ -137,10 +150,15 @@ export function createApp(options) {
     };
     const wakeConfigForAgent = (agentIdLookup) => {
         const cfg = getAgent(agentIdLookup);
+        const rawToken = getAccessToken(agentIdLookup) ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+        const linearAuthToken = rawToken
+            ? (/^Bearer\s+/i.test(rawToken) ? rawToken : `Bearer ${rawToken}`)
+            : undefined;
         return {
             ...wakeConfig,
             hooksUrl: cfg?.hooksUrl ?? wakeConfig.hooksUrl,
             hooksToken: cfg?.hooksToken ?? wakeConfig.hooksToken,
+            linearAuthToken,
         };
     };
     const resignalOptions = {
@@ -601,10 +619,24 @@ export function createApp(options) {
                 });
             }
         }
-        const allPending = [...new Set([...regularPending, ...newHoldIds])];
+        // AI-1574: drain nudge-store coalesced events that were suppressed inside the
+        // dedup window of the session that just ended. These are state-transition
+        // dispatches (e.g. review→filing for the same delegate) that arrived while
+        // the prior session was still within the 120s coalesce window. The session
+        // ended before the window expired, so they were never re-fired. Clear the
+        // nudge record so the re-signal below goes through without hitting the window.
+        const coalescedTickets = nudgeStore
+            ? nudgeStore.getCoalescedTickets(agentId)
+                .filter((t) => !regularPending.includes(t) && !newHoldIds.includes(t))
+            : [];
+        for (const t of coalescedTickets) {
+            nudgeStore.clearNudge(agentId, t);
+            log.info(`Session-end: clearing coalesced nudge for ${agentId} [${t}] — will re-signal`);
+        }
+        const allPending = [...new Set([...regularPending, ...newHoldIds, ...coalescedTickets])];
         operationalEventStore.append({
             outcome: "session-ended", agent: agentId, deliveryMode: "session-end-callback",
-            detail: { queuedTickets: queuedTickets ?? [], bagTickets, regularPending, holdRetry: newHoldIds, allPending }
+            detail: { queuedTickets: queuedTickets ?? [], bagTickets, regularPending, holdRetry: newHoldIds, coalescedTickets, allPending }
         });
         if (regularPending.length > 0) {
             // Re-signal: agent has work waiting. Send one signal per ticket so each

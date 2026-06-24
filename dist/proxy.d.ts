@@ -38,6 +38,13 @@ export interface ProxyDeps {
     operationalEventStore?: OperationalEventStore;
     /** AI-1664: Optional no-activity detector — proxy calls with a resolvable ticket ID satisfy the timer. */
     noActivityDetector?: NoActivityDetector;
+    /**
+     * Called on the first proxy call from an agent for a ticket — auto-acknowledges the
+     * dispatch so the watchdog doesn't re-signal an agent that is actively working but
+     * hasn't sent an explicit pull-ack (e.g. during sessions_yield). The callback is
+     * idempotent; calling it multiple times for the same agent+ticket is harmless.
+     */
+    onProxyCall?: (agentId: string, ticketId: string) => void;
 }
 export declare function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void>;
 //# sourceMappingURL=proxy.d.ts.map

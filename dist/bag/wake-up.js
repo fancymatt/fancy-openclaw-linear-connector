@@ -12,6 +12,7 @@
  * the first ticket's identifier is used as the key.
  */
 import { deliverMessageToAgent } from "../delivery/index.js";
+import { buildWorkflowAwareDeliveryMessage } from "../delivery/build-message.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
 const log = componentLogger(createLogger(), "wakeup");
@@ -60,11 +61,27 @@ export function buildWakeUpMessage(ticketIds, signalTemplate, handoffCtx) {
 /**
  * Send a wake-up signal to an agent.
  *
- * The signal is intentionally thin — just tells the agent how many tickets
- * are pending and their IDs. The agent re-queries Linear for full details.
+ * For single-ticket workflow dispatches where a linearAuthToken is available,
+ * the message is upgraded to the same rich per-step instruction block that
+ * event-driven delegation produces. For multi-ticket dispatches or ad-hoc tickets,
+ * falls back to the thin template.
  */
 export async function sendWakeUpSignal(agentId, ticketIds, config) {
-    const message = buildWakeUpMessage(ticketIds, config.signalTemplate);
+    let message;
+    if (ticketIds.length === 1 && config.linearAuthToken) {
+        const plainId = ticketIds[0].replace(/^linear-/i, "");
+        const rich = await buildWorkflowAwareDeliveryMessage(plainId, config.linearAuthToken);
+        if (rich) {
+            message = rich;
+            log.info(`Rich workflow delivery for ${agentId} [${plainId}]`);
+        }
+        else {
+            message = buildWakeUpMessage(ticketIds, config.signalTemplate);
+        }
+    }
+    else {
+        message = buildWakeUpMessage(ticketIds, config.signalTemplate);
+    }
     // Normalize to strip any legacy prefixes and enforce uppercase.
     // Result is always exactly `linear-<TEAM>-<NUMBER>`.
     const sessionKey = normalizeSessionKey(ticketIds[0]);

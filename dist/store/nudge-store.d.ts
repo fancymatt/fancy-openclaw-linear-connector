@@ -45,6 +45,12 @@ export declare class NudgeStore {
      */
     clearNudge(agentId: string, ticketId: string): void;
     /**
+     * Return ticket IDs that have coalesced (suppressed) events waiting for this
+     * agent. Used by session-end to re-signal work that was swallowed inside the
+     * dedup window when the previous session ended before the window expired.
+     */
+    getCoalescedTickets(agentId: string): string[];
+    /**
      * Reset suppression for an agent (e.g., after they pull their queue).
      */
     resetSuppression(agentId: string): void;

@@ -59,6 +59,7 @@ async function deliverViaHooks(agentName, sessionId, config, opts) {
                     message: opts.message,
                     thinking: config.hooksThinking || undefined,
                     model: config.hooksModel || undefined,
+                    deliver: false,
                 }),
                 signal: controller.signal,
             });

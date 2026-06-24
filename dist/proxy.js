@@ -276,12 +276,16 @@ export async function handleProxyRequest(req, res, deps) {
     // AI-1664: proxy call with a resolvable ticket identifier counts as evidence of agent starting.
     // Prefer the body issueId if it normalizes (e.g. "AI-1664"); fall back to the Target header.
     // UUID-only calls (no normalizable ID, no Target header) do not affect the timer.
-    if (deps?.noActivityDetector) {
+    {
         const proxyTicketId = (issueId && tryNormalizeSessionKey(issueId) !== null)
             ? issueId
             : (target && tryNormalizeSessionKey(target) !== null ? target : null);
         if (proxyTicketId) {
-            deps.noActivityDetector.recordProxyActivity(agentId, proxyTicketId);
+            deps?.noActivityDetector?.recordProxyActivity(agentId, proxyTicketId);
+            // Auto-ack: any proxy call from an agent for a ticket counts as evidence that
+            // the agent is working. This prevents the watchdog from re-signaling agents
+            // that are in sessions_yield (no explicit pull-ack-activity is ever sent).
+            deps?.onProxyCall?.(agentId, proxyTicketId);
         }
     }
     // AI-1583: enforcement and the B2 writer apply to mutations only. A read can
