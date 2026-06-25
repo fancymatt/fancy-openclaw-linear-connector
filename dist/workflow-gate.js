@@ -759,7 +759,7 @@ export async function resolveMetaIntent(intent, issueId, authToken) {
  * @param callerLinearUserId - Linear user ID of the requesting agent (from agents.ts);
  *   used for delegate-only enforcement (AI-1397). Null/undefined → fail-open.
  */
-export async function checkWorkflowRules(intent, issueId, authToken, bodyId, target = null, callerLinearUserId, artifactRef, breakGlassOverride = false) {
+export async function checkWorkflowRules(intent, issueId, authToken, bodyId, target = null, callerLinearUserId, artifactRef, breakGlassOverride = false, isMetaIntent = false) {
     // TODO(AI-1347): fail-open on missing issueId is a Layer A carry-forward.
     // Harden by deriving issueId from the request body when headers are absent.
     if (!issueId)
@@ -1089,6 +1089,13 @@ export async function checkWorkflowRules(intent, issueId, authToken, bodyId, tar
             legalBodies = []; // fail-open
         }
         if (legalBodies.length > 1) {
+            // For meta-intents (continue-workflow/request-revision) on assign.mode: required
+            // transitions, a target must be provided. The CLI's generic path does not carry
+            // the delegate in the forwarded mutation body (unlike named commands), so a
+            // missing target header means no delegate will be set — reject with the valid options.
+            if (!target && isMetaIntent && match.assign?.mode === 'required') {
+                return `[Proxy] '${intent}' requires an assignment target. Legal targets for role '${ownerRole}': ${legalBodies.join(', ')}.`;
+            }
             if (target && !legalBodies.includes(target)) {
                 return `[Proxy] '${target}' is not a legal assignment target for '${intent}'. Legal targets for role '${ownerRole}': ${legalBodies.join(', ')}.`;
             }
