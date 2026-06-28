@@ -1834,6 +1834,14 @@ export interface ApplyStateTransitionOptions {
    * Falls back to the ticket's current state:* label when undefined.
    */
   sourceStateOverride?: string;
+  /**
+   * AI-1709: CLI-supplied target agent name (from X-Openclaw-Linear-Target header).
+   * Required for multi-body role transitions (e.g. `tests-ready` targeting a specific
+   * dev body). The proxy resolves this to a Linear user ID and sets the delegate
+   * atomically with the state label. If the target cannot be resolved, the transition
+   * is aborted fail-closed.
+   */
+  cliTarget?: string;
 }
 
 export async function applyStateTransition(
@@ -2191,8 +2199,27 @@ export async function applyStateTransition(
             );
             return;
           }
+          // AI-1709: multi-body role transitions require a CLI target resolved to a Linear
+          // user ID. The proxy was previously logging "delegate set by CLI target" and then
+          // never actually resolving the target, leaving resolvedDelegateId undefined and the
+          // ticket orphaned with no delegate. Now fail-closed: no target = abort.
+          const cliTarget = options?.cliTarget;
+          if (!cliTarget) {
+            log.error(
+              `workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) on '${intent}' for ${issueId} requires a CLI --target but none was supplied. Transition aborted.`,
+            );
+            return;
+          }
+          const targetAgent = getAgent(cliTarget);
+          if (!targetAgent?.linearUserId) {
+            log.error(
+              `workflow-gate: B2 apply: FAIL-CLOSED — CLI target '${cliTarget}' cannot be resolved to a Linear user ID for ${issueId} (multi-body role '${destOwnerRole}'). Register the agent in agents.json with a linearUserId. Transition aborted.`,
+            );
+            return;
+          }
+          resolvedDelegateId = targetAgent.linearUserId;
           log.info(
-            `workflow-gate: B2 apply: ${issueId} multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) — delegate set by CLI target, skipping proxy auto-assign`,
+            `workflow-gate: B2 apply: ${issueId} multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) — resolved CLI target '${cliTarget}' → delegate=${resolvedDelegateId}`,
           );
         } else {
           if (intent === 'approve' || intent === 'reject') {

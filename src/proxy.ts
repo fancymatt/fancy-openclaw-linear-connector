@@ -529,6 +529,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             feedback,
             artifactRef: artifactRefHeader,
             sourceStateOverride,
+            cliTarget: target ?? undefined,
           });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);

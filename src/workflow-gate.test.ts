@@ -4943,6 +4943,246 @@ describe("applyStateTransition — AI-1493 atomic transitions", () => {
   });
 });
 
+// ── AI-1709: multi-body role cliTarget resolution ────────────────────────────
+//
+// Regression suite for the silent-orphan bug: applyStateTransition was logging
+// "delegate set by CLI target, skipping proxy auto-assign" on multi-body roles
+// but never resolving the target to a Linear user ID, leaving the ticket with
+// no delegate after the state label advanced.
+
+const MULTI_BODY_WORKFLOW_YAML = `
+id: dev-impl
+version: 1
+archetype: single-task
+entry_state: intake
+
+break_glass:
+  command: escape
+  owner_role: steward
+
+states:
+  - id: intake
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: accept
+        to: write-tests
+        assign: { mode: auto }
+
+  - id: write-tests
+    owner_role: test-author
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: tests-ready
+        to: implementation
+        assign: { mode: required }
+
+  - id: implementation
+    owner_role: dev
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: submit
+        to: done
+
+  - id: done
+    kind: terminal
+    native_state: done
+    transitions: []
+
+  - id: escape
+    kind: terminal
+    native_state: invalid
+    transitions:
+      - command: unescape
+        to: intake
+        assign: { mode: auto }
+`;
+
+const MULTI_BODY_POLICY_YAML = `
+capabilities:
+  - id: linear:transition
+  - id: human:escalate
+
+containers:
+  - id: dev
+    grants: [linear:transition]
+  - id: test-author-container
+    grants: [linear:transition]
+  - id: steward
+    grants: [linear:transition, human:escalate]
+
+roles:
+  - id: dev
+    requires: [linear:transition]
+  - id: test-author
+    requires: [linear:transition]
+  - id: steward
+    requires: [human:escalate]
+
+bodies:
+  - id: felix
+    container: dev
+    fills_roles: [dev]
+  - id: igor
+    container: dev
+    fills_roles: [dev]
+  - id: tdd
+    container: test-author-container
+    fills_roles: [test-author]
+  - id: astrid
+    container: steward
+    fills_roles: [steward]
+`;
+
+describe("applyStateTransition — AI-1709 multi-body role cliTarget resolution", () => {
+  let ai1709Dir: string;
+  let ai1709OriginalPolicyPath: string | undefined;
+  let ai1709OriginalWorkflowPath: string | undefined;
+  let ai1709OriginalAgentsFile: string | undefined;
+  let ai1709OriginalImplementerStorePath: string | undefined;
+  let ai1709OriginalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    ai1709Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1709-"));
+    ai1709OriginalFetch = globalThis.fetch;
+
+    const policyFile = path.join(ai1709Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, MULTI_BODY_POLICY_YAML, "utf8");
+    ai1709OriginalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai1709Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, MULTI_BODY_WORKFLOW_YAML, "utf8");
+    ai1709OriginalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    const agentsFile = path.join(ai1709Dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "felix", linearUserId: "felix-linear-uuid", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r" },
+        { name: "igor", linearUserId: "igor-linear-uuid", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r" },
+        { name: "tdd", linearUserId: "tdd-linear-uuid", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r" },
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "c", clientSecret: "s", accessToken: "t", refreshToken: "r" },
+      ],
+    }, null, 2), "utf8");
+    ai1709OriginalAgentsFile = process.env.AGENTS_FILE;
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+
+    ai1709OriginalImplementerStorePath = process.env.IMPLEMENTER_STORE_PATH;
+    process.env.IMPLEMENTER_STORE_PATH = path.join(ai1709Dir, "implementer-store.json");
+    clearImplementerStore();
+
+    resetPolicyCache();
+    resetWorkflowCache();
+    resetNativeStateCache();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = ai1709OriginalFetch;
+
+    if (ai1709OriginalPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = ai1709OriginalPolicyPath;
+    else delete process.env.CAPABILITY_POLICY_PATH;
+
+    if (ai1709OriginalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = ai1709OriginalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+
+    if (ai1709OriginalAgentsFile !== undefined) process.env.AGENTS_FILE = ai1709OriginalAgentsFile;
+    else delete process.env.AGENTS_FILE;
+    reloadAgents();
+
+    if (ai1709OriginalImplementerStorePath !== undefined) process.env.IMPLEMENTER_STORE_PATH = ai1709OriginalImplementerStorePath;
+    else delete process.env.IMPLEMENTER_STORE_PATH;
+    clearImplementerStore();
+
+    fs.rmSync(ai1709Dir, { recursive: true, force: true });
+  });
+
+  it("tests-ready with valid cliTarget resolves delegate and advances state", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:write-tests" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("tests-ready", "AI-1709-VALID", "Bearer tok", {
+      bodyId: "tdd",
+      cliTarget: "igor",
+    });
+
+    const atomicCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(atomicCall).toBeDefined();
+    const vars = atomicCall!.body.variables as { delegateId?: string; labelIds?: string[] };
+    expect(vars.delegateId).toBe("igor-linear-uuid");
+    expect(vars.labelIds?.some((id: string) => id.includes("implementation") || id === "impl-lbl")).toBe(true);
+  });
+
+  it("tests-ready with no cliTarget aborts — state label must not advance", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:write-tests" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("tests-ready", "AI-1709-NOTARGET", "Bearer tok", {
+      bodyId: "tdd",
+      // cliTarget intentionally omitted
+    });
+
+    const atomicCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(atomicCall).toBeUndefined();
+  });
+
+  it("tests-ready with unknown cliTarget aborts — state label must not advance", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:write-tests" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("tests-ready", "AI-1709-BADTARGET", "Bearer tok", {
+      bodyId: "tdd",
+      cliTarget: "nonexistent-agent",
+    });
+
+    const atomicCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(atomicCall).toBeUndefined();
+  });
+
+  it("tests-ready with alternate valid cliTarget (felix) resolves to felix's linearUserId", async () => {
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:write-tests" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("tests-ready", "AI-1709-FELIX", "Bearer tok", {
+      bodyId: "tdd",
+      cliTarget: "felix",
+    });
+
+    const atomicCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(atomicCall).toBeDefined();
+    const vars = atomicCall!.body.variables as { delegateId?: string };
+    expect(vars.delegateId).toBe("felix-linear-uuid");
+  });
+});
+
 // ── AI-1493: Transition-walk canary ──────────────────────────────────────────
 
 describe("AI-1493: transition-walk canary", () => {
