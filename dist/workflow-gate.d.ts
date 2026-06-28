@@ -213,9 +213,25 @@ export declare function resolveTransitionTargets(transition: WorkflowTransition,
 export declare function getWorkflowId(labels: string[]): string | null;
 export declare function getCurrentState(labels: string[]): string | null;
 /**
+ * Thrown by fetchWorkflowLabels when the Linear API returns a transient error
+ * (network failure, 401, 5xx). Non-transient errors (e.g. 404, 403) still fail
+ * open with an empty array.
+ *
+ * AI-1708: Callers in the delivery path catch this to retry or emit a WARN
+ * before falling back to a generic message, rather than silently downgrading.
+ */
+export declare class TransientLabelFetchError extends Error {
+    readonly statusCode?: number | undefined;
+    constructor(message: string, statusCode?: number | undefined);
+}
+/**
  * Fetch label names for a Linear issue.
  * Used by the outbound delivery path (B3) to detect workflow/state labels.
- * Returns an empty array on any error — callers fail open.
+ *
+ * AI-1708: Transient failures (network errors, 401, 5xx) now throw
+ * TransientLabelFetchError instead of silently returning []. Callers that
+ * need fail-open behavior can catch and return []. Non-transient errors
+ * (e.g. malformed response, 4xx other than 401) still fail open with [].
  */
 export declare function fetchWorkflowLabels(issueId: string, authToken: string): Promise<string[]>;
 /**
@@ -342,6 +358,14 @@ export interface ApplyStateTransitionOptions {
      * Falls back to the ticket's current state:* label when undefined.
      */
     sourceStateOverride?: string;
+    /**
+     * AI-1709: CLI-supplied target agent name (from X-Openclaw-Linear-Target header).
+     * Required for multi-body role transitions (e.g. `tests-ready` targeting a specific
+     * dev body). The proxy resolves this to a Linear user ID and sets the delegate
+     * atomically with the state label. If the target cannot be resolved, the transition
+     * is aborted fail-closed.
+     */
+    cliTarget?: string;
 }
 export declare function applyStateTransition(intent: string, issueId: string | null, authToken: string, options?: ApplyStateTransitionOptions): Promise<void>;
 /**

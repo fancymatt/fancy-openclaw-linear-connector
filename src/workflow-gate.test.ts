@@ -209,6 +209,7 @@ entry_state: intake
 
 break_glass:
   command: escape
+  to: intake
   owner_role: steward
 
 states:
@@ -258,14 +259,6 @@ states:
     kind: terminal
     native_state: done
     transitions: []
-
-  - id: escape
-    kind: terminal
-    native_state: invalid
-    transitions:
-      - command: unescape
-        to: intake
-        assign: { mode: auto }
 `;
 
 let dir: string;
@@ -1215,13 +1208,13 @@ describe("applyStateTransition — break-glass escape", () => {
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("transitions to state:escape from any state on 'escape' command", async () => {
+  it("transitions to state:intake from any state on 'escape' command (AI-1710: escape re-enters at intake)", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
         { id: "state-lbl", name: "state:implementation" },
       ],
-      teamLabels: [{ id: "escape-lbl", name: "state:escape" }],
+      teamLabels: [{ id: "intake-lbl", name: "state:intake" }],
     });
     globalThis.fetch = mock;
     await applyStateTransition("escape", "issue-uuid", "Bearer tok");
@@ -1229,7 +1222,7 @@ describe("applyStateTransition — break-glass escape", () => {
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
     const vars = updateCall!.body.variables as { labelIds: string[] };
-    expect(vars.labelIds).toContain("escape-lbl");
+    expect(vars.labelIds).toContain("intake-lbl");
     expect(vars.labelIds).not.toContain("state-lbl");
   });
 });
@@ -1508,10 +1501,12 @@ describe("buildStateTransitionReminder — Layer 1 (AI-1387)", () => {
     expect(result).toBeNull();
   });
 
-  it("returns null for terminal escape state", async () => {
+  it("returns intake transition reminder after escape (AI-1710: escape re-enters at intake, not terminal)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
     const result = await buildStateTransitionReminder("escape", "ABC-123", "Bearer tok");
-    expect(result).toBeNull();
+    // escape now routes to intake (normal state with transitions), not a terminal — reminder is expected
+    expect(result).not.toBeNull();
+    expect(result).toContain("accept");
   });
 
   it("returns null for unknown intent", async () => {
@@ -5514,7 +5509,7 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     }
   });
 
-  it("escape transition writes invalid native stateId", async () => {
+  it("escape transition writes todo native stateId (AI-1710: escape re-enters at intake)", async () => {
     resetWorkflowCache();
     resetNativeStateCache();
     const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:implementation"]);
@@ -5525,7 +5520,7 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     const atomicMutation = mutations.find((m) => m.query.includes("ApplyAtomicTransition"));
     expect(atomicMutation).toBeDefined();
     const vars = atomicMutation!.variables as { stateId?: string };
-    expect(vars.stateId).toBe(SEMANTIC_TO_UUID["invalid"]);
+    expect(vars.stateId).toBe(SEMANTIC_TO_UUID["todo"]);
   });
 
   it("reject transition routes back to implementation with todo resting native state", async () => {
@@ -5714,120 +5709,6 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     const storePath = process.env.IMPLEMENTER_STORE_PATH;
     expect(storePath).toBeDefined(); // FAILS before fix (undefined), PASSES after
     expect(storePath).not.toBe("/tmp/implementer-store.json");
-  });
-});
-
-// ── AI-1521: unescape re-entry verb ──────────────────────────────────────
-
-// Shared setup for AI-1521 test suites: own temp dir so corrupted WORKFLOW_DEF_PATH /
-// CAPABILITY_POLICY_PATH from earlier test suites (ai1463, ai1493) don't interfere.
-let ai1521Dir: string;
-let ai1521OrigWorkflowPath: string | undefined;
-let ai1521OrigPolicyPath: string | undefined;
-
-function setupAi1521(): void {
-  ai1521OrigWorkflowPath = process.env.WORKFLOW_DEF_PATH;
-  ai1521OrigPolicyPath = process.env.CAPABILITY_POLICY_PATH;
-  ai1521Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1521-test-"));
-  const policyFile = path.join(ai1521Dir, "capability-policy.yaml");
-  fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
-  process.env.CAPABILITY_POLICY_PATH = policyFile;
-  process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
-}
-
-function teardownAi1521(): void {
-  fs.rmSync(ai1521Dir, { recursive: true, force: true });
-  if (ai1521OrigWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = ai1521OrigWorkflowPath;
-  else delete process.env.WORKFLOW_DEF_PATH;
-  if (ai1521OrigPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = ai1521OrigPolicyPath;
-  else delete process.env.CAPABILITY_POLICY_PATH;
-}
-
-describe("checkWorkflowRules — AI-1521: unescape from escape state", () => {
-  let originalFetch: typeof globalThis.fetch;
-
-  beforeAll(setupAi1521);
-  afterAll(teardownAi1521);
-
-  beforeEach(() => {
-    resetWorkflowCache();
-    resetNativeStateCache();
-    resetPolicyCache();
-    resetConfigHealth();
-    originalFetch = globalThis.fetch;
-  });
-
-  afterEach(() => { globalThis.fetch = originalFetch; });
-
-  it("unescape is legal from escape state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:escape"]);
-    expect(await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
-  });
-
-  it("unescape is blocked from non-escape states (e.g. implementation)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
-    const result = await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "charles");
-    expect(result).not.toBeNull();
-    expect(result).toContain("implementation");
-    expect(result).toContain("submit");
-  });
-
-  it("unescape is blocked from done state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:done"]);
-    const result = await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "charles");
-    expect(result).not.toBeNull();
-    expect(result).toContain("done");
-  });
-
-  it("illegal command on escaped ticket names unescape as legal move", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:escape"]);
-    const result = await checkWorkflowRules("accept", "issue-uuid", "Bearer tok", "astrid");
-    expect(result).not.toBeNull();
-    expect(result).toContain("unescape");
-    expect(result).toContain("escape"); // break-glass still listed
-  });
-});
-
-describe("applyStateTransition — AI-1521: unescape re-entry", () => {
-  let originalFetch: typeof globalThis.fetch;
-
-  beforeAll(setupAi1521);
-  afterAll(teardownAi1521);
-
-  beforeEach(() => {
-    resetWorkflowCache();
-    resetNativeStateCache();
-    resetPolicyCache();
-    resetConfigHealth();
-    originalFetch = globalThis.fetch;
-  });
-
-  afterEach(() => { globalThis.fetch = originalFetch; });
-
-  it("transitions escape → intake atomically (labels + delegate + native state)", async () => {
-    const { fetch: mock, calls } = makeTransitionFetch({
-      issueLabels: [
-        { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "escape-lbl", name: "state:escape" },
-      ],
-      teamLabels: [{ id: "intake-lbl", name: "state:intake" }],
-    });
-    globalThis.fetch = mock;
-    await applyStateTransition("unescape", "issue-uuid", "Bearer tok", { bodyId: "astrid" });
-
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeDefined();
-    const vars = updateCall!.body.variables as { labelIds: string[]; delegateId?: string; stateId?: string };
-    // state:intake label is added, state:escape is removed
-    expect(vars.labelIds).toContain("intake-lbl");
-    expect(vars.labelIds).not.toContain("escape-lbl");
-    // native state is set (Todo for intake)
-    expect(vars.stateId).toBe("state-todo-uuid");
-  });
-
-  it("canonical: unescape is legal from escape state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:escape"]);
-    expect(await checkWorkflowRules("unescape", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
   });
 });
 

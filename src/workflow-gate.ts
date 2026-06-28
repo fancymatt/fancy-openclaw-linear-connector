@@ -743,9 +743,31 @@ export function getCurrentState(labels: string[]): string | null {
 }
 
 /**
+ * Thrown by fetchWorkflowLabels when the Linear API returns a transient error
+ * (network failure, 401, 5xx). Non-transient errors (e.g. 404, 403) still fail
+ * open with an empty array.
+ *
+ * AI-1708: Callers in the delivery path catch this to retry or emit a WARN
+ * before falling back to a generic message, rather than silently downgrading.
+ */
+export class TransientLabelFetchError extends Error {
+  constructor(
+    message: string,
+    public readonly statusCode?: number,
+  ) {
+    super(message);
+    this.name = "TransientLabelFetchError";
+  }
+}
+
+/**
  * Fetch label names for a Linear issue.
  * Used by the outbound delivery path (B3) to detect workflow/state labels.
- * Returns an empty array on any error — callers fail open.
+ *
+ * AI-1708: Transient failures (network errors, 401, 5xx) now throw
+ * TransientLabelFetchError instead of silently returning []. Callers that
+ * need fail-open behavior can catch and return []. Non-transient errors
+ * (e.g. malformed response, 4xx other than 401) still fail open with [].
  */
 export async function fetchWorkflowLabels(issueId: string, authToken: string): Promise<string[]> {
   const query = `query IssueLabels($id: String!) { issue(id: $id) { labels { nodes { name } } } }`;
@@ -755,14 +777,51 @@ export async function fetchWorkflowLabels(issueId: string, authToken: string): P
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query, variables: { id: issueId } }),
     });
+
+    // AI-1708: Transient HTTP errors should trigger retry, not silent fail-open.
+    if (res.status === 401 || res.status >= 500) {
+      throw new TransientLabelFetchError(
+        `Linear API returned ${res.status} for label fetch on ${issueId}`,
+        res.status,
+      );
+    }
+
     type LabelResp = { data?: { issue?: { labels?: { nodes: Array<{ name: string }> } } } };
     const data = (await res.json()) as LabelResp;
     return (data.data?.issue?.labels?.nodes ?? []).map((n) => n.name);
   } catch (err) {
+    // Re-throw transient errors so callers can retry.
+    if (err instanceof TransientLabelFetchError) throw err;
+
     const msg = err instanceof Error ? err.message : String(err);
+    // Network errors (ECONNRESET, ETIMEDOUT, etc.) are transient.
+    if (isTransientNetworkError(msg)) {
+      throw new TransientLabelFetchError(
+        `Network error during label fetch for ${issueId}: ${msg}`,
+      );
+    }
+
     log.warn(`workflow-gate: outbound label fetch failed for ${issueId}: ${msg} — failing open`);
     return [];
   }
+}
+
+/**
+ * Heuristic: does this error message look like a transient network error?
+ * Covers ECONNRESET, ETIMEDOUT, ENOTFOUND, fetch failed, etc.
+ */
+function isTransientNetworkError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes("econnreset") ||
+    lower.includes("etimedout") ||
+    lower.includes("enotfound") ||
+    lower.includes("econnrefused") ||
+    lower.includes("network error") ||
+    lower.includes("fetch failed") ||
+    lower.includes("socket hang up") ||
+    lower.includes("aborted")
+  );
 }
 
 // ── Done gate: branch/PR verification (AI-1475 Defect 1) ─────────────────
@@ -1724,8 +1783,17 @@ export async function buildStateTransitionReminder(
 ): Promise<string | null> {
   if (!issueId) return null;
 
-  // Resolve the correct def for this ticket's workflow
-  const labels = await fetchWorkflowLabels(issueId, authToken);
+  // Resolve the correct def for this ticket's workflow.
+  // AI-1708: fetchWorkflowLabels now throws TransientLabelFetchError on
+  // transient failures — fail open here (no reminder) rather than crash.
+  let labels: string[];
+  try {
+    labels = await fetchWorkflowLabels(issueId, authToken);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`buildStateTransitionReminder: label fetch failed for ${issueId}: ${msg} — skipping reminder`);
+    return null;
+  }
   const workflowId = getWorkflowId(labels);
   if (!workflowId) return null; // ad-hoc ticket
 

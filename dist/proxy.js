@@ -481,6 +481,7 @@ export async function handleProxyRequest(req, res, deps) {
                         feedback,
                         artifactRef: artifactRefHeader,
                         sourceStateOverride,
+                        cliTarget: target ?? undefined,
                     });
                 }
                 catch (err) {

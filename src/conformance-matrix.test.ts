@@ -841,11 +841,11 @@ describe("buildConformanceMatrix — AC3: def changes auto-regenerate matrix", (
 // ── Canonical fixture integration ─────────────────────────────────────────
 // Smoke-check the generator against the checked-in canonical-dev-impl.yaml.
 
-describe("buildConformanceMatrix — canonical dev-impl fixture (v8)", () => {
+describe("buildConformanceMatrix — canonical dev-impl fixture (v9)", () => {
   const canonicalRaw = fs.readFileSync(CANONICAL_DEV_IMPL_FIXTURE, "utf8");
   const canonicalDef = yaml.load(canonicalRaw) as WorkflowDef;
 
-  it("produces cells for all 9 canonical states (intake, write-tests, implementation, code-review, deployment, host-deploy, ac-validate, done, escape)", () => {
+  it("produces cells for all 8 canonical states (intake, write-tests, implementation, code-review, deployment, host-deploy, ac-validate, done) — escape removed as state in AI-1710", () => {
     const cells = buildConformanceMatrix(canonicalDef, testPolicy);
     const stateSet = new Set(cells.map((c) => c.state));
     const expectedStates = [
@@ -857,11 +857,11 @@ describe("buildConformanceMatrix — canonical dev-impl fixture (v8)", () => {
       "host-deploy",
       "ac-validate",
       "done",
-      "escape",
     ];
     for (const s of expectedStates) {
       expect(stateSet.has(s)).toBe(true);
     }
+    expect(stateSet.has("escape")).toBe(false);
   });
 
   it("deploy in deployment state has a cap-missing block cell (deploy:execute required)", () => {

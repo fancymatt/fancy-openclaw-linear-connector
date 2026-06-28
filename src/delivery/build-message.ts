@@ -18,6 +18,7 @@ import type { RouteResult } from "../types.js";
 import {
   loadWorkflowDefById,
   fetchWorkflowLabels,
+  TransientLabelFetchError,
   getWorkflowId,
   getCurrentState,
   resolveTransitionTargets,
@@ -39,6 +40,42 @@ const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "buil
  */
 function guidanceDir(): string {
   return process.env.WORKFLOW_GUIDANCE_DIR ?? defaultGuidanceDir();
+}
+
+/**
+ * AI-1708: Fetch workflow labels with exponential-backoff retry.
+ *
+ * Transient failures (network errors, 401, 5xx) cause up to `maxRetries`
+ * retries with exponential backoff. If all retries are exhausted, the error
+ * is re-thrown so the caller can decide whether to fall back to generic
+ * (with a WARN) or fail the dispatch entirely.
+ *
+ * Non-transient errors (returned as [] by fetchWorkflowLabels) are not retried.
+ */
+async function fetchLabelsWithRetry(
+  identifier: string,
+  authToken: string,
+  maxRetries = parseInt(process.env.LABEL_FETCH_MAX_RETRIES ?? "2", 10),
+  baseDelayMs = parseInt(process.env.LABEL_FETCH_BASE_DELAY_MS ?? "500", 10),
+): Promise<string[]> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fetchWorkflowLabels(identifier, authToken);
+    } catch (err) {
+      lastError = err;
+      if (err instanceof TransientLabelFetchError && attempt < maxRetries) {
+        const delayMs = baseDelayMs * Math.pow(2, attempt);
+        log.warn(
+          `build-message: label fetch attempt ${attempt + 1}/${maxRetries + 1} failed for ${identifier} (${err.message}) — retrying in ${delayMs}ms`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw lastError;
 }
 
 async function loadStepGuidance(workflowId: string, step: string): Promise<string | null> {
@@ -98,7 +135,8 @@ export async function buildDeliveryMessage(route: RouteResult, authToken?: strin
 /**
  * Build a workflow-aware per-step delivery message for a single ticket by identifier.
  * Fetches title and labels from Linear; returns null when the ticket is not a workflow
- * ticket or on any fetch failure (caller should fall back to a thin message).
+ * ticket. On transient fetch failure, returns a workflow-context-unavailable fallback
+ * (AI-1708) instead of silently returning null.
  *
  * Used by the pending-bag wake-up path so agents get the same rich instruction block
  * that event-driven delegation produces.
@@ -116,10 +154,23 @@ export async function buildWorkflowAwareDeliveryMessage(
       headers: { "content-type": "application/json", authorization: authToken },
       body: JSON.stringify({ query, variables: { id: identifier } }),
     });
-    const json = (await res.json()) as { data?: { issue?: { title?: string; labels?: { nodes: Array<{ name: string }> } } } };
-    title = json.data?.issue?.title ?? "";
-  } catch {
-    return null;
+    // AI-1708: treat 401/5xx as transient — don't silently return null.
+    if (res.status === 401 || res.status >= 500) {
+      log.warn(
+        `build-message: title fetch for ${identifier} returned ${res.status} — proceeding with fallback`,
+      );
+    } else {
+      const json = (await res.json()) as { data?: { issue?: { title?: string; labels?: { nodes: Array<{ name: string }> } } } };
+      title = json.data?.issue?.title ?? "";
+    }
+  } catch (err) {
+    // AI-1708: Network error on title fetch — don't silently return null.
+    // Proceed to tryBuildWorkflowMessage which will retry labels and produce
+    // a context-unavailable fallback if retries are exhausted.
+    const reason = err instanceof Error ? err.message : String(err);
+    log.warn(
+      `build-message: title fetch failed for ${identifier}: ${reason} — proceeding with fallback`,
+    );
   }
   return tryBuildWorkflowMessage(actionText, identifier, title, authToken);
 }
@@ -184,8 +235,11 @@ async function fetchLastComment(
 /**
  * Attempt to build a workflow-aware per-step instruction block.
  * Returns null to signal "fall back to generic" on any error or ad-hoc ticket.
+ *
+ * AI-1708: Label fetch now uses fetchLabelsWithRetry. If all retries are
+ * exhausted, a WARN is logged with the failure reason before returning null.
  */
-async function tryBuildWorkflowMessage(
+export async function tryBuildWorkflowMessage(
   actionText: string,
   identifier: string,
   title: string,
@@ -193,9 +247,16 @@ async function tryBuildWorkflowMessage(
 ): Promise<string | null> {
   let labels: string[];
   try {
-    labels = await fetchWorkflowLabels(identifier, authToken);
-  } catch {
-    return null;
+    labels = await fetchLabelsWithRetry(identifier, authToken);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    log.warn(
+      `build-message: workflow label fetch exhausted retries for ${identifier} — delivering workflow-context-unavailable fallback. Failure reason: ${reason}`,
+    );
+    // AI-1708: Return the context-unavailable fallback instead of null so the
+    // caller never silently delivers a bare generic message. The fallback
+    // includes a prominent notice and instructs the agent to query its state.
+    return buildWorkflowContextUnavailableMessage(actionText, identifier, title);
   }
 
   const workflowId = getWorkflowId(labels);
@@ -343,6 +404,31 @@ async function tryBuildWorkflowMessage(
     ...acRecordBlock,
     "",
     "📝 Comment discipline: post one substantive comment — your actual findings or result. Do NOT post a comment that only restates what is already on the ticket or narrates that you have handed it back. If you have no new information to add, do not comment at all — just transition state.",
+  ].join("\n");
+}
+
+/**
+ * AI-1708: Build a fallback delivery message when workflow context cannot be
+ * fetched due to transient label-fetch failures.
+ *
+ * This is NOT the bare generic message — it includes a prominent notice that
+ * workflow context is unavailable and instructs the agent to query its current
+ * state before acting. This satisfies AC2 (WARN at dispatch site) and AC3
+ * (agent has sufficient context to identify its workflow step).
+ */
+function buildWorkflowContextUnavailableMessage(
+  actionText: string,
+  identifier: string,
+  title: string,
+): string {
+  return [
+    `${actionText}: ${title}`,
+    "",
+    "⚠️ **Workflow context unavailable:** The connector could not fetch workflow labels from Linear after retrying. You may be in a managed workflow (e.g. dev-impl) but the current step could not be determined.",
+    "",
+    `**Before acting, run \`linear observe-issue ${identifier}\` to read the current ticket state, then check the ticket's workflow labels (wf:* and state:*) to identify your current workflow step and legal commands.** Do not guess your workflow state from memory.`,
+    "",
+    "📝 Comment discipline: post one substantive comment — your actual findings or result. Do NOT post a comment that only restates what is already on the ticket.",
   ].join("\n");
 }
 

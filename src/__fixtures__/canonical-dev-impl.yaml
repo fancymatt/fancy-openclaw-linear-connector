@@ -20,7 +20,7 @@
 #   Linear state the CLI should project to when entering that state. v7 (AI-1510)
 #   made native status a pure engagement overlay — every active work-phase rests
 #   at `todo`; the connector cycles To Do → Thinking → Doing off the delegate's
-#   session lifecycle. Terminal states keep semantic value (done→done, escape→invalid).
+#   session lifecycle. Terminal states keep semantic value (done→done).
 #
 # v8 (2026-06-10, Matt directive): test-driven + deploy-real + AC-gate shape.
 #   New states: write-tests (TestDrivenDevelopmentAgent writes failing tests
@@ -29,9 +29,13 @@
 #   re-verifies the deployed artifact against the captured AC before done).
 #   Also reconciled H-7 (AI-1482, Done) stakes/capture_ac/human-signoff config —
 #   it was implemented in code + tests but missing from the production def.
+#
+# v9 (2026-06-27, AI-1710): escape re-enters at intake instead of terminating.
+#   break_glass.to changed from escape → intake; escape state removed entirely.
+#   done remains the only terminal state. unescape verb retired (no escape state to exit).
 
 id: dev-impl
-version: 8
+version: 9
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
@@ -49,7 +53,7 @@ stakes:
 
 break_glass:
   command: escape               # x-openclaw-linear-intent value that triggers break-glass (§4.4)
-  to: escape
+  to: intake   # AI-1710: escape re-enters at intake, not a terminal
   owner_role: steward           # implicit escape edge from EVERY state (design.md §4.4)
 
 states:
@@ -208,12 +212,3 @@ states:
     native_state: done           # targetState: "done" → Done
     satisfies_parent_barrier: true   # uniform terminal contract (design.md §5.4)
 
-  - id: escape
-    kind: terminal
-    native_state: invalid        # targetState: "invalid" → Invalid (canceled-type terminal)
-    # break-glass terminal; steward decides if Matt escalation is warranted (design.md §11)
-    # AI-1521: unescape re-enters the workflow at intake so live tickets can be rescued.
-    transitions:
-      - command: unescape
-        to: intake
-        assign: { mode: auto }  # steward role is singleton; auto-delegates to Astrid

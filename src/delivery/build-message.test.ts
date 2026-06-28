@@ -379,7 +379,7 @@ describe("B3 — outbound per-step instruction injection", () => {
       expect(msg).not.toContain("[dev-impl]");
     });
 
-    it("fetch throws → generic", async () => {
+    it("fetch throws → context-unavailable fallback (AI-1708)", async () => {
       globalThis.fetch = async () => {
         throw new Error("network error");
       };
@@ -387,7 +387,12 @@ describe("B3 — outbound per-step instruction injection", () => {
       const buildDeliveryMessage = await getbuildDeliveryMessage();
       const msg = await buildDeliveryMessage(makeRoute("AI-007", "Fetch error"), "Bearer tok");
 
-      expect(msg).toContain("Next Steps:");
+      // AI-1708: transient fetch failures no longer silently fall back to the
+      // bare generic message. Instead a context-unavailable fallback is delivered
+      // that does NOT contain "Next Steps:" but does include a workflow-context
+      // notice and instructs the agent to check its state.
+      expect(msg).not.toContain("Next Steps:");
+      expect(msg).toContain("Workflow context unavailable");
     });
   });
 

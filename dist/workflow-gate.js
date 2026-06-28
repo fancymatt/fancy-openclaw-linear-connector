@@ -574,9 +574,28 @@ export function getCurrentState(labels) {
     return label ? label.slice(label.indexOf(":") + 1).toLowerCase() : null;
 }
 /**
+ * Thrown by fetchWorkflowLabels when the Linear API returns a transient error
+ * (network failure, 401, 5xx). Non-transient errors (e.g. 404, 403) still fail
+ * open with an empty array.
+ *
+ * AI-1708: Callers in the delivery path catch this to retry or emit a WARN
+ * before falling back to a generic message, rather than silently downgrading.
+ */
+export class TransientLabelFetchError extends Error {
+    constructor(message, statusCode) {
+        super(message);
+        this.statusCode = statusCode;
+        this.name = "TransientLabelFetchError";
+    }
+}
+/**
  * Fetch label names for a Linear issue.
  * Used by the outbound delivery path (B3) to detect workflow/state labels.
- * Returns an empty array on any error — callers fail open.
+ *
+ * AI-1708: Transient failures (network errors, 401, 5xx) now throw
+ * TransientLabelFetchError instead of silently returning []. Callers that
+ * need fail-open behavior can catch and return []. Non-transient errors
+ * (e.g. malformed response, 4xx other than 401) still fail open with [].
  */
 export async function fetchWorkflowLabels(issueId, authToken) {
     const query = `query IssueLabels($id: String!) { issue(id: $id) { labels { nodes { name } } } }`;
@@ -586,14 +605,40 @@ export async function fetchWorkflowLabels(issueId, authToken) {
             headers: { "Content-Type": "application/json", Authorization: authToken },
             body: JSON.stringify({ query, variables: { id: issueId } }),
         });
+        // AI-1708: Transient HTTP errors should trigger retry, not silent fail-open.
+        if (res.status === 401 || res.status >= 500) {
+            throw new TransientLabelFetchError(`Linear API returned ${res.status} for label fetch on ${issueId}`, res.status);
+        }
         const data = (await res.json());
         return (data.data?.issue?.labels?.nodes ?? []).map((n) => n.name);
     }
     catch (err) {
+        // Re-throw transient errors so callers can retry.
+        if (err instanceof TransientLabelFetchError)
+            throw err;
         const msg = err instanceof Error ? err.message : String(err);
+        // Network errors (ECONNRESET, ETIMEDOUT, etc.) are transient.
+        if (isTransientNetworkError(msg)) {
+            throw new TransientLabelFetchError(`Network error during label fetch for ${issueId}: ${msg}`);
+        }
         log.warn(`workflow-gate: outbound label fetch failed for ${issueId}: ${msg} — failing open`);
         return [];
     }
+}
+/**
+ * Heuristic: does this error message look like a transient network error?
+ * Covers ECONNRESET, ETIMEDOUT, ENOTFOUND, fetch failed, etc.
+ */
+function isTransientNetworkError(msg) {
+    const lower = msg.toLowerCase();
+    return (lower.includes("econnreset") ||
+        lower.includes("etimedout") ||
+        lower.includes("enotfound") ||
+        lower.includes("econnrefused") ||
+        lower.includes("network error") ||
+        lower.includes("fetch failed") ||
+        lower.includes("socket hang up") ||
+        lower.includes("aborted"));
 }
 /**
  * Query Linear for the issue's branch and pull request status.
@@ -1417,8 +1462,18 @@ export async function checkRawMutationInterception(body, issueId, authToken, bod
 export async function buildStateTransitionReminder(intent, issueId, authToken) {
     if (!issueId)
         return null;
-    // Resolve the correct def for this ticket's workflow
-    const labels = await fetchWorkflowLabels(issueId, authToken);
+    // Resolve the correct def for this ticket's workflow.
+    // AI-1708: fetchWorkflowLabels now throws TransientLabelFetchError on
+    // transient failures — fail open here (no reminder) rather than crash.
+    let labels;
+    try {
+        labels = await fetchWorkflowLabels(issueId, authToken);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`buildStateTransitionReminder: label fetch failed for ${issueId}: ${msg} — skipping reminder`);
+        return null;
+    }
     const workflowId = getWorkflowId(labels);
     if (!workflowId)
         return null; // ad-hoc ticket
@@ -1791,7 +1846,22 @@ export async function applyStateTransition(intent, issueId, authToken, options) 
                         log.error(`workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' on '${intent}' with no prior implementer. Cannot auto-resolve delegate for ${issueId}. Use --target.`);
                         return;
                     }
-                    log.info(`workflow-gate: B2 apply: ${issueId} multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) — delegate set by CLI target, skipping proxy auto-assign`);
+                    // AI-1709: multi-body role transitions require a CLI target resolved to a Linear
+                    // user ID. The proxy was previously logging "delegate set by CLI target" and then
+                    // never actually resolving the target, leaving resolvedDelegateId undefined and the
+                    // ticket orphaned with no delegate. Now fail-closed: no target = abort.
+                    const cliTarget = options?.cliTarget;
+                    if (!cliTarget) {
+                        log.error(`workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) on '${intent}' for ${issueId} requires a CLI --target but none was supplied. Transition aborted.`);
+                        return;
+                    }
+                    const targetAgent = getAgent(cliTarget);
+                    if (!targetAgent?.linearUserId) {
+                        log.error(`workflow-gate: B2 apply: FAIL-CLOSED — CLI target '${cliTarget}' cannot be resolved to a Linear user ID for ${issueId} (multi-body role '${destOwnerRole}'). Register the agent in agents.json with a linearUserId. Transition aborted.`);
+                        return;
+                    }
+                    resolvedDelegateId = targetAgent.linearUserId;
+                    log.info(`workflow-gate: B2 apply: ${issueId} multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) — resolved CLI target '${cliTarget}' → delegate=${resolvedDelegateId}`);
                 }
                 else {
                     if (intent === 'approve' || intent === 'reject') {
