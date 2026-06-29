@@ -22,6 +22,28 @@
 
 import { evaluateBarrier, attemptBarrierTransition, isChildTerminal, type BarrierResult, type BarrierTransitionResult } from "./barrier.js";
 
+// Dynamic import for onManagingEntry — not yet exported from barrier.ts.
+// Using the module namespace avoids a static ESM import failure so the
+// evaluateBarrier / attemptBarrierTransition tests still run independently.
+import * as barrierModule from "./barrier.js";
+type OnManagingEntryFn = (
+  parentIdentifier: string,
+  authToken: string,
+) => Promise<BarrierTransitionResult | null>;
+const onManagingEntry = (barrierModule as Record<string, unknown>)[
+  "onManagingEntry"
+] as OnManagingEntryFn | undefined;
+
+function requireOnManagingEntry(): OnManagingEntryFn {
+  if (!onManagingEntry) {
+    throw new Error(
+      "onManagingEntry is not exported from barrier.ts — " +
+      "add `export async function onManagingEntry(parentIdentifier, authToken)` to implement AI-1730 ACs 1–3.",
+    );
+  }
+  return onManagingEntry;
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /** Build a mock fetch that returns children for the parent. */
@@ -418,5 +440,161 @@ describe("AC4: Existing fan-out behaviour preserved (story-series/story-lesson a
     expect(result.allTerminal).toBe(true);
     expect(result.totalChildren).toBe(3);
     expect(result.terminalCount).toBe(3);
+  });
+});
+
+// ── onManagingEntry: entry-time hook (new export required) ───────────────
+
+describe("onManagingEntry — entry-time barrier check (AI-1730)", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("AC1: immediately transitions ux-audit parent with zero children", async () => {
+    const fn = requireOnManagingEntry();
+    globalThis.fetch = makeTransitionFetch({ children: [], workflowId: "ux-audit", parentState: "managing" });
+
+    const result = await fn("AI-1730", "Bearer tok");
+
+    expect(result).not.toBeNull();
+    expect(result!.transitioned).toBe(true);
+    expect(result!.totalChildren).toBe(0);
+  });
+
+  it("AC1: immediately transitions sprint parent with zero children", async () => {
+    const fn = requireOnManagingEntry();
+    globalThis.fetch = makeTransitionFetch({ children: [], workflowId: "sprint", parentState: "managing" });
+
+    const result = await fn("AI-1730", "Bearer tok");
+
+    expect(result).not.toBeNull();
+    expect(result!.transitioned).toBe(true);
+  });
+
+  it("AC2: immediately transitions when all children are already done at entry (race condition)", async () => {
+    const fn = requireOnManagingEntry();
+    globalThis.fetch = makeTransitionFetch({
+      children: [
+        { identifier: "AI-2001", labels: ["wf:dev-impl", "state:done"] },
+        { identifier: "AI-2002", labels: ["wf:dev-impl", "state:escape"] },
+      ],
+      workflowId: "ux-audit",
+      parentState: "managing",
+    });
+
+    const result = await fn("AI-1730", "Bearer tok");
+
+    expect(result).not.toBeNull();
+    expect(result!.transitioned).toBe(true);
+  });
+
+  it("AC3: does NOT transition when N ≥ 1 in-progress children exist", async () => {
+    const fn = requireOnManagingEntry();
+    globalThis.fetch = makeTransitionFetch({
+      children: [
+        { identifier: "AI-2001", labels: ["wf:dev-impl", "state:implementation"] },
+        { identifier: "AI-2002", labels: ["wf:dev-impl", "state:done"] },
+      ],
+      workflowId: "ux-audit",
+      parentState: "managing",
+    });
+
+    const result = await fn("AI-1730", "Bearer tok");
+
+    expect(result?.transitioned ?? false).toBe(false);
+  });
+
+  it("AC3: does NOT transition when a single in-progress child exists", async () => {
+    const fn = requireOnManagingEntry();
+    globalThis.fetch = makeTransitionFetch({
+      children: [
+        { identifier: "AI-2001", labels: ["wf:dev-impl", "state:write-tests"] },
+      ],
+      workflowId: "ux-audit",
+      parentState: "managing",
+    });
+
+    const result = await fn("AI-1730", "Bearer tok");
+
+    expect(result?.transitioned ?? false).toBe(false);
+  });
+
+  it("does NOT transition if parent is not in managing state (double-advance guard)", async () => {
+    const fn = requireOnManagingEntry();
+    globalThis.fetch = makeTransitionFetch({
+      children: [],
+      workflowId: "ux-audit",
+      parentState: "review",
+    });
+
+    const result = await fn("AI-1730", "Bearer tok");
+
+    expect(result?.transitioned ?? false).toBe(false);
+  });
+});
+
+// ── vocab-builder / word-build: conditional-spawning workflows ────────────
+
+describe("vocab-builder / word-build workflows — zero-child auto-advance (AI-1730)", () => {
+  // These workflows spawn 0..N children. The bug manifests here because:
+  //   vocab-builder spawns 0..N wf:word-build children (0 when audit finds all words correct)
+  //   word-build spawns 0 or 1 wf:vocab-image children (0 when word already has an image)
+  // In both cases, zero children must trigger immediate auto-advance from managing.
+
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("AC1: vocab-builder parent with zero children auto-advances", async () => {
+    const fn = requireOnManagingEntry();
+    globalThis.fetch = makeTransitionFetch({ children: [], workflowId: "vocab-builder", parentState: "managing" });
+
+    const result = await fn("AI-1730", "Bearer tok");
+
+    expect(result).not.toBeNull();
+    expect(result!.transitioned).toBe(true);
+  });
+
+  it("AC1: word-build parent with zero children auto-advances", async () => {
+    const fn = requireOnManagingEntry();
+    globalThis.fetch = makeTransitionFetch({ children: [], workflowId: "word-build", parentState: "managing" });
+
+    const result = await fn("AI-1730", "Bearer tok");
+
+    expect(result).not.toBeNull();
+    expect(result!.transitioned).toBe(true);
+  });
+
+  it("AC2: word-build parent with single vocab-image child already done auto-advances (race condition)", async () => {
+    const fn = requireOnManagingEntry();
+    globalThis.fetch = makeTransitionFetch({
+      children: [
+        { identifier: "AI-2001", labels: ["wf:vocab-image", "state:done"] },
+      ],
+      workflowId: "word-build",
+      parentState: "managing",
+    });
+
+    const result = await fn("AI-1730", "Bearer tok");
+
+    expect(result).not.toBeNull();
+    expect(result!.transitioned).toBe(true);
+  });
+
+  it("AC3: word-build parent with in-progress vocab-image child does NOT auto-advance", async () => {
+    const fn = requireOnManagingEntry();
+    globalThis.fetch = makeTransitionFetch({
+      children: [
+        { identifier: "AI-2001", labels: ["wf:vocab-image", "state:generating"] },
+      ],
+      workflowId: "word-build",
+      parentState: "managing",
+    });
+
+    const result = await fn("AI-1730", "Bearer tok");
+
+    expect(result?.transitioned ?? false).toBe(false);
   });
 });
