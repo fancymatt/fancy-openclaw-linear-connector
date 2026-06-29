@@ -97,6 +97,8 @@ states:
     transitions:
       - command: submit
         to: code-review
+        generic: continue
+        requires_comment: true
         assign:
           mode: required          # reviewer must be explicitly specified (§4.3)
           constraint: not-implementer  # reviewer must differ from implementer (AI-1475 D2)
@@ -115,6 +117,8 @@ states:
         assign: { mode: auto }
       - command: request-changes
         to: implementation
+        generic: revision
+        requires_comment: true
         feedback:
           required: true
           category_enum:
@@ -149,6 +153,7 @@ states:
         assign: { mode: auto }     # host-deploy is singleton (Grover) — auto-assign
       - command: reject
         to: implementation
+        requires_comment: true
         feedback:
           required: true
           category_enum:
@@ -175,6 +180,7 @@ states:
         assign: { mode: auto }     # ac-validate steward is singleton (Astrid) — auto-assign
       - command: reject
         to: implementation
+        requires_comment: true
         feedback:
           required: true
           category_enum:
@@ -198,6 +204,7 @@ states:
         # terminal → no assignment
       - command: ac-fail
         to: implementation
+        requires_comment: true
         feedback:
           required: true
           category_enum:

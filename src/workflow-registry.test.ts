@@ -450,7 +450,8 @@ describe("AC4: dev-impl regression — registry-based gate identical to single-d
     process.env.WORKFLOW_DEFS_DIR = registryDir;
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
 
-    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles");
+    // AI-1731: submit now has requires_comment — pass hasComment=true to test legality, not the comment gate
+    const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", null, undefined, null, false, false, true);
 
     // With a single reviewer body (reviewer), assign mode=required + not-implementer
     // might block unless a target is provided. Key regression: the gate DOES NOT pass-through.

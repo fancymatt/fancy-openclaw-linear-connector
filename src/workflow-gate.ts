@@ -1039,6 +1039,7 @@ export async function checkWorkflowRules(
   artifactRef?: string | null,
   breakGlassOverride: boolean = false,
   isMetaIntent: boolean = false,
+  hasComment: boolean = false,
 ): Promise<string | null> {
   // TODO(AI-1347): fail-open on missing issueId is a Layer A carry-forward.
   // Harden by deriving issueId from the request body when headers are absent.
@@ -1302,6 +1303,18 @@ export async function checkWorkflowRules(
         `Legal moves: ${legalMoves}.`
       );
     }
+  }
+
+  // AI-1731: Comment requirement gate.
+  // Transitions marked requires_comment: true must be accompanied by a non-empty
+  // comment body (posted via commentCreate in the same request). This ensures
+  // review feedback and rejection reasons are never lost. Break-glass is exempt.
+  if (match.requires_comment && !hasComment && !breakGlassOverride) {
+    log.warn(`workflow-gate: comment gate: '${intent}' on ${issueId} requires a comment — none provided`);
+    return (
+      `[Proxy] '${intent}' requires a comment explaining the transition. ` +
+      `Use --comment-file (or the X-Openclaw-Comment header) to attach a comment to '${intent}'.`
+    );
   }
 
   // §5.7 item 1 / C-2: Artifact-binding gate.

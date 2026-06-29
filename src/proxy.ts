@@ -406,7 +406,8 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         deps?.operationalEventStore?.append({ outcome: "break-glass-used", agent: agentId, key: issueId ?? undefined });
       }
 
-      const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent);
+      const requestHasComment = extractCommentBody(body) !== null;
+      const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment);
       if (p3rejection) {
         log.warn(`workflow-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p3rejection}`);
         res.status(200).json({ errors: [{ message: p3rejection }] });
