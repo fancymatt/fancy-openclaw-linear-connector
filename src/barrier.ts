@@ -36,7 +36,7 @@
  */
 
 import { componentLogger, createLogger } from "./logger.js";
-import { loadWorkflowDef, getWorkflowId, getCurrentState, type WorkflowDef } from "./workflow-gate.js";
+import { loadWorkflowDef, loadWorkflowDefById, getWorkflowId, getCurrentState, type WorkflowDef } from "./workflow-gate.js";
 import {
   LINEAR_API_URL,
   findOrCreateLabel,
@@ -399,8 +399,9 @@ export async function evaluateBarrier(
 ): Promise<BarrierResult> {
   const children = await fetchChildren(parentIdentifier, authToken);
 
+  // AI-1730: zero children = vacuous satisfaction (barrier is trivially met).
   if (children.length === 0) {
-    return { allTerminal: false, totalChildren: 0, terminalCount: 0, children: [] };
+    return { allTerminal: true, totalChildren: 0, terminalCount: 0, children: [] };
   }
 
   const terminalCount = children.filter((c) => c.isTerminal).length;
@@ -446,12 +447,8 @@ export async function attemptBarrierTransition(
   result.terminalCount = barrier.terminalCount;
   result.totalChildren = barrier.totalChildren;
 
-  if (barrier.totalChildren === 0) {
-    log.info(`barrier: no children for ${parentIdentifier} — skipping`);
-    result.error = "No children found — barrier requires at least one child";
-    return result;
-  }
-
+  // AI-1730: zero children is now a valid barrier state (vacuous satisfaction);
+  // do NOT early-return — fall through to the managing-state check.
   if (!barrier.allTerminal) {
     log.info(
       `barrier: not all children terminal for ${parentIdentifier} — ` +
@@ -470,13 +467,17 @@ export async function attemptBarrierTransition(
 
   const workflowId = getWorkflowId(parentState.labels);
   // Phase 6 / C-3 (AI-1473): generalized from ux-audit-only to archetype-agnostic.
-  // Both ux-audit (managing → review) and sprint (managing → validating) use the
-  // same barrier pattern: all children terminal → auto-advance.
-  const isOrchestrator = workflowId === "ux-audit";
-  const isFeatureInitiative = workflowId === "sprint";
-  if (!isOrchestrator && !isFeatureInitiative) {
-    log.info(`barrier: parent ${parentIdentifier} is not an orchestrator or feature-initiative (wf:${workflowId}) — skipping`);
-    result.error = `Parent workflow is '${workflowId}', expected 'ux-audit' or 'sprint'`;
+  // ux-audit (managing → review), sprint (managing → validating), vocab-builder,
+  // and word-build all use the same barrier pattern.
+  const BARRIER_WORKFLOWS = new Set([
+    "ux-audit",
+    "sprint",
+    "vocab-builder",
+    "word-build",
+  ]);
+  if (!BARRIER_WORKFLOWS.has(workflowId)) {
+    log.info(`barrier: parent ${parentIdentifier} workflow wf:${workflowId} is not a barrier workflow — skipping`);
+    result.error = `Parent workflow is '${workflowId}', not a barrier workflow`;
     return result;
   }
 
@@ -501,8 +502,26 @@ export async function attemptBarrierTransition(
     return result;
   }
 
-  // Phase 6 / C-3: ux-audit advances to 'review', sprint advances to 'validating'.
-  const barrierTarget = isOrchestrator ? "review" : "validating";
+  // Phase 6 / C-3 + AI-1730: Determine barrier target from workflow def.
+  // ux-audit → review, sprint → validating, vocab-builder/word-build → from def.
+  // Fallback: try to load the workflow def for the managing state's 'complete' transition.
+  let barrierTarget: string | undefined;
+  try {
+    const wfDef = await loadWorkflowDefById(workflowId);
+    if (wfDef) {
+      const managingState = wfDef.states.find((s) => s.id === "managing");
+      const completeTransition = managingState?.transitions?.find((t) => t.command === "complete");
+      if (completeTransition) {
+        barrierTarget = completeTransition.to;
+      }
+    }
+  } catch {
+    // Workflow def unavailable — fall back to known archetypes
+  }
+  if (!barrierTarget) {
+    // Hardcoded fallback for known archetypes
+    barrierTarget = workflowId === "ux-audit" ? "review" : "validating";
+  }
   const reviewLabelId = await findOrCreateLabel(
     parentWithLabels.teamId,
     `state:${barrierTarget}`,
@@ -539,6 +558,42 @@ export async function attemptBarrierTransition(
     `(${barrier.terminalCount}/${barrier.totalChildren} children terminal)`,
   );
   return result;
+}
+
+/**
+ * AI-1730: Entry-time barrier check for a parent entering the managing state.
+ *
+ * Called unconditionally after the fan-out block in workflow-gate.ts.
+ * This is a no-op when children are in-progress — it only fires when
+ * the barrier is already satisfied (zero children or all children already
+ * terminal at entry time).
+ *
+ * Steps:
+ *   1. Fetch children of the parent.
+ *   2. If evaluateBarrier reports allTerminal, attempt the transition.
+ *   3. Otherwise return null (children still in progress, normal flow).
+ *
+ * Returns BarrierTransitionResult if a transition was attempted,
+ * null if the barrier is not yet satisfied (not an error).
+ */
+export async function onManagingEntry(
+  parentIdentifier: string,
+  authToken: string,
+): Promise<BarrierTransitionResult | null> {
+  // 1. Evaluate the barrier
+  const barrier = await evaluateBarrier(parentIdentifier, authToken);
+
+  // 2. If barrier is not satisfied, return null (normal flow — children still active)
+  if (!barrier.allTerminal) {
+    return null;
+  }
+
+  // 3. Barrier is satisfied — attempt the transition
+  log.info(
+    `barrier: AI-1730 onManagingEntry: barrier satisfied for ${parentIdentifier} ` +
+    `(${barrier.terminalCount}/${barrier.totalChildren} terminal) — attempting transition`,
+  );
+  return attemptBarrierTransition(parentIdentifier, authToken);
 }
 
 /**
