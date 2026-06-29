@@ -466,6 +466,10 @@ export async function attemptBarrierTransition(
   }
 
   const workflowId = getWorkflowId(parentState.labels);
+  if (!workflowId) {
+    result.error = "No workflow ID found on parent labels";
+    return result;
+  }
   // Phase 6 / C-3 (AI-1473): generalized from ux-audit-only to archetype-agnostic.
   // ux-audit (managing → review), sprint (managing → validating), vocab-builder,
   // and word-build all use the same barrier pattern.
