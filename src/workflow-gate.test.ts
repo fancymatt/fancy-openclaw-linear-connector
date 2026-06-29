@@ -760,7 +760,8 @@ describe("checkWorkflowRules — canonical vault schema (src/__fixtures__/canoni
   it("parses the canonical YAML without error (passes for a legal command)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:implementation"]);
     // 'submit' is legal in implementation; auto-assigns to singleton reviewer; null means pass-through
-    expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+    // AI-1731: submit now has requires_comment — pass hasComment=true to test legality, not the comment gate
+    expect(await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles", null, undefined, null, false, false, true)).toBeNull();
   });
 
   it("canonical: escape is legal from every state (§4.4)", async () => {
@@ -778,7 +779,8 @@ describe("checkWorkflowRules — canonical vault schema (src/__fixtures__/canoni
   it("canonical: deployment state allows deploy and reject (not just deploy)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
     // 'reject' requires no capability — should pass through
-    const result = await checkWorkflowRules("reject", "issue-uuid", "Bearer tok", "astrid");
+    // AI-1731: reject now has requires_comment — pass hasComment=true to test legality, not the comment gate
+    const result = await checkWorkflowRules("reject", "issue-uuid", "Bearer tok", "astrid", null, undefined, null, false, false, true);
     expect(result).toBeNull();
   });
 
