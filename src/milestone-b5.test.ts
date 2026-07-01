@@ -33,6 +33,7 @@ import { fileURLToPath } from "node:url";
 import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { resetWorkflowCache } from "./workflow-gate.js";
+import { resetConfigHealth } from "./config-health.js";
 import { extractFindings, shouldTriggerFanout } from "./fanout.js";
 import { isChildTerminal, evaluateBarrier, onChildTerminal, detectStalledChildren, surfaceStalledChildren, isTerminalState } from "./barrier.js";
 import { parseAcChecklist, evaluateAcGate, evaluateParentAcGate, dispositionToDone, resolveDisposition } from "./review.js";
@@ -153,14 +154,26 @@ function createChainedMockFetch(handlers: MockFetchHandler[]): typeof globalThis
 describe("AC1: Real walk — end-to-end milestone validation", () => {
   let originalFetch: typeof globalThis.fetch;
   let fetchLog: Array<{ query: string; variables: Record<string, unknown> }>;
+  let savedWorkflowDefPath: string | undefined;
 
   beforeEach(() => {
     originalFetch = globalThis.fetch;
     fetchLog = [];
+    // AI-1730: attemptBarrierTransition now calls loadWorkflowDefById which
+    // triggers loadWorkflowRegistry. Without a valid WORKFLOW_DEF_PATH, the
+    // registry load fails and poisons config-health, breaking AC2 proxy tests.
+    savedWorkflowDefPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT;
+    resetWorkflowCache();
+    resetConfigHealth();
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    if (savedWorkflowDefPath) process.env.WORKFLOW_DEF_PATH = savedWorkflowDefPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    resetWorkflowCache();
+    resetConfigHealth();
   });
 
   function withFetchLogging(mockFetch: typeof globalThis.fetch): typeof globalThis.fetch {
@@ -413,6 +426,7 @@ describe("AC2: Proxy-validated transitions — illegal moves rejected with legal
     originalFetch = globalThis.fetch;
     resetPolicyCache();
     resetWorkflowCache();
+    resetConfigHealth();
     reloadAgents();
   });
 
@@ -721,6 +735,7 @@ describe("Integration: full state machine walk — all states visited", () => {
     originalFetch = globalThis.fetch;
     resetPolicyCache();
     resetWorkflowCache();
+    resetConfigHealth();
     reloadAgents();
   });
 
