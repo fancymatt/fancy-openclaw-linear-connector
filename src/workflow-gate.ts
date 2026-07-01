@@ -44,7 +44,7 @@ import { ObservationStore, type ReasonCode } from "./store/observation-store.js"
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout } from "./fanout.js";
-import { onChildTerminal, isTerminalState } from "./barrier.js";
+import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
@@ -2462,6 +2462,34 @@ export async function applyStateTransition(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`workflow-gate: B-2 fan-out: fan-out failed for ${issueId}: ${msg}`);
+    }
+  }
+
+  // ── AI-1730: Zero-child barrier auto-advance on managing entry ────────
+  // After the fan-out block (which may create 0..N children), check if
+  // the barrier is already satisfied. This is a no-op when children are
+  // in-progress — it only fires when all children are terminal or none exist.
+  // Called unconditionally; the barrier module handles early exit.
+  if (applied && toStateName === "managing") {
+    try {
+      const barrierResult = await onManagingEntry(issueId, authToken);
+      if (barrierResult) {
+        if (barrierResult.transitioned) {
+          log.info(
+            `workflow-gate: AI-1730: zero-child/all-terminal barrier auto-advanced ` +
+            `${issueId} managing → (next state) (${barrierResult.totalChildren} children)`,
+          );
+          clearAppliedState(issue.identifier);
+          return;
+        }
+        log.info(
+          `workflow-gate: AI-1730: onManagingEntry returned no transition for ${issueId} — children still active`,
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`workflow-gate: AI-1730: onManagingEntry failed for ${issueId}: ${msg}`);
+      // Fail-open: don't block the flow
     }
   }
 

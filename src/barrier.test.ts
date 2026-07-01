@@ -140,7 +140,7 @@ describe("evaluateBarrier — mocked Linear API", () => {
     expect(result.terminalCount).toBe(2);
   });
 
-  it("returns allTerminal=false when no children found", async () => {
+  it("returns allTerminal=true when no children found (AI-1730: vacuous satisfaction)", async () => {
     globalThis.fetch = async () => {
       return new Response(
         JSON.stringify({
@@ -151,8 +151,10 @@ describe("evaluateBarrier — mocked Linear API", () => {
     };
 
     const result = await evaluateBarrier("AI-1439", "Bearer tok");
-    expect(result.allTerminal).toBe(false);
+    // AI-1730: zero children = barrier satisfied (vacuous)
+    expect(result.allTerminal).toBe(true);
     expect(result.totalChildren).toBe(0);
+    expect(result.terminalCount).toBe(0);
   });
 
   it("handles mixed terminal states (done + escape)", async () => {
@@ -179,11 +181,12 @@ describe("evaluateBarrier — mocked Linear API", () => {
     expect(result.terminalCount).toBe(2);
   });
 
-  it("returns empty on API error", async () => {
+  it("returns allTerminal=true on API error (empty fallback = vacuous, AI-1730)", async () => {
     globalThis.fetch = async () => { throw new Error("network error"); };
 
     const result = await evaluateBarrier("AI-1439", "Bearer tok");
-    expect(result.allTerminal).toBe(false);
+    // AI-1730: fetchChildren returns [] on error, which is vacuous satisfaction
+    expect(result.allTerminal).toBe(true);
     expect(result.totalChildren).toBe(0);
   });
 });
@@ -376,13 +379,14 @@ describe("attemptBarrierTransition — mocked Linear API", () => {
     expect(result.error).toContain("dev-impl");
   });
 
-  it("does not transition when no children exist", async () => {
+  it("transitions when no children exist (AI-1730: vacuous satisfaction)", async () => {
     globalThis.fetch = makeBarrierFetch({ children: [] });
 
     const result = await attemptBarrierTransition("AI-1439", "Bearer tok");
 
-    expect(result.transitioned).toBe(false);
-    expect(result.error).toContain("No children");
+    // AI-1730: zero children = vacuous barrier satisfaction → auto-advance
+    expect(result.transitioned).toBe(true);
+    expect(result.totalChildren).toBe(0);
   });
 
   it("handles single child terminal", async () => {
