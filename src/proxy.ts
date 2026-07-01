@@ -456,7 +456,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // — catches anything that survived (strip failure, non-state label manipulation).
         // commentCreate is excluded: workflow commands legitimately use it.
         const intentPathRawRejection = await checkRawMutationInterception(
-          body, issueId, authorization, agentId, callerLinearUserId, /* skipCommentCreate */ true
+          body, issueId, authorization, agentId, callerLinearUserId, /* skipCommentCreate */ true, /* skipLabelFields */ true
         );
         if (intentPathRawRejection) {
           log.warn(`raw-mutation-block-on-intent-path agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${intentPathRawRejection}`);

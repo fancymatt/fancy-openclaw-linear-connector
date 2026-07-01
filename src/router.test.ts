@@ -183,17 +183,19 @@ describe("extractAgentTarget", () => {
   // (object) — both encodings are tested. When updatedFrom is present but has
   // neither key, the delegate field was NOT part of this update.
 
-  it("AC1: non-self same-value delegate write (updatedFrom missing delegate key) does not dispatch", () => {
+  it("AC1: non-self same-value delegate write (updatedFrom missing delegate key) dispatches on state transition", () => {
     // Steward astrid writes delegate=charles when charles is already the delegate.
     // updatedFrom only records the field that changed; no delegateId/delegate key
     // means the delegate was unchanged in this update.
+    // However, stateId changed — per AI-1573, state transitions always dispatch
+    // even when the delegate is unchanged, because the agent is starting a new step.
     const event = makeIssueEvent({
       actorId: ASTRID_ID,
       delegateId: CHARLES_ID,
       updatedFrom: { stateId: "prev-state-id" },
     });
     const result = extractAgentTarget(event);
-    expect(result).toBeNull();
+    expect(result).toEqual({ name: "charles", reason: "delegate" });
   });
 
   it("AC1 (empty updatedFrom): no fields changed at all does not dispatch", () => {

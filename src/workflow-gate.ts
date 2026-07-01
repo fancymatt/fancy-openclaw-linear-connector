@@ -1475,6 +1475,7 @@ export async function checkRawMutationInterception(
   bodyId?: string,
   callerLinearUserId?: string | null,
   skipCommentCreate?: boolean,
+  skipLabelFields?: boolean,
 ): Promise<string | null> {
   if (!body) return null;
 
@@ -1582,7 +1583,10 @@ export async function checkRawMutationInterception(
   const hasAssigneeChange = touches("assigneeId");
   // AI-1658 AC1: also intercept addedLabelIds/removedLabelIds — additive/subtractive
   // label mutations that the old check missed, letting agents bypass Layer 2 via these fields.
-  const hasLabelChange = touches("labelIds") || touches("addedLabelIds") || touches("removedLabelIds");
+  // When skipLabelFields is true (intent path after state-label stripping), label fields
+  // are excluded from interception — the proxy's stripStateLabelDeltas already handled
+  // state:* labels, and non-state labels are legitimate payload.
+  const hasLabelChange = !skipLabelFields && (touches("labelIds") || touches("addedLabelIds") || touches("removedLabelIds"));
   // AI-1535: delegate is a distinct field from assignee. App-user delegates are
   // written via `delegateId` (assigneeId is omitted for them, AI-1395), so a raw
   // delegate write was invisible to this detector and bypassed the delegate-only

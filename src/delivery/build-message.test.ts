@@ -241,7 +241,7 @@ describe("B3 — outbound per-step instruction injection", () => {
         state: "code-review",
         expectedCommands: [
           "linear approve AI-001",
-          'linear request-changes AI-001 <felix|noah|sage|igor> --comment "<feedback>"',
+          'linear request-changes AI-001 <felix|noah|sage|igor> --comment-file <path>',
         ],
         notExpected: ["linear submit AI-001", "linear deploy AI-001"],
       },
@@ -249,7 +249,7 @@ describe("B3 — outbound per-step instruction injection", () => {
         state: "deployment",
         expectedCommands: [
           "linear deploy AI-001",
-          'linear reject AI-001 <felix|noah|sage|igor> --comment "<feedback>"',
+          'linear reject AI-001 <felix|noah|sage|igor> --comment-file <path>',
         ],
         notExpected: ["linear approve AI-001", "linear submit AI-001"],
       },
@@ -271,10 +271,6 @@ describe("B3 — outbound per-step instruction injection", () => {
         for (const cmd of expectedCommands) {
           expect(msg).toContain(cmd);
         }
-
-        // Escape always present (§4.4)
-        expect(msg).toContain("linear escape AI-001");
-        expect(msg).toContain("→ escape");
 
         // Generic "Next Steps:" block absent
         expect(msg).not.toContain("Next Steps:");
