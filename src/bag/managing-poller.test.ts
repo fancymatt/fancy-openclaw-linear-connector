@@ -113,7 +113,7 @@ describe("ManagingPoller.runCycle", () => {
       {
         store: stores.store,
         operationalEventStore: stores.ops,
-        deliveryConfig: { nodeBin: "node" } as never,
+        resolveDeliveryConfig: () => ({ nodeBin: "node" }),
         listAgents: () => agents as never,
         fetchManagingTickets: async () => issues,
         sendWake: sendWake as never,
@@ -153,7 +153,7 @@ describe("ManagingPoller.runCycle", () => {
       {
         store: stores.store,
         operationalEventStore: stores.ops,
-        deliveryConfig: { nodeBin: "node" } as never,
+        resolveDeliveryConfig: () => ({ nodeBin: "node" }),
         listAgents: () => agents as never,
         fetchManagingTickets: async () => issues,
         sendWake: sendWake as never,
@@ -185,7 +185,7 @@ describe("ManagingPoller.runCycle", () => {
       {
         store: stores.store,
         operationalEventStore: stores.ops,
-        deliveryConfig: { nodeBin: "node" } as never,
+        resolveDeliveryConfig: () => ({ nodeBin: "node" }),
         listAgents: () => agents as never,
         fetchManagingTickets: async () => issues,
         sendWake: sendWake as never,
@@ -219,7 +219,7 @@ describe("ManagingPoller.runCycle", () => {
       {
         store: stores.store,
         operationalEventStore: stores.ops,
-        deliveryConfig: { nodeBin: "node" } as never,
+        resolveDeliveryConfig: () => ({ nodeBin: "node" }),
         listAgents: () => agents as never,
         fetchManagingTickets: async () => issues,
         sendWake: sendWake as never,
@@ -251,7 +251,7 @@ describe("ManagingPoller.runCycle", () => {
       {
         store: stores.store,
         operationalEventStore: stores.ops,
-        deliveryConfig: { nodeBin: "node" } as never,
+        resolveDeliveryConfig: () => ({ nodeBin: "node" }),
         listAgents: () => agents as never,
         fetchManagingTickets: fetchTickets as never,
         sendWake: sendWake as never,
@@ -264,6 +264,67 @@ describe("ManagingPoller.runCycle", () => {
     expect(result.agentsChecked).toBe(2);
     expect(result.ticketsDispatched).toBe(1);
     expect((sendWake as jest.Mock).mock.calls[0][0]).toBe("fine");
+  });
+
+  it("AI-1751: resolves per-agent delivery config before sendWake (containerized agents get their own hooksUrl)", async () => {
+    const agents: AgentLike[] = [
+      { name: "astrid", linearUserId: "u1", openclawAgent: "astrid" },
+      { name: "charles", linearUserId: "u2", openclawAgent: "charles" },
+    ];
+    const issuesForAstrid: LinearManagingIssue[] = [
+      { identifier: "AI-10", title: "Astrid task", description: null },
+    ];
+    const issuesForCharles: LinearManagingIssue[] = [
+      { identifier: "AI-20", title: "Charles task", description: null },
+    ];
+    const sendWake = jest.fn(async () => undefined) as unknown as (
+      agentId: string,
+      tickets: ManagingWakeTicket[],
+      config: unknown,
+    ) => Promise<void>;
+
+    // Per-agent resolver: each agent gets a distinct hooksUrl
+    const resolveDeliveryConfig = jest.fn((agentId: string) => ({
+      nodeBin: "node",
+      hooksUrl: `http://container-${agentId}:18822/hooks/agent`,
+      hooksToken: `token-${agentId}`,
+    }));
+
+    const poller = new ManagingPoller(
+      {
+        store: stores.store,
+        operationalEventStore: stores.ops,
+        resolveDeliveryConfig,
+        listAgents: () => agents as never,
+        fetchManagingTickets: async (agent: AgentLike) =>
+          agent.name === "astrid" ? issuesForAstrid : issuesForCharles,
+        sendWake: sendWake as never,
+        now: () => 100_000,
+      },
+      { cycleMs: 60_000, defaultIntervalMs: 30 * 60 * 1000 },
+    );
+
+    const result = await poller.runCycle();
+    expect(result.ticketsDispatched).toBe(2);
+    expect(result.agentsWaked).toBe(2);
+
+    // resolveDeliveryConfig called once per agent
+    expect(resolveDeliveryConfig).toHaveBeenCalledTimes(2);
+    expect(resolveDeliveryConfig).toHaveBeenCalledWith("astrid");
+    expect(resolveDeliveryConfig).toHaveBeenCalledWith("charles");
+
+    // sendWake called once per agent, each with the correct per-agent config
+    expect(sendWake).toHaveBeenCalledTimes(2);
+    const astridCall = (sendWake as jest.Mock).mock.calls.find((c: unknown[]) => c[0] === "astrid")!;
+    expect(astridCall[2]).toMatchObject({
+      hooksUrl: "http://container-astrid:18822/hooks/agent",
+      hooksToken: "token-astrid",
+    });
+    const charlesCall = (sendWake as jest.Mock).mock.calls.find((c: unknown[]) => c[0] === "charles")!;
+    expect(charlesCall[2]).toMatchObject({
+      hooksUrl: "http://container-charles:18822/hooks/agent",
+      hooksToken: "token-charles",
+    });
   });
 
   it("AC2: surfaces stalled children via §5.5 tripwire during managing-wake cycle", async () => {
@@ -297,7 +358,7 @@ describe("ManagingPoller.runCycle", () => {
       {
         store: stores.store,
         operationalEventStore: stores.ops,
-        deliveryConfig: { nodeBin: "node" } as never,
+        resolveDeliveryConfig: () => ({ nodeBin: "node" }),
         listAgents: () => agents as never,
         fetchManagingTickets: async () => issues,
         sendWake: sendWake as never,
