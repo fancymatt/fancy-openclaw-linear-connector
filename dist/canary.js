@@ -27,6 +27,7 @@
 import { componentLogger, createLogger } from "./logger.js";
 import { isHealthy as isConfigHealthy, getStatus as getConfigStatus, onAlert } from "./config-health.js";
 import { loadWorkflowDef, loadWorkflowRegistry } from "./workflow-gate.js";
+import { notify } from "./alerts/alert-bus.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "canary");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 // ── Singleton state ────────────────────────────────────────────────────────
@@ -220,6 +221,14 @@ function formatConfigAlert(status) {
     return `Config health degraded — ${degraded}`;
 }
 function fireCanaryAlerts(result) {
+    // Canary failure = the enforcement/dispatch spine may be silently broken.
+    notify({
+        severity: "critical",
+        source: "canary",
+        title: "canary check failed — enforcement gate or dispatch spine may be silently broken",
+        detail: result.error ?? undefined,
+        dedupKey: "canary|failed",
+    });
     for (const cb of alertCallbacks) {
         try {
             cb(result);

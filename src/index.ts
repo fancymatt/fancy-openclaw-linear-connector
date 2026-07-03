@@ -23,6 +23,9 @@ import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState
 import { registerDistillationCron } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
+import { notify } from "./alerts/alert-bus.js";
+import { onAlert as onConfigHealthAlert } from "./config-health.js";
+import { execFile } from "node:child_process";
 import { getAccessToken, getAgent, getLinearUserIdForAgent } from "./agents.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
@@ -838,8 +841,47 @@ if (isEntryPoint) {
   // G-20: scheduled gate-silently-off canary (AI-1552, §5.1)
   registerG20CanaryCron();
 
+  // Config-health healthy→unhealthy is the loudest structural signal we have
+  // (bad policy/workflow/agents.json = engine fail-closed for workflow tickets).
+  onConfigHealthAlert((status) => {
+    const failing = Object.values(status.artifacts)
+      .filter((artifact) => !artifact.healthy)
+      .map((artifact) => `${artifact.kind}: ${artifact.lastError ?? "unhealthy"}`)
+      .join("; ");
+    notify({
+      severity: "critical",
+      source: "config-health",
+      title: "config artifact unhealthy — engine is fail-closed for workflow tickets",
+      detail: failing || undefined,
+      dedupKey: "config-health|unhealthy",
+    });
+  });
+
+  // Crash-path visibility. Behavior is unchanged (uncaught exceptions still
+  // terminate; systemd restarts us) — we just make the death rattle audible.
+  process.on("uncaughtException", (err) => {
+    notify({ severity: "critical", source: "process", title: "uncaughtException — connector is going down", detail: err.stack ?? err.message });
+    log.error(`uncaughtException: ${err.stack ?? err.message}`);
+    setTimeout(() => process.exit(1), 2000).unref();
+  });
+  process.on("unhandledRejection", (reason) => {
+    notify({ severity: "critical", source: "process", title: "unhandledRejection", detail: String(reason instanceof Error ? reason.stack : reason) });
+    log.error(`unhandledRejection: ${String(reason)}`);
+  });
+
   const server = app.listen(PORT, () => {
     log.info(`fancy-openclaw-linear-connector [${DEPLOYMENT_NAME}] listening on port ${PORT} (pid=${process.pid})`);
+    // Startup alert (warning → pushes): restart audit trail, deploy
+    // verification, and crash-loop indicator (repeat bursts fold + count).
+    execFile("git", ["rev-parse", "--short", "HEAD"], { cwd: process.cwd() }, (gitErr, stdout) => {
+      const commit = gitErr ? "unknown" : stdout.trim();
+      notify({
+        severity: "warning",
+        source: "lifecycle",
+        title: `connector started — commit ${commit}, ${getAgents().length} agents, port ${PORT}`,
+        dedupKey: "lifecycle|startup",
+      });
+    });
     // Recover any backlog left behind by prior process state (v1.0 queue).
     drainBacklog(agentQueue).catch((err) => {
       log.error(`Startup drain failed: ${err instanceof Error ? err.message : String(err)}`);

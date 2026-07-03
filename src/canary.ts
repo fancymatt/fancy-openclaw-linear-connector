@@ -28,6 +28,7 @@
 import { componentLogger, createLogger } from "./logger.js";
 import { isHealthy as isConfigHealthy, getStatus as getConfigStatus, onAlert, type ConfigHealthStatus } from "./config-health.js";
 import { loadWorkflowDef, loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
+import { notify } from "./alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "canary");
 
@@ -280,6 +281,14 @@ function formatConfigAlert(status: ConfigHealthStatus): string {
 }
 
 function fireCanaryAlerts(result: CanaryResult): void {
+  // Canary failure = the enforcement/dispatch spine may be silently broken.
+  notify({
+    severity: "critical",
+    source: "canary",
+    title: "canary check failed — enforcement gate or dispatch spine may be silently broken",
+    detail: result.error ?? undefined,
+    dedupKey: "canary|failed",
+  });
   for (const cb of alertCallbacks) {
     try {
       cb(result);

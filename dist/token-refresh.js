@@ -5,6 +5,7 @@
  */
 import { getAgents, updateTokens, isAgentLocal } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
+import { notify } from "./alerts/alert-bus.js";
 const log = componentLogger(createLogger(), "token-refresh");
 const REFRESH_INTERVAL_MS = 20 * 60 * 60 * 1000; // 20 hours
 async function refreshAgent(agent) {
@@ -34,6 +35,14 @@ async function refreshAgent(agent) {
         if (!res.ok) {
             const text = await res.text();
             log.error(`Token refresh failed for ${agent.name}: ${res.status} ${text}`);
+            // Audit finding #10: refresh failures decay silently — the agent's
+            // proxied Linear calls start 401ing ~24h later with no visible cause.
+            notify({
+                severity: "warning",
+                source: "token-refresh",
+                title: `Linear OAuth refresh failed for ${agent.name} (HTTP ${res.status}) — proxy calls will fail when the current token expires (~24h)`,
+                agent: agent.name,
+            });
             return;
         }
         const data = (await res.json());
@@ -42,6 +51,13 @@ async function refreshAgent(agent) {
     }
     catch (err) {
         log.error(`Token refresh exception for ${agent.name}: ${err instanceof Error ? err.message : String(err)}`);
+        notify({
+            severity: "warning",
+            source: "token-refresh",
+            title: `Linear OAuth refresh threw for ${agent.name} — proxy calls will fail when the current token expires (~24h)`,
+            detail: err instanceof Error ? err.message : String(err),
+            agent: agent.name,
+        });
     }
 }
 async function refreshAll() {

@@ -27,6 +27,7 @@ import type { ManagingStateStore } from "../store/managing-state-store.js";
 import type { DeliveryConfig } from "../delivery/index.js";
 import { sendManagingWakeSignal, type ManagingWakeTicket } from "./managing-wake.js";
 import { surfaceStalledChildren } from "../barrier.js";
+import { notify } from "../alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(), "managing-poller");
 
@@ -316,6 +317,14 @@ export class ManagingPoller {
         log.error(
           `Managing wake delivery failed for ${agent.name}: ${err instanceof Error ? err.message : String(err)}`,
         );
+        notify({
+          severity: "warning",
+          source: "dispatch",
+          title: `managing-wake delivery failed for ${agent.name}`,
+          detail: err instanceof Error ? err.message : String(err),
+          agent: openclawAgent,
+          ticket: dueTickets[0].identifier,
+        });
         operationalEventStore.append({
           outcome: "delivery-failed",
           type: "managing-wake",

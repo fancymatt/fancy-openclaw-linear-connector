@@ -9,6 +9,7 @@
  */
 import { createLogger, componentLogger } from "../logger.js";
 import { runG20Canary } from "./g20-canary-job.js";
+import { notify } from "../alerts/alert-bus.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "g20-canary");
 const DEFAULT_INTERVAL_MS = parseIntervalMs(process.env.G20_CANARY_INTERVAL ?? "15m");
 function parseIntervalMs(value) {
@@ -39,21 +40,14 @@ function buildConfig(onAlert) {
 function onAlert(result) {
     const msg = `[G-20 CANARY] ALERT — enforcement gate may be silently off. error=${result.error} timestamp=${result.timestamp}`;
     log.error(msg);
-    // Best-effort push via gateway; do not let failure mask the primary log alert.
-    const gatewayUrl = (process.env.OPENCLAW_GATEWAY_URL ?? "http://localhost:18789").replace(/\/$/, "");
-    const token = process.env.OPENCLAW_GATEWAY_TOKEN ?? process.env.OPENCLAW_GATEWAY_PASSWORD;
-    const headers = { "Content-Type": "application/json" };
-    if (token)
-        headers["Authorization"] = `Bearer ${token}`;
-    fetch(`${gatewayUrl}/tools/invoke`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-            tool: "push_notification",
-            args: { message: msg },
-        }),
-    }).catch((err) => {
-        log.warn(`[G-20 CANARY] push_notification failed (primary log alert was emitted): ${err instanceof Error ? err.message : String(err)}`);
+    // Route through the alert bus (log + store + push transport chain) instead
+    // of the pre-bus ad-hoc push_notification call this replaced.
+    notify({
+        severity: "critical",
+        source: "canary",
+        title: "G-20 canary: enforcement gate may be silently off",
+        detail: `error=${result.error} timestamp=${result.timestamp}`,
+        dedupKey: "canary|g20",
     });
 }
 async function main() {

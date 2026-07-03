@@ -23,6 +23,7 @@ import { createLogger, componentLogger } from "../logger.js";
 import { isLinearIssueStillRoutedToAgent, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
 import { onChildTerminal } from "../barrier.js";
 import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
+import { notify } from "../alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(), "webhook");
 
@@ -377,6 +378,16 @@ export function createWebhookRouter(
       if (!route) {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
         appendOperationalEvent(operationalEventStore, { outcome: "no-route", type: event.type, errorSummary: `No agent target for ${event.type}` });
+        // Audit finding #1: this was the fully-silent "assigned it and nothing
+        // happened" case — a delegate/assignee/mention matching no registered
+        // agent left no artifact anywhere. Now it pushes.
+        notify({
+          severity: "warning",
+          source: "routing",
+          title: "no-route: event matched no registered agent (delegate/assignee/mention unknown to agents.json)",
+          detail: `type=${event.type} action=${"action" in event ? event.action : "?"}`,
+          ticket: issueIdentifierFromEvent(event) ?? undefined,
+        });
         return;
       }
 

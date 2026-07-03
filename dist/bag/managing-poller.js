@@ -23,6 +23,7 @@ import { createLogger, componentLogger } from "../logger.js";
 import { getAccessToken, getAgents, isAgentLocal } from "../agents.js";
 import { sendManagingWakeSignal } from "./managing-wake.js";
 import { surfaceStalledChildren } from "../barrier.js";
+import { notify } from "../alerts/alert-bus.js";
 const log = componentLogger(createLogger(), "managing-poller");
 const DEFAULT_CYCLE_MS = 60 * 1000;
 const DEFAULT_INTERVAL_MS = 30 * 60 * 1000;
@@ -232,6 +233,14 @@ export class ManagingPoller {
             catch (err) {
                 result.errors++;
                 log.error(`Managing wake delivery failed for ${agent.name}: ${err instanceof Error ? err.message : String(err)}`);
+                notify({
+                    severity: "warning",
+                    source: "dispatch",
+                    title: `managing-wake delivery failed for ${agent.name}`,
+                    detail: err instanceof Error ? err.message : String(err),
+                    agent: openclawAgent,
+                    ticket: dueTickets[0].identifier,
+                });
                 operationalEventStore.append({
                     outcome: "delivery-failed",
                     type: "managing-wake",

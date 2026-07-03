@@ -12,6 +12,7 @@
 
 import { createLogger, componentLogger } from "./logger.js";
 import { getAccessToken } from "./agents.js";
+import { notify } from "./alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(), "escalation");
 
@@ -72,6 +73,17 @@ export async function emitDelegateUnavailable(
   log.warn(
     `DELEGATE_UNAVAILABLE: agent=${targetAgentId} issue=${issueIdentifier} reason=${reason}`,
   );
+
+  // 4. Human push (audit #11): the ticket comment above is only visible to
+  // someone reading that ticket, and delivery to the dead agent was SKIPPED —
+  // the ticket will sit with an unreachable delegate until something re-fires.
+  notify({
+    severity: "warning",
+    source: "dispatch",
+    title: `delegate unreachable — delivery skipped, ticket is stranded on a dead agent (${reason})`,
+    agent: targetAgentId,
+    ticket: issueIdentifier,
+  });
 
   return result;
 }

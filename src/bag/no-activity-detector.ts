@@ -41,6 +41,7 @@ import type { WakeUpConfig } from "./wake-up.js";
 import { resignalPendingTickets, type ResignalOptions } from "./resignal.js";
 import { isLinearIssueActionable } from "../linear-actionable.js";
 import { tryNormalizeSessionKey } from "../session-key.js";
+import { notify } from "../alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(), "no-activity-detector");
 
@@ -473,6 +474,16 @@ export class NoActivityDetector {
     const maxResignals = parseInt(process.env.WATCHDOG_MAX_RESIGNALS ?? "3", 10);
     if (attemptCount >= maxResignals) {
       ackTracker.markEscalated(agentId, ticketId);
+      // "Manual intervention required" must actually reach a human — the 🔴
+      // comment below only helps if someone reads that ticket (audit #14:
+      // hours of re-dispatch loops before anyone notices a broken agent).
+      notify({
+        severity: "warning",
+        source: "dispatch",
+        title: `dispatch exhausted after ${attemptCount} attempts — agent accepts wakes but produces no activity (model down? auth broken?)`,
+        agent: agentId,
+        ticket: ticketId,
+      });
       // Post escalation comment
       const escalationComment = `🔴 **Dispatch failure escalation** — ${attemptCount} attempt(s) exhausted for this ticket. Manual intervention required.\n\nThe gateway accepted the dispatch but the agent never produced any activity. This may indicate a persistent issue (model down, auth token expired, etc.).`;
       if (this.deps.postLinearComment) {

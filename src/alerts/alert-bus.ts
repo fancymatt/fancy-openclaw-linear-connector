@@ -1,5 +1,6 @@
 import { componentLogger, createLogger, type Logger } from "../logger.js";
 import { AlertStore, defaultDedupKey, type AlertInput, type AlertSeverity } from "./alert-store.js";
+import { sendThroughChain } from "./push-transports.js";
 
 export type { AlertInput, AlertSeverity };
 
@@ -13,7 +14,6 @@ const SUPPRESS_WINDOW_MS: Record<AlertSeverity, number> = {
 };
 
 const PUSH_BUDGET_WINDOW_MS = 15 * 60_000;
-const PUSH_TIMEOUT_MS = 10_000;
 
 export interface AlertBusOptions {
   store?: AlertStore;
@@ -38,25 +38,7 @@ function envSeverity(name: string, defaultVal: AlertSeverity): AlertSeverity {
 }
 
 async function gatewayPush(message: string): Promise<void> {
-  const gatewayUrl = (process.env.OPENCLAW_GATEWAY_URL ?? "http://localhost:18789").replace(/\/$/, "");
-  const token = process.env.OPENCLAW_GATEWAY_TOKEN ?? process.env.OPENCLAW_GATEWAY_PASSWORD;
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), PUSH_TIMEOUT_MS);
-  try {
-    const response = await fetch(`${gatewayUrl}/tools/invoke`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ tool: "push_notification", args: { message } }),
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      throw new Error(`gateway push_notification returned ${response.status}`);
-    }
-  } finally {
-    clearTimeout(timer);
-  }
+  await sendThroughChain(message);
 }
 
 /**
