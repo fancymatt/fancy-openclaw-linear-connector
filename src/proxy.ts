@@ -379,7 +379,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         let isAuthorized = false;
         try {
           const { bodyHasCapability } = await import("./escalation-gate.js");
-          isAuthorized = await bodyHasCapability(agentId, "human:escalate");
+          isAuthorized = await bodyHasCapability(agentId, "workflow:break-glass");
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           log.warn(`break-glass-audit agent=${agentId} authorized=false result=identity-check-failed${ticketCtx} intent=${intent}: ${msg}`);
@@ -388,7 +388,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         }
         if (!isAuthorized) {
           log.warn(`break-glass-audit agent=${agentId} authorized=false${ticketCtx} intent=${intent}`);
-          res.status(200).json({ errors: [{ message: `[Proxy] Break-glass rejected: caller '${agentId}' is not a steward or human. Only stewards may use break-glass.` }] });
+          res.status(200).json({ errors: [{ message: `[Proxy] Break-glass rejected: caller '${agentId}' is not the recovery steward. Only the steward (workflow:break-glass) may use break-glass.` }] });
           return;
         }
         log.warn(`break-glass-audit agent=${agentId} authorized=true${ticketCtx} intent=${intent}`);

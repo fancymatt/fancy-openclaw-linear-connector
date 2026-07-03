@@ -95,7 +95,7 @@ export const ENFORCEMENT_RULES: EnforcementRule[] = [
   {
     intent: "needs-human",
     requiredCapability: "human:escalate",
-    legalMove: "escalate → steward (Astrid)",
+    legalMove: "escalate → Ai (human gateway)",
   },
 ];
 

@@ -242,7 +242,7 @@ describe("checkEnforcementRules", () => {
     expect(result).not.toBeNull();
     expect(result).toContain("needs-human");
     expect(result).toContain("human:escalate");
-    expect(result).toContain("steward");
+    expect(result).toContain("Ai (human gateway)");
   });
 
   it("returns null when steward (Astrid) runs needs-human on workflow ticket", async () => {

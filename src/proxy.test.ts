@@ -18,10 +18,11 @@ import { resetConfigHealth } from "./config-health.js";
 const TEST_POLICY_YAML = `
 capabilities:
   - id: human:escalate
+  - id: workflow:break-glass
   - id: linear:transition
 containers:
   - id: steward
-    grants: [linear:transition, human:escalate]
+    grants: [linear:transition, human:escalate, workflow:break-glass]
   - id: dev
     grants: [linear:transition]
 roles:
@@ -40,11 +41,12 @@ bodies:
 const TEST_POLICY_WITH_MERGE_YAML = `
 capabilities:
   - id: human:escalate
+  - id: workflow:break-glass
   - id: linear:transition
   - id: deploy:execute
 containers:
   - id: steward
-    grants: [linear:transition, human:escalate]
+    grants: [linear:transition, human:escalate, workflow:break-glass]
   - id: dev
     grants: [linear:transition]
   - id: deployment
@@ -463,7 +465,7 @@ describe("proxy enforcement — needs-human (Phase 2 slice 1)", () => {
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeDefined();
     expect(res.body.errors[0].message).toContain("[Proxy]");
-    expect(res.body.errors[0].message).toContain("steward");
+    expect(res.body.errors[0].message).toContain("Ai (human gateway)");
   });
 
   it("allows needs-human from steward (Astrid) on a workflow ticket", async () => {

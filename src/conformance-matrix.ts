@@ -103,10 +103,11 @@ function isKnownBody(policy: CapabilityPolicyInput, bodyId: string): boolean {
 function findStewardBody(policy: CapabilityPolicyInput): string | null {
   const stewardBodies = bodiesForRole(policy, 'steward');
   if (stewardBodies.length > 0) return stewardBodies[0];
-  // Fallback: body whose container grants human:escalate
+  // Fallback: body whose container grants the steward's break-glass authority
+  // (human:escalate belongs to Ai, the human gateway — not the steward).
   const body = policy.bodies.find((b) => {
     const container = policy.containers.find((c) => c.id === b.container);
-    return container?.grants.includes('human:escalate');
+    return container?.grants.includes('workflow:break-glass');
   });
   return body?.id ?? policy.bodies[0]?.id ?? null;
 }

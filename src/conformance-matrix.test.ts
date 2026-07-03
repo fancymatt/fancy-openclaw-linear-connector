@@ -144,6 +144,7 @@ const TEST_POLICY_YAML = `
 capabilities:
   - id: linear:transition
   - id: human:escalate
+  - id: workflow:break-glass
   - id: deploy:execute
 
 containers:
@@ -152,7 +153,7 @@ containers:
   - id: deployment
     grants: [linear:transition, deploy:execute]
   - id: steward
-    grants: [linear:transition, human:escalate]
+    grants: [linear:transition, human:escalate, workflow:break-glass]
   - id: code-review
     grants: [linear:transition]
 

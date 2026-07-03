@@ -55,6 +55,7 @@ const TEST_POLICY_YAML = `
 capabilities:
   - id: linear:transition
   - id: human:escalate
+  - id: workflow:break-glass
   - id: deploy:execute
 
 containers:
@@ -63,7 +64,7 @@ containers:
   - id: deployment
     grants: [linear:transition, deploy:execute]
   - id: steward
-    grants: [linear:transition, human:escalate]
+    grants: [linear:transition, human:escalate, workflow:break-glass]
   - id: code-review
     grants: [linear:transition]
 
@@ -98,6 +99,7 @@ const UX_AUDIT_POLICY_YAML = `
 capabilities:
   - id: linear:transition
   - id: human:escalate
+  - id: workflow:break-glass
   - id: deploy:execute
 
 containers:
@@ -106,7 +108,7 @@ containers:
   - id: deployment
     grants: [linear:transition, deploy:execute]
   - id: steward
-    grants: [linear:transition, human:escalate]
+    grants: [linear:transition, human:escalate, workflow:break-glass]
   - id: ux-researcher
     grants: [linear:transition]
   - id: engine
@@ -148,6 +150,7 @@ const SPRINT_POLICY_YAML = `
 capabilities:
   - id: linear:transition
   - id: human:escalate
+  - id: workflow:break-glass
   - id: deploy:execute
 
 containers:
@@ -156,7 +159,7 @@ containers:
   - id: deployment
     grants: [linear:transition, deploy:execute]
   - id: steward
-    grants: [linear:transition, human:escalate]
+    grants: [linear:transition, human:escalate, workflow:break-glass]
   - id: ux-researcher
     grants: [linear:transition]
   - id: engine
@@ -2467,6 +2470,7 @@ describe("checkRawMutationInterception — AI-1579: recovery-actor authorization
 capabilities:
   - id: linear:transition
   - id: human:escalate
+  - id: workflow:break-glass
   - id: deploy:execute
 
 containers:
@@ -2475,7 +2479,7 @@ containers:
   - id: deployment
     grants: [linear:transition, deploy:execute]
   - id: steward
-    grants: [linear:transition, human:escalate]
+    grants: [linear:transition, human:escalate, workflow:break-glass]
   - id: code-review
     grants: [linear:transition]
   - id: orchestrator
@@ -5002,6 +5006,7 @@ const MULTI_BODY_POLICY_YAML = `
 capabilities:
   - id: linear:transition
   - id: human:escalate
+  - id: workflow:break-glass
 
 containers:
   - id: dev
@@ -5009,7 +5014,7 @@ containers:
   - id: test-author-container
     grants: [linear:transition]
   - id: steward
-    grants: [linear:transition, human:escalate]
+    grants: [linear:transition, human:escalate, workflow:break-glass]
 
 roles:
   - id: dev

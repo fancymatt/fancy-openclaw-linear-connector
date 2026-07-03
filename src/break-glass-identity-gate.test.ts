@@ -29,22 +29,22 @@ import { OPERATIONAL_EVENT_OUTCOMES } from "./store/operational-event-store.js";
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
-// Policy: astrid is a steward (human:escalate), charles is a dev (no human:escalate).
+// Policy: astrid is the recovery steward (workflow:break-glass), charles is a dev (no break-glass).
 const TEST_POLICY_YAML = `
 capabilities:
   - id: linear:transition
-  - id: human:escalate
+  - id: workflow:break-glass
   - id: deploy:execute
 containers:
   - id: steward
-    grants: [linear:transition, human:escalate]
+    grants: [linear:transition, workflow:break-glass]
   - id: dev
     grants: [linear:transition]
   - id: deployment
     grants: [linear:transition, deploy:execute]
 roles:
   - id: steward
-    requires: [human:escalate]
+    requires: [workflow:break-glass]
   - id: deployment
     requires: [deploy:execute]
 bodies:
