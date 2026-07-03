@@ -167,6 +167,19 @@ function save(agents: AgentConfig[]): void {
 // In-memory cache, kept in sync with disk via file watcher
 let _agents: AgentConfig[] = load();
 
+// Listeners fired after every SUCCESSFUL hot-reload (not the boot-time load).
+// Used by the registry⇄policy cross-check to re-assert on registry edits.
+type AgentsReloadedListener = () => void;
+let _reloadListeners: AgentsReloadedListener[] = [];
+
+/** Subscribe to successful agents.json hot-reloads. Returns an unsubscribe fn. */
+export function onAgentsReloaded(listener: AgentsReloadedListener): () => void {
+  _reloadListeners.push(listener);
+  return () => {
+    _reloadListeners = _reloadListeners.filter((l) => l !== listener);
+  };
+}
+
 /**
  * Reload the registry from disk, keeping the previous in-memory registry on
  * failure. A malformed hot edit must never take the running connector down
@@ -183,6 +196,13 @@ export function safeReloadAgents(): boolean {
     log.info(`agents.json reloaded: ${_agents.length} agent(s)` +
       (added.length ? ` — added: ${added.map((a) => a.name).join(", ")}` : "") +
       (removed.length ? ` — removed: ${removed.map((a) => a.name).join(", ")}` : ""));
+    for (const listener of _reloadListeners) {
+      try {
+        listener();
+      } catch (err) {
+        log.error(`agents-reloaded listener threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     return true;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

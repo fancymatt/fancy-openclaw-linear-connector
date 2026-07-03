@@ -25,6 +25,7 @@ import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { notify } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
+import { startRegistryPolicyCheck } from "./registry-policy.js";
 import { execFile } from "node:child_process";
 import { getAccessToken, getAgent, getLinearUserIdForAgent } from "./agents.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
@@ -825,6 +826,10 @@ if (isEntryPoint) {
 
   // Watch agents.json for external changes — no restart needed to add agents
   watchAgentsFile();
+
+  // Phase 2 (rebuild): assert agents.json ⇄ capability-policy agreement at
+  // startup and on every registry hot-reload. Drift alerts, never crashes.
+  startRegistryPolicyCheck();
 
   // Start token refresh for all configured agents
   if (agents.length > 0) {

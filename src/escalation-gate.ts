@@ -32,11 +32,18 @@ function policyPath(): string {
 
 // ── YAML schema types ──────────────────────────────────────────────────────
 
-interface PolicyBody {
+export interface PolicyBody {
   id: string;
   /** Optional OpenClaw runtime agent alias. Resolves `x-openclaw-agent` headers that differ from `id` (e.g. main → ai). */
   openclaw_agent?: string;
   container: string;
+  /**
+   * Physical (docker) container when it legitimately differs from the
+   * capability bundle named by `container:` (e.g. igor: bundle `dev-backend`,
+   * runs in `dev`). Asserted against agents.json by the Phase-2
+   * registry⇄policy cross-check (src/registry-policy.ts).
+   */
+  openclaw_container?: string;
   fills_roles: string[];
 }
 
@@ -189,6 +196,12 @@ async function loadPolicy(): Promise<CapabilityPolicy> {
 /** Invalidate the in-process policy cache (used in tests). */
 export function resetPolicyCache(): void {
   _policyCache = null;
+}
+
+/** Policy bodies, for the registry⇄policy cross-check (src/registry-policy.ts). */
+export async function getPolicyBodies(): Promise<PolicyBody[]> {
+  const policy = await loadPolicy();
+  return policy.bodies ?? [];
 }
 
 // ── Body → capability resolution ───────────────────────────────────────────
