@@ -53,6 +53,49 @@ function appendOperationalEvent(store: OperationalEventStore | undefined, input:
   try { store.append(input); } catch (err) { log.error(`Operational event write failed: ${errorSummary(err)}`); }
 }
 
+/**
+ * Rebuild WS1 (2026-07-03, pilot finding): Comment webhooks carry no delegate,
+ * so "a comment wakes the ticket's delegate" NEVER worked — every plain
+ * comment no-routed (verified live: AI-1755/AI-1756). Before routing, fetch
+ * the issue's delegate/assignee and graft them onto event.data so the
+ * standard sync router path (delegate → assignee → mention) applies.
+ * Fail-open: on any error the event routes as before (mentions still work).
+ */
+export async function enrichCommentEventForRouting(event: LinearEvent): Promise<void> {
+  if (event.type !== "Comment") return;
+  const data = (event as { data?: Record<string, unknown> }).data;
+  if (!data || data.delegate || data.assignee) return;
+  const issueId = (data.issueId as string) || ((data.issue as Record<string, unknown> | undefined)?.id as string);
+  if (!issueId) return;
+  const token = (() => {
+    for (const a of getAgents()) {
+      const t = getAccessToken(a.name);
+      if (t) return t;
+    }
+    return undefined;
+  })();
+  if (!token) return;
+  try {
+    const res = await fetch("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: token.startsWith("Bearer") ? token : `Bearer ${token}` },
+      body: JSON.stringify({
+        query: `query CommentRouting($id: String!) { issue(id: $id) { delegate { id } assignee { id } } }`,
+        variables: { id: issueId },
+      }),
+    });
+    const json = (await res.json()) as { data?: { issue?: { delegate?: { id: string } | null; assignee?: { id: string } | null } } };
+    const issue = json.data?.issue;
+    if (issue?.delegate?.id) data.delegate = { id: issue.delegate.id };
+    if (issue?.assignee?.id) data.assignee = { id: issue.assignee.id };
+    if (issue?.delegate?.id || issue?.assignee?.id) {
+      log.info(`Comment routing enrichment: issue ${issueId} delegate=${issue?.delegate?.id ?? "none"} assignee=${issue?.assignee?.id ?? "none"}`);
+    }
+  } catch (err) {
+    log.warn(`Comment routing enrichment failed (fail-open): ${errorSummary(err)}`);
+  }
+}
+
 function acknowledgeAgentAuthoredActivity(
   event: LinearEvent,
   onAgentActivity?: (agentId: string, ticketId: string) => void,
@@ -374,6 +417,7 @@ export function createWebhookRouter(
         }
       }
 
+      await enrichCommentEventForRouting(event);
       const routes = routeEventAll(event);
       if (routes.length === 0) {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
