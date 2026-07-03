@@ -1448,6 +1448,12 @@ export async function checkWorkflowRules(
     return `[Proxy] Self-review blocked: reviewer must differ from implementer ('${bodyId}').`;
   }
 
+  // not-self constraint (self-assignment prevention — e.g. a routing head may
+  // not claim the worker slot for itself; task.yaml §4.3)
+  if (match.assign?.constraint === 'not-self' && target && target === bodyId) {
+    return `[Proxy] Self-assignment blocked: '${intent}' may not target the caller ('${bodyId}').`;
+  }
+
   return null;
 }
 

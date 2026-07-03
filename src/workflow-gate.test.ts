@@ -71,6 +71,8 @@ containers:
 roles:
   - id: dev
     requires: [linear:transition]
+  - id: worker
+    requires: [linear:transition]
   - id: deployment
     requires: [deploy:execute]
   - id: steward
@@ -91,6 +93,12 @@ bodies:
   - id: reviewer
     container: code-review
     fills_roles: [code-review]
+  - id: worker1
+    container: dev
+    fills_roles: [worker]
+  - id: worker2
+    container: dev
+    fills_roles: [worker]
 `;
 
 // ── Capability policy with ux-audit roles (AI-1438 Phase 5 / B-1) ────────
@@ -116,6 +124,8 @@ containers:
 
 roles:
   - id: dev
+    requires: [linear:transition]
+  - id: worker
     requires: [linear:transition]
   - id: deployment
     requires: [deploy:execute]
@@ -170,6 +180,8 @@ containers:
 roles:
   - id: dev
     requires: [linear:transition]
+  - id: worker
+    requires: [linear:transition]
   - id: deployment
     requires: [deploy:execute]
   - id: steward
@@ -223,6 +235,11 @@ states:
     transitions:
       - command: accept
         to: implementation
+      - command: route
+        to: working
+        assign:
+          mode: required
+          constraint: not-self
       - command: demote
         to: __ad_hoc__
 
@@ -236,6 +253,14 @@ states:
         assign:
           mode: required
           constraint: not-implementer
+
+  - id: working
+    owner_role: worker
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: submit
+        to: code-review
 
   - id: code-review
     owner_role: code-review
@@ -597,6 +622,19 @@ describe("checkWorkflowRules — implementation state", () => {
     expect(result).toContain("charles");
     // Either singleton override or self-review constraint blocks it
     expect(result!.includes("auto-assigns") || result!.includes("Self-review blocked")).toBe(true);
+  });
+
+  it("blocks 'route' when the caller targets itself (not-self constraint)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+    const result = await checkWorkflowRules("route", "issue-uuid", "Bearer tok", "worker1", "worker1");
+    expect(result).not.toBeNull();
+    expect(result).toContain("Self-assignment blocked");
+    expect(result).toContain("worker1");
+  });
+
+  it("allows 'route' to a different legal worker (not-self constraint)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:intake"]);
+    expect(await checkWorkflowRules("route", "issue-uuid", "Bearer tok", "worker1", "worker2")).toBeNull();
   });
 
   it("rejects submit with wrong target (not a code-review body)", async () => {
@@ -2488,6 +2526,8 @@ containers:
 roles:
   - id: dev
     requires: [linear:transition]
+  - id: worker
+    requires: [linear:transition]
   - id: deployment
     requires: [deploy:execute]
   - id: steward
@@ -2995,6 +3035,8 @@ containers:
 
 roles:
   - id: dev
+    requires: [linear:transition]
+  - id: worker
     requires: [linear:transition]
   - id: deployment
     requires: [deploy:execute]
@@ -4527,6 +4569,11 @@ states:
     transitions:
       - command: accept
         to: implementation
+      - command: route
+        to: working
+        assign:
+          mode: required
+          constraint: not-self
         capture_ac: true
       - command: demote
         to: __ad_hoc__
@@ -4541,6 +4588,14 @@ states:
         assign:
           mode: required
           constraint: not-implementer
+
+  - id: working
+    owner_role: worker
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: submit
+        to: code-review
 
   - id: code-review
     owner_role: code-review
@@ -5018,6 +5073,8 @@ containers:
 
 roles:
   - id: dev
+    requires: [linear:transition]
+  - id: worker
     requires: [linear:transition]
   - id: test-author
     requires: [linear:transition]
