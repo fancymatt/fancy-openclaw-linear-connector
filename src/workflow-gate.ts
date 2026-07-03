@@ -2243,18 +2243,44 @@ export async function applyStateTransition(
   const isTerminal = destStateNode?.kind === 'terminal' || !destOwnerRole;
   let resolvedDelegateId: string | null | undefined = undefined;
 
+  // Rebuild WS2 (2026-07-03): delegate routing is DEF-DRIVEN, not state-name-
+  // driven. The matched transition's `assign.default: prior-implementer` marks
+  // deterministic return-to-worker routing (dev-impl: → implementation; task:
+  // → doing). Identical dev-impl behavior — its yaml carries the field on
+  // exactly the transitions the old hardcode matched.
+  const wantsPriorImplementer = matchedTransition?.assign?.default === 'prior-implementer';
+
   if (isTerminal) {
     resolvedDelegateId = null;
   } else {
-    // Deterministic routing for reject / request-changes / ac-fail (back to implementation).
-    if ((intent === 'reject' || intent === 'request-changes' || intent === 'ac-fail') && toStateName === 'implementation') {
+    // (a) Explicit CLI target wins. Legality against the destination role was
+    // already validated in checkWorkflowRules; this makes the wake brief's
+    // "overridable with --target" true, and makes zero-body roles drivable.
+    const explicitTarget = options?.cliTarget;
+    if (explicitTarget) {
+      const targetAgent = getAgent(explicitTarget);
+      if (targetAgent?.linearUserId) {
+        resolvedDelegateId = targetAgent.linearUserId;
+        log.info(
+          `workflow-gate: B2 apply: ${issueId} ${intent} — explicit target '${explicitTarget}' → delegate=${resolvedDelegateId}`,
+        );
+      } else {
+        log.error(
+          `workflow-gate: B2 apply: FAIL-CLOSED — CLI target '${explicitTarget}' cannot be resolved to a Linear user ID for ${issueId}. Register the agent in agents.json with a linearUserId. Transition aborted.`,
+        );
+        return;
+      }
+    }
+
+    // (b) Deterministic prior-implementer routing (def-driven).
+    if (resolvedDelegateId === undefined && wantsPriorImplementer) {
       const priorImplementer = await getImplementer(issueId);
       if (priorImplementer) {
         const agent = getAgent(priorImplementer);
         if (agent?.linearUserId) {
           resolvedDelegateId = agent.linearUserId;
           log.info(
-            `workflow-gate: B2 apply: ${issueId} ${intent} → implementation, routing to prior implementer '${priorImplementer}'`,
+            `workflow-gate: B2 apply: ${issueId} ${intent} → ${toStateName}, routing to prior implementer '${priorImplementer}'`,
           );
         } else {
           log.error(
@@ -2283,37 +2309,14 @@ export async function applyStateTransition(
             );
           }
         } else if (roleBodies.length > 1) {
-          // AI-1493 review fix: fail-closed for reject/request-changes when no prior implementer.
-          // Multi-body roles on these intents MUST have a resolved delegate — silently
-          // skipping leaves the ticket owner-less, which violates AC.
-          if (intent === 'reject' || intent === 'request-changes' || intent === 'ac-fail') {
-            log.error(
-              `workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' on '${intent}' with no prior implementer. Cannot auto-resolve delegate for ${issueId}. Use --target.`,
-            );
-            return;
-          }
-          // AI-1709: multi-body role transitions require a CLI target resolved to a Linear
-          // user ID. The proxy was previously logging "delegate set by CLI target" and then
-          // never actually resolving the target, leaving resolvedDelegateId undefined and the
-          // ticket orphaned with no delegate. Now fail-closed: no target = abort.
-          const cliTarget = options?.cliTarget;
-          if (!cliTarget) {
-            log.error(
-              `workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) on '${intent}' for ${issueId} requires a CLI --target but none was supplied. Transition aborted.`,
-            );
-            return;
-          }
-          const targetAgent = getAgent(cliTarget);
-          if (!targetAgent?.linearUserId) {
-            log.error(
-              `workflow-gate: B2 apply: FAIL-CLOSED — CLI target '${cliTarget}' cannot be resolved to a Linear user ID for ${issueId} (multi-body role '${destOwnerRole}'). Register the agent in agents.json with a linearUserId. Transition aborted.`,
-            );
-            return;
-          }
-          resolvedDelegateId = targetAgent.linearUserId;
-          log.info(
-            `workflow-gate: B2 apply: ${issueId} multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) — resolved CLI target '${cliTarget}' → delegate=${resolvedDelegateId}`,
+          // AI-1709 / AI-1493: multi-body roles need an explicit delegate. An
+          // explicit target was consumed in (a) and prior-implementer in (b) —
+          // reaching here means neither resolved. Fail-closed: silently
+          // skipping leaves the ticket owner-less.
+          log.error(
+            `workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) on '${intent}' for ${issueId} requires a CLI --target${wantsPriorImplementer ? " (no prior implementer recorded)" : ""} but none was supplied. Transition aborted.`,
           );
+          return;
         } else {
           if (intent === 'approve' || intent === 'reject') {
             log.error(
@@ -2335,8 +2338,16 @@ export async function applyStateTransition(
     }
   }
 
-  // Step 3: Record implementer BEFORE the mutation.
-  if (toStateName === 'implementation' && resolvedDelegateId) {
+  // Step 3: Record implementer BEFORE the mutation. Def-driven (rebuild WS2):
+  // the "worker" states are those any prior-implementer-default transition
+  // returns to (dev-impl: implementation; task: doing).
+  const implementerEntryStates = new Set<string>();
+  for (const st of def.states) {
+    for (const t of st.transitions ?? []) {
+      if (t.assign?.default === 'prior-implementer') implementerEntryStates.add(t.to);
+    }
+  }
+  if (implementerEntryStates.has(toStateName) && resolvedDelegateId) {
     const agents = getAgents();
     const implementerAgent = agents.find(a => a.linearUserId === resolvedDelegateId);
     if (implementerAgent) {

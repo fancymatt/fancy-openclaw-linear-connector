@@ -271,6 +271,7 @@ states:
         to: deployment
       - command: request-changes
         to: implementation
+        assign: { default: prior-implementer }
 
   - id: deployment
     owner_role: deployment
@@ -282,6 +283,7 @@ states:
         requires_capability: deploy:execute
       - command: reject
         to: implementation
+        assign: { default: prior-implementer }
 
   - id: done
     kind: terminal
@@ -4846,6 +4848,27 @@ describe("applyStateTransition — AI-1493 atomic transitions", () => {
     }
 
     fs.rmSync(ai1493Dir, { recursive: true, force: true });
+  });
+
+  it("explicit CLI target overrides the prior-implementer default (rebuild WS2)", async () => {
+    const { recordImplementer: doRecord } = await import("./implementer-store.js");
+    doRecord("issue-target-override", "hanzo", "dev-impl");
+
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "state-lbl", name: "state:deployment" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("reject", "issue-target-override", "Bearer tok", { cliTarget: "charles" });
+
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.body.variables as { delegateId?: string };
+    expect(vars.delegateId).toBe("charles-linear-uuid");
   });
 
   it("routes reject back to prior implementer from implementer store", async () => {
