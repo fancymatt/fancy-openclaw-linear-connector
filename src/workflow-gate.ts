@@ -1020,6 +1020,18 @@ export async function resolveMetaIntent(
 }
 
 /**
+ * The CLI verb an agent actually types for a transition. Generic-tagged
+ * transitions resolve via the meta-intent commands; def-internal command
+ * names (e.g. task.yaml's `request`) do not exist as CLI commands, so
+ * rejection hints must never render them bare (pilot finding, 2026-07-03).
+ */
+export function cliVerbFor(t: { command: string; generic?: string }): string {
+  if (t.generic === "continue") return "continue-workflow";
+  if (t.generic === "revision") return "request-revision";
+  return t.command;
+}
+
+/**
  * Evaluate full workflow-def-driven command validation for an inbound proxied request.
  *
  * Returns a rejection message when the command should be blocked, or null to forward.
@@ -1145,7 +1157,7 @@ export async function checkWorkflowRules(
     );
     if (!isHumanSignoffPath) {
       log.warn(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} ticket ${issueId} — blocking`);
-      const legalMoves = [...(preNode?.transitions?.map((t) => t.command) ?? []), breakGlassCommand].join(", ");
+      const legalMoves = [...(preNode?.transitions?.map((t) => cliVerbFor(t)) ?? []), breakGlassCommand].join(", ");
       return (
         `[Proxy] Unknown caller '${bodyId}' blocked on workflow ticket. ` +
         `Ensure this agent is registered in the capability policy. ` +
@@ -1172,7 +1184,7 @@ export async function checkWorkflowRules(
     log.warn(`workflow-gate: escape blocked agent=${bodyId} ticket=${issueId} (not delegate or steward)`);
     const escapeCurrentState = getCurrentState(labels);
     const escapeNode = escapeCurrentState ? def.states.find((s) => s.id === escapeCurrentState) : undefined;
-    const escapeLegalMoves = [...(escapeNode?.transitions?.map((t) => t.command) ?? []), breakGlassCommand].join(", ");
+    const escapeLegalMoves = [...(escapeNode?.transitions?.map((t) => cliVerbFor(t)) ?? []), breakGlassCommand].join(", ");
     return (
       `[Proxy] 'escape' blocked: '${bodyId}' is not the current delegate or the workflow steward. ` +
       `Only the assigned delegate or a workflow steward may use break-glass on a governed ticket. ` +
@@ -1229,7 +1241,7 @@ export async function checkWorkflowRules(
     log.warn(`workflow-gate: unknown-caller block agent=${bodyId} intent=${intent} ticket=${issueId}`);
     const wcState = getCurrentState(labels);
     const wcNode = wcState ? def.states.find((s) => s.id === wcState) : undefined;
-    const legalMoves = [...(wcNode?.transitions?.map((t) => t.command) ?? []), breakGlassCommand].join(", ");
+    const legalMoves = [...(wcNode?.transitions?.map((t) => cliVerbFor(t)) ?? []), breakGlassCommand].join(", ");
     return (
       `[Proxy] '${intent}' blocked: caller '${bodyId}' cannot be verified and the ticket has a known delegate. ` +
       `Register the agent in agents.json with a linearUserId to proceed. ` +
@@ -1240,7 +1252,7 @@ export async function checkWorkflowRules(
     log.warn(`workflow-gate: delegate-only block agent=${bodyId} intent=${intent} ticket=${issueId}`);
     const wdState = getCurrentState(labels);
     const wdNode = wdState ? def.states.find((s) => s.id === wdState) : undefined;
-    const legalMoves = [...(wdNode?.transitions?.map((t) => t.command) ?? []), breakGlassCommand].join(", ");
+    const legalMoves = [...(wdNode?.transitions?.map((t) => cliVerbFor(t)) ?? []), breakGlassCommand].join(", ");
     return (
       `[Proxy] '${intent}' blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
       `Only the ticket delegate may mutate its state. ` +
@@ -1499,66 +1511,16 @@ export async function checkRawMutationInterception(
   // commands (e.g. brief-ready --comment-file) use it to post their required comment.
   if (skipCommentCreate && isCommentCreate) return null;
 
-  // AC2: commentCreate on governed tickets must use approved semantic verbs — a raw
-  // comment breaks the one-comment-per-step rule and allows meta-commentary outside
-  // the approved verb set.
+  // Rebuild WS1 (2026-07-03) — SUPERSEDES AI-1658 AC2: pure commentCreate is
+  // ALLOWED on governed tickets. Rationale: (1) comment→delegate routing now
+  // wakes the ticket owner, making comments the legitimate nudge/question path
+  // mid-state; (2) the step guidance explicitly instructs agents to ask for
+  // missing specifics in a comment; (3) human UI comments never went through
+  // this gate, so the block only created agent/human asymmetry. State, label,
+  // assignee, and delegate manipulation remain fully gated below — a comment
+  // cannot smuggle a transition (isCommentCreate excludes issueUpdate).
   if (isCommentCreate) {
-    if (!issueId) {
-      log.warn(`workflow-gate: raw commentCreate with unresolvable issueId — blocking (fail-closed)`);
-      return (
-        `[Proxy] Direct commentCreate on workflow tickets must go through workflow commands, ` +
-        `and the ticket id could not be resolved from this request. ` +
-        `Re-issue using the linear CLI workflow commands.`
-      );
-    }
-    const { labels: ccLabels } = await fetchTicketContext(issueId, authToken);
-    const ccWorkflowId = getWorkflowId(ccLabels);
-    if (!ccWorkflowId) return null; // ad-hoc ticket — pass-through
-
-    let ccDef: WorkflowDef | undefined;
-    try {
-      const registry = await loadWorkflowRegistry();
-      ccDef = registry.get(ccWorkflowId);
-    } catch {
-      return null; // fail-open
-    }
-    if (!ccDef) return null; // unknown workflow — pass-through
-
-    const ccBreakGlass = ccDef.break_glass?.command ?? "escape";
-    const ccState = getCurrentState(ccLabels);
-
-    if (!ccState) {
-      const allCmds = new Set<string>();
-      for (const s of ccDef.states) {
-        for (const t of s.transitions ?? []) allCmds.add(t.command);
-      }
-      allCmds.add(ccBreakGlass);
-      return (
-        `[Proxy] Direct commentCreate is blocked on this workflow ticket (state unknown). ` +
-        `Use workflow commands instead: ${[...allCmds].join(", ")}.`
-      );
-    }
-
-    const ccStateNode = ccDef.states.find((s) => s.id === ccState);
-    if (!ccStateNode) return null;
-
-    const ccHelpLines = await Promise.all(
-      (ccStateNode.transitions ?? []).map(async (t) => {
-        const { bodies, mode } = await resolveTransitionTargets(t, ccDef!);
-        let cmd = `linear ${t.command} ${issueId}`;
-        if (mode === "required") cmd += ` <${bodies.join("|")}>`;
-        return `  - \`${cmd}\` (→ ${t.to})`;
-      }),
-    );
-    ccHelpLines.push(
-      `  - \`linear ${ccBreakGlass} ${issueId}\` (break glass → ${ccDef.break_glass?.to ?? "escape"}, legal from any state)`,
-    );
-
-    return (
-      `[Proxy] Direct commentCreate is blocked on this workflow ticket ` +
-      `(state: **${ccState}**). Use workflow commands instead:\n\n` +
-      ccHelpLines.join("\n")
-    );
+    return null;
   }
 
   // Check if the mutation touches any workflow-affecting field.

@@ -346,7 +346,6 @@ export function createWebhookRouter(
         }
         return undefined;
       })();
-      console.error(`[bootstrap-check] token=${bootstrapToken ? "yes" : "no"} agents=${getAgents().length} action=${event.action}`);
       if (bootstrapToken) {
         try {
           const bootstrapResult = await maybeBootstrapWorkflow(event, bootstrapToken);
@@ -421,7 +420,19 @@ export function createWebhookRouter(
       const routes = routeEventAll(event);
       if (routes.length === 0) {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
-        appendOperationalEvent(operationalEventStore, { outcome: "no-route", type: event.type, errorSummary: `No agent target for ${event.type}` });
+        const noRouteData = (event as { data?: Record<string, unknown> }).data;
+        const noRouteTicket =
+          (noRouteData?.identifier as string) ||
+          (noRouteData?.issueIdentifier as string) ||
+          (noRouteData?.issueId as string) ||
+          (noRouteData?.id as string) ||
+          null;
+        appendOperationalEvent(operationalEventStore, {
+          outcome: "no-route",
+          type: event.type,
+          key: noRouteTicket ? `linear-${noRouteTicket}` : null,
+          errorSummary: `No agent target for ${event.type}${noRouteTicket ? ` (${noRouteTicket})` : ""}`,
+        });
         // Audit finding #1: this was the fully-silent "assigned it and nothing
         // happened" case — a delegate/assignee/mention matching no registered
         // agent left no artifact anywhere. Now it pushes — but only when the

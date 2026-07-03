@@ -2228,30 +2228,18 @@ describe("checkRawMutationInterception — AI-1658: addedLabelIds/removedLabelId
     expect(result).toContain("escape");
   });
 
-  // ── AC2: commentCreate blocked on governed ticket ─────────────────────────
+  // ── 2026-07-03 supersession of AI-1658 AC2: pure comments are ALLOWED ─────
+  // Comment→delegate routing wakes the owner, so comments are the legitimate
+  // mid-state nudge path; state/label/assignee writes remain gated.
 
-  it("AC2: blocks commentCreate on governed ticket when no intent header is present", async () => {
+  it("allows pure commentCreate on a governed ticket (supersedes AI-1658 AC2)", async () => {
     globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
     const body = {
       query: "mutation M($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }",
       variables: { input: { issueId: "issue-uuid", body: "here is a status update" } },
     };
     const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
-  });
-
-  it("AC2: commentCreate rejection names legal verbs for current state", async () => {
-    globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
-    const body = {
-      query: "mutation M($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }",
-      variables: { input: { issueId: "issue-uuid", body: "posting a comment" } },
-    };
-    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
-    expect(result).not.toBeNull();
-    expect(result).toContain("submit");
-    expect(result).toContain("escape");
-    expect(result).toContain("implementation");
+    expect(result).toBeNull();
   });
 
   // ── AC4: commentCreate passes through on ad-hoc ticket ───────────────────
@@ -2266,14 +2254,13 @@ describe("checkRawMutationInterception — AI-1658: addedLabelIds/removedLabelId
     expect(result).toBeNull();
   });
 
-  it("AC2: commentCreate with unresolvable issueId fails closed", async () => {
+  it("allows commentCreate with unresolvable issueId (comments are ungated)", async () => {
     const body = {
       query: "mutation M($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }",
       variables: { input: { body: "a comment without issueId" } },
     };
     const result = await checkRawMutationInterception(body, null, "Bearer tok", "charles");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
+    expect(result).toBeNull();
   });
 });
 
@@ -6369,33 +6356,23 @@ describe("checkRawMutationInterception — AI-1658: commentCreate interception",
     };
   }
 
-  // RED until implementation intercepts commentCreate on governed tickets
-  it("blocks a raw commentCreate on a workflow ticket without intent header", async () => {
+  // 2026-07-03 supersession: pure comments are allowed on governed tickets.
+  it("allows a raw commentCreate on a workflow ticket without intent header (supersedes AI-1658)", async () => {
     globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
     const body = {
       query: "mutation M($issueId: ID!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success } }",
-      variables: { issueId: "issue-uuid", body: "free-form comment bypassing workflow" },
+      variables: { issueId: "issue-uuid", body: "free-form comment on a workflow ticket" },
     };
-    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
-    expect(result).toContain("commentCreate");
+    expect(await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles")).toBeNull();
   });
 
-  // RED until implementation intercepts commentCreate with $input variable shape
-  it("blocks commentCreate with $input variable shape on a workflow ticket", async () => {
-    // Linear SDKs often batch the commentCreate payload into a single $input variable.
-    // issueId is nested inside input.issueId — the proxy resolves it externally and
-    // passes it in; checkRawMutationInterception receives it as the issueId parameter.
+  it("allows commentCreate with $input variable shape on a workflow ticket (supersedes AI-1658)", async () => {
     globalThis.fetch = mockLabelFetch(WORKFLOW_IMPL_LABELS);
     const body = {
       query: "mutation M($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }",
-      variables: { input: { issueId: "issue-uuid", body: "injected comment" } },
+      variables: { input: { issueId: "issue-uuid", body: "a comment" } },
     };
-    const result = await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
-    expect(result).toContain("commentCreate");
+    expect(await checkRawMutationInterception(body, "issue-uuid", "Bearer tok", "charles")).toBeNull();
   });
 
   // GREEN: ad-hoc tickets are not governed — commentCreate must pass through.

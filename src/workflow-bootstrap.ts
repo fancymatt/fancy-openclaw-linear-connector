@@ -169,10 +169,8 @@ export async function maybeBootstrapWorkflow(
   const removedIds = previousLabelIds.filter((id) => !currentSet.has(id));
 
   if (addedIds.length === 0 && removedIds.length === 0) {
-    console.error(`[bootstrap-dbg] no label delta: current=${currentLabelIds.length} previous=${previousLabelIds.length} updatedFrom=${!!updatedFrom} dataKeys=${Object.keys(issueEvent.data).join(",")} rawLabelIds=${JSON.stringify((issueEvent as any).raw?.data?.labelIds ?? "missing")} updatedFromKeys=${updatedFrom ? Object.keys(updatedFrom).join(",") : "none"}`);
     return null;
   }
-  console.error(`[bootstrap-dbg] added=${addedIds.length} removed=${removedIds.length} currentLabels=${currentLabelIds.length} previousLabels=${previousLabelIds.length} updatedFromLen=${Array.isArray(updatedFrom?.labelIds) ? (updatedFrom.labelIds as unknown[]).length : "none"}`);
 
   // Fetch current label names — needed to distinguish wf:* from state:* by ID.
   // Try the provided token first; if issue fetch fails, fall back to other
@@ -199,7 +197,6 @@ export async function maybeBootstrapWorkflow(
         try {
           issue = await tryFetch(t);
           if (issue) {
-            console.error(`[bootstrap-dbg] fallback token from agent '${a.name}' succeeded for issue ${issueEvent.data.id}`);
             effectiveToken = t;
             break;
           }
@@ -212,13 +209,11 @@ export async function maybeBootstrapWorkflow(
     }
   }
   if (!issue) {
-    console.error(`[bootstrap-dbg] fetchIssueContext returned null for issue ${issueEvent.data.id} (tried ${triedTokens.length} token(s))`);
     return null;
   }
 
   const currentWfLabelNode = issue.labels.find((n) => n.name.startsWith("wf:"));
   const currentStateLabels = issue.labels.filter((n) => n.name.startsWith("state:"));
-  console.error(`[bootstrap-dbg] issue=${issue.identifier} labels=[${issue.labels.map(l=>l.name).join(",")}] wfLabel=${currentWfLabelNode?.name ?? "none"} stateLabels=${currentStateLabels.length} addedIds=[${addedIds.join(",")}]`);
 
   // ── Bootstrap path: a wf:* label was newly added ──────────────────────────
   if (addedIds.length > 0 && currentWfLabelNode && addedIds.includes(currentWfLabelNode.id)) {
@@ -262,7 +257,6 @@ export async function maybeBootstrapWorkflow(
           );
           const nextRole = firstTransTarget?.owner_role;
           if (nextRole && nextRole !== delegateRole) {
-            console.error(`[bootstrap-dbg] entry role '${delegateRole}' has no bodies — falling through to next state role '${nextRole}'`);
             bodies = await resolveBodiesForRole(nextRole);
             if (bodies.length > 0) delegateRole = nextRole;
           }
