@@ -4,6 +4,7 @@ export default {
   testEnvironment: 'node',
   extensionsToTreatAsEsm: ['.ts'],
   roots: ['<rootDir>/src'],
+  setupFiles: ['<rootDir>/jest.setup.ts'],
   testMatch: ['**/*.test.ts'],
   collectCoverageFrom: ['src/**/*.ts', '!src/**/*.test.ts'],
   moduleNameMapper: {
