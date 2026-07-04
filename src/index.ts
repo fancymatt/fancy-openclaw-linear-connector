@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express, { Request, Response, NextFunction } from "express";
 import { createWebhookRouter } from "./webhook/index.js";
 import { handleProxyRequest } from "./proxy.js";
+import { handleProxyUploadRequest } from "./proxy-upload.js";
 import { startTokenRefresh } from "./token-refresh.js";
 import { getAgents, watchAgentsFile } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
@@ -151,6 +152,11 @@ export function createApp(options?: CreateAppOptions) {
       }
     },
   }));
+
+  // Upload proxy — AI-1767. Agents can't fetch uploads.linear.app directly
+  // because their lpx_ proxy token is rejected by Linear. This endpoint
+  // resolves the real token from the proxy token and fetches the asset.
+  app.get("/proxy/upload", (req, res) => handleProxyUploadRequest(req, res));
 
   // Health check
   app.get("/health", (_req: Request, res: Response) => {
