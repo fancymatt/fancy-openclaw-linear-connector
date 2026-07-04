@@ -158,11 +158,17 @@ export function createApp(options?: CreateAppOptions) {
   // resolves the real token from the proxy token and fetches the asset.
   app.get("/proxy/upload", (req, res) => handleProxyUploadRequest(req, res));
 
-  // Health check
+  // Health check — returns 503 when the agent roster is empty so the
+  // Docker healthcheck (and any load balancer) pulls the container out of
+  // rotation instead of silently serving an empty-roster instance. This was
+  // the exact failure mode of the v1.5.0 deploy (AI-1767): the image booted,
+  // /health returned 200, but 0 of 28 agents were loaded → fleet-wide 401s
+  // and dropped webhooks.
   app.get("/health", (_req: Request, res: Response) => {
     const agents = getAgents();
-    res.json({
-      status: "ok",
+    const healthy = agents.length > 0;
+    res.status(healthy ? 200 : 503).json({
+      status: healthy ? "ok" : "degraded",
       service: "fancy-openclaw-linear-connector",
       deployment: DEPLOYMENT_NAME,
       agents: agents.length,
@@ -867,6 +873,27 @@ async function drainBacklog(agentQueue: AgentQueue): Promise<void> {
 const isEntryPoint = process.argv[1]?.endsWith('index.ts') || process.argv[1]?.endsWith('index.js');
 if (isEntryPoint) {
   const agents = getAgents();
+
+  // AI-1767: Empty-roster startup guard. The v1.5.0 Docker deploy booted
+  // with 0 of 28 agents (misconfigured AGENTS_FILE mount) and silently served
+  // 401s + dropped webhooks fleet-wide. An empty roster is never a valid
+  // operating state — refuse to start so a broken deploy fails loudly and
+  // the orchestrizer (systemd / Docker restart policy) doesn't keep reviving
+  // a zombie instance.
+  if (agents.length === 0) {
+    const agentsPath = process.env.AGENTS_FILE ?? path.resolve(process.cwd(), "agents.json");
+    const msg = `Fatal: agent roster is empty (AGENTS_FILE=${agentsPath}). Refusing to start — check that the agents file exists and is mounted correctly.`;
+    log.error(msg);
+    notify({
+      severity: "critical",
+      source: "agents",
+      title: "Connector refusing to start — empty agent roster",
+      detail: msg,
+      dedupKey: "agents|empty-roster",
+    });
+    process.exit(1);
+  }
+
   log.info(`Starting connector [${DEPLOYMENT_NAME}] with ${agents.length} agent(s): ${agents.map((a) => a.name).join(", ")}`);
 
   // Watch agents.json for external changes — no restart needed to add agents
