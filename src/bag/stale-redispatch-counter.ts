@@ -8,7 +8,7 @@ export class StaleRedispatchCounter {
   private db: Database.Database;
 
   constructor(dbPath?: string) {
-    const resolvedPath = dbPath ?? path.join(process.cwd(), "data", "stale-redispatch-attempts.db");
+    const resolvedPath = dbPath ?? path.join(process.env.DATA_DIR ?? path.join(process.cwd(), "data"), "stale-redispatch-attempts.db");
     this.db = new Database(resolvedPath);
     this.db.pragma("journal_mode = WAL");
     this.migrate();

@@ -14,7 +14,7 @@ export class EventStore {
   private db: Database.Database;
 
   constructor(dbPath?: string) {
-    const resolvedPath = dbPath ?? path.join(process.cwd(), "data", "events.db");
+    const resolvedPath = dbPath ?? path.join(process.env.DATA_DIR ?? path.join(process.cwd(), "data"), "events.db");
     // Ensure directory exists
     const dir = path.dirname(resolvedPath);
 

@@ -43,7 +43,7 @@ export class DispatchAckTracker {
 
   constructor(dbPath?: string, ttlMs?: number) {
     const resolvedPath =
-      dbPath ?? path.join(process.cwd(), "data", "dispatch-acks.db");
+      dbPath ?? path.join(process.env.DATA_DIR ?? path.join(process.cwd(), "data"), "dispatch-acks.db");
     this.ttlMs = ttlMs ?? DEFAULT_TTL_MS;
     this.db = new Database(resolvedPath);
     this.db.pragma("journal_mode = WAL");

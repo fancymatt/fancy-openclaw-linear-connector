@@ -13,7 +13,7 @@ export class StallBreachStore {
   private db: Database.Database;
 
   constructor(dbPath?: string) {
-    const resolvedPath = dbPath ?? path.join(process.cwd(), "data", "stall-breaches.db");
+    const resolvedPath = dbPath ?? path.join(process.env.DATA_DIR ?? path.join(process.cwd(), "data"), "stall-breaches.db");
     const dir = path.dirname(resolvedPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });

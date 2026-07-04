@@ -7,6 +7,16 @@
  *
  * Tests that need one of these set their own value in beforeAll/beforeEach.
  */
+import fs from "fs";
+import os from "os";
+import path from "path";
+
+// Every sqlite store defaults to DATA_DIR (falling back to <cwd>/data — the
+// LIVE deployment databases, since jest runs from the service's working
+// directory). Tests that skip explicit db paths were writing session-end,
+// dispatch-ack, and webhook-dedup rows straight into production state.
+// A fresh temp dir per jest worker keeps every defaulted store isolated.
+process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "connector-jest-"));
 // jest only sets NODE_ENV=test when it is unset; the deployment container
 // exports NODE_ENV=production, which silently disabled createApp's test-mode
 // delivery config (50ms timeout, 0 retries) and let tests run with the

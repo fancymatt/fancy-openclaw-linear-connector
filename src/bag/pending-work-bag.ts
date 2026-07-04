@@ -49,7 +49,7 @@ export class PendingWorkBag {
 
   constructor(dbPath?: string, ttlMs?: number) {
     const resolvedPath =
-      dbPath ?? path.join(process.cwd(), "data", "pending-bag.db");
+      dbPath ?? path.join(process.env.DATA_DIR ?? path.join(process.cwd(), "data"), "pending-bag.db");
     this.ttlMs =
       ttlMs ?? parseInt(process.env.BAG_ENTRY_TTL_MS ?? `${DEFAULT_TTL_MS}`, 10);
 
