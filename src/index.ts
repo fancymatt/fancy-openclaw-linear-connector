@@ -605,8 +605,8 @@ export function createApp(options?: CreateAppOptions) {
     res.json({ ok: true });
   });
 
-  // v1 admin dashboard — read-only operational UI and safe JSON API.
-  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, deploymentName: DEPLOYMENT_NAME }));
+  // Management console (Phase 3): React SPA + JSON API, session or secret auth.
+  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME }));
 
   app.use("/", createWebhookRouter(
     eventStore,

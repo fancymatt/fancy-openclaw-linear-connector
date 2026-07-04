@@ -210,6 +210,40 @@ export class DispatchAckTracker {
   }
 
   /**
+   * Most recent dispatch entries across all agents and statuses — the
+   * management console's fleet/dispatch view (Phase 3). Read-only.
+   */
+  listRecent(limit = 200): DispatchAckEntry[] {
+    const capped = Math.min(Math.max(limit, 1), 1000);
+    const rows = this.db
+      .prepare(
+        `SELECT id, agent_id, ticket_id, dispatched_at, last_signal_at,
+                ack_status, attempt_count
+         FROM dispatch_acks
+         ORDER BY last_signal_at DESC
+         LIMIT ?`,
+      )
+      .all(capped) as Array<{
+        id: number;
+        agent_id: string;
+        ticket_id: string;
+        dispatched_at: string;
+        last_signal_at: string;
+        ack_status: string;
+        attempt_count: number;
+      }>;
+    return rows.map((r) => ({
+      id: r.id,
+      agentId: r.agent_id,
+      ticketId: r.ticket_id,
+      dispatchedAt: r.dispatched_at,
+      lastSignalAt: r.last_signal_at,
+      ackStatus: r.ack_status as AckStatus,
+      attemptCount: r.attempt_count,
+    }));
+  }
+
+  /**
    * Update a dispatch record after a watchdog re-signal attempt.
    * Sets status to 'unconfirmed', bumps attempt_count, resets last_signal_at
    * AND dispatched_at — a re-signal is a new dispatch attempt, so its

@@ -1,9 +1,13 @@
-import { Router, Request, Response, NextFunction } from "express";
+import express, { Router, Request, Response, NextFunction } from "express";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { getAgents, getAccessToken, type AgentConfig } from "./agents.js";
 import type { AgentQueue } from "./queue/index.js";
 import type { PendingWorkBag, BagEntry } from "./bag/index.js";
 import type { SessionTracker } from "./bag/index.js";
+import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 import type { RouteResult } from "./types.js";
 import type { LinearEvent } from "./webhook/schema.js";
 import type { OperationalEventStore, OperationalEventOutcome } from "./store/operational-event-store.js";
@@ -14,6 +18,16 @@ import { setStateAtomic, loadWorkflowRegistry } from "./workflow-gate.js";
 import { getStatus as getConfigHealthStatus } from "./config-health.js";
 import { getRegistryPolicyStatus } from "./registry-policy.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
+import { getAlertBus } from "./alerts/alert-bus.js";
+import type { AlertSeverity } from "./alerts/alert-store.js";
+import {
+  mintSessionToken,
+  verifySessionToken,
+  sessionTokenFromRequest,
+  setSessionCookie,
+  clearSessionCookie,
+  LoginRateLimiter,
+} from "./admin-session.js";
 
 interface AdminDeps {
   agentQueue: AgentQueue;
@@ -21,9 +35,12 @@ interface AdminDeps {
   sessionTracker: SessionTracker;
   operationalEventStore?: OperationalEventStore;
   observationStore?: ObservationStore;
+  ackTracker?: DispatchAckTracker;
   deploymentName: string;
   /** If provided, set-state will re-dispatch to the new state's owner role (AI-1607). */
   wakeConfigForAgent?: (agentId: string) => WakeUpConfig;
+  /** Override the SPA asset directory (tests). */
+  webDistDir?: string;
 }
 
 type Severity = "green" | "yellow" | "red" | "gray";
@@ -51,7 +68,6 @@ function ageLabel(value?: string | number | null): string {
   if (hours < 48) return `${hours}h ago`;
   return `${Math.floor(hours / 24)}d ago`;
 }
-
 
 function slugId(value: unknown): string {
   const slug = String(value ?? "")
@@ -309,157 +325,102 @@ function adminSecretFromRequest(req: Request): string | null {
   return null;
 }
 
-function wantsHtml(req: Request): boolean {
-  return !req.path.startsWith("/api/") && req.accepts(["html", "json"]) === "html";
-}
-
-function renderAuthFailurePage(status: number, title: string, message: string): string {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(title)} · Linear Connector Admin</title><style>
-    :root { color-scheme: dark; --bg:#0b0f14; --panel:#111821; --line:#263342; --text:#eef4f8; --muted:#9dafbe; --red:#ff837d; --yellow:#f2c96d; }
-    *{box-sizing:border-box} body{margin:0;min-height:100vh;display:grid;place-items:center;background:linear-gradient(180deg,#071018,#10151b);color:var(--text);font:15px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}.card{width:min(560px,calc(100vw - 32px));background:rgba(17,24,33,.94);border:1px solid var(--line);border-radius:18px;padding:24px;box-shadow:0 18px 50px rgba(0,0,0,.3)}.eyebrow{color:${status === 503 ? "var(--yellow)" : "var(--red)"};font-weight:700;text-transform:uppercase;letter-spacing:.08em;font-size:12px}h1{margin:8px 0 10px;font-size:24px}.muted{color:var(--muted)}code{background:#0b1118;border:1px solid var(--line);border-radius:7px;padding:2px 5px}
-  </style></head><body><main class="card"><div class="eyebrow">Admin access</div><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p><p class="muted">The dashboard is read-only and hides token values. Browser navigation supports HTTP Basic auth using <code>ADMIN_SECRET</code> as the password; API clients may use <code>x-admin-secret</code> or Bearer auth.</p></main></body></html>`;
-}
-
-function sendAdminAuthFailure(req: Request, res: Response, status: number, title: string, message: string): void {
-  if (wantsHtml(req)) {
-    if (status === 401) res.setHeader("WWW-Authenticate", 'Basic realm="Linear Connector Admin", charset="UTF-8"');
-    res.status(status).type("html").send(renderAuthFailurePage(status, title, message));
-    return;
-  }
-  if (status === 401) res.setHeader("WWW-Authenticate", 'Basic realm="Linear Connector Admin", charset="UTF-8"');
-  res.status(status).json({ error: title, message });
+/** True when the request carries valid admin credentials (header secret or session cookie). */
+function isAuthenticated(req: Request, expected: string): boolean {
+  const secret = adminSecretFromRequest(req);
+  if (secret && timingSafeEquals(secret, expected)) return true;
+  const token = sessionTokenFromRequest(req);
+  return token !== null && verifySessionToken(token, expected);
 }
 
 function adminAuth(req: Request, res: Response, next: NextFunction): void {
   const expected = process.env.ADMIN_SECRET;
   if (!expected) {
-    sendAdminAuthFailure(req, res, 503, "ADMIN_SECRET is not configured", "Set ADMIN_SECRET before using the admin dashboard.");
+    res.status(503).json({ error: "ADMIN_SECRET is not configured", message: "Set ADMIN_SECRET before using the admin console." });
     return;
   }
-  const actual = adminSecretFromRequest(req);
-  if (!actual || !timingSafeEquals(actual, expected)) {
-    sendAdminAuthFailure(req, res, 401, "Unauthorized", "Enter the admin password to view the Linear connector dashboard.");
+  if (!isAuthenticated(req, expected)) {
+    res.setHeader("WWW-Authenticate", 'Basic realm="Linear Connector Admin", charset="UTF-8"');
+    res.status(401).json({ error: "Unauthorized", message: "Sign in with the admin password, or send x-admin-secret / Bearer auth." });
     return;
   }
   next();
 }
 
-function escapeHtml(value: unknown): string {
-  return String(value ?? "").replace(/[&<>"]/g, (char) => ({
-
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-  }[char] ?? char));
+function parseJsonBody(req: Request): Record<string, unknown> | null {
+  try {
+    if (Buffer.isBuffer(req.body)) return JSON.parse(req.body.toString("utf8")) as Record<string, unknown>;
+    if (typeof req.body === "string") return JSON.parse(req.body) as Record<string, unknown>;
+    if (typeof req.body === "object" && req.body !== null) return req.body as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  return null;
 }
 
-function chip(severity: Severity, label: string): string {
-  return `<span class="chip ${severity}">${escapeHtml(label)}</span>`;
+function placeholderPage(title: string, message: string): string {
+  const esc = (v: string) => v.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] ?? c));
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${esc(title)} · Linear Connector</title><style>
+    :root{color-scheme:dark} body{margin:0;min-height:100vh;display:grid;place-items:center;background:linear-gradient(180deg,#071018,#10151b);color:#eef4f8;font:15px/1.5 ui-sans-serif,system-ui,sans-serif}
+    .card{width:min(560px,calc(100vw - 32px));background:rgba(17,24,33,.94);border:1px solid #263342;border-radius:18px;padding:24px}
+    h1{margin:0 0 10px;font-size:22px}.muted{color:#9dafbe}
+  </style></head><body><main class="card"><h1>${esc(title)}</h1><p class="muted">${esc(message)}</p></main></body></html>`;
 }
 
-function attentionHtml(dashboard: ReturnType<typeof buildDashboard>): string {
-  const stateClass = dashboard.attention.length ? "attention" : "attention-ok";
-  return `<section class="card span-12 ${stateClass}"><h2>Attention Needed</h2>${dashboard.attention.length
-    ? dashboard.attention.map((item) => `<div class="stack item">${chip(item.severity, item.severity === "red" ? "Action required" : "Needs attention")}<div class="row-title">${escapeHtml(item.title)}</div><div class="muted">${escapeHtml(item.message)} ${item.href ? `<a href="${escapeHtml(item.href)}">Open destination</a>` : ""}</div></div>`).join("")
-    : `<div class="empty">No attention needed. Connector is running and no tasks are blocked.</div>`}</section>`;
-}
-
-function statusStripHtml(status: ReturnType<typeof buildDashboard>["status"]): string {
-  return `<div class="strip">${chip(status.severity as Severity, status.severity === "green" ? "Healthy" : status.severity === "yellow" ? "Degraded" : "Action required")}${chip("gray", `${status.agentsConfigured} agents`)}${chip(status.activeSessions ? "yellow" : "gray", `${status.activeSessions} active sessions`)}${chip(status.pendingBagSize ? "yellow" : "green", `${status.pendingBagSize} pending`)}${chip("gray", `${status.eventsReceived} events`)}${chip("gray", `${status.signalsSent} signals`)}</div>`;
-}
-
-function diagnostics(value: unknown): string {
-  return `<details><summary>Raw diagnostics</summary><pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre></details>`;
-}
-
-function agentTableHtml(rows: ReturnType<typeof buildDashboard>["agents"]): string {
-  if (rows.length === 0) return `<div class="empty">No agents configured.</div>`;
-  return `<table><thead><tr><th>Agent</th><th>State</th><th>Pending</th><th>Next expected task</th></tr></thead><tbody>${rows.map((agent) => `<tr id="${agentAnchor(agent.name)}"><td><div class="row-title">${escapeHtml(agent.name)}</div><div class="muted">${escapeHtml(agent.openclawAgent)} · ${escapeHtml(agent.linearUserId)}</div></td><td>${chip(agent.severity, agent.activity)}<div class="muted">${escapeHtml(agent.credentialState)}</div></td><td>${escapeHtml(agent.pendingCount)} pending<br><span class="muted">${escapeHtml(agent.queueDepth)} queued</span></td><td>${escapeHtml(agent.nextExpectedTask)}<div class="muted">Last success: ${escapeHtml(agent.lastSuccess)}</div><div class="muted">Last error: ${escapeHtml(agent.lastError)}</div>${diagnostics(agent.diagnostics)}</td></tr>`).join("")}</tbody></table>`;
-}
-
-function taskTableHtml(rows: ReturnType<typeof buildDashboard>["tasks"]): string {
-  if (rows.length === 0) return `<div class="empty">No work in this state.</div>`;
-  return `<table><thead><tr><th>Task</th><th>Owner / Agent</th><th>State</th><th>Detail panel</th></tr></thead><tbody>${rows.map((task) => `<tr id="${taskAnchor(task.sessionKey)}"><td><div class="row-title">${task.relatedUrl ? `<a href="${escapeHtml(task.relatedUrl)}">${escapeHtml(task.related)}</a>` : escapeHtml(task.related)}</div><div class="muted">${escapeHtml(task.eventType)} · ${escapeHtml(task.sessionKey)} · ${escapeHtml(task.age)} · updated ${escapeHtml(ageLabel(task.updated))}</div></td><td>${escapeHtml(task.owner)}</td><td>${chip(task.severity as Severity, task.state)}<button class="nudge-button" data-agent="${escapeHtml(task.agent)}" data-ticket="${escapeHtml(task.sessionKey.replace(/^linear-/, ""))}" type="button">Nudge</button><span class="nudge-status muted" aria-live="polite"></span>${task.safeError ? `<div class="muted">${escapeHtml(task.safeError)}</div>` : ""}</td><td><details class="detail-panel"><summary>Open task detail</summary><div class="detail-grid"><div><strong>Related</strong><br>${task.relatedUrl ? `<a href="${escapeHtml(task.relatedUrl)}">${escapeHtml(task.related)}</a>` : escapeHtml(task.related)}</div><div><strong>Event / session</strong><br>${escapeHtml(task.eventType)} · ${escapeHtml(task.sessionKey)}</div><div><strong>Lifecycle</strong><br>${escapeHtml(task.lifecycle)}</div>${task.safeError ? `<div><strong>Safe error</strong><br>${escapeHtml(task.safeError)}</div>` : ""}</div>${diagnostics(task.diagnostics)}</details></td></tr>`).join("")}</tbody></table>`;
-}
-
-function renderOverview(dashboard: ReturnType<typeof buildDashboard>): string {
-  return `<div class="grid">${attentionHtml(dashboard)}<section class="card span-12"><h2>System Status</h2>${statusStripHtml(dashboard.status)}</section><section class="card span-6"><h2>Agent Status</h2>${agentTableHtml(dashboard.agents.slice(0, 8))}</section><section class="card span-6"><h2>Work in Motion</h2>${taskTableHtml(dashboard.tasks.slice(0, 8))}</section></div>`;
-}
-
-function renderAgentsPage(dashboard: ReturnType<typeof buildDashboard>): string {
-  return `<div class="grid">${attentionHtml(dashboard)}<section class="card span-12"><h2>Agents</h2><p class="muted">Identity mapping, credential/OAuth state, activity, pending count, last known status, and next expected task. Tokens and secrets are intentionally hidden.</p>${agentTableHtml(dashboard.agents)}</section></div>`;
-}
-
-function renderTasksPage(dashboard: ReturnType<typeof buildDashboard>): string {
-  const tabs = ["active", "pending", "stale", "failed", "completed"];
-  const tables = tabs.map((tab) => {
-    const rows = dashboard.tasks.filter((task) => tab === "stale" ? task.state === "pending" && /d ago|h ago/.test(task.age) : task.state === tab);
-    return `<section class="card span-12"><h2>${tab[0].toUpperCase()}${tab.slice(1)}</h2>${taskTableHtml(rows)}</section>`;
-  }).join("");
-  return `<div class="grid">${attentionHtml(dashboard)}<section class="card span-12"><h2>Tasks</h2><div class="tabs">${tabs.map((tab) => chip(tab === "failed" ? "red" : tab === "completed" ? "green" : tab === "stale" ? "yellow" : "gray", tab)).join("")}</div><p class="muted">Rows include owner/agent, state, age/updated, related issue/comment/event/session, lifecycle context, safe errors, and collapsed diagnostics.</p></section>${tables}</div>`;
-}
-
-function settingsTable(rows: Record<string, unknown>): string {
-  return `<table><tbody>${Object.entries(rows).map(([key, value]) => `<tr><th>${escapeHtml(key)}</th><td>${escapeHtml(value)}</td></tr>`).join("")}</tbody></table>`;
-}
-
-function renderSettingsPage(dashboard: ReturnType<typeof buildDashboard>): string {
-  const settings = dashboard.settings;
-  return `<div class="grid">${attentionHtml(dashboard)}<section class="card span-6"><h2>Read-only Effective Config</h2>${settingsTable(settings.effectiveConfig)}</section><section class="card span-6"><h2>OAuth / Setup State</h2>${settings.oauthSetup.map((item) => `<div id="${oauthAnchor(item.agent)}" class="stack item">${chip(item.state === "configured" ? "green" : "red", item.state)}<div>${escapeHtml(item.agent)}</div><div class="muted">${escapeHtml(item.safeNote)}</div></div>`).join("") || `<div class="empty">No OAuth setup data.</div>`}</section><section class="card span-12"><h2>Linear Workspace / Team Mappings</h2>${settings.workspaceTeamMappings.length ? `<table><tbody>${settings.workspaceTeamMappings.map((mapping) => `<tr><td>${escapeHtml(mapping.agent)}</td><td>${escapeHtml(mapping.linearUserId)}</td><td>${escapeHtml(mapping.openclawAgent)}</td><td>${escapeHtml(mapping.host)}</td></tr>`).join("")}</tbody></table>` : `<div class="empty">No mappings configured.</div>`}</section><section class="card span-12"><h2>Agent Mapping Table</h2>${settings.agentMappings.length ? `<table><tbody>${settings.agentMappings.map((mapping) => `<tr><td>${escapeHtml(mapping.name)}</td><td>${escapeHtml(mapping.openclawAgent)}</td><td>${escapeHtml(mapping.identityMapped ? "mapped" : "not mapped")}</td><td>${escapeHtml(mapping.credentialState)}</td></tr>`).join("")}</tbody></table>` : `<div class="empty">No mappings configured.</div>`}</section><section class="card span-12"><h2>Restart-required Flags</h2>${settings.restartRequiredFlags.map((flag) => `<div class="item">${chip(flag.required ? "yellow" : "green", flag.required ? "Restart required" : "Hot reload")} <strong>${escapeHtml(flag.name)}</strong> <span class="muted">${escapeHtml(flag.note)}</span></div>`).join("")}</section></div>`;
-}
-
-function renderShell(initialPage: string, dashboard: ReturnType<typeof buildDashboard>): string {
-  const nav = [
-    ["overview", "/admin/", "Overview"],
-    ["agents", "/admin/agents", "Agents"],
-    ["tasks", "/admin/tasks", "Tasks"],
-    ["settings", "/admin/settings", "Settings"],
-  ].map(([key, href, label]) => `<a class="${key === initialPage ? "active" : ""}" href="${href}">${label}</a>`).join("");
-  const body = initialPage === "agents" ? renderAgentsPage(dashboard)
-    : initialPage === "tasks" ? renderTasksPage(dashboard)
-      : initialPage === "settings" ? renderSettingsPage(dashboard)
-        : renderOverview(dashboard);
-
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Linear Connector Admin</title><style>
-    :root { color-scheme: dark; --bg:#0b0f14; --panel:#111821; --line:#263342; --text:#eef4f8; --muted:#9dafbe; --green:#74d99f; --yellow:#f2c96d; --red:#ff837d; --gray:#a4afba; --blue:#8fc7ff; }
-    *{box-sizing:border-box} body{margin:0;background:linear-gradient(180deg,#071018,#10151b);color:var(--text);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif} a{color:var(--blue)} .wrap{max-width:1180px;margin:0 auto;padding:28px 20px 48px} header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:22px} h1{margin:0;font-size:24px;letter-spacing:-.02em}.sub{color:var(--muted);margin-top:4px} nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 20px} nav a{color:var(--text);text-decoration:none;padding:9px 13px;border:1px solid var(--line);border-radius:999px;background:#0f151d} nav a.active{background:#203044;border-color:#3d5570}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{background:rgba(17,24,33,.92);border:1px solid var(--line);border-radius:16px;padding:16px;box-shadow:0 14px 40px rgba(0,0,0,.25)}.span-12{grid-column:span 12}.span-6{grid-column:span 6}h2{margin:0 0 12px;font-size:17px}.attention{border-color:#68413f;background:linear-gradient(180deg,rgba(255,131,125,.10),rgba(17,24,33,.94))}.attention-ok{border-color:#315b43;background:linear-gradient(180deg,rgba(116,217,159,.08),rgba(17,24,33,.94))}.empty{color:var(--muted);padding:14px;border:1px dashed var(--line);border-radius:12px;background:#0e151d}.attention-ok .empty{border-color:#315b43;background:#0f1b18;color:#bfd9ca}.strip,.tabs{display:flex;gap:10px;flex-wrap:wrap}.chip{display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border-radius:999px;border:1px solid;font-size:12px;font-weight:650}.green{color:var(--green);border-color:#315b43;background:#102019}.yellow{color:var(--yellow);border-color:#67562d;background:#241d0f}.red{color:var(--red);border-color:#72413f;background:#271514}.gray{color:var(--gray);border-color:#4a525b;background:#1a2028}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:top}tr:target,.item:target{outline:2px solid var(--blue);outline-offset:3px;background:rgba(143,199,255,.07)}th{color:var(--muted);font-size:12px;font-weight:650}.row-title{font-weight:700}.muted{color:var(--muted)}.stack{display:flex;flex-direction:column;gap:8px}.item{margin:10px 0}.detail-panel{padding:8px 10px;border:1px solid var(--line);border-radius:12px;background:#0d141c}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:10px}details{margin-top:8px}summary{color:var(--muted);cursor:pointer}pre{overflow:auto;padding:10px;border-radius:10px;background:#080d12;border:1px solid var(--line);color:#c8d6e2}.nudge-button{display:inline-flex;margin:8px 8px 0 0;padding:6px 10px;border-radius:999px;border:1px solid #3d5570;background:#203044;color:var(--text);font-weight:700;cursor:pointer}.nudge-button:disabled{opacity:.55;cursor:not-allowed}.nudge-status{display:inline-block;margin-top:8px}@media(max-width:820px){.span-6{grid-column:span 12}header{flex-direction:column}.detail-grid{grid-template-columns:1fr}}
-  </style></head><body><div class="wrap"><header><div><h1>Linear Connector Admin</h1><div class="sub">Control-room view for routing health, agent setup, and work in motion.</div></div><div class="muted">Updated ${escapeHtml(new Date(dashboard.generatedAt).toLocaleString())}</div></header><nav>${nav}</nav><main>${body}</main></div><script>
-    document.querySelectorAll('.nudge-button').forEach((button) => {
-      button.addEventListener('click', async () => {
-        const status = button.parentElement.querySelector('.nudge-status');
-        const original = button.textContent;
-        button.disabled = true;
-        button.textContent = 'Sending…';
-        if (status) status.textContent = '';
-        try {
-          const response = await fetch('/nudge', {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              agent: button.dataset.agent,
-              ticketId: button.dataset.ticket,
-              message: 'Recheck ' + button.dataset.ticket + ' and continue work. Run linear consider-work ' + button.dataset.ticket + '.',
-            }),
-          });
-          const body = await response.json().catch(() => ({}));
-          if (!response.ok || !body.success) throw new Error(body.error || ('HTTP ' + response.status));
-          if (status) status.textContent = 'Nudge sent to ' + button.dataset.agent;
-        } catch (err) {
-          if (status) status.textContent = err instanceof Error ? err.message : 'No active session found';
-        } finally {
-          button.disabled = false;
-          button.textContent = original;
-        }
-      });
-    });
-  </script></body></html>`;
+function defaultWebDistDir(): string {
+  // dist/admin.js → <repo>/web/dist ; src/admin.ts (ts-node) resolves the same.
+  return fileURLToPath(new URL("../web/dist", import.meta.url));
 }
 
 export function createAdminRouter(deps: AdminDeps): Router {
   const router = Router();
-  router.use(adminAuth);
+  const loginLimiter = new LoginRateLimiter();
+  const webDistDir = deps.webDistDir ?? process.env.ADMIN_WEB_DIST ?? defaultWebDistDir();
+  const indexHtmlPath = path.join(webDistDir, "index.html");
+
+  // ── Unauthenticated surface ──────────────────────────────────────────────
+  // Static SPA assets contain no operational data; every /api route below
+  // (except login/me) requires credentials.
+
+  router.post("/api/login", (req: Request, res: Response) => {
+    const expected = process.env.ADMIN_SECRET;
+    if (!expected) {
+      res.status(503).json({ ok: false, error: "ADMIN_SECRET is not configured" });
+      return;
+    }
+    const key = req.ip ?? "unknown";
+    if (loginLimiter.isBlocked(key)) {
+      res.status(429).json({ ok: false, error: "Too many failed attempts. Try again in a few minutes." });
+      return;
+    }
+    const body = parseJsonBody(req);
+    const password = typeof body?.password === "string" ? body.password : "";
+    if (!password || !timingSafeEquals(password, expected)) {
+      loginLimiter.recordFailure(key);
+      res.status(401).json({ ok: false, error: "Wrong password" });
+      return;
+    }
+    loginLimiter.reset(key);
+    setSessionCookie(res, mintSessionToken(expected));
+    res.json({ ok: true });
+  });
+
+  router.get("/api/me", (req: Request, res: Response) => {
+    const expected = process.env.ADMIN_SECRET;
+    res.json({
+      authenticated: Boolean(expected && isAuthenticated(req, expected)),
+      secretConfigured: Boolean(expected),
+    });
+  });
+
+  router.post("/api/logout", (_req: Request, res: Response) => {
+    clearSessionCookie(res);
+    res.json({ ok: true });
+  });
+
+  // ── Authenticated API ────────────────────────────────────────────────────
+  router.use("/api", adminAuth);
+
   router.get("/api/dashboard", (_req: Request, res: Response) => {
     res.json(buildDashboard(deps));
   });
@@ -483,6 +444,51 @@ export function createAdminRouter(deps: AdminDeps): Router {
       workflows,
       workflowError,
       registryPolicy: getRegistryPolicyStatus(),
+    });
+  });
+  // Full workflow definitions — read-only feed for the console's workflow
+  // views and the future visual editor.
+  router.get("/api/workflows", async (_req: Request, res: Response) => {
+    try {
+      const registry = await loadWorkflowRegistry();
+      res.json({ workflows: [...registry.values()], error: null });
+    } catch (err) {
+      res.json({ workflows: [], error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+  // Alert feed from alerts.db (docs/alert-bus.md) — what has been pushed,
+  // folded, or stored silently.
+  router.get("/api/alerts", (req: Request, res: Response) => {
+    const store = getAlertBus().getStore();
+    if (!store) {
+      res.json({ alerts: [] });
+      return;
+    }
+    const severityRaw = typeof req.query.severity === "string" ? req.query.severity : undefined;
+    const severity: AlertSeverity | undefined =
+      severityRaw === "info" || severityRaw === "warning" || severityRaw === "critical" ? severityRaw : undefined;
+    const limitRaw = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : undefined;
+    res.json({
+      alerts: store.query({
+        severity,
+        source: typeof req.query.source === "string" ? req.query.source : undefined,
+        agent: typeof req.query.agent === "string" ? req.query.agent : undefined,
+        unackedOnly: req.query.unackedOnly === "true",
+        since: typeof req.query.since === "string" ? req.query.since : undefined,
+        limit: Number.isFinite(limitRaw ?? NaN) ? limitRaw : undefined,
+      }),
+    });
+  });
+  // Fleet liveness matrix: registry rows + dispatch-ack state + policy drift,
+  // one payload for the console's fleet page.
+  router.get("/api/fleet", (_req: Request, res: Response) => {
+    const dashboard = buildDashboard(deps);
+    res.json({
+      generatedAt: dashboard.generatedAt,
+      agents: dashboard.agents,
+      dispatches: deps.ackTracker?.listRecent(200) ?? [],
+      registryPolicy: getRegistryPolicyStatus(),
+      configHealth: getConfigHealthStatus(),
     });
   });
   router.get("/api/events", (req: Request, res: Response) => {
@@ -586,17 +592,11 @@ export function createAdminRouter(deps: AdminDeps): Router {
     }));
   });
   // AI-1546 / G-6: Steward/human-only atomic set-state.
-  // All admin routes are already protected by adminAuth (ADMIN_SECRET).
+  // All admin API routes are protected by adminAuth (ADMIN_SECRET or console session).
   // AC2: agents cannot call this — they have no ADMIN_SECRET.
   router.post("/api/set-state", async (req: Request, res: Response) => {
-    let body: Record<string, unknown> | null = null;
-    try {
-      if (Buffer.isBuffer(req.body)) {
-        body = JSON.parse(req.body.toString("utf8")) as Record<string, unknown>;
-      } else if (typeof req.body === "object" && req.body !== null) {
-        body = req.body as Record<string, unknown>;
-      }
-    } catch {
+    const body = parseJsonBody(req);
+    if (body === null && (Buffer.isBuffer(req.body) || typeof req.body === "string")) {
       res.status(400).json({ ok: false, error: "Malformed JSON body" });
       return;
     }
@@ -636,10 +636,21 @@ export function createAdminRouter(deps: AdminDeps): Router {
     res.status(result.ok ? 200 : 422).json(result);
   });
 
-  router.get(["/", "/agents", "/tasks", "/settings"], (req: Request, res: Response) => {
-    const segment = req.path.split("/").filter(Boolean)[0];
-    const initialPage = ["agents", "tasks", "settings"].includes(segment) ? segment : "overview";
-    res.type("html").send(renderShell(initialPage, buildDashboard(deps)));
+  // ── SPA (management console) ─────────────────────────────────────────────
+  // Assets are public; all data flows through the authenticated API above.
+  router.use(express.static(webDistDir, { index: false, fallthrough: true }));
+  router.get(/^\/(?!api\/).*/, (_req: Request, res: Response) => {
+    if (fs.existsSync(indexHtmlPath)) {
+      res.sendFile(indexHtmlPath);
+      return;
+    }
+    res
+      .status(503)
+      .type("html")
+      .send(placeholderPage(
+        "Console UI not built",
+        "The management console SPA is missing. Build it with: npm --prefix web install && npm --prefix web run build — the API under /admin/api/ is unaffected.",
+      ));
   });
   return router;
 }

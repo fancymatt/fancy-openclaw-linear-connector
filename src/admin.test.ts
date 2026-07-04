@@ -37,14 +37,19 @@ function writeAgents(dir: string): string {
   return file;
 }
 
-describe("admin dashboard", () => {
+describe("admin console", () => {
   let dir: string;
+  let webDist: string;
   let appState: ReturnType<typeof createApp>;
 
   beforeEach(() => {
     dir = tempDir();
+    webDist = path.join(dir, "web-dist");
+    fs.mkdirSync(webDist, { recursive: true });
+    fs.writeFileSync(path.join(webDist, "index.html"), "<!doctype html><title>Linear Connector Console</title><div id=\"root\"></div>", "utf8");
     process.env.AGENTS_FILE = writeAgents(dir);
     process.env.ADMIN_SECRET = ADMIN_SECRET;
+    process.env.ADMIN_WEB_DIST = webDist;
     reloadAgents();
     appState = createApp({
       bagDbPath: path.join(dir, "pending-bag.db"),
@@ -60,12 +65,13 @@ describe("admin dashboard", () => {
     appState.operationalEventStore.close();
     delete process.env.AGENTS_FILE;
     delete process.env.ADMIN_SECRET;
+    delete process.env.ADMIN_WEB_DIST;
     delete process.env.OPENCLAW_HOOKS_URL;
     delete process.env.OPENCLAW_HOOKS_TOKEN;
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  test("requires ADMIN_SECRET for admin API routes", async () => {
+  test("requires credentials for admin API routes", async () => {
     const unauthorized = await request(appState.app).get("/admin/api/dashboard");
     expect(unauthorized.status).toBe(401);
     expect(unauthorized.headers["www-authenticate"]).toContain("Basic");
@@ -76,37 +82,63 @@ describe("admin dashboard", () => {
     process.env.ADMIN_SECRET = ADMIN_SECRET;
   });
 
-  test("supports browser-compatible Basic auth and safe HTML auth failures", async () => {
-    const unauthorized = await request(appState.app).get("/admin/").set("Accept", "text/html");
-    expect(unauthorized.status).toBe(401);
-    expect(unauthorized.headers["www-authenticate"]).toContain("Basic");
-    expect(unauthorized.text).toContain("Enter the admin password");
-    expect(unauthorized.text).toContain("HTTP Basic auth");
-
-    const authed = await adminBasicGet(appState.app, "/admin/tasks");
-    expect(authed.status).toBe(200);
-    expect(authed.text).toContain("Linear Connector Admin");
-    expect(authed.text).toContain("Tasks");
-
-    delete process.env.ADMIN_SECRET;
-    const unconfigured = await request(appState.app).get("/admin/").set("Accept", "text/html");
-    expect(unconfigured.status).toBe(503);
-    expect(unconfigured.text).toContain("ADMIN_SECRET is not configured");
-    expect(unconfigured.text).not.toContain(ADMIN_SECRET);
-    process.env.ADMIN_SECRET = ADMIN_SECRET;
+  test("header, Bearer, and Basic auth all work for the API", async () => {
+    const viaHeader = await adminGet(appState.app, "/admin/api/dashboard");
+    expect(viaHeader.status).toBe(200);
+    const viaBearer = await request(appState.app).get("/admin/api/dashboard").set("Authorization", `Bearer ${ADMIN_SECRET}`);
+    expect(viaBearer.status).toBe(200);
+    const viaBasic = await adminBasicGet(appState.app, "/admin/api/dashboard");
+    expect(viaBasic.status).toBe(200);
   });
 
-  test("renders nav and all v1 admin pages", async () => {
-    for (const route of ["/admin/", "/admin/agents", "/admin/tasks", "/admin/settings"]) {
-      const res = await adminGet(appState.app, route);
+  test("serves the SPA shell for console routes without auth", async () => {
+    for (const route of ["/admin/", "/admin/fleet", "/admin/alerts", "/admin/workflows"]) {
+      const res = await request(appState.app).get(route);
       expect(res.status).toBe(200);
-      expect(res.text).toContain("Linear Connector Admin");
-      expect(res.text).toContain("Overview");
-      expect(res.text).toContain("Agents");
-      expect(res.text).toContain("Tasks");
-      expect(res.text).toContain("Settings");
-      expect(res.text).toContain("Attention Needed");
+      expect(res.text).toContain("Linear Connector Console");
     }
+  });
+
+  test("shows a build placeholder when the SPA bundle is missing", async () => {
+    fs.rmSync(webDist, { recursive: true, force: true });
+    const res = await request(appState.app).get("/admin/");
+    expect(res.status).toBe(503);
+    expect(res.text).toContain("Console UI not built");
+  });
+
+  test("login issues a session cookie that grants API access; logout clears it", async () => {
+    const wrong = await request(appState.app).post("/admin/api/login").send({ password: "nope" });
+    expect(wrong.status).toBe(401);
+
+    const login = await request(appState.app).post("/admin/api/login").send({ password: ADMIN_SECRET });
+    expect(login.status).toBe(200);
+    const cookie = login.headers["set-cookie"]?.[0];
+    expect(cookie).toContain("admin_session=");
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("SameSite=Lax");
+
+    const sessionCookie = cookie!.split(";")[0];
+    const authed = await request(appState.app).get("/admin/api/dashboard").set("Cookie", sessionCookie);
+    expect(authed.status).toBe(200);
+
+    const me = await request(appState.app).get("/admin/api/me").set("Cookie", sessionCookie);
+    expect(me.body).toEqual({ authenticated: true, secretConfigured: true });
+    const anonMe = await request(appState.app).get("/admin/api/me");
+    expect(anonMe.body).toEqual({ authenticated: false, secretConfigured: true });
+
+    const logout = await request(appState.app).post("/admin/api/logout").set("Cookie", sessionCookie);
+    expect(logout.headers["set-cookie"]?.[0]).toContain("Max-Age=0");
+
+    const tampered = await request(appState.app).get("/admin/api/dashboard").set("Cookie", "admin_session=v1.9999999999999.x.forged");
+    expect(tampered.status).toBe(401);
+  });
+
+  test("login rate-limits repeated failures", async () => {
+    for (let i = 0; i < 10; i++) {
+      await request(appState.app).post("/admin/api/login").send({ password: "wrong" });
+    }
+    const blocked = await request(appState.app).post("/admin/api/login").send({ password: ADMIN_SECRET });
+    expect(blocked.status).toBe(429);
   });
 
   test("admin API exposes operational data without raw secrets", async () => {
@@ -128,29 +160,27 @@ describe("admin dashboard", () => {
     expect(serialized).not.toContain("client-id-secret-value");
   });
 
-  test("healthy empty state is visible above tables", async () => {
-    const res = await adminGet(appState.app, "/admin/");
+  test("fleet endpoint merges agent rows, dispatch acks, and policy status", async () => {
+    appState.ackTracker.recordDispatch("sage", "AI-700");
+    const res = await adminGet(appState.app, "/admin/api/fleet");
     expect(res.status).toBe(200);
-    expect(res.text).toContain("No attention needed. Connector is running and no tasks are blocked.");
-    expect(res.text).toContain("attention-ok");
-    expect(res.text.indexOf("Attention Needed")).toBeLessThan(res.text.indexOf("System Status"));
+    expect(res.body.agents[0].name).toBe("sage");
+    expect(res.body.dispatches.some((d: { ticketId: string }) => d.ticketId.includes("AI-700"))).toBe(true);
+    expect(res.body.registryPolicy).toBeDefined();
+    expect(res.body.configHealth).toBeDefined();
+    expect(JSON.stringify(res.body)).not.toContain("access-token-secret-value");
   });
 
-  test("warning destinations point to specific anchored rows and task detail panels", async () => {
-    appState.bag.add("sage", "AI-615", "Issue");
+  test("alerts endpoint returns rows from the alert store", async () => {
+    const res = await adminGet(appState.app, "/admin/api/alerts?limit=5");
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.alerts)).toBe(true);
+  });
 
-    const tasks = await adminGet(appState.app, "/admin/tasks");
-    expect(tasks.status).toBe(200);
-    expect(tasks.text).toContain('id="task-linear-ai-615"');
-    expect(tasks.text).toContain("Detail panel");
-    expect(tasks.text).toContain("Open task detail");
-    expect(tasks.text).toContain("Event / session");
-
-    const overview = await adminGet(appState.app, "/admin/");
-    expect(overview.text).toContain('/admin/tasks#task-linear-ai-615');
-    expect(tasks.text).toContain('class="nudge-button"');
-    expect(tasks.text).toContain('data-agent="sage"');
-    expect(tasks.text).toContain('data-ticket="AI-615"');
+  test("workflows endpoint returns full definitions", async () => {
+    const res = await adminGet(appState.app, "/admin/api/workflows");
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.workflows)).toBe(true);
   });
 
   test("nudge endpoint requires auth, active session, then posts to hooks", async () => {
