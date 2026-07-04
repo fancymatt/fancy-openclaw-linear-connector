@@ -19,7 +19,7 @@ export interface AlertBusOptions {
   store?: AlertStore;
   log?: Logger;
   /** Override push transport (tests). Default posts push_notification to the OpenClaw gateway. */
-  pushFn?: (message: string) => Promise<void>;
+  pushFn?: (message: string) => Promise<string | void>;
   pushEnabled?: boolean;
   pushMinSeverity?: AlertSeverity;
   pushBudget?: number;
@@ -37,8 +37,8 @@ function envSeverity(name: string, defaultVal: AlertSeverity): AlertSeverity {
   return raw === "info" || raw === "warning" || raw === "critical" ? raw : defaultVal;
 }
 
-async function gatewayPush(message: string): Promise<void> {
-  await sendThroughChain(message);
+async function gatewayPush(message: string): Promise<string> {
+  return await sendThroughChain(message);
 }
 
 /**
@@ -53,7 +53,7 @@ async function gatewayPush(message: string): Promise<void> {
 export class AlertBus {
   private store: AlertStore | null;
   private log: Logger;
-  private pushFn: (message: string) => Promise<void>;
+  private pushFn: (message: string) => Promise<string | void>;
   private pushEnabled: boolean;
   private pushMinSeverity: AlertSeverity;
   private pushBudget: number;
@@ -161,8 +161,8 @@ export class AlertBus {
 
   private sendPush(message: string, rowId: number | null): void {
     this.pushFn(message)
-      .then(() => {
-        if (rowId !== null && this.store) this.store.markPushed(rowId, this.now());
+      .then((via) => {
+        if (rowId !== null && this.store) this.store.markPushed(rowId, this.now(), typeof via === "string" ? via : undefined);
       })
       .catch((err) => {
         this.log.error(`push sink failed (alert is stored+logged): ${err instanceof Error ? err.message : String(err)}`);

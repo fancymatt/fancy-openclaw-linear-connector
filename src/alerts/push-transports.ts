@@ -68,14 +68,21 @@ export function hookRelayTransport(): Transport {
   const agentId = process.env.ALERT_HOOK_AGENT ?? "astrid";
   const room = process.env.ALERT_MATRIX_ROOM;
   return {
-    name: "hook-relay",
+    // "(accepted)" is deliberate: HTTP 200 here means the gateway STARTED a
+    // model turn, not that the alert reached the room. 2026-07-04: a relay
+    // turn composed its reply and the ambient deliver-leg dropped it silently
+    // while the bus recorded the alert as pushed. This transport can never
+    // hard-confirm delivery — pushed_via makes that visible in the store.
+    name: "hook-relay(accepted)",
     available: () => Boolean(hookUrl && hookToken && room),
     send: async (message: string) => {
       const response = await postJson(hookUrl!, hookToken, {
         agentId,
         message:
-          `You are relaying a connector alert to Matt. Repeat the following alert verbatim as your entire reply ` +
-          `(no preamble, no commentary):\n\n${message}`,
+          `SYSTEM ALERT RELAY — do exactly this, nothing else. Do not investigate, do not use any other tools. ` +
+          `Call your message tool once: action="send", channel="matrix", target="${room}", ` +
+          `message set to the alert text between the markers below, verbatim. Then reply with only the word DONE.\n` +
+          `-----BEGIN ALERT-----\n${message}\n-----END ALERT-----`,
         deliver: true,
         channel: "matrix",
         to: room,

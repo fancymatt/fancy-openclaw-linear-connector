@@ -30,6 +30,7 @@ import type { DispatchAckTracker } from "./dispatch-ack-tracker.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
 import { resignalPendingTickets, type ResignalOptions } from "./resignal.js";
 import type { WakeUpConfig } from "./wake-up.js";
+import { normalizeSessionKey } from "../session-key.js";
 
 const log = componentLogger(createLogger(), "dispatch-watchdog");
 
@@ -205,6 +206,16 @@ export class DispatchWatchdog {
         log.info(
           `Watchdog: re-signaled ${agentId} [${ticketId}] (attempt ${attemptCount + 1})`,
         );
+        // Same observability rule as the no-activity path: direct re-signals
+        // bypass the router, so record them or they never appear in the stream.
+        operationalEventStore.append({
+          outcome: "watchdog-resignal",
+          agent: agentId,
+          key: normalizeSessionKey(ticketId),
+          sessionKey: normalizeSessionKey(ticketId),
+          deliveryMode: "watchdog",
+          attemptCount: attemptCount + 1,
+        });
       } else if (pruned) {
         ackTracker.acknowledge(agentId, ticketId);
         autoAcknowledged++;

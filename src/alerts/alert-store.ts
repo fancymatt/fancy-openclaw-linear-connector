@@ -32,6 +32,7 @@ export interface AlertRow {
   dedupKey: string;
   count: number;
   pushedAt: string | null;
+  pushedVia: string | null;
   ackedAt: string | null;
 }
 
@@ -76,6 +77,7 @@ function rowToAlert(row: Record<string, unknown>): AlertRow {
     dedupKey: String(row.dedup_key),
     count: Number(row.count),
     pushedAt: (row.pushed_at as string | null) ?? null,
+    pushedVia: (row.pushed_via as string | null) ?? null,
     ackedAt: (row.acked_at as string | null) ?? null,
   };
 }
@@ -120,6 +122,15 @@ export class AlertStore {
       CREATE INDEX IF NOT EXISTS idx_alerts_dedup ON alerts (dedup_key, last_at);
       CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts (severity, last_at);
     `);
+    // pushed_via: which transport claimed the push. "pushed" alone proved
+    // meaningless on 2026-07-04 — hook-relay resolved success while the
+    // message never reached Matt. Recording the transport makes "pushed_at"
+    // auditable: hook-relay means ACCEPTED (model turn started), only
+    // matrix-message means the gateway confirmed the channel send.
+    const cols = this.db.prepare("PRAGMA table_info(alerts)").all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "pushed_via")) {
+      this.db.exec("ALTER TABLE alerts ADD COLUMN pushed_via TEXT");
+    }
   }
 
   /**
@@ -169,8 +180,10 @@ export class AlertStore {
     };
   }
 
-  markPushed(id: number, now = new Date()): void {
-    this.db.prepare("UPDATE alerts SET pushed_at = ? WHERE id = ?").run(now.toISOString(), id);
+  markPushed(id: number, now = new Date(), via?: string): void {
+    this.db
+      .prepare("UPDATE alerts SET pushed_at = ?, pushed_via = ? WHERE id = ?")
+      .run(now.toISOString(), via ?? null, id);
   }
 
   ack(id: number, now = new Date()): boolean {

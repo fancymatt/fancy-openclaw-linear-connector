@@ -112,6 +112,27 @@ describe("DispatchAckTracker", () => {
     expect(entries[0].attemptCount).toBe(2);
   });
 
+  // AI-1759 (2026-07-04): retries were judged against the ORIGINAL dispatch
+  // clock, so attempts 2 and 3 were executed within one detector cycle each.
+  // A re-signal must restart the no-activity window.
+  test("markResignaled resets dispatched_at so the retry gets a fresh window", () => {
+    tracker.recordDispatch("emi", "linear-CT-52");
+    // Backdate the original dispatch far past any threshold (the no-activity
+    // detector measures its window from dispatched_at).
+    (tracker as unknown as { db: import("better-sqlite3").Database }).db
+      .prepare("UPDATE dispatch_acks SET dispatched_at = datetime('now', '-1 hour') WHERE agent_id = ? AND ticket_id = ?")
+      .run("emi", "linear-CT-52");
+    const before = tracker.getPendingTimedOut(0)[0];
+    expect(Date.now() - new Date(before.dispatchedAt.replace(" ", "T") + "Z").getTime()).toBeGreaterThan(50 * 60_000);
+
+    tracker.markResignaled("emi", "linear-CT-52");
+
+    const entry = tracker.getPendingTimedOut(0)[0];
+    expect(entry.attemptCount).toBe(2);
+    // Fresh clock: the retry's no-activity window starts at the re-signal.
+    expect(Date.now() - new Date(entry.dispatchedAt.replace(" ", "T") + "Z").getTime()).toBeLessThan(60_000);
+  });
+
   test("markEscalated removes entry from timed-out results", () => {
     tracker.recordDispatch("emi", "linear-CT-52");
     tracker.markEscalated("emi", "linear-CT-52");

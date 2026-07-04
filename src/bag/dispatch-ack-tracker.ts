@@ -211,7 +211,11 @@ export class DispatchAckTracker {
 
   /**
    * Update a dispatch record after a watchdog re-signal attempt.
-   * Sets status to 'unconfirmed', bumps attempt_count, resets last_signal_at.
+   * Sets status to 'unconfirmed', bumps attempt_count, resets last_signal_at
+   * AND dispatched_at — a re-signal is a new dispatch attempt, so its
+   * no-activity window starts now. Judging retries against the original
+   * dispatch clock executed attempts 2 and 3 within one detector cycle
+   * (~30s each) instead of giving them full windows (AI-1759, 2026-07-04).
    */
   markResignaled(agentId: string, ticketId: string): void {
     const normalizedId = normalizeSessionKey(ticketId);
@@ -219,6 +223,7 @@ export class DispatchAckTracker {
       .prepare(
         `UPDATE dispatch_acks
          SET ack_status = 'unconfirmed',
+             dispatched_at = datetime('now'),
              last_signal_at = datetime('now'),
              attempt_count = attempt_count + 1
          WHERE agent_id = ? AND ticket_id = ?`,

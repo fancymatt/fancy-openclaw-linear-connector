@@ -528,6 +528,17 @@ export class NoActivityDetector {
     if (dispatched) {
       ackTracker.markResignaled(agentId, ticketId);
       log.info(`No-activity: re-dispatched ${agentId} [${ticketId}] (attempt ${attemptCount + 1})`);
+      // Re-dispatches bypass the webhook router, so nothing else records them.
+      // Without this event the retry loop is invisible in the operational
+      // stream (AI-1759: had to read the ack sqlite directly to reconstruct).
+      operationalEventStore.append({
+        outcome: "no-activity-redispatch",
+        agent: agentId,
+        key: sessionKey,
+        sessionKey,
+        deliveryMode: "no-activity-detector",
+        attemptCount: attemptCount + 1,
+      });
     } else if (pruned) {
       // Ownership check in resignalPendingTickets determined the agent no longer owns this ticket.
       // Acknowledge so the ackTracker stops tracking it and the detector doesn't re-add it on

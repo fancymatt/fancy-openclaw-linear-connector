@@ -322,40 +322,76 @@ export function createApp(options?: CreateAppOptions) {
    * Used by NoActivityDetector to notify when dispatches fail silently.
    */
   async function postLinearComment(agentId: string, ticketId: string, message: string): Promise<boolean> {
-    const token = getAccessToken(agentId) ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
-    if (!token) {
-      log.warn(`No Linear token for comment post on ${ticketId}`);
-      return false;
-    }
-    const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
     const identifier = ticketId.replace(/^linear-/, "");
-    try {
-      // Fetch issue ID
-      const issueRes = await fetch("https://api.linear.app/graphql", {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: authHeader },
-        body: JSON.stringify({
-          query: `query($id: String!) { issue(id: $id) { id } }`,
-          variables: { id: identifier },
-        }),
-      });
-      const issueBody = (await issueRes.json()) as { data?: { issue?: { id: string } | null } };
-      const issueId = issueBody.data?.issue?.id;
-      if (!issueId) return false;
-      // Post comment
-      const commentRes = await fetch("https://api.linear.app/graphql", {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: authHeader },
-        body: JSON.stringify({
-          query: `mutation($issueId: ID!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { comment { id } } }`,
-          variables: { issueId, body: message },
-        }),
-      });
-      return commentRes.ok;
-    } catch (err) {
-      log.error(`Linear comment failed for ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
-      return false;
+    // Failure-path comments must not depend solely on the failing agent's own
+    // credentials — fall back to the steward's token. (The primary historical
+    // failure here was not auth but a broken mutation: $issueId was declared
+    // ID! where Linear's CommentCreateInput expects String — every call 400'd
+    // silently until AI-1759, 2026-07-04.)
+    const tokenCandidates: Array<{ source: string; token: string | undefined }> = [
+      { source: agentId, token: getAccessToken(agentId) },
+      { source: "steward:astrid", token: getAccessToken("astrid") },
+      { source: "env", token: process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY },
+    ];
+    let lastError = "no Linear token available";
+    for (const { source, token } of tokenCandidates) {
+      if (!token) continue;
+      const authHeader = /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
+      try {
+        const issueRes = await fetch("https://api.linear.app/graphql", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: authHeader },
+          body: JSON.stringify({
+            query: `query($id: String!) { issue(id: $id) { id } }`,
+            variables: { id: identifier },
+          }),
+        });
+        const issueBody = (await issueRes.json()) as {
+          data?: { issue?: { id: string } | null };
+          errors?: Array<{ message?: string }>;
+        };
+        const issueId = issueBody.data?.issue?.id;
+        if (!issueId) {
+          lastError = `issue lookup failed via ${source}: ${issueBody.errors?.[0]?.message ?? `no issue for '${identifier}'`}`;
+          continue;
+        }
+        const commentRes = await fetch("https://api.linear.app/graphql", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: authHeader },
+          body: JSON.stringify({
+            query: `mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { comment { id } } }`,
+            variables: { issueId, body: message },
+          }),
+        });
+        const commentBody = (await commentRes.json()) as {
+          data?: { commentCreate?: { comment?: { id: string } | null } | null };
+          errors?: Array<{ message?: string }>;
+        };
+        if (commentBody.data?.commentCreate?.comment?.id) return true;
+        lastError = `commentCreate via ${source} returned ${commentRes.status}: ${commentBody.errors?.[0]?.message ?? "no comment id in response"}`;
+      } catch (err) {
+        lastError = `comment via ${source} threw: ${err instanceof Error ? err.message : String(err)}`;
+      }
     }
+    // Never silent: a failure-path comment that can't post is itself a failure signal.
+    log.error(`Linear comment failed for ${identifier}: ${lastError}`);
+    try {
+      operationalEventStore.append({
+        outcome: "comment-post-failed",
+        agent: agentId,
+        key: normalizeSessionKey(ticketId),
+        detail: { error: lastError.slice(0, 300) },
+      });
+    } catch { /* observability must not block */ }
+    notify({
+      severity: "warning",
+      source: "dispatch",
+      title: "failure-path Linear comment could not be posted",
+      agent: agentId,
+      ticket: ticketId,
+      detail: lastError.slice(0, 300),
+    });
+    return false;
   }
 
   /**
