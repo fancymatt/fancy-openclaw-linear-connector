@@ -560,4 +560,102 @@ describe("proxy — AI-1731 comment requirement integration", () => {
     expect(res.body.errors).toBeDefined();
     expect(res.body.errors[0].message).toContain("comment");
   });
+
+  // ── AI-1769 AC2: X-Openclaw-Comment-Satisfied-By ──────────────────────
+  // A dedup-suppressed comment may satisfy requires_comment when the CLI
+  // points at the existing comment that already carries the feedback. The
+  // proxy verifies issue match, recency, and authorship — fail-closed.
+
+  function makeSatisfiedByFetch(labelResponse: object, commentNode: object | null) {
+    const base = makeProxyFetch(labelResponse);
+    return async (url: unknown, init?: RequestInit) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+      const parsed = bodyText ? JSON.parse(bodyText) as { query?: string } : {};
+      if (typeof url === "string" && url.includes("api.linear.app") && parsed.query?.includes("SatisfiedByComment")) {
+        return new Response(JSON.stringify({ data: { comment: commentNode } }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      return base(url, init);
+    };
+  }
+
+  const VALID_SATISFIED_COMMENT = {
+    id: "comment-dup-1",
+    createdAt: new Date(Date.now() - 20_000).toISOString(), // 20s old
+    user: { id: "u1" }, // charles
+    issue: { id: "issue-uuid", identifier: "AI-999" },
+  };
+
+  function satisfiedBySubmit() {
+    return request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer test-token")
+      .set("X-Openclaw-Agent", "charles")
+      .set("X-Openclaw-Linear-Intent", "submit")
+      .set("X-Openclaw-Linear-Target", "reviewer")
+      .set("X-Openclaw-Comment-Satisfied-By", "comment-dup-1")
+      .send({
+        query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }",
+        variables: { id: "issue-uuid" },
+      });
+  }
+
+  it("AI-1769: allows submit without commentCreate when a verified satisfied-by comment is referenced", async () => {
+    globalThis.fetch = makeSatisfiedByFetch(IMPLEMENTATION_RESPONSE, VALID_SATISFIED_COMMENT);
+
+    const res = await satisfiedBySubmit();
+    expect(res.status).toBe(200);
+    if (res.body.errors) {
+      for (const err of res.body.errors) {
+        expect(err.message).not.toContain("comment");
+        expect(err.message).not.toContain("--comment-file");
+      }
+    }
+  });
+
+  it("AI-1769: rejects satisfied-by pointing at a comment on a DIFFERENT issue (fail-closed)", async () => {
+    globalThis.fetch = makeSatisfiedByFetch(IMPLEMENTATION_RESPONSE, {
+      ...VALID_SATISFIED_COMMENT,
+      issue: { id: "other-issue-uuid", identifier: "AI-111" },
+    });
+
+    const res = await satisfiedBySubmit();
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("comment");
+  });
+
+  it("AI-1769: rejects a stale satisfied-by comment (older than 1h, fail-closed)", async () => {
+    globalThis.fetch = makeSatisfiedByFetch(IMPLEMENTATION_RESPONSE, {
+      ...VALID_SATISFIED_COMMENT,
+      createdAt: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+    });
+
+    const res = await satisfiedBySubmit();
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("comment");
+  });
+
+  it("AI-1769: rejects a satisfied-by comment authored by someone else (fail-closed)", async () => {
+    globalThis.fetch = makeSatisfiedByFetch(IMPLEMENTATION_RESPONSE, {
+      ...VALID_SATISFIED_COMMENT,
+      user: { id: "u9" },
+    });
+
+    const res = await satisfiedBySubmit();
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("comment");
+  });
+
+  it("AI-1769: rejects satisfied-by when the comment lookup returns null (fail-closed)", async () => {
+    globalThis.fetch = makeSatisfiedByFetch(IMPLEMENTATION_RESPONSE, null);
+
+    const res = await satisfiedBySubmit();
+    expect(res.status).toBe(200);
+    expect(res.body.errors).toBeDefined();
+    expect(res.body.errors[0].message).toContain("comment");
+  });
 });

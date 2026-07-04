@@ -1041,6 +1041,74 @@ export function cliVerbFor(t: { command: string; generic?: string }): string {
  * @param callerLinearUserId - Linear user ID of the requesting agent (from agents.ts);
  *   used for delegate-only enforcement (AI-1397). Null/undefined → fail-open.
  */
+/**
+ * AI-1769 AC2: verify an X-Openclaw-Comment-Satisfied-By reference.
+ *
+ * When a governed transition's required comment is suppressed client-side as a
+ * near-duplicate of an existing comment (a prior blocked attempt already posted
+ * the feedback), the CLI sends the transition trigger WITHOUT a commentCreate
+ * and points at the comment that already carries the feedback. A
+ * requires_comment gate may treat that as satisfied ONLY when the referenced
+ * comment (1) exists, (2) belongs to the transitioning issue, (3) is recent
+ * (≤1h — the CLI dedup window is 10min, so this is generous), and (4) was
+ * authored by the calling agent when the caller is resolvable.
+ *
+ * Fail-closed: any verification failure returns false and the gate blocks
+ * exactly as it would without the header.
+ */
+export async function verifyCommentSatisfiedBy(
+  issueId: string,
+  commentId: string,
+  authToken: string,
+  callerLinearUserId?: string | null,
+): Promise<boolean> {
+  const query = `query SatisfiedByComment($id: String!) { comment(id: $id) { id createdAt user { id } issue { id identifier } } }`;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: commentId } }),
+    });
+    type CommentResp = {
+      data?: {
+        comment?: {
+          id: string;
+          createdAt?: string;
+          user?: { id: string } | null;
+          issue?: { id: string; identifier?: string } | null;
+        } | null;
+      };
+    };
+    const data = (await res.json()) as CommentResp;
+    const comment = data.data?.comment;
+    if (!comment) {
+      log.warn(`workflow-gate: satisfied-by: comment ${commentId} not found — rejecting`);
+      return false;
+    }
+    const issueMatches =
+      comment.issue?.id === issueId ||
+      (comment.issue?.identifier ?? "").toUpperCase() === issueId.toUpperCase();
+    if (!issueMatches) {
+      log.warn(`workflow-gate: satisfied-by: comment ${commentId} belongs to ${comment.issue?.identifier ?? comment.issue?.id ?? "unknown"}, not ${issueId} — rejecting`);
+      return false;
+    }
+    const ageMs = Date.now() - new Date(comment.createdAt ?? 0).getTime();
+    if (!Number.isFinite(ageMs) || ageMs > 3_600_000) {
+      log.warn(`workflow-gate: satisfied-by: comment ${commentId} is too old (${Math.round(ageMs / 1000)}s) — rejecting`);
+      return false;
+    }
+    if (callerLinearUserId && comment.user?.id !== callerLinearUserId) {
+      log.warn(`workflow-gate: satisfied-by: comment ${commentId} was authored by ${comment.user?.id ?? "unknown"}, caller is ${callerLinearUserId} — rejecting`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: satisfied-by: verification failed for comment ${commentId} on ${issueId}: ${msg} — rejecting (fail-closed)`);
+    return false;
+  }
+}
+
 export async function checkWorkflowRules(
   intent: string,
   issueId: string | null,
