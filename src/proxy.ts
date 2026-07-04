@@ -31,7 +31,7 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, resolveMetaIntent, type TransitionFeedback } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, resolveMetaIntent, verifyCommentSatisfiedBy, type TransitionFeedback } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
@@ -406,7 +406,20 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         deps?.operationalEventStore?.append({ outcome: "break-glass-used", agent: agentId, key: issueId ?? undefined });
       }
 
-      const requestHasComment = extractCommentBody(body) !== null;
+      // AI-1769 AC2: a dedup-suppressed comment may satisfy requires_comment via
+      // the X-Openclaw-Comment-Satisfied-By header — the CLI points at the
+      // existing comment that already carries the feedback, and the proxy
+      // verifies it (issue match, recency, authorship) before honoring it.
+      let requestHasComment = extractCommentBody(body) !== null;
+      const satisfiedByHeader = (req.headers["x-openclaw-comment-satisfied-by"] as string | undefined) ?? null;
+      if (!requestHasComment && satisfiedByHeader && issueId) {
+        requestHasComment = await verifyCommentSatisfiedBy(issueId, satisfiedByHeader, authorization, callerLinearUserId);
+        if (requestHasComment) {
+          log.info(`comment-satisfied-by accepted agent=${agentId} intent=${effectiveIntent}${ticketCtx} comment=${satisfiedByHeader}`);
+        } else {
+          log.warn(`comment-satisfied-by rejected agent=${agentId} intent=${effectiveIntent}${ticketCtx} comment=${satisfiedByHeader}`);
+        }
+      }
       const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment);
       if (p3rejection) {
         log.warn(`workflow-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p3rejection}`);
