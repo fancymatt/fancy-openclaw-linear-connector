@@ -182,12 +182,12 @@ export class NoActivityDetector {
   }
 
   private async handleAtCapacity(
-    entry: { agentId: string; ticketId: string; attemptCount: number; dispatchedAt: string },
+    entry: { agentId: string; ticketId: string; attemptCount: number; dispatchedAt: string; lastSignalAt: string },
     sessionKey: string,
   ): Promise<void> {
     const { agentId, ticketId } = entry;
     const { operationalEventStore, sessionTracker } = this.deps;
-    const ageMs = Date.now() - new Date(entry.dispatchedAt.replace(' ', 'T') + 'Z').getTime();
+    const ageMs = Date.now() - new Date(entry.lastSignalAt.replace(' ', 'T') + 'Z').getTime();
     const activeCount = sessionTracker.getActiveSessionKeys(agentId).length;
     const maxConcurrent = this.getAgentMaxConcurrentValue(agentId);
 
@@ -293,11 +293,12 @@ export class NoActivityDetector {
         continue;
       }
 
-      // Parse dispatch time to compute age.
+      // Age is measured from the LATEST delivery attempt (last_signal_at) —
+      // consistent with getPendingTimedOut's filter. Measuring from the first
+      // dispatch executed fresh re-wakes seconds after delivery (AI-1766).
       // SQLite datetime('now') returns "YYYY-MM-DD HH:MM:SS" (UTC).
-      // Replace the space with 'T' and append 'Z' for reliable ISO 8601 parsing.
-      const dispatchedAt = new Date(entry.dispatchedAt.replace(' ', 'T') + 'Z').getTime();
-      const ageMs = now - dispatchedAt;
+      const lastSignalAt = new Date(entry.lastSignalAt.replace(' ', 'T') + 'Z').getTime();
+      const ageMs = now - lastSignalAt;
       const sessionKeyWarn = `${agentId}:${sessionKey}`;
 
       // AI-1666: use per-state no-activity timeout when available.
@@ -392,12 +393,15 @@ export class NoActivityDetector {
    * Returns true if the ticket was deferred (agent alive but at capacity), false for hard failure.
    */
   private async handleFailure(
-    entry: { agentId: string; ticketId: string; attemptCount: number; dispatchedAt: string },
+    entry: { agentId: string; ticketId: string; attemptCount: number; dispatchedAt: string; lastSignalAt: string },
     sessionKey: string,
   ): Promise<boolean> {
     const { agentId, ticketId, attemptCount } = entry;
     const { sessionTracker, ackTracker, bag, operationalEventStore, wakeConfig, wakeConfigForAgent } = this.deps;
-    const ageMs = Date.now() - new Date(entry.dispatchedAt.replace(' ', 'T') + 'Z').getTime();
+    // Age is measured from the LATEST delivery attempt, not the first dispatch.
+    // AI-1766: fresh wakes inherited a stale dispatched_at (recordDispatch upsert
+    // keeps the original) and were failed/escalated seconds after delivery.
+    const ageMs = Date.now() - new Date(entry.lastSignalAt.replace(' ', 'T') + 'Z').getTime();
 
     log.error(
       `No-activity failure for ${agentId} [${sessionKey}] ` +

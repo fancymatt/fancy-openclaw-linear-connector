@@ -323,14 +323,17 @@ export function createApp(options?: CreateAppOptions) {
    */
   async function postLinearComment(agentId: string, ticketId: string, message: string): Promise<boolean> {
     const identifier = ticketId.replace(/^linear-/, "");
-    // Failure-path comments must not depend solely on the failing agent's own
-    // credentials — fall back to the steward's token. (The primary historical
-    // failure here was not auth but a broken mutation: $issueId was declared
-    // ID! where Linear's CommentCreateInput expects String — every call 400'd
-    // silently until AI-1759, 2026-07-04.)
+    // Steward token FIRST: these are system diagnostics about a failing agent.
+    // Posting them with the agent's own token (a) attributes "manual
+    // intervention required" to the agent it's about — live confusion on
+    // AI-1759 — and (b) counts as agent-authored Linear activity, flipping
+    // engagement and acknowledging the very dispatch being reported dead.
+    // Agent token remains a fallback so a steward-token outage can't silence
+    // the failure path. (Original bug here: $issueId declared ID! where
+    // Linear expects String — every call 400'd silently until 2026-07-04.)
     const tokenCandidates: Array<{ source: string; token: string | undefined }> = [
-      { source: agentId, token: getAccessToken(agentId) },
       { source: "steward:astrid", token: getAccessToken("astrid") },
+      { source: agentId, token: getAccessToken(agentId) },
       { source: "env", token: process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY },
     ];
     let lastError = "no Linear token available";
