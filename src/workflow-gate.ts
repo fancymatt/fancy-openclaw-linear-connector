@@ -922,6 +922,39 @@ async function fetchIssueDescription(issueId: string, authToken: string): Promis
   }
 }
 
+/**
+ * AI-1776 AC2: Post a fail-visible warning comment when a capture_ac: true
+ * transition captures nothing (null extraction or description fetch failure).
+ * Signal, not gate — the transition still completes. The comment tells the
+ * steward the AC of record was not captured and why, so they can react.
+ */
+async function postAcCaptureWarningComment(
+  internalIssueId: string,
+  issueIdentifier: string,
+  authToken: string,
+  cause: string,
+): Promise<void> {
+  const mutation = `
+    mutation($issueId: ID!, $body: String!) {
+      commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
+    }
+  `;
+  const body =
+    `[AC Capture Warning] The AC of record was **not captured** at accept time: ${cause}. ` +
+    `The transition proceeded, but there is no verbatim AC snapshot for this ticket. ` +
+    `Use the recapture verb to create the AC record from the current description once an Acceptance Criteria section is present.`;
+  try {
+    await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId: internalIssueId, body } }),
+    });
+    log.info(`workflow-gate: H-7: posted AC capture warning comment for ${issueIdentifier}`);
+  } catch (err) {
+    log.warn(`workflow-gate: H-7: failed to post AC capture warning comment for ${issueIdentifier}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 // ── Stakes-level resolution (AI-1482) ───────────────────────────────────────
 
 /**
@@ -2218,7 +2251,11 @@ export async function applyStateTransition(
       const { description, fetchFailed } = await fetchIssueDescription(issueId, authToken);
       if (fetchFailed) {
         log.warn(`workflow-gate: H-7: description fetch failed for ${issueId} — AC capture skipped, delivery message will note incomplete capture`);
-        // Continue with the transition but note that AC capture was incomplete
+        // AI-1776 AC2: fail-visible — post a warning comment so the steward knows
+        // the AC of record was not captured and why. Signal, not gate: the
+        // transition still proceeds below.
+        await postAcCaptureWarningComment(issue.internalId, issueId, authToken,
+          'description fetch failed — could not retrieve the issue description to extract acceptance criteria');
       } else {
         const verbatimAc = extractAcFromDescription(description);
         if (verbatimAc) {
@@ -2231,6 +2268,9 @@ export async function applyStateTransition(
           log.info(`workflow-gate: H-7: captured verbatim AC for ${issueId} (${verbatimAc.length} chars)`);
         } else {
           log.warn(`workflow-gate: H-7: no AC section header found in description for ${issueId} — AC capture skipped (description has no '### Acceptance' or '### AC' section)`);
+          // AI-1776 AC2: fail-visible — no AC section header found.
+          await postAcCaptureWarningComment(issue.internalId, issueId, authToken,
+            "no acceptance criteria header found in the ticket description — the AC of record was not captured. Add an '## Acceptance Criteria' or '### AC' section and use the recapture verb to create the record.");
         }
       }
     } catch (err) {
