@@ -37,6 +37,7 @@ export function Diagnostics({ value, label = "Raw diagnostics" }: { value: unkno
 const TABS: Array<[string, string]> = [
   ["/", "Overview"],
   ["/fleet", "Fleet"],
+  ["/board", "Board"],
   ["/tasks", "Tasks"],
   ["/events", "Events"],
   ["/alerts", "Alerts"],

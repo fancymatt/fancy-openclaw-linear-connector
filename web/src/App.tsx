@@ -5,6 +5,7 @@ import { Tabs } from "./components";
 import { LoginPage } from "./pages/LoginPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { FleetPage } from "./pages/FleetPage";
+import { BoardPage } from "./pages/BoardPage";
 import { TasksPage } from "./pages/TasksPage";
 import { EventsPage } from "./pages/EventsPage";
 import { AlertsPage } from "./pages/AlertsPage";
@@ -60,6 +61,7 @@ export function App() {
         <Routes>
           <Route path="/" element={<OverviewPage />} />
           <Route path="/fleet" element={<FleetPage />} />
+          <Route path="/board" element={<BoardPage />} />
           <Route path="/tasks" element={<TasksPage />} />
           <Route path="/events" element={<EventsPage />} />
           <Route path="/alerts" element={<AlertsPage />} />

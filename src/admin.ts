@@ -16,6 +16,7 @@ import type { ObservationStore, ReasonCode } from "./store/observation-store.js"
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { setStateAtomic, loadWorkflowRegistry } from "./workflow-gate.js";
+import { parseSlaToMs } from "./barrier.js";
 import { recaptureAc } from "./ac-record-store.js";
 import { getStatus as getConfigHealthStatus } from "./config-health.js";
 import { getRegistryPolicyStatus } from "./registry-policy.js";
@@ -71,6 +72,35 @@ function ageLabel(value?: string | number | null): string {
   const hours = Math.floor(minutes / 60);
   if (hours < 48) return `${hours}h ago`;
   return `${Math.floor(hours / 24)}d ago`;
+}
+
+/** Render a last event as prose from an enrolled-ticket row. */
+function renderEventProse(row: { last_event_kind: string | null; delegate: string | null; last_event_at: string | null }): string {
+  const kind = row.last_event_kind ?? 'enrolled';
+  const who = row.delegate ?? 'system';
+  const when = row.last_event_at ? ageLabel(row.last_event_at) : 'recently';
+  const verbs: Record<string, string> = {
+    enroll: 'enrolled',
+    accept: 'accepted the ticket',
+    tests_ready: 'marked tests ready',
+    'tests-ready': 'marked tests ready',
+    submit: 'submitted for review',
+    approve: 'approved',
+    'request-changes': 'requested changes',
+    deploy: 'deployed',
+    'host-deployed': 'host-deployed',
+    validated: 'validated and closed',
+    'ac-fail': 'AC validation failed',
+    complete: 'completed',
+    demoted: 'demoted from workflow',
+    reconciled: 'state reconciled',
+  };
+  const verb = verbs[kind] ?? kind;
+  return `${capitalize(who)} ${verb}, ${when}`;
+}
+
+function capitalize(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
 function slugId(value: unknown): string {
@@ -569,18 +599,65 @@ export function createAdminRouter(deps: AdminDeps): Router {
     res.json({ agents: result });
   });
 
-  // AI-1799 AC4: Board read API — enrolled-tickets mirror joined with
-  // latest wake_id status from the operational event store.
-  router.get("/api/board", (_req: Request, res: Response) => {
+  // AI-1799/1800: Board read API — enrolled-tickets mirror joined with
+  // workflow defs (columns), SLA thresholds, prose rendering, and terminal
+  // handling.
+  router.get("/api/board", async (_req: Request, res: Response) => {
     if (!deps.enrolledTicketsStore) {
-      res.json({ tickets: [] });
+      res.json({ workflows: [], tickets: [] });
       return;
     }
-    const tickets = deps.enrolledTicketsStore.getAll().map((row) => {
-      // Find the latest event with a wake_id for this ticket.
+    const registry = await loadWorkflowRegistry();
+    const allTickets = deps.enrolledTicketsStore.getAll();
+    const TWENTY_FOUR_H_MS = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+
+    // Determine which workflows have enrolled tickets (including terminal done).
+    const workflowIds = new Set(allTickets.map((t) => t.workflow).filter(Boolean));
+
+    // Build the workflows array with state ordering + SLA lookup.
+    const workflows: Array<{ id: string; states: string[] }> = [];
+    const slaCache = new Map<string, Map<string, number | null>>();
+    for (const wfId of workflowIds) {
+      const def = registry.get(wfId);
+      if (!def) continue;
+      const stateSlaMap = new Map<string, number | null>();
+      for (const s of def.states) {
+        stateSlaMap.set(s.id, s.sla ? parseSlaToMs(s.sla) : null);
+      }
+      slaCache.set(wfId, stateSlaMap);
+      // Only include workflows that have at least one non-demoted, non-24h-aged ticket.
+      const hasLive = allTickets.some((t) => {
+        if (t.workflow !== wfId) return false;
+        if (t.last_event_kind === 'demoted') return false;
+        if (t.terminal === 1) {
+          const termAt = t.last_event_at ?? t.entered_state_at;
+          if (now - new Date(termAt).getTime() > TWENTY_FOUR_H_MS) return false;
+        }
+        return true;
+      });
+      if (hasLive) {
+        workflows.push({ id: def.id, states: def.states.map((s) => s.id) });
+      }
+    }
+
+    // Build enriched ticket array.
+    const tickets: Array<Record<string, unknown>> = [];
+    for (const row of allTickets) {
       const events = deps.operationalEventStore?.query({ key: `linear-${row.ticket_id}`, limit: 50 }) ?? [];
       const wakeEvent = events.find((e) => e.wakeId);
-      return {
+      const muted = row.last_event_kind === 'demoted';
+      const termAt = row.terminal === 1 ? (row.last_event_at ?? row.entered_state_at) : null;
+      const terminal_duration_ms = termAt ? Math.max(0, now - new Date(termAt).getTime()) : undefined;
+      const stateSlaMap = slaCache.get(row.workflow);
+      const sla_ms = stateSlaMap?.get(row.state) ?? null;
+
+      // Exclude terminal tickets older than 24h.
+      if (row.terminal === 1 && terminal_duration_ms !== undefined && terminal_duration_ms > TWENTY_FOUR_H_MS) {
+        continue;
+      }
+
+      tickets.push({
         ticket_id: row.ticket_id,
         workflow: row.workflow,
         state: row.state,
@@ -591,10 +668,118 @@ export function createAdminRouter(deps: AdminDeps): Router {
         last_event_at: row.last_event_at,
         terminal: row.terminal,
         latest_wake_id: wakeEvent?.wakeId ?? null,
-        time_in_state_ms: Math.max(0, Date.now() - new Date(row.entered_state_at).getTime()),
-      };
+        time_in_state_ms: Math.max(0, now - new Date(row.entered_state_at).getTime()),
+        sla_ms,
+        last_event_prose: renderEventProse(row),
+        muted,
+        terminal_duration_ms: row.terminal === 1 ? terminal_duration_ms : undefined,
+      });
+    }
+    res.json({ workflows, tickets });
+  });
+
+  // AI-1800 AC4: Dispatches sub-view — grouped by wake_id.
+  router.get("/api/dispatches", (_req: Request, res: Response) => {
+    if (!deps.operationalEventStore) {
+      res.json({ label: "Dispatch cycles", cycles: [] });
+      return;
+    }
+    const allEvents = deps.operationalEventStore.query({ limit: 500 });
+    const byWakeId = new Map<string, { agent_id: string; dispatches: Array<{ ticket_id: string; dispatched_at: string; ack_status: string; attempt_count: number }> }>();
+
+    for (const ev of allEvents) {
+      if (!ev.wakeId) continue;
+      const ticketId = ev.key?.startsWith("linear-") ? ev.key.slice(7) : ev.key ?? '';
+      if (!byWakeId.has(ev.wakeId)) {
+        byWakeId.set(ev.wakeId, { agent_id: ev.agent ?? '', dispatches: [] });
+      }
+      const group = byWakeId.get(ev.wakeId)!;
+      if (!group.dispatches.some((d) => d.ticket_id === ticketId)) {
+        group.dispatches.push({
+          ticket_id: ticketId,
+          dispatched_at: ev.occurredAt,
+          ack_status: 'pending',
+          attempt_count: 1,
+        });
+      }
+    }
+
+    // Cross-reference with ackTracker for accurate ack_status/attempt_count.
+    if (deps.ackTracker) {
+      const acks = deps.ackTracker.listRecent(500);
+      for (const group of byWakeId.values()) {
+        for (const d of group.dispatches) {
+          const match = acks.find((a) => a.ticketId === d.ticket_id && a.agentId === group.agent_id);
+          if (match) {
+            d.ack_status = match.ackStatus;
+            d.attempt_count = match.attemptCount;
+            d.dispatched_at = match.dispatchedAt;
+          }
+        }
+      }
+    }
+
+    const cycles = Array.from(byWakeId.entries()).map(([wake_id, group]) => ({
+      wake_id,
+      agent_id: group.agent_id,
+      dispatches: group.dispatches,
+    }));
+
+    res.json({ label: "Dispatch cycles", cycles });
+  });
+
+  // AI-1800 AC5: Per-ticket detail — state transitions with wake cycles.
+  router.get("/api/board/ticket/:ticketId", (_req: Request, res: Response) => {
+    const { ticketId } = _req.params;
+    if (!deps.enrolledTicketsStore) {
+      res.status(404).json({ ticket_id: ticketId });
+      return;
+    }
+    const row = deps.enrolledTicketsStore.getByTicketId(ticketId);
+    if (!row) {
+      res.status(404).json({ ticket_id: ticketId });
+      return;
+    }
+    const events = deps.operationalEventStore?.query({ key: `linear-${ticketId}`, limit: 200 }) ?? [];
+    const stateTransitions: Array<{
+      state: string;
+      delegate: string | null;
+      timestamp: string;
+      event_kind: string;
+      default_plane: string;
+      expandable_planes: string[];
+      wake_cycles: Array<{ wake_id: string; plane: string; summary: string }>;
+    }> = [];
+    const seenStates = new Set<string>();
+    for (const ev of events) {
+      const ws = (ev as unknown as { workflowState?: string }).workflowState;
+      if (ws && !seenStates.has(ws)) {
+        seenStates.add(ws);
+        const wakeCycles = events
+          .filter((e) => e.wakeId && ((e as unknown as { workflowState?: string }).workflowState === ws || !e.workflowState))
+          .map((e) => ({
+            wake_id: e.wakeId ?? '',
+            plane: e.plane ?? 'agent',
+            summary: `${e.outcome}${e.agent ? ` by ${e.agent}` : ''}, ${e.occurredAt}`,
+          }));
+        stateTransitions.push({
+          state: ws,
+          delegate: ev.agent ?? null,
+          timestamp: ev.occurredAt,
+          event_kind: ev.outcome,
+          default_plane: 'agent',
+          expandable_planes: ['connector'],
+          wake_cycles: wakeCycles,
+        });
+      }
+    }
+    res.json({
+      ticket_id: row.ticket_id,
+      workflow: row.workflow,
+      state: row.state,
+      delegate: row.delegate,
+      state_transitions: stateTransitions,
     });
-    res.json({ tickets });
   });
   router.get("/api/events", (req: Request, res: Response) => {
     if (!deps.operationalEventStore) {
