@@ -28,7 +28,8 @@ import { LINEAR_API_URL } from "./linear-helpers.js";
 
 export interface SlaSweepOptions {
   authToken: string;
-  /** Path to a single YAML file (possibly multi-document) containing workflow defs. */
+  /** Path to a single YAML file or a directory of *.yaml files containing workflow defs.
+   *  In directory mode (production WORKFLOW_DEFS_DIR), all *.yaml files are loaded. */
   workflowDefPath: string;
   /** Injectable fetch for testing; defaults to globalThis.fetch. */
   fetchFn?: (url: string | URL, init?: RequestInit) => Promise<Response>;
@@ -81,16 +82,31 @@ function parseSlaToMs(sla: string): number | null {
   }
 }
 
-/** Load all workflow defs from a single-doc or multi-doc YAML file. */
-function loadDefsFromFile(filePath: string): Map<string, WorkflowDef> {
+/** Load workflow defs from a YAML file (possibly multi-document). */
+function loadDefsFromFile(filePath: string, map: Map<string, WorkflowDef>): void {
   const raw = fs.readFileSync(filePath, "utf8");
-  const map = new Map<string, WorkflowDef>();
   yaml.loadAll(raw, (doc: unknown) => {
     const def = doc as WorkflowDef;
     if (def && typeof def === "object" && def.id) {
       map.set(def.id, def);
     }
   });
+}
+
+/** Load all workflow defs from a single YAML file or a directory of *.yaml files. */
+function loadDefs(workflowDefPath: string): Map<string, WorkflowDef> {
+  const map = new Map<string, WorkflowDef>();
+  if (!fs.existsSync(workflowDefPath)) return map;
+  const stat = fs.statSync(workflowDefPath);
+  if (stat.isDirectory()) {
+    for (const entry of fs.readdirSync(workflowDefPath).sort()) {
+      if (/\.ya?ml$/.test(entry)) {
+        loadDefsFromFile(path.join(workflowDefPath, entry), map);
+      }
+    }
+  } else {
+    loadDefsFromFile(workflowDefPath, map);
+  }
   return map;
 }
 
@@ -172,7 +188,7 @@ export async function runSlaSweep(opts: SlaSweepOptions): Promise<SlaSweepResult
     errors: [],
   };
 
-  const defs = loadDefsFromFile(workflowDefPath);
+  const defs = loadDefs(workflowDefPath);
   const store = new BreachStore(breachStorePath);
 
   // Single batch query — no per-ticket fan-out (AC5).
@@ -292,6 +308,7 @@ const DEFAULT_CADENCE_MS = 5 * 60 * 1000; // 5 minutes
  */
 export function registerSlaSweepCron(opts: SlaSweepOptions): ReturnType<typeof setInterval> {
   const cadenceMs = opts.cadenceMs ?? DEFAULT_CADENCE_MS;
+  console.info(`sla-sweep: registered (cadence=${cadenceMs}ms)`);
   const timer = setInterval(() => {
     runSlaSweep(opts).catch(() => {
       // sweep errors are non-fatal; result.errors captures per-ticket issues
