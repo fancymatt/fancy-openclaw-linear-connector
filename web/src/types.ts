@@ -111,6 +111,17 @@ export interface FleetResponse {
   configHealth: ConfigHealthStatus;
 }
 
+export interface CapacityAgent {
+  agentId: string;
+  slotsUsed: number;
+  cap: number;
+  parkedCount: number;
+}
+
+export interface CapacityResponse {
+  agents: CapacityAgent[];
+}
+
 export interface AlertRow {
   id: number;
   firstAt: string;
