@@ -9,7 +9,8 @@
  */
 import type { BoardTicket } from "../board-types";
 
-function formatDuration(ms: number): string {
+function formatDuration(ms: number | null | undefined): string {
+  if (ms == null) return "—";
   const hours = Math.floor(ms / 3600000);
   if (hours < 1) {
     const minutes = Math.floor(ms / 60000);

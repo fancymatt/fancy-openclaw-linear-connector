@@ -66,7 +66,12 @@ describe("AI-1800 AC1: GET /api/board — workflow column ordering", () => {
     resetWorkflowCache();
     fs.rmSync(path.dirname(mirrorDbPath), { recursive: true, force: true });
     fs.rmSync(path.dirname(eventsDbPath), { recursive: true, force: true });
-    if (wfDefsDir) fs.rmSync(wfDefsDir, { recursive: true, force: true });
+    // Only clean up temp dirs created by this test (mkdtemp prefix: ai1800-wf-defs-).
+    // Never delete the canonical __fixtures__ directory — using startsWith(os.tmpdir())
+    // alone is unsafe when the repo itself is cloned under /tmp.
+    if (wfDefsDir && path.basename(wfDefsDir).startsWith('ai1800-wf-defs-')) {
+      fs.rmSync(wfDefsDir, { recursive: true, force: true });
+    }
   });
 
   it("board response includes a workflows array with state ordering", async () => {

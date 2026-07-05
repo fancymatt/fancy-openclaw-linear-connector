@@ -50,19 +50,20 @@ export function BoardPage({ workflows: propWorkflows, tickets: propTickets }: Bo
               <div className="board-columns">
                 {wf.states.map((state) => {
                   const columnTickets = wfTickets.filter((t) => t.state === state);
-                  const isDone = state === "done";
                   return (
                     <div
                       key={state}
-                      data-testid={isDone ? "board-column-done" : `board-column-${state}`}
+                      data-testid="board-column"
                       data-column-state={state}
                       className="board-column"
                     >
-                      <div className="board-column-header">{state}</div>
-                      <div className="board-column-cards">
-                        {columnTickets.filter((t) => !t.muted).map((ticket) => (
-                          <BoardCard key={ticket.ticket_id} ticket={ticket} />
-                        ))}
+                      <div data-testid={`board-column-${state}`} className="board-column-inner">
+                        <div className="board-column-header">{state}</div>
+                        <div className="board-column-cards">
+                          {columnTickets.filter((t) => !t.muted).map((ticket) => (
+                            <BoardCard key={ticket.ticket_id} ticket={ticket} />
+                          ))}
+                        </div>
                       </div>
                     </div>
                   );

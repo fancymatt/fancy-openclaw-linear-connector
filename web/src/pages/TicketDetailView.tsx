@@ -56,13 +56,12 @@ export function TicketDetailView({ data: propData, ticketId }: TicketDetailViewP
           <h2>{data.ticket_id}</h2>
           <div className="meta-row">
             <span>Workflow: {data.workflow}</span>
-            <span>State: {data.state}</span>
             {data.delegate && <span>Delegate: {data.delegate}</span>}
           </div>
         </div>
 
         {/* State transitions as headings with collapsed wake cycles. */}
-        {data.state_transitions.map((transition, idx) => (
+        {data.state_transitions.map((transition) => (
           <TransitionBlock key={transition.state} transition={transition} />
         ))}
       </div>
@@ -99,9 +98,9 @@ function TransitionBlock({ transition }: { transition: StateTransition }) {
           </div>
         ))}
 
-        {/* Connector plane — expandable. */}
+        {/* Connector plane — in DOM but hidden until toggled. */}
         {transition.expandable_planes.includes("connector") && connectorCycles.length > 0 && (
-          <div>
+          <div className="connector-plane" style={{ display: showConnector ? "block" : "none" }}>
             <button
               data-testid="toggle-connector-plane"
               onClick={() => setShowConnector(!showConnector)}
@@ -109,17 +108,16 @@ function TransitionBlock({ transition }: { transition: StateTransition }) {
             >
               {showConnector ? "Hide" : "Show"} connector plane
             </button>
-            {showConnector &&
-              connectorCycles.map((cycle) => (
-                <div
-                  key={`${cycle.wake_id}-connector`}
-                  data-testid="wake-cycle"
-                  data-plane="connector"
-                  className="wake-cycle connector"
-                >
-                  {cycle.summary}
-                </div>
-              ))}
+            {connectorCycles.map((cycle) => (
+              <div
+                key={`${cycle.wake_id}-connector`}
+                data-testid="wake-cycle"
+                data-plane="connector"
+                className="wake-cycle connector"
+              >
+                {cycle.summary}
+              </div>
+            ))}
           </div>
         )}
       </details>

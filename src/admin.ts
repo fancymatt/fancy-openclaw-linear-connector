@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import yaml from "js-yaml";
 import { getAgents, getAccessToken, type AgentConfig } from "./agents.js";
 import type { AgentQueue } from "./queue/index.js";
 import type { PendingWorkBag, BagEntry } from "./bag/index.js";
@@ -602,43 +603,98 @@ export function createAdminRouter(deps: AdminDeps): Router {
   // AI-1799/1800: Board read API — enrolled-tickets mirror joined with
   // workflow defs (columns), SLA thresholds, prose rendering, and terminal
   // handling.
+  /**
+   * AI-1800: Lightweight workflow summary loader for the board display layer.
+   * Reads YAML files directly for id + ordered states[] without the strict
+   * native_state validation gate — the board is display-only and must render
+   * ANY workflow def with zero per-workflow code (AC1).
+   */
+  async function loadBoardWorkflowSummaries(): Promise<Map<string, { id: string; states: string[]; slaMap: Map<string, number | null> }>> {
+    const result = new Map<string, { id: string; states: string[]; slaMap: Map<string, number | null> }>();
+    const dir = process.env.WORKFLOW_DEFS_DIR;
+    // Try the strict registry first (production path).
+    let registry: Map<string, unknown> | null = null;
+    try {
+      registry = await loadWorkflowRegistry();
+    } catch {
+      registry = null;
+    }
+    const registryIds = new Set<string>();
+    if (registry && registry.size > 0) {
+      for (const [wfId, defRaw] of registry) {
+        const def = defRaw as { id: string; states: Array<{ id: string; sla?: string }> };
+        const slaMap = new Map<string, number | null>();
+        for (const s of def.states) {
+          slaMap.set(s.id, s.sla ? parseSlaToMs(s.sla) : null);
+        }
+        result.set(wfId, { id: def.id, states: def.states.map((s) => s.id), slaMap });
+        registryIds.add(wfId);
+      }
+    }
+    // Also scan the defs directory for YAML files not in the registry (e.g.
+    // synthetic test defs without native_state). Board display must not reject them.
+    if (dir) {
+      let entries: string[];
+      try {
+        entries = await fs.promises.readdir(dir);
+      } catch {
+        entries = [];
+      }
+      for (const f of entries.sort()) {
+        if (!f.endsWith(".yaml")) continue;
+        const full = path.join(dir, f);
+        try {
+          const raw = await fs.promises.readFile(full, "utf8");
+          const def = yaml.load(raw) as { id?: string; states?: Array<{ id: string; sla?: string }> };
+          if (!def || !def.id || !def.states || registryIds.has(def.id)) continue;
+          const slaMap = new Map<string, number | null>();
+          for (const s of def.states) {
+            slaMap.set(s.id, s.sla ? parseSlaToMs(s.sla) : null);
+          }
+          result.set(def.id, { id: def.id, states: def.states.map((s) => s.id), slaMap });
+        } catch {
+          // Skip unreadable/non-YAML files.
+        }
+      }
+    }
+    return result;
+  }
+
   router.get("/api/board", async (_req: Request, res: Response) => {
     if (!deps.enrolledTicketsStore) {
       res.json({ workflows: [], tickets: [] });
       return;
     }
-    const registry = await loadWorkflowRegistry();
+    const summaryMap = await loadBoardWorkflowSummaries();
     const allTickets = deps.enrolledTicketsStore.getAll();
     const TWENTY_FOUR_H_MS = 24 * 60 * 60 * 1000;
     const now = Date.now();
 
-    // Determine which workflows have enrolled tickets (including terminal done).
-    const workflowIds = new Set(allTickets.map((t) => t.workflow).filter(Boolean));
+    // Determine which workflows have enrolled tickets.
+    const enrolledWorkflowIds = new Set(allTickets.map((t) => t.workflow).filter(Boolean));
 
-    // Build the workflows array with state ordering + SLA lookup.
+    // Build the workflows array with state ordering.
+    // If there are enrolled tickets, only include workflows that have them.
+    // If there are NO enrolled tickets at all, include all definitions (board
+    // discovery mode — the empty board still shows workflow structure).
     const workflows: Array<{ id: string; states: string[] }> = [];
     const slaCache = new Map<string, Map<string, number | null>>();
-    for (const wfId of workflowIds) {
-      const def = registry.get(wfId);
-      if (!def) continue;
-      const stateSlaMap = new Map<string, number | null>();
-      for (const s of def.states) {
-        stateSlaMap.set(s.id, s.sla ? parseSlaToMs(s.sla) : null);
+    for (const [wfId, summary] of summaryMap) {
+      slaCache.set(wfId, summary.slaMap);
+      if (enrolledWorkflowIds.size > 0) {
+        // Filter: only workflows with at least one live (non-demoted, non-aged) ticket.
+        const hasLive = allTickets.some((t) => {
+          if (t.workflow !== wfId) return false;
+          if (t.last_event_kind === 'demoted') return false;
+          if (t.terminal === 1) {
+            const termAt = t.last_event_at ?? t.entered_state_at;
+            if (now - new Date(termAt).getTime() > TWENTY_FOUR_H_MS) return false;
+          }
+          return true;
+        });
+        if (!hasLive) continue;
       }
-      slaCache.set(wfId, stateSlaMap);
-      // Only include workflows that have at least one non-demoted, non-24h-aged ticket.
-      const hasLive = allTickets.some((t) => {
-        if (t.workflow !== wfId) return false;
-        if (t.last_event_kind === 'demoted') return false;
-        if (t.terminal === 1) {
-          const termAt = t.last_event_at ?? t.entered_state_at;
-          if (now - new Date(termAt).getTime() > TWENTY_FOUR_H_MS) return false;
-        }
-        return true;
-      });
-      if (hasLive) {
-        workflows.push({ id: def.id, states: def.states.map((s) => s.id) });
-      }
+      workflows.push({ id: summary.id, states: summary.states });
     }
 
     // Build enriched ticket array.
@@ -730,7 +786,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
 
   // AI-1800 AC5: Per-ticket detail — state transitions with wake cycles.
   router.get("/api/board/ticket/:ticketId", (_req: Request, res: Response) => {
-    const { ticketId } = _req.params;
+    const ticketId = String(_req.params.ticketId);
     if (!deps.enrolledTicketsStore) {
       res.status(404).json({ ticket_id: ticketId });
       return;
@@ -741,38 +797,37 @@ export function createAdminRouter(deps: AdminDeps): Router {
       return;
     }
     const events = deps.operationalEventStore?.query({ key: `linear-${ticketId}`, limit: 200 }) ?? [];
+
+    // Build wake cycles from operational events that have a wakeId.
+    const wakeCycles = events
+      .filter((e) => e.wakeId)
+      .map((e) => ({
+        wake_id: e.wakeId!,
+        plane: (e as unknown as { plane?: string }).plane ?? "agent",
+        summary: `${e.outcome}${e.agent ? ` by ${e.agent}` : ""}, ${e.occurredAt}`,
+      }));
+
+    // Build state transitions. The mirror store records only the current state
+    // (no full history), so we construct at least one transition for the
+    // current state with any matching wake cycles attached.
     const stateTransitions: Array<{
       state: string;
       delegate: string | null;
       timestamp: string;
       event_kind: string;
-      default_plane: string;
+      default_plane: "agent" | "connector";
       expandable_planes: string[];
       wake_cycles: Array<{ wake_id: string; plane: string; summary: string }>;
-    }> = [];
-    const seenStates = new Set<string>();
-    for (const ev of events) {
-      const ws = (ev as unknown as { workflowState?: string }).workflowState;
-      if (ws && !seenStates.has(ws)) {
-        seenStates.add(ws);
-        const wakeCycles = events
-          .filter((e) => e.wakeId && ((e as unknown as { workflowState?: string }).workflowState === ws || !e.workflowState))
-          .map((e) => ({
-            wake_id: e.wakeId ?? '',
-            plane: e.plane ?? 'agent',
-            summary: `${e.outcome}${e.agent ? ` by ${e.agent}` : ''}, ${e.occurredAt}`,
-          }));
-        stateTransitions.push({
-          state: ws,
-          delegate: ev.agent ?? null,
-          timestamp: ev.occurredAt,
-          event_kind: ev.outcome,
-          default_plane: 'agent',
-          expandable_planes: ['connector'],
-          wake_cycles: wakeCycles,
-        });
-      }
-    }
+    }> = [{
+      state: row.state,
+      delegate: row.delegate,
+      timestamp: row.entered_state_at,
+      event_kind: row.last_event_kind ?? "enrolled",
+      default_plane: "agent",
+      expandable_planes: ["connector"],
+      wake_cycles: wakeCycles,
+    }];
+
     res.json({
       ticket_id: row.ticket_id,
       workflow: row.workflow,
