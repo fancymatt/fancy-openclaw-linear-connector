@@ -345,6 +345,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       if (parsed && floor && semverLt(parsed, floor)) {
         const msg = `[Proxy] CLI version ${cliVersion} is below the minimum required ${minVer}. Update fancy-openclaw-linear-skill-cli to proceed.`;
         log.warn(`version-floor-block agent=${agentId} cli=${cliVersion}${ticketCtx}: below ${minVer}`);
+        deps?.operationalEventStore?.append({ outcome: "proxy-blocked", agent: agentId, key: issueId ?? undefined, type: intent ?? undefined, errorSummary: `CLI version ${cliVersion} below minimum ${minVer}`, detail: { reason: "version-floor", cliVersion, minRequired: minVer } });
         res.status(200).json({ errors: [{ message: msg }] });
         return;
       }
@@ -370,6 +371,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         const metaResult = await resolveMetaIntent(intent, issueId, authorization);
         if ('error' in metaResult) {
           log.warn(`meta-intent-block agent=${agentId} intent=${intent}${ticketCtx}: ${metaResult.error}`);
+          deps?.operationalEventStore?.append({ outcome: "proxy-blocked", agent: agentId, key: issueId, type: intent ?? undefined, errorSummary: metaResult.error, detail: { reason: "meta-intent-unresolved", effectiveIntent } });
           res.status(200).json({ errors: [{ message: metaResult.error }] });
           return;
         }
@@ -386,11 +388,13 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           log.warn(`break-glass-audit agent=${agentId} authorized=false result=identity-check-failed${ticketCtx} intent=${intent}: ${msg}`);
+          deps?.operationalEventStore?.append({ outcome: "proxy-blocked", agent: agentId, key: issueId, type: intent ?? undefined, errorSummary: `Break-glass identity check failed: ${msg}`, detail: { reason: "break-glass-identity-failed" } });
           res.status(200).json({ errors: [{ message: `[Proxy] Break-glass rejected: identity check failed (${msg}). Only stewards may use break-glass.` }] });
           return;
         }
         if (!isAuthorized) {
           log.warn(`break-glass-audit agent=${agentId} authorized=false${ticketCtx} intent=${intent}`);
+          deps?.operationalEventStore?.append({ outcome: "proxy-blocked", agent: agentId, key: issueId, type: intent ?? undefined, errorSummary: `Break-glass rejected: caller '${agentId}' is not the recovery steward`, detail: { reason: "break-glass-unauthorized" } });
           res.status(200).json({ errors: [{ message: `[Proxy] Break-glass rejected: caller '${agentId}' is not the recovery steward. Only the steward (workflow:break-glass) may use break-glass.` }] });
           return;
         }
@@ -400,6 +404,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       const p2rejection = await checkEnforcementRules(effectiveIntent, issueId, authorization, agentId);
       if (p2rejection) {
         log.warn(`enforcement-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p2rejection}`);
+        deps?.operationalEventStore?.append({ outcome: "proxy-blocked", agent: agentId, key: issueId, type: effectiveIntent, errorSummary: p2rejection, detail: { reason: "escalation-gate" } });
         res.status(200).json({ errors: [{ message: p2rejection }] });
         return;
       }
@@ -426,6 +431,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment);
       if (p3rejection) {
         log.warn(`workflow-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p3rejection}`);
+        deps?.operationalEventStore?.append({ outcome: "proxy-blocked", agent: agentId, key: issueId, type: effectiveIntent, errorSummary: p3rejection, detail: { reason: "workflow-gate" } });
         res.status(200).json({ errors: [{ message: p3rejection }] });
         return;
       }
@@ -460,6 +466,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             log.warn(`state-label-strip failed agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg} — blocking (fail-closed)`);
+            deps?.operationalEventStore?.append({ outcome: "proxy-blocked", agent: agentId, key: issueId, type: effectiveIntent, errorSummary: `State label strip failed: ${msg}`, detail: { reason: "state-label-strip-failed" } });
             res.status(200).json({ errors: [{ message: `[Proxy] '${effectiveIntent}' blocked: workflow label safety check failed (${msg}). Try again or contact a steward.` }] });
             return;
           }
@@ -476,6 +483,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         );
         if (intentPathRawRejection) {
           log.warn(`raw-mutation-block-on-intent-path agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${intentPathRawRejection}`);
+          deps?.operationalEventStore?.append({ outcome: "proxy-blocked", agent: agentId, key: issueId, type: effectiveIntent, errorSummary: intentPathRawRejection, detail: { reason: "raw-mutation-on-intent-path" } });
           res.status(200).json({ errors: [{ message: intentPathRawRejection }] });
           return;
         }
@@ -491,6 +499,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log.error(`upstream request failed: ${msg}`);
+        deps?.operationalEventStore?.append({ outcome: "proxy-upstream-error", agent: agentId, key: issueId, type: effectiveIntent, errorSummary: `Linear API unreachable: ${msg}`, detail: { reason: "fetch-threw", op: opName } });
         res.status(200).json({
           errors: [{
             message: `Linear API unreachable: ${msg}. No state was changed.`,
@@ -509,6 +518,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         if (status === 429) {
           const retryAfterHeader = upstreamRes.headers.get("Retry-After");
           const retryAfterSeconds = retryAfterHeader ? parseInt(retryAfterHeader, 10) : 60;
+          deps?.operationalEventStore?.append({ outcome: "proxy-rate-limited", agent: agentId, key: issueId, type: effectiveIntent, errorSummary: `Linear rate limit (429)`, detail: { op: opName, retryAfterSeconds } });
           res.status(200).json({
             errors: [{
               message: `Linear rate limit exceeded. No state was changed. Retry after ${retryAfterSeconds}s.`,
@@ -516,6 +526,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             }],
           });
         } else {
+          deps?.operationalEventStore?.append({ outcome: "proxy-upstream-error", agent: agentId, key: issueId, type: effectiveIntent, errorSummary: `Linear API returned ${status}`, detail: { op: opName, httpStatus: status } });
           res.status(200).json({
             errors: [{
               message: `Linear API returned ${status}. No state was changed.`,
@@ -525,6 +536,11 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         }
         return;
       }
+
+      // Record the proxy forward — this is the audit record for AC2 reconcile.
+      // Every successful intent-path forward gets a `proxy-forwarded` event so the
+      // reconcile cron can match it against webhook-observed state changes.
+      deps?.operationalEventStore?.append({ outcome: "proxy-forwarded", agent: agentId, key: issueId, type: effectiveIntent, detail: { op: opName, intent: effectiveIntent, cliVersion: cliVersion ?? null } });
 
       // Phase 3 B2: apply state:* label transition after a successful forward.
       // Phase 4 / P4-1: record feedback observation for feedback transitions.
@@ -555,11 +571,15 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           });
           if (transitionResult.status === "failed") {
             log.error(`state-transition FAILED agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${transitionResult.code}${transitionResult.detail ? ` — ${transitionResult.detail}` : ""}`);
+            deps?.operationalEventStore?.append({ outcome: "transition-failed", agent: agentId, key: issueId, type: effectiveIntent, errorSummary: `${transitionResult.code}${transitionResult.detail ? `: ${transitionResult.detail}` : ""}`, detail: { reason: "applyStateTransition", code: transitionResult.code, from: transitionResult.from, to: transitionResult.to, op: opName } });
+          } else if (transitionResult.status === "applied") {
+            deps?.operationalEventStore?.append({ outcome: "transition-applied", agent: agentId, key: issueId, type: effectiveIntent, detail: { code: transitionResult.code, from: transitionResult.from, to: transitionResult.to, op: opName } });
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           log.error(`state-transition threw agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg}`);
           transitionResult = { status: "failed", code: "transition-exception", detail: msg };
+          deps?.operationalEventStore?.append({ outcome: "transition-failed", agent: agentId, key: issueId, type: effectiveIntent, errorSummary: `Exception: ${msg}`, detail: { reason: "applyStateTransition-threw", op: opName } });
         }
 
         // Layer 1 (AI-1387): proactive legal-verb re-injection at completion.
@@ -598,6 +618,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
     if (issueId) {
       await runWithTicketLock(issueId, runCommand, () => {
         log.warn(`concurrent-command-block agent=${agentId} intent=${intent}${ticketCtx}`);
+        deps?.operationalEventStore?.append({ outcome: "proxy-blocked", agent: agentId, key: issueId, type: intent ?? undefined, errorSummary: "Another command is in-flight for this ticket", detail: { reason: "concurrent-command" } });
         res.status(200).json({ errors: [{ message: `[Proxy] '${intent}' blocked: another command is currently in-flight for ${issueId}. Retry once it completes.` }] });
       });
     } else {
@@ -613,6 +634,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
     const rawRejection = await checkRawMutationInterception(body, issueId, authorization, agentId, callerLinearUserId);
     if (rawRejection) {
       log.warn(`raw-mutation-block agent=${agentId}${ticketCtx}: ${rawRejection}`);
+      deps?.operationalEventStore?.append({ outcome: "proxy-blocked", agent: agentId, key: issueId ?? undefined, errorSummary: rawRejection, detail: { reason: "raw-mutation-interception" } });
       res.status(200).json({ errors: [{ message: rawRejection }] });
       return;
     }

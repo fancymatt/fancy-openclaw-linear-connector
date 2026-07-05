@@ -28,6 +28,7 @@ import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
+import { registerOutOfBandReconcileCron } from "./cron/out-of-band-reconcile.js";
 import { getRegisteredCrons } from "./cron/registry.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
@@ -965,6 +966,12 @@ if (isEntryPoint) {
     authToken: reconciliationAuthToken,
     wakeFn: reconciliationWakeFn,
   });
+
+  // AI-1838 AC2: out-of-band mutation reconcile — periodically diff
+  // webhook-observed state changes against proxy ops to detect mutations
+  // that bypassed the connector (Linear UI / raw token API).
+  registerOutOfBandReconcileCron({ operationalEventStore });
+  log.info("AI-1838: out-of-band reconcile cron registered");
 
   // AI-1773: periodic SLA sweep — detect governed tickets whose time in
   // their current state exceeds the per-state `sla:` value. Emits a
