@@ -51,6 +51,8 @@ import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./co
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
 import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
 import { recordAppliedState, clearAppliedState } from "./store/applied-state-store.js";
+import { reposWithoutCiAutoDeploy, githubRepoFromUrl } from "./deploy-policy.js";
+import { notify } from "./alerts/alert-bus.js";
 
 /**
  * Phase 6.5 / H-6: Label read-only projection + override path + drift reconciliation.
@@ -892,6 +894,61 @@ async function fetchBranchAndPRStatus(
   }
 }
 
+// ── Repo resolution for the no-CI-auto-deploy guard (AI-1795) ─────────────
+
+/**
+ * Resolve which GitHub repos a ticket's implementation touched, from its
+ * GitHub-sourced attachments (PR/branch links synced by Linear's GitHub
+ * integration). Returns "owner/repo" refs. Fail-open: any error → [].
+ *
+ * Deliberately a separate query from fetchBranchAndPRStatus: the guard must
+ * not risk regressing the done gate, and attachments are plain public schema.
+ */
+async function fetchGithubRepoRefs(issueId: string, authToken: string): Promise<string[]> {
+  const query = `query IssueRepoAttachments($id: String!) { issue(id: $id) { attachments { nodes { url sourceType } } } }`;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    type AttachResp = {
+      data?: { issue?: { attachments?: { nodes: Array<{ url?: string | null; sourceType?: string | null }> } } };
+    };
+    const data = (await res.json()) as AttachResp;
+    const nodes = data.data?.issue?.attachments?.nodes ?? [];
+    const refs = new Set<string>();
+    for (const node of nodes) {
+      const repo = node.url ? githubRepoFromUrl(node.url) : null;
+      if (repo) refs.add(repo);
+    }
+    return [...refs];
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: attachment fetch failed for ${issueId}: ${msg} — repo guard fails open`);
+    return [];
+  }
+}
+
+/**
+ * AI-1795: collect a ticket's repo refs from explicit `repo:*` labels plus
+ * GitHub attachments. Labels win nothing over attachments — both are checked;
+ * the guard blocks if ANY resolved repo is flagged (host-deploy is a harmless
+ * no-op for repos that do auto-deploy, per deployment.md).
+ */
+async function resolveTicketRepoRefs(
+  labels: string[],
+  issueId: string,
+  authToken: string,
+): Promise<string[]> {
+  const fromLabels = labels
+    .filter((l) => l.toLowerCase().startsWith("repo:"))
+    .map((l) => l.slice("repo:".length).trim())
+    .filter((l) => l.length > 0);
+  const fromAttachments = await fetchGithubRepoRefs(issueId, authToken);
+  return [...new Set([...fromLabels, ...fromAttachments])];
+}
+
 // ── Issue description fetch (AI-1482) ─────────────────────────────────────
 
 /**
@@ -1525,6 +1582,37 @@ export async function checkWorkflowRules(
         );
       }
       log.info(`workflow-gate: done gate: ${issueId} passed (has branch + PR, not yet merged)`);
+    }
+  }
+
+  // AI-1795: no-CI-auto-deploy guard. On repos flagged `ci_auto_deploy: false`
+  // in the instance deploy policy, `deploy` (merge → ac-validate directly) is
+  // rejected: merge alone leaves the running service on the old build, and
+  // ac-validate would verify a stale artifact (recurred twice on AI-1775).
+  // The legal exit for such repos is `handoff-host-deploy` → host-deploy,
+  // which is never blocked here. Repo resolution: `repo:*` labels + GitHub
+  // attachments; unresolvable or unflagged repos pass (guard is opt-in per
+  // repo). Break-glass is exempt (steward recovery path, identity-gated).
+  if (intent === "deploy" && !breakGlassOverride) {
+    const repoRefs = await resolveTicketRepoRefs(labels, issueId, authToken);
+    const flagged = reposWithoutCiAutoDeploy(repoRefs);
+    if (flagged.length > 0) {
+      const repoList = flagged.join("', '");
+      log.warn(`workflow-gate: AI-1795 no-CI-auto-deploy guard blocked 'deploy' on ${issueId} (repo '${repoList}', agent=${bodyId})`);
+      notify({
+        severity: "warning",
+        source: "deploy-policy",
+        title: `no-CI-auto-deploy guard blocked 'deploy' (repo: ${flagged.join(", ")})`,
+        detail: `Ticket ${issueId}: 'deploy' would advance to ac-validate without the merged artifact running. Agent must use 'handoff-host-deploy' → host-deploy instead.`,
+        agent: bodyId,
+        ticket: issueId,
+      });
+      const legalMoves = [...transitions.filter((t) => t.command !== "deploy").map((t) => cliVerbFor(t)), breakGlassCommand].join(", ");
+      return (
+        `[Proxy] 'deploy' blocked: repo '${repoList}' has no CI auto-deploy — merging alone leaves the running service on the old build, ` +
+        `and AC validation would verify a stale artifact. Use 'handoff-host-deploy' to route through host-deploy instead. ` +
+        `Legal moves: ${legalMoves}.`
+      );
     }
   }
 
