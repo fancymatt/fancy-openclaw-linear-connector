@@ -13,6 +13,7 @@ import {
   removeAcRecord,
   clearAcRecordStore,
   extractAcFromDescription,
+  acRecordsPath,
 } from "./ac-record-store.js";
 
 // Use a temp file for persistence tests so we don't pollute /tmp
@@ -157,36 +158,119 @@ describe("ac-record-store", () => {
   });
 
   describe("default path durability", () => {
-    it("does not default to /tmp (AI-1818 AC1)", async () => {
-      // Verify that when no AC_RECORDS_PATH is set, the resolved path is durable
-      // (not /tmp). We test by clearing the env var, forcing a reload, and checking
-      // that persist writes to a non-/tmp location.
-      const original = process.env.AC_RECORDS_PATH;
+    // AI-1827: prove AC1 (default resolves via DATA_DIR ?? <cwd>/data) purely by
+    // asserting on the resolved path string — with NO disk I/O to the real
+    // repo-root data/ac-records.json. The old AI-1818 AC1 test captured to and
+    // then unlink'd data/ac-records.json relative to cwd; run inside the prod
+    // working tree (per DEPLOY.md, `npm test` runs in the live service dir) that
+    // destroyed the live records file. These tests replace it. Env vars are
+    // saved/restored around each case.
+
+    it("defaults to <cwd>/data/ac-records.json — durable, never /tmp (AI-1818 AC1 / AI-1827 AC1)", () => {
+      const origDataDir = process.env.DATA_DIR;
+      const origAcPath = process.env.AC_RECORDS_PATH;
+      delete process.env.DATA_DIR;
       delete process.env.AC_RECORDS_PATH;
-      clearAcRecordStore();
-
-      await captureAc("AI-TEST-DURABLE", {
-        verbatimAc: "durable test",
-        capturedAt: "2026-07-05T00:00:00Z",
-        capturedBy: "test",
-        source: "description",
-      });
-
-      // The file should exist at data/ac-records.json relative to the repo root
-      const { existsSync } = await import("node:fs");
-      const defaultPath = "data/ac-records.json";
-      expect(existsSync(defaultPath)).toBe(true);
-
-      // Clean up test record from the default path
       try {
-        await fs.unlink(defaultPath);
+        const resolved = acRecordsPath();
+        expect(resolved).toBe(path.join(process.cwd(), "data", "ac-records.json"));
+        // Regression guard against the original AI-1818 defect: the old default
+        // was the ephemeral, hardcoded /tmp/ac-records.json. (Assert against that
+        // exact string, not any /tmp prefix — the repo/cwd itself may live under
+        // /tmp, e.g. in a worktree.)
+        expect(resolved).not.toBe("/tmp/ac-records.json");
+        expect(resolved.endsWith(path.join("data", "ac-records.json"))).toBe(true);
+      } finally {
+        if (origDataDir !== undefined) process.env.DATA_DIR = origDataDir;
+        else delete process.env.DATA_DIR;
+        if (origAcPath !== undefined) process.env.AC_RECORDS_PATH = origAcPath;
+        else delete process.env.AC_RECORDS_PATH;
+      }
+    });
+
+    it("resolves the default through DATA_DIR when set, matching the other stores (AI-1827 AC1)", () => {
+      const origDataDir = process.env.DATA_DIR;
+      const origAcPath = process.env.AC_RECORDS_PATH;
+      delete process.env.AC_RECORDS_PATH;
+      process.env.DATA_DIR = "/var/lib/connector-xyz";
+      try {
+        expect(acRecordsPath()).toBe(path.join("/var/lib/connector-xyz", "ac-records.json"));
+      } finally {
+        if (origDataDir !== undefined) process.env.DATA_DIR = origDataDir;
+        else delete process.env.DATA_DIR;
+        if (origAcPath !== undefined) process.env.AC_RECORDS_PATH = origAcPath;
+        else delete process.env.AC_RECORDS_PATH;
+      }
+    });
+
+    it("AC_RECORDS_PATH overrides the DATA_DIR default (AI-1827 AC1)", () => {
+      const origDataDir = process.env.DATA_DIR;
+      const origAcPath = process.env.AC_RECORDS_PATH;
+      process.env.DATA_DIR = "/var/lib/connector-xyz";
+      process.env.AC_RECORDS_PATH = "/explicit/override/ac.json";
+      try {
+        expect(acRecordsPath()).toBe("/explicit/override/ac.json");
+      } finally {
+        if (origDataDir !== undefined) process.env.DATA_DIR = origDataDir;
+        else delete process.env.DATA_DIR;
+        if (origAcPath !== undefined) process.env.AC_RECORDS_PATH = origAcPath;
+        else delete process.env.AC_RECORDS_PATH;
+      }
+    });
+
+    it("persists to <DATA_DIR>/ac-records.json and leaves repo-root data/ byte-identical (AI-1827 AC2)", async () => {
+      // Snapshot the real repo-root file (if any) to prove this test never
+      // reads/writes/deletes it — running `npm test` in the prod working tree
+      // must leave data/ac-records.json unchanged.
+      const repoRootDefault = path.join(process.cwd(), "data", "ac-records.json");
+      let before: string | null;
+      try {
+        before = await fs.readFile(repoRootDefault, "utf8");
       } catch {
-        // ignore
+        before = null;
       }
 
-      // Restore env
-      if (original !== undefined) process.env.AC_RECORDS_PATH = original;
+      const sandbox = path.join(
+        os.tmpdir(),
+        `ac-datadir-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      );
+      const origDataDir = process.env.DATA_DIR;
+      const origAcPath = process.env.AC_RECORDS_PATH;
+      process.env.DATA_DIR = sandbox;
+      delete process.env.AC_RECORDS_PATH; // exercise the default resolver
       clearAcRecordStore();
+      try {
+        await captureAc("AI-TEST-DURABLE", {
+          verbatimAc: "durable test",
+          capturedAt: "2026-07-05T00:00:00Z",
+          capturedBy: "test",
+          source: "description",
+        });
+
+        const { existsSync } = await import("node:fs");
+        const resolved = path.join(sandbox, "ac-records.json");
+        expect(existsSync(resolved)).toBe(true);
+
+        // Round-trip: clearing memory and reloading reads back from the sandbox.
+        clearAcRecordStore();
+        const reloaded = await getAcRecord("AI-TEST-DURABLE");
+        expect(reloaded?.verbatimAc).toBe("durable test");
+      } finally {
+        if (origDataDir !== undefined) process.env.DATA_DIR = origDataDir;
+        else delete process.env.DATA_DIR;
+        if (origAcPath !== undefined) process.env.AC_RECORDS_PATH = origAcPath;
+        else delete process.env.AC_RECORDS_PATH;
+        clearAcRecordStore();
+        await fs.rm(sandbox, { recursive: true, force: true });
+      }
+
+      let after: string | null;
+      try {
+        after = await fs.readFile(repoRootDefault, "utf8");
+      } catch {
+        after = null;
+      }
+      expect(after).toBe(before);
     });
   });
 

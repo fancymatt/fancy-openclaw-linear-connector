@@ -7,27 +7,40 @@
  * of record — not Ai's restatement. Ai may annotate alongside, but
  * sign-off is judged against the verbatim original.
  *
- * Storage is persisted to a JSON file (AC_RECORDS_PATH env or
- * /tmp/ac-records.json by default). On startup, existing records are
+ * Storage is persisted to a JSON file. The path resolves as: the explicit
+ * AC_RECORDS_PATH override, else `<DATA_DIR>/ac-records.json`, using the same
+ * `process.env.DATA_DIR ?? <cwd>/data` convention every other connector store
+ * uses (see src/db.ts, src/store/*.ts, src/bag/*.ts) so AC records live
+ * alongside the rest of the connector state. On startup, existing records are
  * loaded from disk. The store is keyed by ticket identifier (e.g. "AI-1482").
  *
  * Design: design.md §13b (Phase 6.5 hardening).
  */
 
 import fs from "node:fs/promises";
+import path from "node:path";
 import { componentLogger, createLogger } from "./logger.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "ac-record-store");
 
-/** Default path for persisted AC records. Override via AC_RECORDS_PATH env. */
-const DEFAULT_AC_RECORDS_PATH = "data/ac-records.json";
-
 /** Linear GraphQL API endpoint (used by recaptureAc to fetch description / post comments). */
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
-function acRecordsPath(): string {
-  return process.env.AC_RECORDS_PATH ?? DEFAULT_AC_RECORDS_PATH;
+/**
+ * Resolve the on-disk path for persisted AC records.
+ *
+ * Precedence: the explicit AC_RECORDS_PATH override, else the shared data
+ * directory (`DATA_DIR` env, else `<cwd>/data`) joined with "ac-records.json".
+ * Resolving at call time — not module load — lets DATA_DIR / AC_RECORDS_PATH be
+ * set before the first store operation (e.g. by tests). Exported as a test seam
+ * so AC1 can be proven by asserting on the resolved string, with no disk I/O to
+ * the real data directory. (AI-1827)
+ */
+export function acRecordsPath(): string {
+  if (process.env.AC_RECORDS_PATH) return process.env.AC_RECORDS_PATH;
+  const dataDir = process.env.DATA_DIR ?? path.join(process.cwd(), "data");
+  return path.join(dataDir, "ac-records.json");
 }
 
 /** A verbatim AC record captured at intake. */
@@ -82,7 +95,12 @@ async function persist(): Promise<void> {
     for (const [key, record] of _store) {
       data[key] = record;
     }
-    await fs.writeFile(acRecordsPath(), JSON.stringify(data, null, 2), "utf8");
+    const target = acRecordsPath();
+    // Ensure the data directory exists — DATA_DIR may point at a location the
+    // rest of the service hasn't created yet. Without this, writeFile would
+    // ENOENT and (fail-open) silently drop the record.
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, JSON.stringify(data, null, 2), "utf8");
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`ac-record-store: failed to persist records to ${acRecordsPath()}: ${msg}`);
