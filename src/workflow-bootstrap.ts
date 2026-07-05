@@ -29,7 +29,11 @@ const LINEAR_API_URL = "https://api.linear.app/graphql";
 // ── Public result type ────────────────────────────────────────────────────────
 
 export interface BootstrapResult {
-  action: "bootstrapped" | "demoted";
+  action: "bootstrapped" | "demoted" | "failed";
+  /** For failed actions: machine-readable reason code. */
+  failureReason?: string;
+  /** For failed actions: human-readable explanation. */
+  failureMessage?: string;
   workflowId?: string;
   entryState?: string;
   /** OpenClaw agent name of the newly-set delegate (bootstrapped only). */
@@ -278,8 +282,13 @@ export async function maybeBootstrapWorkflow(
  * the race between a late webhook and the sweep is covered even when the
  * caller's context is slightly stale.
  *
- * Returns a BootstrapResult on success, or null if the ticket was already
- * enrolled, the workflow def is missing, or label/mutation application failed.
+ * Returns a BootstrapResult on success, null for idempotency skips, or a
+ * { action: "failed" } result when enrollment was attempted but could not
+ * complete (AI-1836: definitive failure rather than silent null).
+ *
+ * Failure reasons are surfaced so callers can decide whether to roll back,
+ * alert, or retry. The sweep treats failures as retryable (next cycle);
+ * the webhook path treats them as visible errors.
  */
 export async function applyBootstrapToIssue(
   issue: IssueContext,
@@ -305,17 +314,37 @@ export async function applyBootstrapToIssue(
     try {
       registry = await loadWorkflowRegistry();
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
       log.warn(
-        `workflow-bootstrap: failed to load registry for '${workflowId}': ${err instanceof Error ? err.message : String(err)}`,
+        `workflow-bootstrap: failed to load registry for '${workflowId}': ${msg}`,
       );
-      return null;
+      return {
+        action: "failed",
+        workflowId,
+        failureReason: "registry_load_failed",
+        failureMessage: `Cannot load workflow registry — enrollment of '${workflowId}' cannot proceed: ${msg}`,
+      };
     }
   }
 
   const def = registry.get(workflowId);
-  if (!def?.entry_state) {
-    log.warn(`workflow-bootstrap: no def (or no entry_state) for workflow '${workflowId}' — skipping bootstrap`);
-    return null;
+  if (!def) {
+    log.warn(`workflow-bootstrap: no workflow def for '${workflowId}' — cannot enroll`);
+    return {
+      action: "failed",
+      workflowId,
+      failureReason: "no_workflow_def",
+      failureMessage: `No workflow definition found for '${workflowId}' — enrollment rejected. Either create the workflow def or remove the wf:${workflowId} label.`,
+    };
+  }
+  if (!def.entry_state) {
+    log.warn(`workflow-bootstrap: workflow '${workflowId}' has no entry_state — cannot enroll`);
+    return {
+      action: "failed",
+      workflowId,
+      failureReason: "no_entry_state",
+      failureMessage: `Workflow '${workflowId}' exists but has no entry_state — enrollment rejected. Fix the workflow def or remove the label.`,
+    };
   }
 
   const entryState = def.entry_state;
@@ -361,7 +390,12 @@ export async function applyBootstrapToIssue(
   const stateLabelId = await findOrCreateLabel(issue.teamId, `state:${entryState}`, authToken);
   if (!stateLabelId) {
     log.warn(`workflow-bootstrap: could not resolve label 'state:${entryState}' — aborting bootstrap`);
-    return null;
+    return {
+      action: "failed",
+      workflowId,
+      failureReason: "label_creation_failed",
+      failureMessage: `Could not find or create state label 'state:${entryState}' for workflow '${workflowId}' — enrollment cannot proceed.`,
+    };
   }
 
   const currentLabelIds = issue.labels.map((l) => l.id);
@@ -370,6 +404,12 @@ export async function applyBootstrapToIssue(
 
   if (!success) {
     log.warn(`workflow-bootstrap: issueUpdate returned non-success for ${issue.id}`);
+    return {
+      action: "failed",
+      workflowId,
+      failureReason: "mutation_failed",
+      failureMessage: `Linear API mutation to stamp state:${entryState} + delegate on ${issue.identifier ?? issue.id} failed — enrollment could not be applied atomically. The sweep will retry.`,
+    };
   } else {
     log.info(
       `workflow-bootstrap: bootstrapped ${issue.id} → ${workflowId}:${entryState}, delegate=${delegateLinearUserId ?? "none"}`,

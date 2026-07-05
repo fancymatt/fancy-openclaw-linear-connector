@@ -255,6 +255,28 @@ export async function runBootstrapReconciliationSweep(
           },
           ticket: ticket.identifier,
         });
+      } else if (bootstrapResult?.action === "failed") {
+        // AI-1836: the heal attempt definitively failed (e.g., no workflow def,
+        // mutation error). Emit a visible alert so the enrollment-gap is surfaced.
+        result.errors.push(
+          `heal rejected for ${ticket.identifier}: ${bootstrapResult.failureReason ?? "unknown"} — ${bootstrapResult.failureMessage ?? ""}`,
+        );
+        log.error(
+          `bootstrap-reconciliation: heal rejected for ${ticket.identifier}: ${bootstrapResult.failureReason} — ${bootstrapResult.failureMessage}`,
+        );
+        alertBus.notify({
+          severity: "warning",
+          source: "bootstrap-reconciliation-rejected",
+          title: `Bootstrap reconciliation rejected ${ticket.identifier} — enrollment cannot proceed`,
+          detail: {
+            ticket: ticket.identifier,
+            issueId: ticket.id,
+            workflow: bootstrapResult.workflowId,
+            reason: bootstrapResult.failureReason,
+            message: bootstrapResult.failureMessage,
+          },
+          ticket: ticket.identifier,
+        });
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

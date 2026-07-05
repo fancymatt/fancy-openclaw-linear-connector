@@ -24,7 +24,7 @@ import { createLogger, componentLogger } from "../logger.js";
 import { isLinearIssueStillRoutedToAgent, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
 import { onChildTerminal } from "../barrier.js";
 import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
-import { notify } from "../alerts/alert-bus.js";
+import { notify, getAlertBus } from "../alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(), "webhook");
 
@@ -355,11 +355,39 @@ export function createWebhookRouter(
           const bootstrapResult = await maybeBootstrapWorkflow(event, bootstrapToken, enrolledTicketsStore);
           if (bootstrapResult) {
             log.info(`Workflow bootstrap: ${bootstrapResult.action} (wf:${bootstrapResult.workflowId ?? "unknown"})`);
-            const bootstrapOutcome = bootstrapResult.action === "bootstrapped" ? "bootstrap-bootstrapped" : "bootstrap-demoted";
-            appendOperationalEvent(operationalEventStore, { outcome: bootstrapOutcome, type: event.type });
+
+            // AI-1836: emit a visible alert on enrollment failure so the
+            // deadlock-gap state is surfaced immediately, not left silent.
+            // The reconciliation sweep will also attempt a heal, but the
+            // alert provides immediate observability.
+            if (bootstrapResult.action === "failed") {
+              log.error(
+                `Workflow bootstrap FAILED for wf:${bootstrapResult.workflowId ?? "unknown"}: ${bootstrapResult.failureReason ?? "unknown"} — ${bootstrapResult.failureMessage ?? ""}`,
+              );
+              appendOperationalEvent(operationalEventStore, {
+                outcome: "bootstrap-failed",
+                type: event.type,
+                errorSummary: bootstrapResult.failureMessage,
+              });
+              getAlertBus().notify({
+                severity: "warning",
+                source: "bootstrap-enrollment-failed",
+                title: `Workflow enrollment failed for wf:${bootstrapResult.workflowId ?? "unknown"}`,
+                detail: {
+                  issueId: event.data?.id,
+                  workflow: bootstrapResult.workflowId,
+                  reason: bootstrapResult.failureReason,
+                  message: bootstrapResult.failureMessage,
+                },
+              });
+            } else {
+              const bootstrapOutcome = bootstrapResult.action === "bootstrapped" ? "bootstrap-bootstrapped" : "bootstrap-demoted";
+              appendOperationalEvent(operationalEventStore, { outcome: bootstrapOutcome, type: event.type });
+            }
 
             // AI-fix: after bootstrap, deliver a workflow-aware wake to the
             // newly-assigned delegate so they know what to do.
+            // AI-1836: only dispatch wake on successful bootstrap (not on failed).
             if (bootstrapResult.action === "bootstrapped" && bootstrapResult.delegateAgentName && bootstrapResult.ticketIdentifier) {
               const wakeSessionKey = normalizeSessionKey(bootstrapResult.ticketIdentifier);
               const wakeRoute: RouteResult = {
