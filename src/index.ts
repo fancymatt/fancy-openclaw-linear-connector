@@ -10,6 +10,7 @@ import { handleOAuthCallback } from "./oauth-callback.js";
 import { EventStore } from "./store/event-store.js";
 import { NudgeStore } from "./store/nudge-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
+import { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { ObservationStore } from "./store/observation-store.js";
 import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
@@ -115,6 +116,8 @@ export interface CreateAppOptions {
   observationsDbPath?: string;
   /** Override ManagingStateStore database path (for testing). */
   managingStateDbPath?: string;
+  /** Override EnrolledTicketsStore database path (for testing). */
+  enrolledTicketsDbPath?: string;
   /**
    * Test hook: override wake-up delivery for resignal/hold-retry dispatches.
    * When provided, replaces the real sendWakeUpSignal so tests don't hit the
@@ -150,6 +153,7 @@ export function createApp(options?: CreateAppOptions) {
     observationStore,
     operationalEventStore,
     noActivityDetector,
+    enrolledTicketsStore,
     onProxyCall: (agentId, ticketId) => {
       // Any proxy call = implicit acknowledgment. Prevents the dispatch watchdog from
       // re-signaling agents that are working silently (e.g. sessions_yield during image gen).
@@ -195,6 +199,7 @@ export function createApp(options?: CreateAppOptions) {
   const eventStore = new EventStore();
   const nudgeStore = new NudgeStore();
   const operationalEventStore = new OperationalEventStore(options?.operationalEventsDbPath);
+  const enrolledTicketsStore = new EnrolledTicketsStore(options?.enrolledTicketsDbPath);
   const agentQueue = new AgentQueue(options?.agentQueueDbPath);
   const bag = new PendingWorkBag(options?.bagDbPath);
   const wakeConfig = {
@@ -615,7 +620,7 @@ export function createApp(options?: CreateAppOptions) {
   });
 
   // Management console (Phase 3): React SPA + JSON API, session or secret auth.
-  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME }));
+  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME, enrolledTicketsStore }));
 
   app.use("/", createWebhookRouter(
     eventStore,
@@ -643,6 +648,7 @@ export function createApp(options?: CreateAppOptions) {
     // AI-1538: register a pending dispatch expectation at delivery-commit so a
     // swallowed delivery self-heals via the watchdog.
     (agentId, ticketId) => ackTracker.ensurePending(agentId, ticketId),
+    enrolledTicketsStore,
   ));
 
   // ── v1.1: Session-end callback endpoint ──────────────────────────────
@@ -837,7 +843,7 @@ export function createApp(options?: CreateAppOptions) {
     });
   });
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore };
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore };
 }
 
 /**

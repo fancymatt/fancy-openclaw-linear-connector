@@ -6,6 +6,7 @@ import type { LinearEvent } from "./schema.js";
 import { EventStore } from "../store/event-store.js";
 import { NudgeStore } from "../store/nudge-store.js";
 import type { OperationalEventInput, OperationalEventStore } from "../store/operational-event-store.js";
+import type { EnrolledTicketsStore } from "../store/enrolled-tickets-store.js";
 import { routeEvent, routeEventAll, unresolvedRoutingCandidates } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
 import { deliverToAgent, DeliveryThrottle, type DeliveryConfig } from "../delivery/index.js";
@@ -147,6 +148,7 @@ export function createWebhookRouter(
   onDispatched?: (agentId: string, ticketId: string) => void,
   onAgentActivity?: (agentId: string, ticketId: string) => void,
   onDeliveryCommitted?: (agentId: string, ticketId: string) => void,
+  enrolledTicketsStore?: EnrolledTicketsStore,
 ): Router {
   const router = Router();
 
@@ -350,7 +352,7 @@ export function createWebhookRouter(
       })();
       if (bootstrapToken) {
         try {
-          const bootstrapResult = await maybeBootstrapWorkflow(event, bootstrapToken);
+          const bootstrapResult = await maybeBootstrapWorkflow(event, bootstrapToken, enrolledTicketsStore);
           if (bootstrapResult) {
             log.info(`Workflow bootstrap: ${bootstrapResult.action} (wf:${bootstrapResult.workflowId ?? "unknown"})`);
             const bootstrapOutcome = bootstrapResult.action === "bootstrapped" ? "bootstrap-bootstrapped" : "bootstrap-demoted";
@@ -469,6 +471,9 @@ export function createWebhookRouter(
       return;
 
       async function dispatchRoute(route: RouteResult): Promise<void> {
+      // AI-1799 AC2: mint a wake_id at route time so the full dispatch cycle
+      // (routed → bag-added → dispatch-accepted → delivered) can be correlated.
+      const wakeId = crypto.randomUUID();
       // ── 9a. Stale-route guard ───────────────────────────────────────────
       // Linear webhook payloads are snapshots. Before waking an agent from a
       // delegate/assignee event, re-check Linear's current issue state so an
@@ -501,7 +506,7 @@ export function createWebhookRouter(
 
       const agentName = route.agentId;
       log.info(`Routed event to ${agentName} [${route.sessionKey}]`);
-      appendOperationalEvent(operationalEventStore, { outcome: "routed", type: event.type, agent: agentName, key: route.sessionKey, sessionKey: route.sessionKey, deliveryMode: bag && sessionTracker ? "pending-bag" : agentQueue ? "agent-queue" : "direct" });
+      appendOperationalEvent(operationalEventStore, { outcome: "routed", type: event.type, agent: agentName, key: route.sessionKey, sessionKey: route.sessionKey, deliveryMode: bag && sessionTracker ? "pending-bag" : agentQueue ? "agent-queue" : "direct", wakeId, plane: "connector" });
 
       // ── 9c. AI-1428: Pre-flight liveness check + role-guard ────────────
       // Before dispatching to an agent, verify it's reachable. If not,
@@ -635,7 +640,7 @@ export function createWebhookRouter(
             log.info(`Bag: purged stale entries for ${normalizedTicketId} from ${purgedStale} other agent(s)`);
           }
         }
-        appendOperationalEvent(operationalEventStore, { outcome: "bag-added", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "pending-bag" });
+        appendOperationalEvent(operationalEventStore, { outcome: "bag-added", type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId, deliveryMode: "pending-bag", wakeId, plane: "connector" });
 
         const wakeConfig: WakeUpConfig = {
           nodeBin: process.execPath,
@@ -684,7 +689,7 @@ export function createWebhookRouter(
             appendOperationalEvent(operationalEventStore, {
               outcome: sameTicketResult.runId ? "dispatch-accepted" : "delivered",
               type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId,
-              deliveryMode: "active-same-ticket", attemptCount: 1, runId: sameTicketResult.runId ?? null
+              deliveryMode: "active-same-ticket", attemptCount: 1, runId: sameTicketResult.runId ?? null, wakeId, plane: "connector"
             });
           } catch (err) {
             log.error(`Same-ticket active delivery failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`);
@@ -707,7 +712,7 @@ export function createWebhookRouter(
           outcome: dispatched > 0 ? "dispatch-accepted" : "delivery-failed",
           type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId,
           deliveryMode: "wake-up", attemptCount: pendingIds.length, runId: firstRunId,
-          errorSummary: dispatched > 0 ? null : "No wake-up signals dispatched"
+          errorSummary: dispatched > 0 ? null : "No wake-up signals dispatched", wakeId, plane: "connector"
         });
         return;
       }
@@ -749,7 +754,7 @@ export function createWebhookRouter(
           throttle.record(route.agentId);
         }
         const directResult = await deliverWithSlot(route, deliveryConfig, throttle);
-        appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null });
+        appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null, wakeId, plane: "connector" });
         // Direct deliveries (incl. comment-routed wakes into an existing
         // session) must register the dispatch and flip engagement → Thinking
         // like every other delivery path. Observed on AI-1768 (2026-07-04

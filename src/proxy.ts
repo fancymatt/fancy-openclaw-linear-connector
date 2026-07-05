@@ -34,6 +34,7 @@ import { checkEnforcementRules } from "./escalation-gate.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, resolveMetaIntent, verifyCommentSatisfiedBy, type TransitionFeedback } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
+import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
 import type { NoActivityDetector } from "./bag/no-activity-detector.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
@@ -262,6 +263,8 @@ export interface ProxyDeps {
   operationalEventStore?: OperationalEventStore;
   /** AI-1664: Optional no-activity detector — proxy calls with a resolvable ticket ID satisfy the timer. */
   noActivityDetector?: NoActivityDetector;
+  /** AI-1799: enrolled-tickets mirror — transitions write to the board mirror. */
+  enrolledTicketsStore?: EnrolledTicketsStore;
   /**
    * Called on the first proxy call from an agent for a ticket — auto-acknowledges the
    * dispatch so the watchdog doesn't re-signal an agent that is actively working but
@@ -544,6 +547,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             artifactRef: artifactRefHeader,
             sourceStateOverride,
             cliTarget: target ?? undefined,
+            enrolledTicketsStore: deps?.enrolledTicketsStore,
           });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
