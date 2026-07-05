@@ -15,6 +15,7 @@ import type { ObservationStore, ReasonCode } from "./store/observation-store.js"
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { setStateAtomic, loadWorkflowRegistry } from "./workflow-gate.js";
+import { recaptureAc } from "./ac-record-store.js";
 import { getStatus as getConfigHealthStatus } from "./config-health.js";
 import { getRegistryPolicyStatus } from "./registry-policy.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
@@ -672,6 +673,47 @@ export function createAdminRouter(deps: AdminDeps): Router {
 
     const result = await setStateAtomic(ticketId, targetState, delegate, authToken, { sendWakeUp });
     res.status(result.ok ? 200 : 422).json(result);
+  });
+
+  // POST /api/recapture-ac — steward-gated AC-of-record recapture (AI-1785).
+  // Auth: adminAuth (ADMIN_SECRET or console session).  Authorization: the
+  // steward gate inside recaptureAc() checks callerBodyId against
+  // resolveBodiesForRole("steward").  No separate permission mechanism.
+  router.post("/api/recapture-ac", async (req: Request, res: Response) => {
+    const body = parseJsonBody(req);
+    if (body === null && (Buffer.isBuffer(req.body) || typeof req.body === "string")) {
+      res.status(400).json({ ok: false, error: "Malformed JSON body" });
+      return;
+    }
+    const ticketId = typeof body?.ticketId === "string" ? body.ticketId.trim() : "";
+    const callerBodyId = typeof body?.callerBodyId === "string" ? body.callerBodyId.trim() : "";
+    const force = body?.force === true;
+
+    if (!ticketId || !callerBodyId) {
+      res.status(400).json({ ok: false, error: "ticketId and callerBodyId are required" });
+      return;
+    }
+
+    // Resolve a Linear auth token — prefer first agent's OAuth token, fall back to env.
+    const agents = getAgents();
+    const authToken =
+      (agents.length > 0 ? getAccessToken(agents[0].name) : undefined) ??
+      process.env.LINEAR_OAUTH_TOKEN ??
+      process.env.LINEAR_API_KEY;
+    if (!authToken) {
+      res.status(503).json({ ok: false, error: "no Linear auth token available" });
+      return;
+    }
+
+    try {
+      await recaptureAc(ticketId, authToken, callerBodyId, { force });
+      res.status(200).json({ ok: true, ticketId, callerBodyId, force });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Authorization failures → 403; other recapture errors → 422.
+      const isAuthError = msg.includes("not authorized");
+      res.status(isAuthError ? 403 : 422).json({ ok: false, error: msg });
+    }
   });
 
   // ── SPA (management console) ─────────────────────────────────────────────
