@@ -15,7 +15,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { componentLogger, createLogger } from "./logger.js";
-import { loadWorkflowRegistry } from "./workflow-gate.js";
+import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
 import { findOrCreateLabel } from "./linear-helpers.js";
 import type { LinearEvent, LinearIssueCreatedEvent, LinearIssueUpdatedEvent } from "./webhook/schema.js";
@@ -54,7 +54,8 @@ async function loadAgents(): Promise<Array<{ name: string; linearUserId?: string
 
 // ── Linear API helpers ────────────────────────────────────────────────────────
 
-interface IssueContext {
+/** Issue context used by both the webhook bootstrap and the reconciliation sweep. */
+export interface IssueContext {
   id: string;
   teamId: string;
   identifier: string;
@@ -62,7 +63,16 @@ interface IssueContext {
   labels: Array<{ id: string; name: string }>;
 }
 
-async function fetchIssueContext(issueId: string, authToken: string): Promise<IssueContext | null> {
+/** Re-export so callers (sweep) can import from a single module. */
+export type { WorkflowDef };
+
+/**
+ * Fetch an issue's current context (labels, team, identifier) from Linear.
+ *
+ * Shared by the webhook bootstrap path and the reconciliation sweep — the
+ * sweep uses this for the idempotency re-fetch before healing a ticket.
+ */
+export async function fetchIssueContext(issueId: string, authToken: string): Promise<IssueContext | null> {
   const query = `
     query IssueWithLabels($id: String!) {
       issue(id: $id) {
@@ -108,7 +118,12 @@ async function fetchIssueContext(issueId: string, authToken: string): Promise<Is
   }
 }
 
-async function issueUpdateAtomic(
+/**
+ * Atomically apply label IDs (+ optional delegate) to an issue.
+ *
+ * Shared primitive — used by both the webhook bootstrap and the sweep.
+ */
+export async function issueUpdateAtomic(
   internalId: string,
   labelIds: string[],
   authToken: string,
@@ -220,83 +235,7 @@ export async function maybeBootstrapWorkflow(
     // Idempotency: if state:* is already present, this ticket is already in-flight.
     if (currentStateLabels.length > 0) return null;
 
-    const workflowId = currentWfLabelNode.name.slice("wf:".length);
-
-    let registry: Awaited<ReturnType<typeof loadWorkflowRegistry>>;
-    try {
-      registry = await loadWorkflowRegistry();
-    } catch (err) {
-      log.warn(
-        `workflow-bootstrap: failed to load registry for '${workflowId}': ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return null;
-    }
-
-    const def = registry.get(workflowId);
-    if (!def?.entry_state) {
-      log.warn(`workflow-bootstrap: no def (or no entry_state) for workflow '${workflowId}' — skipping bootstrap`);
-      return null;
-    }
-
-    const entryState = def.entry_state;
-    const entryStateDef = def.states.find((s) => s.id === entryState);
-    const ownerRole = entryStateDef?.owner_role;
-
-    // Resolve first-owner delegate from capability policy.
-    let delegateLinearUserId: string | undefined;
-    let delegateAgentName: string | undefined;
-    let delegateRole = entryStateDef?.owner_role;
-    if (delegateRole) {
-      try {
-        let bodies = await resolveBodiesForRole(delegateRole);
-        // If the entry role has no bodies (e.g. synthetic "engine" role),
-        // look ahead to the first transition target's owner_role.
-        if (bodies.length === 0 && entryStateDef?.transitions?.length) {
-          const firstTransTarget = def.states.find(
-            (s) => s.id === entryStateDef!.transitions![0].to,
-          );
-          const nextRole = firstTransTarget?.owner_role;
-          if (nextRole && nextRole !== delegateRole) {
-            bodies = await resolveBodiesForRole(nextRole);
-            if (bodies.length > 0) delegateRole = nextRole;
-          }
-        }
-        if (bodies.length === 1) {
-          delegateAgentName = bodies[0];
-          const agents = await loadAgents();
-          const agent = agents.find((a) => a.name === delegateAgentName);
-          if (agent?.linearUserId) {
-            delegateLinearUserId = agent.linearUserId;
-          } else {
-            log.warn(`workflow-bootstrap: body '${delegateAgentName}' has no linearUserId — delegate not set`);
-          }
-        }
-      } catch (err) {
-        log.warn(
-          `workflow-bootstrap: role resolution failed for '${delegateRole}': ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    }
-
-    // Find or create the entry state label.
-    const stateLabelId = await findOrCreateLabel(issue.teamId, `state:${entryState}`, effectiveToken);
-    if (!stateLabelId) {
-      log.warn(`workflow-bootstrap: could not resolve label 'state:${entryState}' — aborting bootstrap`);
-      return null;
-    }
-
-    const newLabelIds = Array.from(new Set([...currentLabelIds, stateLabelId]));
-    const success = await issueUpdateAtomic(issue.id, newLabelIds, effectiveToken, delegateLinearUserId);
-
-    if (!success) {
-      log.warn(`workflow-bootstrap: issueUpdate returned non-success for ${issueEvent.data.id}`);
-    } else {
-      log.info(
-        `workflow-bootstrap: bootstrapped ${issueEvent.data.id} → ${workflowId}:${entryState}, delegate=${delegateLinearUserId ?? "none"}`,
-      );
-    }
-
-    return { action: "bootstrapped", workflowId, entryState, delegateAgentName, ticketIdentifier: issue.identifier, ticketTitle: issue.title };
+    return applyBootstrapToIssue(issue, effectiveToken);
   }
 
   // ── Demote path: wf:* was removed, state:* labels remain ─────────────────
@@ -313,4 +252,132 @@ export async function maybeBootstrapWorkflow(
   }
 
   return null;
+}
+
+// ── Shared bootstrap core ────────────────────────────────────────────────────
+
+/**
+ * Apply bootstrap (entry-state label + first-owner delegate) to an issue whose
+ * context has already been fetched.
+ *
+ * This is the shared core invoked by both:
+ *   - the webhook bootstrap hook (`maybeBootstrapWorkflow`)
+ *   - the periodic reconciliation sweep (`runBootstrapReconciliationSweep`)
+ *
+ * AI-1775: a parallel reimplementation is explicitly disallowed by AC1 — both
+ * paths must funnel through this function so the heal is identical to the
+ * webhook-triggered bootstrap.
+ *
+ * Pre-conditions (checked by the caller):
+ *   - The issue has a `wf:*` label
+ *   - The issue has NO `state:*` label (idempotency)
+ *
+ * This function re-checks idempotency defensively (state:* present → null) so
+ * the race between a late webhook and the sweep is covered even when the
+ * caller's context is slightly stale.
+ *
+ * Returns a BootstrapResult on success, or null if the ticket was already
+ * enrolled, the workflow def is missing, or label/mutation application failed.
+ */
+export async function applyBootstrapToIssue(
+  issue: IssueContext,
+  authToken: string,
+  /** Optional registry override (used by the sweep). If absent, loads from file. */
+  workflowRegistryOverride?: Map<string, WorkflowDef>,
+): Promise<BootstrapResult | null> {
+  // Defensive idempotency re-check — handles the webhook/sweep race.
+  const currentStateLabels = issue.labels.filter((n) => n.name.startsWith("state:"));
+  if (currentStateLabels.length > 0) return null;
+
+  const wfLabelNode = issue.labels.find((n) => n.name.startsWith("wf:"));
+  if (!wfLabelNode) return null;
+
+  const workflowId = wfLabelNode.name.slice("wf:".length);
+
+  let registry: Map<string, WorkflowDef>;
+  if (workflowRegistryOverride) {
+    registry = workflowRegistryOverride;
+  } else {
+    try {
+      registry = await loadWorkflowRegistry();
+    } catch (err) {
+      log.warn(
+        `workflow-bootstrap: failed to load registry for '${workflowId}': ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
+  }
+
+  const def = registry.get(workflowId);
+  if (!def?.entry_state) {
+    log.warn(`workflow-bootstrap: no def (or no entry_state) for workflow '${workflowId}' — skipping bootstrap`);
+    return null;
+  }
+
+  const entryState = def.entry_state;
+  const entryStateDef = def.states.find((s) => s.id === entryState);
+
+  // Resolve first-owner delegate from capability policy.
+  let delegateLinearUserId: string | undefined;
+  let delegateAgentName: string | undefined;
+  let delegateRole = entryStateDef?.owner_role;
+  if (delegateRole) {
+    try {
+      let bodies = await resolveBodiesForRole(delegateRole);
+      // If the entry role has no bodies (e.g. synthetic "engine" role),
+      // look ahead to the first transition target's owner_role.
+      if (bodies.length === 0 && (entryStateDef as { transitions?: Array<{ to: string }> })?.transitions?.length) {
+        const firstTransTarget = def.states.find(
+          (s) => s.id === (entryStateDef as { transitions?: Array<{ to: string }> }).transitions![0].to,
+        );
+        const nextRole = firstTransTarget?.owner_role;
+        if (nextRole && nextRole !== delegateRole) {
+          bodies = await resolveBodiesForRole(nextRole);
+          if (bodies.length > 0) delegateRole = nextRole;
+        }
+      }
+      if (bodies.length === 1) {
+        delegateAgentName = bodies[0];
+        const agents = await loadAgents();
+        const agent = agents.find((a) => a.name === delegateAgentName);
+        if (agent?.linearUserId) {
+          delegateLinearUserId = agent.linearUserId;
+        } else {
+          log.warn(`workflow-bootstrap: body '${delegateAgentName}' has no linearUserId — delegate not set`);
+        }
+      }
+    } catch (err) {
+      log.warn(
+        `workflow-bootstrap: role resolution failed for '${delegateRole}': ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Find or create the entry state label.
+  const stateLabelId = await findOrCreateLabel(issue.teamId, `state:${entryState}`, authToken);
+  if (!stateLabelId) {
+    log.warn(`workflow-bootstrap: could not resolve label 'state:${entryState}' — aborting bootstrap`);
+    return null;
+  }
+
+  const currentLabelIds = issue.labels.map((l) => l.id);
+  const newLabelIds = Array.from(new Set([...currentLabelIds, stateLabelId]));
+  const success = await issueUpdateAtomic(issue.id, newLabelIds, authToken, delegateLinearUserId);
+
+  if (!success) {
+    log.warn(`workflow-bootstrap: issueUpdate returned non-success for ${issue.id}`);
+  } else {
+    log.info(
+      `workflow-bootstrap: bootstrapped ${issue.id} → ${workflowId}:${entryState}, delegate=${delegateLinearUserId ?? "none"}`,
+    );
+  }
+
+  return {
+    action: "bootstrapped",
+    workflowId,
+    entryState,
+    delegateAgentName,
+    ticketIdentifier: issue.identifier,
+    ticketTitle: issue.title,
+  };
 }
