@@ -32,7 +32,7 @@ import { getRegisteredCrons } from "./cron/registry.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { startRegistryPolicyCheck } from "./registry-policy.js";
-import { execFile } from "node:child_process";
+import { resolveStartupCommit } from "./startup-commit.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent } from "./agents.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
@@ -1048,13 +1048,14 @@ if (isEntryPoint) {
     log.info(`fancy-openclaw-linear-connector [${DEPLOYMENT_NAME}] listening on port ${PORT} (pid=${process.pid})`);
     // Startup alert (warning → pushes): restart audit trail, deploy
     // verification, and crash-loop indicator (repeat bursts fold + count).
-    execFile("git", ["rev-parse", "--short", "HEAD"], { cwd: process.cwd() }, (gitErr, stdout) => {
-      const commit = gitErr ? "unknown" : stdout.trim();
+    // AI-1841: prefer the dist/DEPLOY_COMMIT stamp over git HEAD — the shared
+    // working tree may be on a feature branch and its HEAD is not what runs.
+    resolveStartupCommit().then(({ commit, source }) => {
       setStartupCommit(commit);
       notify({
         severity: "warning",
         source: "lifecycle",
-        title: `connector started — commit ${commit}, ${getAgents().length} agents, port ${PORT}`,
+        title: `connector started — commit ${commit} (${source}), ${getAgents().length} agents, port ${PORT}`,
         dedupKey: "lifecycle|startup",
       });
     });
