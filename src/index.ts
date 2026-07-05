@@ -26,7 +26,8 @@ import { registerDistillationCron } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
-import { notify } from "./alerts/alert-bus.js";
+import { registerSlaSweepCron } from "./sla-sweep.js";
+import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { startRegistryPolicyCheck } from "./registry-policy.js";
 import { execFile } from "node:child_process";
@@ -952,6 +953,53 @@ if (isEntryPoint) {
     authToken: reconciliationAuthToken,
     wakeFn: reconciliationWakeFn,
   });
+
+  // AI-1773: periodic SLA sweep — detect governed tickets whose time in
+  // their current state exceeds the per-state `sla:` value. Emits a
+  // warning-level alert + steward wake per new breach (deduped via SQLite).
+  // Managed children are excluded (barrier.ts predicate owns them).
+  const defaultWorkflowDefPath = "config/workflows.yaml";
+  const slaWorkflowDefPath = process.env.WORKFLOW_DEFS_DIR ?? process.env.WORKFLOW_DEF_PATH ?? defaultWorkflowDefPath;
+  const slaDataDir = process.env.DATA_DIR ?? "data";
+  const slaBreachStorePath = process.env.SLA_BREACH_STORE_PATH ?? path.join(slaDataDir, "sla-breaches.db");
+  const slaAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const slaCadenceMs = process.env.SLA_SWEEP_CADENCE_MS ? parseInt(process.env.SLA_SWEEP_CADENCE_MS, 10) : undefined;
+
+  if (slaAuthToken) {
+    const slaWakeAgent = async (identifier: string) => {
+      const sessionKey = normalizeSessionKey(identifier);
+      const agentCfg = getAgent("ai");
+      const deliveryConfig: DeliveryConfig = {
+        nodeBin: process.execPath,
+        hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
+        hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
+        hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+        hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+      };
+      const actionText = `SLA breach detected for ${identifier}`;
+      const message =
+        (await buildWorkflowAwareDeliveryMessage(identifier, slaAuthToken, actionText)) ??
+        actionText;
+      await deliverMessageToAgent("ai", sessionKey, message, deliveryConfig);
+    };
+
+    const slaTimer = registerSlaSweepCron({
+      authToken: slaAuthToken,
+      workflowDefPath: slaWorkflowDefPath,
+      breachStorePath: slaBreachStorePath,
+      cadenceMs: slaCadenceMs,
+      notify: (alert) =>
+        notify({
+          ...alert,
+          severity: alert.severity as AlertSeverity,
+          dedupKey: `sla-sweep|${alert.ticket}`,
+        }),
+      wakeAgent: slaWakeAgent,
+    });
+    log.info(`AI-1773: SLA sweep cron registered (cadence=${slaCadenceMs ?? 300_000}ms, store=${slaBreachStorePath}, defs=${slaWorkflowDefPath})`);
+  } else {
+    log.warn("AI-1773: SLA sweep cron NOT registered — no Linear auth token available");
+  }
 
   // G-20: scheduled gate-silently-off canary (AI-1552, §5.1)
   registerG20CanaryCron();
