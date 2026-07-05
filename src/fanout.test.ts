@@ -950,8 +950,8 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
       return baseFetch(url, init);
     };
 
-    // Should not throw — fan-out completes despite comment failure
-    await expect(applyStateTransition("spawn", "AI-1439", "Bearer tok")).resolves.toBeUndefined();
+    // Should not throw — fan-out completes despite comment failure (AI-1809: transition reports applied)
+    await expect(applyStateTransition("spawn", "AI-1439", "Bearer tok")).resolves.toMatchObject({ status: "applied" });
 
     // Children should still have been created
     const childCreateCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));

@@ -2088,24 +2088,50 @@ export interface ApplyStateTransitionOptions {
   cliTarget?: string;
 }
 
+/**
+ * AI-1809: machine-readable outcome of applyStateTransition.
+ *
+ * A workflow transition must be all-or-nothing across its facets (state label,
+ * delegate, native status). When it is anything other than fully applied, the
+ * caller (the proxy) must be able to surface that to the requesting agent in a
+ * machine-readable form — a stderr-only warning beside a success response is
+ * how AI-1773 ended up in a split state the proxy itself couldn't route out of.
+ */
+export interface TransitionApplyResult {
+  /**
+   * applied — all facets written atomically (or an equivalent gated helper applied them);
+   * noop    — nothing to do (ad-hoc ticket, already in target state);
+   * blocked — a governance gate intentionally stopped the transition;
+   * failed  — a resolution or write genuinely failed; the ticket may now be
+   *           inconsistent with the agent's expectation and needs attention.
+   */
+  status: "applied" | "noop" | "blocked" | "failed";
+  /** Stable machine-readable code (e.g. "atomic-mutation-failed", "release-gate"). */
+  code: string;
+  /** Human-readable detail. */
+  detail?: string;
+  from?: string;
+  to?: string;
+}
+
 export async function applyStateTransition(
   intent: string,
   issueId: string | null,
   authToken: string,
   options?: ApplyStateTransitionOptions,
-): Promise<void> {
+): Promise<TransitionApplyResult> {
   // TODO(AI-1347): no-op on missing issueId carries the same fail-open posture as B1.
-  if (!issueId) return;
+  if (!issueId) return { status: "noop", code: "no-issue-id" };
 
   const issue = await fetchIssueWithLabels(issueId, authToken);
   if (!issue) {
     log.warn(`workflow-gate: B2 apply: could not fetch labels for ${issueId} — skipping`);
-    return;
+    return { status: "failed", code: "context-fetch-failed", detail: `could not fetch labels for ${issueId}` };
   }
 
   const labelNames = issue.labels.map((l) => l.name);
   const workflowId = getWorkflowId(labelNames);
-  if (!workflowId) return; // ad-hoc ticket — no-op
+  if (!workflowId) return { status: "noop", code: "ad-hoc" }; // ad-hoc ticket — no-op
 
   let def: WorkflowDef | undefined;
   try {
@@ -2114,10 +2140,10 @@ export async function applyStateTransition(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: B2 apply: failed to load workflow registry: ${msg} — skipping`);
-    return;
+    return { status: "failed", code: "registry-load-failed", detail: msg };
   }
 
-  if (!def) return; // unknown workflow — no-op (AI-1530)
+  if (!def) return { status: "noop", code: "unknown-workflow", detail: `no definition for wf:${workflowId}` }; // unknown workflow — no-op (AI-1530)
 
   // AI-1498 fix: prefer the captured pre-forward state. The CLI advances the
   // state:* label inside its own forwarded mutation, so by now `labelNames`
@@ -2128,7 +2154,7 @@ export async function applyStateTransition(
   const currentStateName = options?.sourceStateOverride ?? actualStateName;
   if (!currentStateName) {
     log.warn(`workflow-gate: B2 apply: no state:* label on ${issueId} — skipping`);
-    return;
+    return { status: "failed", code: "no-state-label", detail: `workflow ticket ${issueId} has no state:* label` };
   }
 
   const breakGlassCommand = def.break_glass?.command ?? "escape";
@@ -2145,7 +2171,7 @@ export async function applyStateTransition(
       log.warn(
         `workflow-gate: B2 apply: no transition for '${intent}' in state '${currentStateName}' on ${issueId} — skipping`,
       );
-      return;
+      return { status: "failed", code: "no-transition", detail: `no transition for '${intent}' in state '${currentStateName}'`, from: currentStateName };
     }
     toStateName = matchedTransition.to;
   }
@@ -2163,7 +2189,7 @@ export async function applyStateTransition(
     log.info(
       `workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels`,
     );
-    return;
+    return { status: "applied", code: "demoted-ad-hoc", from: currentStateName, to: "__ad_hoc__" };
   }
 
   // ── Idempotency check (AI-1490 hardened) ────────────────────────────────
@@ -2181,7 +2207,7 @@ export async function applyStateTransition(
       log.info(
         `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' with label present — no-op`,
       );
-      return;
+      return { status: "noop", code: "already-in-state", from: currentStateName, to: toStateName };
     }
     // Label is missing despite being in the correct state — re-stamp.
     log.warn(
@@ -2194,7 +2220,7 @@ export async function applyStateTransition(
     );
     if (!newLabelId) {
       log.warn(`workflow-gate: B2 apply: could not create label '${targetLabelName}' for re-stamp on ${issueId} — skipping`);
-      return;
+      return { status: "failed", code: "label-resolve-failed", detail: `could not resolve label '${targetLabelName}' for re-stamp`, from: currentStateName, to: toStateName };
     }
     // Remove any stale state:* labels and add the correct one.
     const cleanedLabelIds = issue.labels
@@ -2204,8 +2230,9 @@ export async function applyStateTransition(
     const applied = await issueUpdateLabels(issue.internalId, cleanedLabelIds, authToken);
     if (applied) {
       log.info(`workflow-gate: B2 apply: ${issueId} re-stamped label '${targetLabelName}'`);
+      return { status: "applied", code: "re-stamped", from: currentStateName, to: toStateName };
     }
-    return;
+    return { status: "failed", code: "atomic-mutation-failed", detail: `re-stamp of '${targetLabelName}' did not apply`, from: currentStateName, to: toStateName };
   }
 
   // ── AI-1475 Defect 1 + AI-1492 + AI-1497: Merged-PR release gate defense-in-depth (§5.6) ─
@@ -2240,7 +2267,7 @@ export async function applyStateTransition(
         if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
         if (!branchStatus.hasPR) missing.push('no pull request associated');
         log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
-        return; // Block the transition
+        return { status: "blocked", code: "release-gate", detail: missing.join('; '), from: currentStateName, to: toStateName }; // Block the transition
       }
     } else if (noEvidenceAtAll) {
       log.info(`workflow-gate: B2 apply: done gate for ${issueId} — no branch/PR evidence, treating as merged (AI-1497 fail-open)`);
@@ -2260,18 +2287,18 @@ export async function applyStateTransition(
       const acResult = await dispositionToDone(issueId, authToken);
       if (!acResult.applied) {
         log.warn(`workflow-gate: B-4 review: → done blocked for ${issueId}: ${acResult.error ?? "unknown"}`);
-        return; // Block the transition — AC gate failed
+        return { status: "blocked", code: "parent-ac-gate", detail: acResult.error ?? "unknown", from: currentStateName, to: toStateName }; // Block the transition — AC gate failed
       }
       // AC gate passed and dispositionToDone already applied the label swap + comment.
       // Skip the normal atomic swap below — dispositionToDone handled it.
       // AI-1534: terminal state, no further per-step delivery — drop any cached state.
       clearAppliedState(issue.identifier);
       log.info(`workflow-gate: B-4 review: ${issueId} review → done (parent AC satisfied)`);
-      return;
+      return { status: "applied", code: "disposition-done", from: currentStateName, to: "done" };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`workflow-gate: B-4 review: parent-AC gate failed for ${issueId}: ${msg} — blocking transition`);
-      return;
+      return { status: "blocked", code: "parent-ac-gate-error", detail: msg, from: currentStateName, to: toStateName };
     }
   }
 
@@ -2288,7 +2315,7 @@ export async function applyStateTransition(
         // drop the now-stale cached state rather than leave a wrong override.
         clearAppliedState(issue.identifier);
         log.info(`workflow-gate: B-4 review: ${issueId} review → spawning (follow-up)`);
-        return;
+        return { status: "applied", code: "disposition-spawning", from: currentStateName, to: "spawning" };
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -2325,7 +2352,7 @@ export async function applyStateTransition(
       } catch (commentErr) {
         log.warn(`workflow-gate: C-2: failed to post diagnostic comment for ${issueId}: ${commentErr instanceof Error ? commentErr.message : String(commentErr)}`);
       }
-      return; // Block the transition
+      return { status: "blocked", code: "artifact-gate", detail: "no sprint-plan artifact bound at intake", from: currentStateName, to: toStateName }; // Block the transition
     }
     log.info(`workflow-gate: C-2: sprint artifact gate: ${issueId} artifact '${artifact.ref}' present — allowing validating → done`);
   }
@@ -2381,7 +2408,7 @@ export async function applyStateTransition(
     log.error(
       `workflow-gate: B2 apply: FAIL-CLOSED — could not resolve label id for state:${toStateName}. Transition aborted.`,
     );
-    return;
+    return { status: "failed", code: "label-resolve-failed", detail: `could not resolve label id for state:${toStateName}`, from: currentStateName, to: toStateName };
   }
 
   // AI-1498 fix: compute the target label set robustly — strip ALL state:* labels
@@ -2426,7 +2453,7 @@ export async function applyStateTransition(
         log.error(
           `workflow-gate: B2 apply: FAIL-CLOSED — CLI target '${explicitTarget}' cannot be resolved to a Linear user ID for ${issueId}. Register the agent in agents.json with a linearUserId. Transition aborted.`,
         );
-        return;
+        return { status: "failed", code: "target-unresolved", detail: `CLI target '${explicitTarget}' has no linearUserId`, from: currentStateName, to: toStateName };
       }
     }
 
@@ -2444,7 +2471,7 @@ export async function applyStateTransition(
           log.error(
             `workflow-gate: B2 apply: FAIL-CLOSED — prior implementer '${priorImplementer}' has no linearUserId. Cannot route ${intent} on ${issueId}.`,
           );
-          return;
+          return { status: "failed", code: "delegate-unresolved", detail: `prior implementer '${priorImplementer}' has no linearUserId`, from: currentStateName, to: toStateName };
         }
       } else {
         log.warn(
@@ -2474,13 +2501,13 @@ export async function applyStateTransition(
           log.error(
             `workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) on '${intent}' for ${issueId} requires a CLI --target${wantsPriorImplementer ? " (no prior implementer recorded)" : ""} but none was supplied. Transition aborted.`,
           );
-          return;
+          return { status: "failed", code: "delegate-unresolved", detail: `multi-body role '${destOwnerRole}' requires a --target`, from: currentStateName, to: toStateName };
         } else {
           if (intent === 'approve' || intent === 'reject') {
             log.error(
               `workflow-gate: B2 apply: FAIL-CLOSED — no bodies found for role '${destOwnerRole}' on '${intent}'. Transition aborted per AI-1493.`,
             );
-            return;
+            return { status: "failed", code: "delegate-unresolved", detail: `no bodies found for role '${destOwnerRole}'`, from: currentStateName, to: toStateName };
           }
           log.warn(
             `workflow-gate: B2 apply: no bodies found for role '${destOwnerRole}' on '${intent}' — skipping auto-delegate`,
@@ -2491,7 +2518,7 @@ export async function applyStateTransition(
         log.error(
           `workflow-gate: B2 apply: FAIL-CLOSED — role resolution failed for '${destOwnerRole}': ${msg}. Transition aborted.`,
         );
-        return;
+        return { status: "failed", code: "delegate-unresolved", detail: `role resolution failed for '${destOwnerRole}': ${msg}`, from: currentStateName, to: toStateName };
       }
     }
   }
@@ -2534,7 +2561,7 @@ export async function applyStateTransition(
       log.error(
         `workflow-gate: B2 apply: FAIL-CLOSED — could not resolve native stateId for '${destNativeState}' on team ${issue.teamId}. Transition aborted.`,
       );
-      return;
+      return { status: "failed", code: "native-state-unresolved", detail: `could not resolve native stateId for '${destNativeState}'`, from: currentStateName, to: toStateName };
     }
     resolvedNativeStateId = stateId;
     log.info(
@@ -2546,7 +2573,7 @@ export async function applyStateTransition(
     log.error(
       `workflow-gate: B2 apply: FAIL-CLOSED — destination state '${toStateName}' has no native_state field. Transition aborted.`,
     );
-    return;
+    return { status: "failed", code: "native-state-missing", detail: `destination state '${toStateName}' has no native_state field`, from: currentStateName, to: toStateName };
   }
 
   // Step 5: Apply the FULL transition atomically (labels + delegate + native state in one mutation).
@@ -2584,7 +2611,7 @@ export async function applyStateTransition(
     log.error(
       `workflow-gate: B2 apply: atomic mutation FAILED for ${issueId} — all facets rolled back (no partial state)`,
     );
-    return;
+    return { status: "failed", code: "atomic-mutation-failed", detail: "atomic issueUpdate (label + delegate + native state) did not apply", from: currentStateName, to: toStateName };
   }
 
   // ── §5.7 item 1 / C-2: Artifact-binding recording ────────────────────
@@ -2657,7 +2684,7 @@ export async function applyStateTransition(
             `${issueId} managing → (next state) (${barrierResult.totalChildren} children)`,
           );
           clearAppliedState(issue.identifier);
-          return;
+          return { status: "applied", code: "transition-applied", from: currentStateName, to: toStateName };
         }
         log.info(
           `workflow-gate: AI-1730: onManagingEntry returned no transition for ${issueId} — children still active`,
@@ -2728,6 +2755,8 @@ export async function applyStateTransition(
       log.warn(`workflow-gate: B-3 barrier check failed for ${issueId}: ${msg}`);
     }
   }
+
+  return { status: "applied", code: "transition-applied", from: currentStateName, to: toStateName };
 }
 
 /**
