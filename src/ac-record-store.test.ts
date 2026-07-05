@@ -195,5 +195,37 @@ describe("ac-record-store", () => {
       const desc = "### acceptance criteria\n- Lowercase AC";
       expect(extractAcFromDescription(desc)).toBe("- Lowercase AC");
     });
+
+    // ── AI-1776 AC1: Tolerant extraction — decorated headers ──────────────
+
+    it("extracts AC from '## Acceptance criteria (draft — final at intake)' (AI-1776 AC1)", () => {
+      const desc = "## Problem\nSome text.\n\n## Acceptance criteria (draft — final at intake)\n* AC1: Foo works\n* AC2: Bar passes\n\n## Pointers\nNotes.";
+      expect(extractAcFromDescription(desc)).toBe("* AC1: Foo works\n* AC2: Bar passes");
+    });
+
+    it("extracts AC from '## Acceptance Criteria (v2)' (AI-1776 AC1)", () => {
+      const desc = "## Acceptance Criteria (v2)\n* AC1: Thing\n\n## Notes\nBlah";
+      expect(extractAcFromDescription(desc)).toBe("* AC1: Thing");
+    });
+
+    it("extracts AC from '### AC — final' decorated header (AI-1776 AC1)", () => {
+      const desc = "## Background\nContext.\n\n### AC — final\n1. Pass this\n2. Pass that\n\n## Notes";
+      expect(extractAcFromDescription(desc)).toBe("1. Pass this\n2. Pass that");
+    });
+
+    it("case-insensitive match with trailing decoration (AI-1776 AC1)", () => {
+      const desc = "## acceptance criteria (final)\n- Works\n\n## Notes\nDone.";
+      expect(extractAcFromDescription(desc)).toBe("- Works");
+    });
+
+    it("bare headers still extract correctly after tolerant-matching change (AI-1776 AC1 non-regression)", () => {
+      const desc = "### Acceptance Criteria\n- Still works\n\n### Notes\nOk";
+      expect(extractAcFromDescription(desc)).toBe("- Still works");
+    });
+
+    it("returns null when description has no AC header variant (AI-1776 AC1 non-regression)", () => {
+      const desc = "## Problem\nBlah.\n\n## Notes\nNo AC section at all.";
+      expect(extractAcFromDescription(desc)).toBeNull();
+    });
   });
 });

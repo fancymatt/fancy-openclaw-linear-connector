@@ -38,7 +38,7 @@ import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
 import { clearArtifactStore, getBoundArtifact, hasBoundArtifact } from "./artifact-store.js";
 import { runTransitionWalk } from "./canary.js";
-import { clearAcRecordStore } from "./ac-record-store.js";
+import { clearAcRecordStore, getAcRecord } from "./ac-record-store.js";
 import { resetConfigHealth } from "./config-health.js";
 import { clearImplementerStore } from "./implementer-store.js";
 
@@ -6572,5 +6572,323 @@ describe("AI-1666: WorkflowState.noActivityTimeout YAML schema (AC1)", () => {
     const state = def2.states.find((s) => s.id === "normal");
     expect(state).toBeDefined();
     expect((state as Record<string, unknown>)["noActivityTimeout"]).toBeUndefined();
+  });
+});
+
+// ── AI-1776: H-7 fail-visible warning comment ─────────────────────────────
+//
+// When a capture_ac: true transition captures nothing (null extraction OR
+// description fetch failure), a warning comment must be posted on the ticket.
+// The transition still completes (signal, not gate).
+
+const AC2_WORKFLOW_YAML = `
+id: dev-impl
+version: 1
+archetype: single-task
+entry_state: intake
+
+break_glass:
+  command: escape
+  to: intake
+  owner_role: steward
+
+states:
+  - id: intake
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: accept
+        to: implementation
+        capture_ac: true
+      - command: demote
+        to: __ad_hoc__
+
+  - id: implementation
+    owner_role: dev
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: submit
+        to: done
+
+  - id: done
+    kind: terminal
+    native_state: done
+    transitions: []
+
+  - id: escape
+    kind: terminal
+    native_state: invalid
+    transitions:
+      - command: unescape
+        to: intake
+        assign: { mode: auto }
+`;
+
+describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () => {
+  let origFetch: typeof globalThis.fetch;
+  let ac2Dir: string;
+  let origWorkflowPath: string | undefined;
+  let origPolicyPath: string | undefined;
+  let origAcRecordsPath: string | undefined;
+
+  beforeEach(() => {
+    origFetch = globalThis.fetch;
+    ac2Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1776-test-"));
+
+    const policyFile = path.join(ac2Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
+    origPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ac2Dir, "dev-impl-ac2.yaml");
+    fs.writeFileSync(workflowFile, AC2_WORKFLOW_YAML, "utf8");
+    origWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    // Isolate AC record store to a per-test temp file so disk persists don't
+    // bleed between tests (the store lazy-loads from disk on first access).
+    origAcRecordsPath = process.env.AC_RECORDS_PATH;
+    process.env.AC_RECORDS_PATH = path.join(ac2Dir, "ac-records.json");
+
+    resetWorkflowCache();
+    resetPolicyCache();
+    clearAcRecordStore();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = origFetch;
+    resetWorkflowCache();
+    resetPolicyCache();
+    clearAcRecordStore();
+
+    if (origWorkflowPath !== undefined) {
+      process.env.WORKFLOW_DEF_PATH = origWorkflowPath;
+    } else {
+      delete process.env.WORKFLOW_DEF_PATH;
+    }
+    if (origPolicyPath !== undefined) {
+      process.env.CAPABILITY_POLICY_PATH = origPolicyPath;
+    } else {
+      delete process.env.CAPABILITY_POLICY_PATH;
+    }
+    if (origAcRecordsPath !== undefined) {
+      process.env.AC_RECORDS_PATH = origAcRecordsPath;
+    } else {
+      delete process.env.AC_RECORDS_PATH;
+    }
+    try { fs.rmSync(ac2Dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  function makeAc2Fetch(opts: {
+    description?: string;
+    descriptionFetchFails?: boolean;
+  }): { fetch: typeof globalThis.fetch; calls: Array<{ query: string; variables: Record<string, unknown> }> } {
+    const calls: Array<{ query: string; variables: Record<string, unknown> }> = [];
+
+    const mockFetch: typeof globalThis.fetch = async (_url, init) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
+      calls.push({ query: parsed.query ?? "", variables: parsed.variables ?? {} });
+      const q = parsed.query ?? "";
+
+      if (q.includes("IssueWithLabels")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "internal-uuid",
+                team: { id: "team-uuid" },
+                labels: {
+                  nodes: [
+                    { id: "wf-lbl", name: "wf:dev-impl" },
+                    { id: "state-lbl", name: "state:intake" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (q.includes("IssueDescription")) {
+        if (opts.descriptionFetchFails) throw new Error("simulated description fetch failure");
+        return new Response(
+          JSON.stringify({ data: { issue: { description: opts.description ?? "" } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (q.includes("commentCreate")) {
+        return new Response(
+          JSON.stringify({ data: { commentCreate: { success: true, comment: { id: "warn-comment-id" } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (q.includes("TeamLabels")) {
+        return new Response(
+          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "impl-lbl", name: "state:implementation" }] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (q.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              team: {
+                states: {
+                  nodes: [
+                    { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+                    { id: "state-doing-uuid", name: "Doing", type: "started" },
+                    { id: "state-done-uuid", name: "Done", type: "completed" },
+                    { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (q.includes("issueLabelCreate")) {
+        return new Response(
+          JSON.stringify({ data: { issueLabelCreate: { success: true, issueLabel: { id: "new-label-id" } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (q.includes("ApplyAtomicTransition")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (q.includes("UpdateDelegate")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (q.includes("IssueBranchAndPR")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                branch: { id: "br", name: "feat", updatedAt: "2026-01-01T00:00:00Z" },
+                pullRequests: { nodes: [{ id: "pr", state: "open" }] },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      throw new Error(`unexpected Linear query in AI-1776 test: ${q.slice(0, 80)}`);
+    };
+
+    return { fetch: mockFetch, calls };
+  }
+
+  it("AC2: posts a warning comment when description has no AC header (AI-1776)", async () => {
+    const { fetch: mock, calls } = makeAc2Fetch({
+      description: "## Problem\nNo acceptance criteria section here.\n\n## Notes\nJust notes.",
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+
+    const commentCall = calls.find((c) => c.query.includes("commentCreate"));
+    expect(commentCall).toBeDefined();
+    const body = (commentCall!.variables as { body?: string }).body ?? "";
+    expect(body).toMatch(/AC.*not.*captured|no.*AC.*section|capture.*failed|no.*acceptance.*criteria/i);
+  });
+
+  it("AC2: warning comment names the cause — no header found (AI-1776)", async () => {
+    const { fetch: mock, calls } = makeAc2Fetch({
+      description: "## Just notes\nNo AC here.",
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+
+    const commentCall = calls.find((c) => c.query.includes("commentCreate"));
+    expect(commentCall).toBeDefined();
+    const body = (commentCall!.variables as { body?: string }).body ?? "";
+    expect(body).toMatch(/header|no.*AC|acceptance.*criteria/i);
+  });
+
+  it("AC2: transition still completes (ApplyAtomicTransition fires) when AC header is absent (AI-1776)", async () => {
+    const { fetch: mock, calls } = makeAc2Fetch({
+      description: "No AC header anywhere in here.",
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(true);
+  });
+
+  it("AC2: posts a warning comment when description fetch fails (AI-1776)", async () => {
+    const { fetch: mock, calls } = makeAc2Fetch({ descriptionFetchFails: true });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+
+    const commentCall = calls.find((c) => c.query.includes("commentCreate"));
+    expect(commentCall).toBeDefined();
+    const body = (commentCall!.variables as { body?: string }).body ?? "";
+    expect(body).toMatch(/fetch.*fail|description.*unavailable|could not fetch|AC.*not.*captured/i);
+  });
+
+  it("AC2: transition still completes when description fetch fails (AI-1776)", async () => {
+    const { fetch: mock, calls } = makeAc2Fetch({ descriptionFetchFails: true });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+
+    expect(calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(true);
+  });
+
+  it("AC2: does NOT post a warning comment when AC is captured successfully (AI-1776 non-regression)", async () => {
+    const { fetch: mock, calls } = makeAc2Fetch({
+      description: "## Acceptance Criteria\n\n* AC1: Works\n* AC2: Passes\n\n## Notes\nDone.",
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+
+    const commentCall = calls.find((c) => c.query.includes("commentCreate"));
+    expect(commentCall).toBeUndefined();
+  });
+
+  it("AC2: exactly one warning comment posted per null-capture event (AI-1776)", async () => {
+    const { fetch: mock, calls } = makeAc2Fetch({
+      description: "## Problem\nNo AC section.",
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+
+    const commentCalls = calls.filter((c) => c.query.includes("commentCreate"));
+    expect(commentCalls).toHaveLength(1);
+  });
+
+  it("AC2: AC record is not stored when capture returns null (AI-1776)", async () => {
+    const { fetch: mock } = makeAc2Fetch({
+      description: "## Problem\nNo AC section.",
+    });
+    globalThis.fetch = mock;
+
+    await applyStateTransition("accept", "AI-1776", "Bearer tok");
+
+    const record = await getAcRecord("AI-1776");
+    expect(record).toBeNull();
   });
 });

@@ -16,11 +16,15 @@
 
 import fs from "node:fs/promises";
 import { componentLogger, createLogger } from "./logger.js";
+import { resolveBodiesForRole } from "./escalation-gate.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "ac-record-store");
 
 /** Default path for persisted AC records. Override via AC_RECORDS_PATH env. */
 const DEFAULT_AC_RECORDS_PATH = "/tmp/ac-records.json";
+
+/** Linear GraphQL API endpoint (used by recaptureAc to fetch description / post comments). */
+const LINEAR_API_URL = "https://api.linear.app/graphql";
 
 function acRecordsPath(): string {
   return process.env.AC_RECORDS_PATH ?? DEFAULT_AC_RECORDS_PATH;
@@ -148,9 +152,13 @@ export function clearAcRecordStore(): void {
 export function extractAcFromDescription(description: string): string | null {
   if (!description) return null;
 
-  // Try to find an "### Acceptance" or "### AC" or "## Acceptance" section
+  // Try to find an "### Acceptance" or "### AC" or "## Acceptance" section.
+  // AI-1776 AC1: tolerate trailing decoration on the header line (e.g.
+  // "## Acceptance criteria (draft — final at intake)", "### AC — final").
+  // The word-boundary anchor (`\b`) after the keyword prevents matching
+  // unrelated words while allowing trailing qualifier text.
   const acPatterns = [
-    /^#{1,3}\s*(?:Acceptance(?:\s+Criteria)?|AC)\s*$/mi,
+    /^#{1,3}\s*(?:Acceptance(?:\s+Criteria)?|AC)\b.*$/mi,
   ];
 
   for (const pattern of acPatterns) {
@@ -170,4 +178,113 @@ export function extractAcFromDescription(description: string): string | null {
   // No AC section header found — return null rather than the full description.
   log.warn(`ac-record-store: extractAcFromDescription: no '### Acceptance' or '### AC' header found in description — returning null (full description will NOT be treated as AC of record)`);
   return null;
+}
+
+/**
+ * AI-1776 AC3: Steward-gated recapture of the AC of record.
+ *
+ * Allows a steward to (re)capture the verbatim AC from the ticket's current
+ * description after the accept transition — for tickets that entered the spine
+ * without a snapshot (e.g. capture failed at accept, or the description was
+ * finalized after accept).
+ *
+ * Authorization: the caller must be a body that fills the `steward` role
+ * (resolved via the capability policy). Non-steward callers are rejected.
+ *
+ * Overwrite semantics: if a record already exists, `force: true` is required.
+ * A forced overwrite posts a Linear comment trail naming the steward and the
+ * action, so the audit path is preserved. Fresh creates post no comment.
+ *
+ * @param ticketId      Linear ticket identifier (e.g. "AI-1776")
+ * @param authToken     Linear auth token (Bearer ...) for API calls
+ * @param callerBodyId  The body ID of the caller (must be a steward)
+ * @param opts.force    When true, allows overwriting an existing record
+ */
+export async function recaptureAc(
+  ticketId: string,
+  authToken: string,
+  callerBodyId: string,
+  opts?: { force?: boolean },
+): Promise<void> {
+  // ── Authorization: steward-only ──────────────────────────────────────────
+  const stewardBodies = await resolveBodiesForRole("steward");
+  if (!stewardBodies.includes(callerBodyId)) {
+    throw new Error(
+      `recaptureAc: caller '${callerBodyId}' is not authorized — only steward bodies can recapture the AC of record`,
+    );
+  }
+
+  const force = opts?.force === true;
+
+  // ── Overwrite guard ────────────────────────────────────────────────────────
+  const existing = await getAcRecord(ticketId);
+  if (existing && !force) {
+    throw new Error(
+      `recaptureAc: an AC record already exists for ${ticketId} (captured by ${existing.capturedBy}). Use { force: true } to overwrite.`,
+    );
+  }
+
+  // ── Fetch description ─────────────────────────────────────────────────────
+  const descriptionQuery = `query IssueDescription($id: String!) { issue(id: $id) { description } }`;
+  let description: string;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: descriptionQuery, variables: { id: ticketId } }),
+    });
+    type DescResp = { data?: { issue?: { description?: string | null } } };
+    const data = (await res.json()) as DescResp;
+    const desc = data.data?.issue?.description;
+    if (desc === undefined || desc === null) {
+      throw new Error("description fetch returned no description");
+    }
+    description = desc;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`recaptureAc: could not fetch description for ${ticketId}: ${msg}`);
+  }
+
+  // ── Extract AC ─────────────────────────────────────────────────────────────
+  const verbatimAc = extractAcFromDescription(description);
+  if (!verbatimAc) {
+    throw new Error(
+      `recaptureAc: no acceptance criteria header found in the description for ${ticketId} — cannot create AC record`,
+    );
+  }
+
+  // ── Store (capture) ─────────────────────────────────────────────────────────
+  const capturedAt = new Date().toISOString();
+  await captureAc(ticketId, {
+    verbatimAc,
+    capturedAt,
+    capturedBy: callerBodyId,
+    source: "description",
+  });
+  log.info(`recaptureAc: captured AC for ${ticketId} (by ${callerBodyId}, force=${force}, ${verbatimAc.length} chars)`);
+
+  // ── Comment trail on forced overwrite ───────────────────────────────────────
+  if (existing && force) {
+    const commentMutation = `
+      mutation($issueId: String!, $body: String!) {
+        commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
+      }
+    `;
+    const commentBody =
+      `[AC Recapture] AC of record force-overwritten by steward **${callerBodyId}** at ${capturedAt}. ` +
+      `The previous record (captured by ${existing.capturedBy}) has been replaced with the current description's acceptance criteria.`;
+    try {
+      await fetch(LINEAR_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authToken },
+        body: JSON.stringify({
+          query: commentMutation,
+          variables: { issueId: ticketId, body: commentBody },
+        }),
+      });
+      log.info(`recaptureAc: posted force-overwrite comment trail for ${ticketId}`);
+    } catch (err) {
+      log.warn(`recaptureAc: failed to post force-overwrite comment for ${ticketId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 }
