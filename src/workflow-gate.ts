@@ -1856,11 +1856,30 @@ export async function checkRawMutationInterception(
   //   - caller is a known non-delegate            → block
   //   - caller unverifiable + ticket has delegate → block (AI-1400 B2 parity)
   //   - no current delegate / no caller+delegate  → fail-open (establishing first delegate)
+  //
+  // AI-1835: the current-delegate allowance must NOT extend to clearing the
+  // delegate (delegateId → null). A null write is a self-clear, not a re-route
+  // — it is the shape of the ungoverned direct-Done bypass (the `complete` verb
+  // clears delegate + assignee + state). A non-null delegateId write remains
+  // legitimate (handoff-work, undelegate).
+  const inputDelegateId =
+    vars?.input && typeof vars.input === "object"
+      ? (vars.input as Record<string, unknown>).delegateId
+      : undefined;
+  const isClearingDelegate =
+    hasDelegateChange && (inputDelegateId === null || /\bdelegateId\s*:\s*null\b/.test(q));
   const delegateOnlyChange =
     hasDelegateChange && !hasStateChange && !hasAssigneeChange && !hasLabelChange;
   if (delegateOnlyChange) {
     if (callerLinearUserId && delegateId && callerLinearUserId === delegateId) {
-      return null; // current delegate may re-route
+      if (isClearingDelegate) {
+        log.warn(`workflow-gate: raw delegate null (self-clear) block agent=${bodyId} ticket=${issueId}`);
+        return (
+          `[Proxy] Direct delegate clear blocked: the current delegate may re-route ${issueId} ` +
+          `but may not null the delegate field directly. Use undelegate or handoff-work to release ownership.`
+        );
+      }
+      return null; // current delegate may re-route (non-null target only)
     }
     if (!callerLinearUserId && delegateId) {
       log.warn(`workflow-gate: raw delegate unknown-caller block agent=${bodyId} ticket=${issueId}`);
