@@ -21,7 +21,7 @@ import { resolveBodiesForRole } from "./escalation-gate.js";
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "ac-record-store");
 
 /** Default path for persisted AC records. Override via AC_RECORDS_PATH env. */
-const DEFAULT_AC_RECORDS_PATH = "/tmp/ac-records.json";
+const DEFAULT_AC_RECORDS_PATH = "data/ac-records.json";
 
 /** Linear GraphQL API endpoint (used by recaptureAc to fetch description / post comments). */
 const LINEAR_API_URL = "https://api.linear.app/graphql";
