@@ -533,6 +533,42 @@ export function createAdminRouter(deps: AdminDeps): Router {
       configHealth: getConfigHealthStatus(),
     });
   });
+  // AI-1802: Per-agent capacity strip (slots used / cap, parked count).
+  // Read-only feed for the console's fleet/board page. Only agents with
+  // any live sessions or parked tickets appear (idle agents are filtered
+  // out). Cap source: per-agent maxConcurrent from agents.json with
+  // fallback to AGENT_DEFAULT_MAX_CONCURRENT (3) — NOT delivery/throttle.ts.
+  router.get("/api/capacity", (_req: Request, res: Response) => {
+    const DEFAULT_MAX_CONCURRENT = 3;
+    const agents = getAgents();
+
+    // Build cap lookup: every known name/openclawAgent alias → maxConcurrent.
+    const capByAgentId = new Map<string, number>();
+    for (const agent of agents) {
+      const cap = agent.maxConcurrent ?? DEFAULT_MAX_CONCURRENT;
+      capByAgentId.set(agent.name, cap);
+      if (agent.openclawAgent) {
+        capByAgentId.set(agent.openclawAgent, cap);
+      }
+    }
+
+    // Collect all agent IDs that have live sessions or parked work.
+    const liveAgents = deps.sessionTracker.getActiveAgents();
+    const parkedAgents = deps.bag.getAgentStats().map((s) => s.agentId);
+    const allIds = [...new Set([...liveAgents, ...parkedAgents])];
+
+    const result = allIds
+      .map((agentId) => {
+        const slotsUsed = deps.sessionTracker.getActiveSessionKeys(agentId).length;
+        const parkedCount = deps.bag.getPendingTickets(agentId).length;
+        const cap = capByAgentId.get(agentId) ?? DEFAULT_MAX_CONCURRENT;
+        return { agentId, slotsUsed, cap, parkedCount };
+      })
+      .filter((a) => a.slotsUsed > 0 || a.parkedCount > 0);
+
+    res.json({ agents: result });
+  });
+
   // AI-1799 AC4: Board read API — enrolled-tickets mirror joined with
   // latest wake_id status from the operational event store.
   router.get("/api/board", (_req: Request, res: Response) => {

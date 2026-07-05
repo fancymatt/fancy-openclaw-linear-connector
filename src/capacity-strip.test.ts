@@ -36,6 +36,7 @@ function getApp(...dbPaths: string[]) {
   return createApp({
     enrolledTicketsDbPath: dbPaths[0],
     operationalEventsDbPath: dbPaths[1],
+    bagDbPath: dbPaths[2],
   });
 }
 
@@ -76,13 +77,15 @@ describe("AI-1802 AC1: GET /admin/api/capacity — per-agent capacity strip", ()
   let app: ReturnType<typeof createApp>;
   let mirrorDbPath: string;
   let eventsDbPath: string;
+  let bagDbPath: string;
   let sessionTracker: SessionTracker;
   let bag: PendingWorkBag;
 
   beforeEach(() => {
     mirrorDbPath = tmpDbPath("mirror");
     eventsDbPath = tmpDbPath("events");
-    app = getApp(mirrorDbPath, eventsDbPath);
+    bagDbPath = tmpDbPath("bag");
+    app = getApp(mirrorDbPath, eventsDbPath, bagDbPath);
     sessionTracker = getSessionTracker(app);
     bag = getBag(app);
   });
@@ -92,6 +95,7 @@ describe("AI-1802 AC1: GET /admin/api/capacity — per-agent capacity strip", ()
     delete process.env.ADMIN_SECRET;
     fs.rmSync(path.dirname(mirrorDbPath), { recursive: true, force: true });
     fs.rmSync(path.dirname(eventsDbPath), { recursive: true, force: true });
+    fs.rmSync(path.dirname(bagDbPath), { recursive: true, force: true });
   });
 
   // -----------------------------------------------------------------------
