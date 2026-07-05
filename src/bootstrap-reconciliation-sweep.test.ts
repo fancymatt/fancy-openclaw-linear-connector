@@ -33,6 +33,7 @@ import {
 } from "./bootstrap-reconciliation-sweep.js";
 import { AlertBus } from "./alerts/alert-bus.js";
 import { AlertStore } from "./alerts/alert-store.js";
+import { resetWorkflowCache } from "./workflow-gate.js";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -202,9 +203,30 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
 
 let tmpDir: string;
 let savedFetch: typeof globalThis.fetch;
+let savedWorkflowDefsDir: string | undefined;
+
+/** Minimal dev-impl workflow YAML for file-based registry load (cron tests). */
+const DEV_IMPL_YAML = `id: dev-impl
+entry_state: intake
+states:
+  - id: intake
+    owner_role: steward
+    native_state: thinking
+  - id: write-tests
+    owner_role: test-author
+    native_state: thinking
+  - id: implementation
+    owner_role: dev
+    native_state: doing
+  - id: done
+    native_state: done
+  - id: escape
+    native_state: invalid
+`;
 
 beforeAll(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "bootstrap-reconciliation-test-"));
+  fs.writeFileSync(path.join(tmpDir, "dev-impl.yaml"), DEV_IMPL_YAML);
 });
 
 afterAll(() => {
@@ -213,10 +235,14 @@ afterAll(() => {
 
 beforeEach(() => {
   savedFetch = globalThis.fetch;
+  savedWorkflowDefsDir = process.env.WORKFLOW_DEFS_DIR;
 });
 
 afterEach(() => {
   globalThis.fetch = savedFetch;
+  if (savedWorkflowDefsDir === undefined) delete process.env.WORKFLOW_DEFS_DIR;
+  else process.env.WORKFLOW_DEFS_DIR = savedWorkflowDefsDir;
+  resetWorkflowCache();
   jest.restoreAllMocks();
 });
 
@@ -665,5 +691,124 @@ describe("registerBootstrapReconciliationCron", () => {
       const timer = registerBootstrapReconciliationCron({ authToken: "", intervalMs: 10_000 });
       clearInterval(timer);
     }).not.toThrow();
+  });
+});
+
+// ── Cron entry-point behavioral test (AC1 + AC2 through the prod path) ─────
+//
+// This is the test that closes the exact gap from AC-validation round 2:
+// the unit tests above inject alertBus/wakeFn directly into
+// runBootstrapReconciliationSweep, but nothing asserted the *cron entry*
+// actually forwards those collaborators. A heal through the cron must produce
+// exactly one alert AND one wake — string-matching index.ts is not enough.
+
+describe("registerBootstrapReconciliationCron: behavioral — heal produces alert + wake", () => {
+  beforeEach(() => {
+    // Point the workflow registry at our test YAML so applyBootstrapToIssue
+    // can resolve the dev-impl workflow without a caller-injected registry.
+    process.env.WORKFLOW_DEFS_DIR = tmpDir;
+    resetWorkflowCache();
+  });
+
+  it("a heal through the cron entry point produces at least one alert and one wake dispatch", async () => {
+    const { bus, alerts } = makeTestAlertBus();
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+
+    // Stub the Linear API to return one unenrolled ticket past the grace window
+    globalThis.fetch = makeReconciliationFetch({
+      unenrolledTickets: [
+        {
+          id: ISSUE_ID_UNENROLLED,
+          identifier: "AI-9999",
+          updatedAt: OLD_TIMESTAMP,
+          labelNodes: [{ id: WF_LABEL_ID, name: WF_LABEL_NAME }],
+          delegateId: null,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    // Register with a short interval + both collaborators wired
+    const timer = registerBootstrapReconciliationCron({
+      authToken: "Bearer test-token",
+      intervalMs: 50,
+      alertBus: bus,
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+    });
+
+    // Wait for the cron to tick at least once
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    clearInterval(timer);
+
+    // AC1: at least one wake dispatched — the cron forwarded wakeFn to the sweep
+    expect(wakeDispatches.length).toBeGreaterThanOrEqual(1);
+    expect(wakeDispatches[0].ticketIdentifier).toBe("AI-9999");
+
+    // AC2: at least one bootstrap-reconciled alert — the cron forwarded alertBus
+    const reconcileAlerts = alerts.filter((a) => a.source === "bootstrap-reconciled");
+    expect(reconcileAlerts.length).toBeGreaterThanOrEqual(1);
+    expect(reconcileAlerts[0].severity).toBe("warning");
+  });
+
+  it("does not dispatch a wake when no unenrolled tickets are found", async () => {
+    const { bus } = makeTestAlertBus();
+    const wakeDispatches: string[] = [];
+
+    globalThis.fetch = makeReconciliationFetch({ unenrolledTickets: [] });
+
+    const timer = registerBootstrapReconciliationCron({
+      authToken: "Bearer test-token",
+      intervalMs: 50,
+      alertBus: bus,
+      wakeFn: async (_, id) => { wakeDispatches.push(id); },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    clearInterval(timer);
+
+    expect(wakeDispatches).toHaveLength(0);
+  });
+
+  it("alerts via the global bus when alertBus is not explicitly passed", async () => {
+    // The prod cron path in index.ts omits alertBus, relying on the global
+    // singleton. This test verifies the default fires an alert.
+    const wakeDispatches: string[] = [];
+    const { getAlertBus, _resetAlertBusForTests } = await import("./alerts/alert-bus.js");
+    _resetAlertBusForTests();
+    const globalBus = getAlertBus();
+    const alertSpy = jest.spyOn(globalBus, "notify");
+
+    globalThis.fetch = makeReconciliationFetch({
+      unenrolledTickets: [
+        {
+          id: ISSUE_ID_UNENROLLED,
+          identifier: "AI-GLOBAL-BUS",
+          updatedAt: OLD_TIMESTAMP,
+          labelNodes: [{ id: WF_LABEL_ID, name: WF_LABEL_NAME }],
+          delegateId: null,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const timer = registerBootstrapReconciliationCron({
+      authToken: "Bearer test-token",
+      intervalMs: 50,
+      wakeFn: async (_, id) => { wakeDispatches.push(id); },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    clearInterval(timer);
+
+    // Should have alerted through the global bus
+    expect(alertSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ source: "bootstrap-reconciled" }),
+    );
+    expect(wakeDispatches.length).toBeGreaterThanOrEqual(1);
+
+    alertSpy.mockRestore();
+    _resetAlertBusForTests();
   });
 });

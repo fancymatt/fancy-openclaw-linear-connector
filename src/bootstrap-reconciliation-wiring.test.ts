@@ -38,4 +38,14 @@ describe("AI-1775: bootstrap reconciliation cron is wired in index.ts", () => {
     expect(INDEX_TS.includes("LINEAR_OAUTH_TOKEN")).toBe(true);
     expect(INDEX_TS.includes("LINEAR_API_KEY")).toBe(true);
   });
+
+  it("passes a wakeFn that uses buildWorkflowAwareDeliveryMessage + deliverMessageToAgent", () => {
+    // AC1 round-2 fix: the cron entry point must forward a wakeFn so healed
+    // tickets actually notify their delegate. String-matching index.ts is the
+    // regression guard; the behavioral test in the sweep suite covers runtime.
+    expect(INDEX_TS.includes("wakeFn")).toBe(true);
+    expect(INDEX_TS.includes("buildWorkflowAwareDeliveryMessage")).toBe(true);
+    expect(INDEX_TS.includes("deliverMessageToAgent")).toBe(true);
+    expect(INDEX_TS.includes("normalizeSessionKey")).toBe(true);
+  });
 });

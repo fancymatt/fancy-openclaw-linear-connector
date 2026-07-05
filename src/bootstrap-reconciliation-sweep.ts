@@ -27,7 +27,7 @@ import {
   applyBootstrapToIssue,
   type WorkflowDef,
 } from "./workflow-bootstrap.js";
-import type { AlertBus } from "./alerts/alert-bus.js";
+import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "bootstrap-reconciliation");
 
@@ -156,7 +156,10 @@ export async function runBootstrapReconciliationSweep(
   const graceWindowMs = opts.graceWindowMs ?? DEFAULT_GRACE_WINDOW_MS;
   const nowMs = opts.nowMs ?? Date.now();
   const fetchFn = opts.fetchFn ?? globalThis.fetch;
-  const alertBus = opts.alertBus;
+  // Default to the global alert bus singleton so the prod cron path always
+  // emits alerts even when the caller (index.ts) doesn't inject one.
+  // Tests inject their own bus to assert alert behavior.
+  const alertBus = opts.alertBus ?? getAlertBus();
   const wakeFn = opts.wakeFn;
 
   const result: ReconciliationSweepResult = {
@@ -174,7 +177,7 @@ export async function runBootstrapReconciliationSweep(
     const msg = err instanceof Error ? err.message : String(err);
     result.errors.push(`query failed: ${msg}`);
     log.error(`bootstrap-reconciliation: query failed: ${msg}`);
-    alertBus?.notify({
+    alertBus.notify({
       severity: "warning",
       source: "bootstrap-reconciled",
       title: `Bootstrap reconciliation sweep query failed: ${msg}`,
@@ -238,7 +241,7 @@ export async function runBootstrapReconciliationSweep(
         }
 
         // Emit deduped warning alert — a heal is evidence a webhook was dropped
-        alertBus?.notify({
+        alertBus.notify({
           severity: "warning",
           source: "bootstrap-reconciled",
           title: `Bootstrap reconciliation healed ${ticket.identifier}`,
@@ -256,7 +259,7 @@ export async function runBootstrapReconciliationSweep(
       const msg = err instanceof Error ? err.message : String(err);
       result.errors.push(`heal failed for ${ticket.identifier}: ${msg}`);
       log.error(`bootstrap-reconciliation: heal failed for ${ticket.identifier}: ${msg}`);
-      alertBus?.notify({
+      alertBus.notify({
         severity: "warning",
         source: "bootstrap-reconciled",
         title: `Bootstrap reconciliation heal error for ${ticket.identifier}`,
@@ -278,12 +281,29 @@ export async function runBootstrapReconciliationSweep(
  * `index.ts` via `getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ??
  * process.env.LINEAR_API_KEY`, matching every other server-side Linear call.
  *
+ * **Wake wiring (AC1):** the caller MUST supply a `wakeFn` that delivers a
+ * workflow-aware wake to the healed delegate — identical to the post-bootstrap
+ * wake delivery in the webhook path. Without it, a healed ticket gets labels
+ * + delegate but the delegate is never notified.
+ *
+ * **Alert bus (AC2/AC4):** if `alertBus` is omitted, the sweep defaults to the
+ * global alert-bus singleton (`getAlertBus()`), so alerts always fire in prod.
+ *
  * Returns the NodeJS.Timeout so the caller can clear it (e.g. on shutdown).
  * In production this is called once from index.ts alongside other periodic
  * loops.
  */
 export function registerBootstrapReconciliationCron(
-  opts: { authToken: string; intervalMs?: number },
+  opts: {
+    authToken: string;
+    intervalMs?: number;
+    /** Alert bus for heal/failure notifications. Defaults to the global singleton. */
+    alertBus?: AlertBus;
+    /** Delivers a wake to the first-owner delegate after a successful heal.
+     *  Required for AC1 in the prod path — index.ts wires this to the same
+     *  delivery mechanism the webhook bootstrap path uses. */
+    wakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
+  },
 ): NodeJS.Timeout {
   const intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
 
@@ -298,6 +318,8 @@ export function registerBootstrapReconciliationCron(
     // via the alert bus, not propagated to the interval handler.
     void runBootstrapReconciliationSweep({
       authToken: opts.authToken,
+      alertBus: opts.alertBus,
+      wakeFn: opts.wakeFn,
     }).catch((err) => {
       log.error(
         `bootstrap-reconciliation: unexpected sweep failure: ${err instanceof Error ? err.message : String(err)}`,
@@ -307,6 +329,6 @@ export function registerBootstrapReconciliationCron(
 
   timer.unref();
 
-  log.info(`bootstrap-reconciliation: cron registered (${intervalMs}ms interval)`);
+  log.info(`bootstrap-reconciliation: cron registered (${intervalMs}ms interval, wakeFn=${opts.wakeFn ? "wired" : "absent"})`);
   return timer;
 }

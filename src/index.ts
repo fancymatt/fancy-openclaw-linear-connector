@@ -13,7 +13,8 @@ import { OperationalEventStore } from "./store/operational-event-store.js";
 import { ObservationStore } from "./store/observation-store.js";
 import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
-import { deliverToAgent, deliverMessageToAgent, DeliveryThrottle } from "./delivery/index.js";
+import { deliverToAgent, deliverMessageToAgent, type DeliveryConfig, DeliveryThrottle } from "./delivery/index.js";
+import { buildWorkflowAwareDeliveryMessage } from "./delivery/build-message.js";
 import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, StuckDelegateDetector, HoldRetryTracker, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { getTicketNoActivityTimeoutMs } from "./workflow-gate.js";
@@ -924,8 +925,32 @@ if (isEntryPoint) {
 
   // AI-1775: periodic reconciliation sweep — heal wf:* tickets that never
   // enrolled (dropped Issue-update webhook). Safety net for the bootstrap path.
+  // The wakeFn delivers a workflow-aware wake to the healed delegate via the
+  // same delivery primitive the webhook bootstrap path uses (buildWorkflowAware
+  // DeliveryMessage + deliverMessageToAgent), so a healed ticket is not just
+  // labeled-and-delegated but actually surfaced to its owner.
+  const reconciliationAuthToken =
+    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const reconciliationWakeFn = async (agentName: string, ticketIdentifier: string) => {
+    const sessionKey = normalizeSessionKey(ticketIdentifier);
+    const agentCfg = getAgent(agentName);
+    const deliveryConfig: DeliveryConfig = {
+      nodeBin: process.execPath,
+      hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
+      hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
+      hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+      hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+    };
+    const actionText = `You were delegated ${ticketIdentifier}`;
+    const message =
+      (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, reconciliationAuthToken, actionText)) ??
+      actionText;
+    await deliverMessageToAgent(agentName, sessionKey, message, deliveryConfig);
+  };
+
   registerBootstrapReconciliationCron({
-    authToken: getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "",
+    authToken: reconciliationAuthToken,
+    wakeFn: reconciliationWakeFn,
   });
 
   // G-20: scheduled gate-silently-off canary (AI-1552, §5.1)
