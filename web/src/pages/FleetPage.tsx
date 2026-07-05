@@ -1,6 +1,7 @@
 import { apiGet } from "../api";
 import { usePoll, ageLabel } from "../hooks";
 import { Card, Chip, Diagnostics, Empty, ErrorBanner } from "../components";
+import { CapacityStrip } from "../components/CapacityStrip";
 import type { FleetResponse } from "../types";
 
 const ACK_TONE: Record<string, string> = {
@@ -20,6 +21,7 @@ export function FleetPage() {
   return (
     <>
       <ErrorBanner message={fleet.error} />
+      <CapacityStrip />
       <div className="grid">
         <Card span={12} title={`Fleet liveness (${f?.agents.length ?? "…"} agents)`}>
           {f ? (

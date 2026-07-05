@@ -160,6 +160,47 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 .stat .value { font-size: 22px; font-weight: 750; }
 .stat .label { color: var(--muted); font-size: 12px; margin-top: 2px; }
 
+.capacity-strip {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.capacity-agent {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #0e151d;
+}
+.capacity-agent.over-cap {
+  border-color: #72413f;
+  background: #1a1210;
+}
+.capacity-name {
+  font-weight: 700;
+  font-size: 13px;
+}
+.capacity-meters {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.capacity-slots .over {
+  color: var(--red);
+  font-weight: 750;
+}
+.capacity-slots {
+  font-weight: 650;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+.capacity-parked {
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 .wf-state {
   border: 1px solid var(--line);
   border-radius: 12px;
