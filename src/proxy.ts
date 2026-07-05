@@ -31,7 +31,7 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, resolveMetaIntent, verifyCommentSatisfiedBy, type TransitionFeedback } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, resolveMetaIntent, verifyCommentSatisfiedBy, type TransitionFeedback, type StateTransitionResult } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
@@ -360,6 +360,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
     const runCommand = async (): Promise<void> => {
       // AI-1498: capture the ticket's workflow state BEFORE forwarding.
       let sourceStateOverride: string | undefined;
+      let transitionMeta: StateTransitionResult | undefined;
 
       // Resolve meta-intents (continue-workflow, request-revision) to actual workflow
       // command names before any enforcement layer sees them. The original intent is
@@ -540,7 +541,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
               freeText: extractCommentBody(body),
             };
           }
-          await applyStateTransition(effectiveIntent, issueId, authorization, {
+          const transitionResult = await applyStateTransition(effectiveIntent, issueId, authorization, {
             bodyId: agentId,
             observationStore: deps?.observationStore,
             feedback,
@@ -549,6 +550,9 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             cliTarget: target ?? undefined,
             enrolledTicketsStore: deps?.enrolledTicketsStore,
           });
+          if (transitionResult && transitionResult.status === "applied") {
+            transitionMeta = transitionResult;
+          }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           log.warn(`state-transition failed agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg}`);
@@ -563,10 +567,15 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           log.warn(`reminder-build failed agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg}`);
         }
 
-        if (workflowReminder) {
+        if (workflowReminder || transitionMeta) {
           try {
             const parsedResponse = JSON.parse(responseText);
-            parsedResponse._workflowReminder = workflowReminder;
+            if (workflowReminder) {
+              parsedResponse._workflowReminder = workflowReminder;
+            }
+            if (transitionMeta) {
+              parsedResponse._workflowTransition = transitionMeta;
+            }
             res.status(upstreamRes.status).set("Content-Type", "application/json").send(JSON.stringify(parsedResponse));
             return;
           } catch {

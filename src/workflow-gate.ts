@@ -2141,24 +2141,32 @@ export interface ApplyStateTransitionOptions {
   enrolledTicketsStore?: EnrolledTicketsStore;
 }
 
+export interface StateTransitionResult {
+  status: "applied" | "no-op";
+  from: string | null;
+  to: string | null;
+}
+
+const NOOP_RESULT: StateTransitionResult = { status: "no-op", from: null, to: null };
+
 export async function applyStateTransition(
   intent: string,
   issueId: string | null,
   authToken: string,
   options?: ApplyStateTransitionOptions,
-): Promise<void> {
+): Promise<StateTransitionResult> {
   // TODO(AI-1347): no-op on missing issueId carries the same fail-open posture as B1.
-  if (!issueId) return;
+  if (!issueId) return NOOP_RESULT;
 
   const issue = await fetchIssueWithLabels(issueId, authToken);
   if (!issue) {
     log.warn(`workflow-gate: B2 apply: could not fetch labels for ${issueId} — skipping`);
-    return;
+    return NOOP_RESULT;
   }
 
   const labelNames = issue.labels.map((l) => l.name);
   const workflowId = getWorkflowId(labelNames);
-  if (!workflowId) return; // ad-hoc ticket — no-op
+  if (!workflowId) return NOOP_RESULT; // ad-hoc ticket — no-op
 
   let def: WorkflowDef | undefined;
   try {
@@ -2167,10 +2175,10 @@ export async function applyStateTransition(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: B2 apply: failed to load workflow registry: ${msg} — skipping`);
-    return;
+    return NOOP_RESULT;
   }
 
-  if (!def) return; // unknown workflow — no-op (AI-1530)
+  if (!def) return NOOP_RESULT; // unknown workflow — no-op (AI-1530)
 
   // AI-1498 fix: prefer the captured pre-forward state. The CLI advances the
   // state:* label inside its own forwarded mutation, so by now `labelNames`
@@ -2179,14 +2187,20 @@ export async function applyStateTransition(
   // true source before forwarding and passes it as sourceStateOverride.
   const actualStateName = getCurrentState(labelNames);
   const currentStateName = options?.sourceStateOverride ?? actualStateName;
-  if (!currentStateName) {
-    log.warn(`workflow-gate: B2 apply: no state:* label on ${issueId} — skipping`);
-    return;
-  }
 
   const breakGlassCommand = def.break_glass?.command ?? "escape";
+
+  // AI-1813: break-glass (escape) must work even when the state:* label is
+  // missing — the exact corruption it exists to fix. Treat missing source
+  // state as `from: null` and proceed to the break-glass application.
+  if (!currentStateName && intent !== breakGlassCommand) {
+    log.warn(`workflow-gate: B2 apply: no state:* label on ${issueId} — skipping (non-break-glass intent: ${intent})`);
+    return NOOP_RESULT;
+  }
+
   let toStateName: string;
   let matchedTransition: WorkflowTransition | undefined;
+  const fromState = currentStateName ?? null;
 
   if (intent === breakGlassCommand) {
     toStateName = def.break_glass?.to ?? "escape";
@@ -2198,7 +2212,7 @@ export async function applyStateTransition(
       log.warn(
         `workflow-gate: B2 apply: no transition for '${intent}' in state '${currentStateName}' on ${issueId} — skipping`,
       );
-      return;
+      return NOOP_RESULT;
     }
     toStateName = matchedTransition.to;
   }
@@ -2218,7 +2232,7 @@ export async function applyStateTransition(
     log.info(
       `workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels`,
     );
-    return;
+    return NOOP_RESULT;
   }
 
   // ── Idempotency check (AI-1490 hardened) ────────────────────────────────
@@ -2236,7 +2250,7 @@ export async function applyStateTransition(
       log.info(
         `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' with label present — no-op`,
       );
-      return;
+      return NOOP_RESULT;
     }
     // Label is missing despite being in the correct state — re-stamp.
     log.warn(
@@ -2249,7 +2263,7 @@ export async function applyStateTransition(
     );
     if (!newLabelId) {
       log.warn(`workflow-gate: B2 apply: could not create label '${targetLabelName}' for re-stamp on ${issueId} — skipping`);
-      return;
+      return NOOP_RESULT;
     }
     // Remove any stale state:* labels and add the correct one.
     const cleanedLabelIds = issue.labels
@@ -2260,7 +2274,7 @@ export async function applyStateTransition(
     if (applied) {
       log.info(`workflow-gate: B2 apply: ${issueId} re-stamped label '${targetLabelName}'`);
     }
-    return;
+    return NOOP_RESULT;
   }
 
   // ── AI-1475 Defect 1 + AI-1492 + AI-1497: Merged-PR release gate defense-in-depth (§5.6) ─
@@ -2295,7 +2309,7 @@ export async function applyStateTransition(
         if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
         if (!branchStatus.hasPR) missing.push('no pull request associated');
         log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
-        return; // Block the transition
+        return NOOP_RESULT; // Block the transition
       }
     } else if (noEvidenceAtAll) {
       log.info(`workflow-gate: B2 apply: done gate for ${issueId} — no branch/PR evidence, treating as merged (AI-1497 fail-open)`);
@@ -2308,25 +2322,25 @@ export async function applyStateTransition(
   // parent's own AC is verified, not the sum of children.
   // Fail-closed: if the AC gate cannot be evaluated (description fetch error),
   // block the transition to prevent premature done.
-  const disposition = resolveDisposition(workflowId, currentStateName, intent);
+  const disposition = currentStateName ? resolveDisposition(workflowId, currentStateName, intent) : null;
   if (disposition === "done") {
     try {
       log.info(`workflow-gate: B-4 review: evaluating parent-AC gate for ${issueId} (review → done)`);
       const acResult = await dispositionToDone(issueId, authToken);
       if (!acResult.applied) {
         log.warn(`workflow-gate: B-4 review: → done blocked for ${issueId}: ${acResult.error ?? "unknown"}`);
-        return; // Block the transition — AC gate failed
+        return NOOP_RESULT; // Block the transition — AC gate failed
       }
       // AC gate passed and dispositionToDone already applied the label swap + comment.
       // Skip the normal atomic swap below — dispositionToDone handled it.
       // AI-1534: terminal state, no further per-step delivery — drop any cached state.
       clearAppliedState(issue.identifier);
       log.info(`workflow-gate: B-4 review: ${issueId} review → done (parent AC satisfied)`);
-      return;
+      return NOOP_RESULT;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`workflow-gate: B-4 review: parent-AC gate failed for ${issueId}: ${msg} — blocking transition`);
-      return;
+      return NOOP_RESULT;
     }
   }
 
@@ -2343,7 +2357,7 @@ export async function applyStateTransition(
         // drop the now-stale cached state rather than leave a wrong override.
         clearAppliedState(issue.identifier);
         log.info(`workflow-gate: B-4 review: ${issueId} review → spawning (follow-up)`);
-        return;
+        return NOOP_RESULT;
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -2380,7 +2394,7 @@ export async function applyStateTransition(
       } catch (commentErr) {
         log.warn(`workflow-gate: C-2: failed to post diagnostic comment for ${issueId}: ${commentErr instanceof Error ? commentErr.message : String(commentErr)}`);
       }
-      return; // Block the transition
+      return NOOP_RESULT; // Block the transition
     }
     log.info(`workflow-gate: C-2: sprint artifact gate: ${issueId} artifact '${artifact.ref}' present — allowing validating → done`);
   }
@@ -2436,7 +2450,7 @@ export async function applyStateTransition(
     log.error(
       `workflow-gate: B2 apply: FAIL-CLOSED — could not resolve label id for state:${toStateName}. Transition aborted.`,
     );
-    return;
+    return NOOP_RESULT;
   }
 
   // AI-1498 fix: compute the target label set robustly — strip ALL state:* labels
@@ -2481,7 +2495,7 @@ export async function applyStateTransition(
         log.error(
           `workflow-gate: B2 apply: FAIL-CLOSED — CLI target '${explicitTarget}' cannot be resolved to a Linear user ID for ${issueId}. Register the agent in agents.json with a linearUserId. Transition aborted.`,
         );
-        return;
+        return NOOP_RESULT;
       }
     }
 
@@ -2499,7 +2513,7 @@ export async function applyStateTransition(
           log.error(
             `workflow-gate: B2 apply: FAIL-CLOSED — prior implementer '${priorImplementer}' has no linearUserId. Cannot route ${intent} on ${issueId}.`,
           );
-          return;
+          return NOOP_RESULT;
         }
       } else {
         log.warn(
@@ -2529,13 +2543,13 @@ export async function applyStateTransition(
           log.error(
             `workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) on '${intent}' for ${issueId} requires a CLI --target${wantsPriorImplementer ? " (no prior implementer recorded)" : ""} but none was supplied. Transition aborted.`,
           );
-          return;
+          return NOOP_RESULT;
         } else {
           if (intent === 'approve' || intent === 'reject') {
             log.error(
               `workflow-gate: B2 apply: FAIL-CLOSED — no bodies found for role '${destOwnerRole}' on '${intent}'. Transition aborted per AI-1493.`,
             );
-            return;
+            return NOOP_RESULT;
           }
           log.warn(
             `workflow-gate: B2 apply: no bodies found for role '${destOwnerRole}' on '${intent}' — skipping auto-delegate`,
@@ -2546,7 +2560,7 @@ export async function applyStateTransition(
         log.error(
           `workflow-gate: B2 apply: FAIL-CLOSED — role resolution failed for '${destOwnerRole}': ${msg}. Transition aborted.`,
         );
-        return;
+        return NOOP_RESULT;
       }
     }
   }
@@ -2589,7 +2603,7 @@ export async function applyStateTransition(
       log.error(
         `workflow-gate: B2 apply: FAIL-CLOSED — could not resolve native stateId for '${destNativeState}' on team ${issue.teamId}. Transition aborted.`,
       );
-      return;
+      return NOOP_RESULT;
     }
     resolvedNativeStateId = stateId;
     log.info(
@@ -2601,7 +2615,7 @@ export async function applyStateTransition(
     log.error(
       `workflow-gate: B2 apply: FAIL-CLOSED — destination state '${toStateName}' has no native_state field. Transition aborted.`,
     );
-    return;
+    return NOOP_RESULT;
   }
 
   // Step 5: Apply the FULL transition atomically (labels + delegate + native state in one mutation).
@@ -2649,7 +2663,7 @@ export async function applyStateTransition(
     }
 
     log.info(
-      `workflow-gate: B2 apply: ${issueId} state:${currentStateName} → state:${toStateName}` +
+      `workflow-gate: B2 apply: ${issueId} state:${fromState} → state:${toStateName}` +
       (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
       (resolvedNativeStateId ? ` native=${destNativeState}(${resolvedNativeStateId})` : ``),
     );
@@ -2657,7 +2671,7 @@ export async function applyStateTransition(
     log.error(
       `workflow-gate: B2 apply: atomic mutation FAILED for ${issueId} — all facets rolled back (no partial state)`,
     );
-    return;
+    return NOOP_RESULT;
   }
 
   // ── §5.7 item 1 / C-2: Artifact-binding recording ────────────────────
@@ -2730,7 +2744,7 @@ export async function applyStateTransition(
             `${issueId} managing → (next state) (${barrierResult.totalChildren} children)`,
           );
           clearAppliedState(issue.identifier);
-          return;
+          return NOOP_RESULT;
         }
         log.info(
           `workflow-gate: AI-1730: onManagingEntry returned no transition for ${issueId} — children still active`,
@@ -2801,6 +2815,10 @@ export async function applyStateTransition(
       log.warn(`workflow-gate: B-3 barrier check failed for ${issueId}: ${msg}`);
     }
   }
+
+  return applied
+    ? { status: "applied", from: fromState, to: toStateName }
+    : NOOP_RESULT;
 }
 
 /**

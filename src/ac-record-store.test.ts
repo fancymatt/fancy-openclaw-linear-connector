@@ -13,6 +13,7 @@ import {
   removeAcRecord,
   clearAcRecordStore,
   extractAcFromDescription,
+  acRecordsPath,
 } from "./ac-record-store.js";
 
 // Use a temp file for persistence tests so we don't pollute /tmp
@@ -158,35 +159,21 @@ describe("ac-record-store", () => {
 
   describe("default path durability", () => {
     it("does not default to /tmp (AI-1818 AC1)", async () => {
-      // Verify that when no AC_RECORDS_PATH is set, the resolved path is durable
-      // (not /tmp). We test by clearing the env var, forcing a reload, and checking
-      // that persist writes to a non-/tmp location.
+      // Verify that when no AC_RECORDS_PATH is set, the resolved default path is
+      // durable (not under /tmp). Pure path-string check — no filesystem side effects.
       const original = process.env.AC_RECORDS_PATH;
       delete process.env.AC_RECORDS_PATH;
-      clearAcRecordStore();
-
-      await captureAc("AI-TEST-DURABLE", {
-        verbatimAc: "durable test",
-        capturedAt: "2026-07-05T00:00:00Z",
-        capturedBy: "test",
-        source: "description",
-      });
-
-      // The file should exist at data/ac-records.json relative to the repo root
-      const { existsSync } = await import("node:fs");
-      const defaultPath = "data/ac-records.json";
-      expect(existsSync(defaultPath)).toBe(true);
-
-      // Clean up test record from the default path
       try {
-        await fs.unlink(defaultPath);
-      } catch {
-        // ignore
+        const resolved = acRecordsPath();
+        // Must not resolve to a /tmp-based path
+        expect(resolved).not.toMatch(/^(\/tmp\/|[A-Za-z]:\\.*\\Temp\\)/);
+        // Must be a relative or absolute non-tmp path
+        expect(resolved).toBeTruthy();
+      } finally {
+        if (original !== undefined) process.env.AC_RECORDS_PATH = original;
+        else delete process.env.AC_RECORDS_PATH;
+        clearAcRecordStore();
       }
-
-      // Restore env
-      if (original !== undefined) process.env.AC_RECORDS_PATH = original;
-      clearAcRecordStore();
     });
   });
 

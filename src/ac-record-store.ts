@@ -26,7 +26,8 @@ const DEFAULT_AC_RECORDS_PATH = "data/ac-records.json";
 /** Linear GraphQL API endpoint (used by recaptureAc to fetch description / post comments). */
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
-function acRecordsPath(): string {
+/** Resolve the AC records file path (env override or default). */
+export function acRecordsPath(): string {
   return process.env.AC_RECORDS_PATH ?? DEFAULT_AC_RECORDS_PATH;
 }
 
