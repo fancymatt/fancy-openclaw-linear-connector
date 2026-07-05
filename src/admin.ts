@@ -11,6 +11,7 @@ import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 import type { RouteResult } from "./types.js";
 import type { LinearEvent } from "./webhook/schema.js";
 import type { OperationalEventStore, OperationalEventOutcome } from "./store/operational-event-store.js";
+import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
@@ -38,6 +39,8 @@ interface AdminDeps {
   observationStore?: ObservationStore;
   ackTracker?: DispatchAckTracker;
   deploymentName: string;
+  /** AI-1799: enrolled-tickets mirror for the /api/board endpoint. */
+  enrolledTicketsStore?: EnrolledTicketsStore;
   /** If provided, set-state will re-dispatch to the new state's owner role (AI-1607). */
   wakeConfigForAgent?: (agentId: string) => WakeUpConfig;
   /** Override the SPA asset directory (tests). */
@@ -529,6 +532,33 @@ export function createAdminRouter(deps: AdminDeps): Router {
       registryPolicy: getRegistryPolicyStatus(),
       configHealth: getConfigHealthStatus(),
     });
+  });
+  // AI-1799 AC4: Board read API — enrolled-tickets mirror joined with
+  // latest wake_id status from the operational event store.
+  router.get("/api/board", (_req: Request, res: Response) => {
+    if (!deps.enrolledTicketsStore) {
+      res.json({ tickets: [] });
+      return;
+    }
+    const tickets = deps.enrolledTicketsStore.getAll().map((row) => {
+      // Find the latest event with a wake_id for this ticket.
+      const events = deps.operationalEventStore?.query({ key: `linear-${row.ticket_id}`, limit: 50 }) ?? [];
+      const wakeEvent = events.find((e) => e.wakeId);
+      return {
+        ticket_id: row.ticket_id,
+        workflow: row.workflow,
+        state: row.state,
+        delegate: row.delegate,
+        entered_state_at: row.entered_state_at,
+        enrolled_at: row.enrolled_at,
+        last_event_kind: row.last_event_kind,
+        last_event_at: row.last_event_at,
+        terminal: row.terminal,
+        latest_wake_id: wakeEvent?.wakeId ?? null,
+        time_in_state_ms: Math.max(0, Date.now() - new Date(row.entered_state_at).getTime()),
+      };
+    });
+    res.json({ tickets });
   });
   router.get("/api/events", (req: Request, res: Response) => {
     if (!deps.operationalEventStore) {

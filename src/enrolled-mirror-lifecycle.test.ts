@@ -14,8 +14,8 @@ import { jest } from "@jest/globals";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createApp } from "../index.js";
-import type { EnrolledTicketsStore } from "../store/enrolled-tickets-store.js";
+import { createApp } from "./index.js";
+import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -67,7 +67,7 @@ describe("AI-1799 AC1: mirror written on bootstrap enrollment (webhook path)", (
     //
     // This test imports the real applyBootstrapToIssue and verifies the
     // side-effect on the mirror — a wiring assertion, not a module-only test.
-    const { applyBootstrapToIssue } = await import("../workflow-bootstrap.js");
+    const { applyBootstrapToIssue } = await import("./workflow-bootstrap.js");
     const mirror = getMirror(app);
 
     // Mock the Linear API for the bootstrap's label/mutation calls.
@@ -110,7 +110,7 @@ describe("AI-1799 AC1: mirror updated on proxy-applied transition", () => {
     // pre-set labels, and assert the mirror gained the transition.
     //
     // AC1: "every proxy-applied transition updates state/delegate/entered_state_at"
-    const { EnrolledTicketsStore } = await import("../store/enrolled-tickets-store.js");
+    const { EnrolledTicketsStore } = await import("./store/enrolled-tickets-store.js");
     const store = new EnrolledTicketsStore(mirrorDbPath);
     store.enroll({ ticketId: "AI-3002", workflow: "dev-impl", state: "write-tests", delegate: "tdd" });
 
@@ -121,7 +121,7 @@ describe("AI-1799 AC1: mirror updated on proxy-applied transition", () => {
     // enrolledTicketsStore option (dependency injection) so the proxy path
     // can write to the mirror.  If this option doesn't exist, the test
     // fails — that's the RED state.
-    const { applyStateTransition } = await import("../workflow-gate.js");
+    const { applyStateTransition } = await import("./workflow-gate.js");
     const opts = (applyStateTransition as unknown as { length: number }).length;
     // applyStateTransition takes (intent, issueId, authToken, options?)
     // The options object must accept enrolledTicketsStore.
@@ -144,7 +144,7 @@ describe("AI-1799 AC1: mirror marked terminal on terminal disposition", () => {
   });
 
   it("a terminal transition marks the mirror row terminal without deleting it", async () => {
-    const { EnrolledTicketsStore } = await import("../store/enrolled-tickets-store.js");
+    const { EnrolledTicketsStore } = await import("./store/enrolled-tickets-store.js");
     const store = new EnrolledTicketsStore(mirrorDbPath);
 
     store.enroll({ ticketId: "AI-3003", workflow: "dev-impl", state: "ac-validate", delegate: "ai" });

@@ -17,6 +17,12 @@ export interface OperationalEventInput {
   errorSummary?: string | null;
   detail?: unknown;
   occurredAt?: string;
+  /** AI-1799: workflow state resolved from the ticket's state:* label (null when not enrolled). */
+  workflowState?: string | null;
+  /** AI-1799: audience axis — 'agent' (narrative) or 'connector' (mechanics). */
+  plane?: string | null;
+  /** AI-1799: dispatch-cycle correlation id minted at route time. */
+  wakeId?: string | null;
 }
 export interface OperationalEvent extends Omit<Required<OperationalEventInput>, "detail" | "occurredAt"> { id: number; occurredAt: string; detail: unknown; }
 export interface OperationalEventQuery { agent?: string; key?: string; outcome?: OperationalEventOutcome; type?: string; since?: string; until?: string; limit?: number; }
@@ -103,6 +109,9 @@ function rowToEvent(row: Record<string, unknown>): OperationalEvent {
     sessionKey: (row.session_key as string | null) ?? null,
     errorSummary: (row.error_summary as string | null) ?? null,
     detail: parseDetail(String(row.detail_json ?? "{}")),
+    workflowState: (row.workflow_state as string | null) ?? null,
+    plane: (row.plane as string | null) ?? null,
+    wakeId: (row.wake_id as string | null) ?? null,
   };
 }
 
@@ -143,6 +152,23 @@ export class OperationalEventStore {
       CREATE INDEX IF NOT EXISTS idx_operational_events_outcome_time ON operational_events(outcome, occurred_at DESC);
       CREATE INDEX IF NOT EXISTS idx_operational_events_type_time ON operational_events(event_type, occurred_at DESC);
     `);
+
+    // AI-1799: add enrichment columns (additive migration for existing databases).
+    const addColumnIfMissing = (col: string, def: string): void => {
+      const exists = this.db.prepare(
+        `SELECT COUNT(*) AS c FROM pragma_table_info('operational_events') WHERE name = ?`,
+      ).get(col) as { c: number };
+      if (exists.c === 0) {
+        this.db.exec(`ALTER TABLE operational_events ADD COLUMN ${col} ${def}`);
+      }
+    };
+    addColumnIfMissing("workflow_state", "TEXT");
+    addColumnIfMissing("plane", "TEXT");
+    addColumnIfMissing("wake_id", "TEXT");
+
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_operational_events_wake_id ON operational_events(wake_id)`,
+    );
   }
   prune(): number {
     const ageResult = this.db.prepare(
@@ -160,12 +186,13 @@ export class OperationalEventStore {
   append(input: OperationalEventInput): number {
     if (!OPERATIONAL_EVENT_OUTCOMES.includes(input.outcome)) throw new Error(`Unsupported operational event outcome: ${input.outcome}`);
     const result = this.db.prepare(`
-      INSERT INTO operational_events (occurred_at, outcome, event_type, agent, subject_key, delivery_mode, attempt_count, run_id, session_key, error_summary, detail_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO operational_events (occurred_at, outcome, event_type, agent, subject_key, delivery_mode, attempt_count, run_id, session_key, error_summary, detail_json, workflow_state, plane, wake_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.occurredAt ?? new Date().toISOString(), input.outcome, input.type ?? null, input.agent ?? null, input.key ?? input.sessionKey ?? null,
       input.deliveryMode ?? null, input.attemptCount ?? null, input.runId ?? null, input.sessionKey ?? input.key ?? null,
       input.errorSummary ? truncateUtf8(redactText(input.errorSummary), MAX_ERROR_BYTES) : null, JSON.stringify(redactOperationalDetail(input.detail)),
+      input.workflowState ?? null, input.plane ?? null, input.wakeId ?? null,
     );
     this.writeCount++;
     if (this.writeCount % PRUNE_EVERY_N_WRITES === 0) this.prune();
@@ -182,7 +209,7 @@ export class OperationalEventStore {
     if (query.until) { clauses.push("occurred_at <= ?"); params.push(query.until); }
     const limit = Math.min(Math.max(query.limit ?? 100, 1), 500);
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-    const rows = this.db.prepare(`SELECT id, occurred_at, outcome, event_type, agent, subject_key, delivery_mode, attempt_count, run_id, session_key, error_summary, detail_json FROM operational_events ${where} ORDER BY occurred_at DESC, id DESC LIMIT ?`).all(...params, limit) as Record<string, unknown>[];
+    const rows = this.db.prepare(`SELECT id, occurred_at, outcome, event_type, agent, subject_key, delivery_mode, attempt_count, run_id, session_key, error_summary, detail_json, workflow_state, plane, wake_id FROM operational_events ${where} ORDER BY occurred_at DESC, id DESC LIMIT ?`).all(...params, limit) as Record<string, unknown>[];
     return rows.map(rowToEvent);
   }
   snapshot(query: { key?: string; agent?: string; limit?: number }): OperationalSnapshot {
@@ -190,4 +217,12 @@ export class OperationalEventStore {
     return { key: query.key, agent: query.agent, lastSuccess: lifecycle.find((event) => SUCCESS_OUTCOMES.has(event.outcome)), lastError: lifecycle.find((event) => ERROR_OUTCOMES.has(event.outcome) || event.errorSummary), lifecycle };
   }
   close(): void { this.db.close(); }
+
+  /** AI-1799: query all events sharing a dispatch-cycle wake_id. */
+  queryByWakeId(wakeId: string): OperationalEvent[] {
+    const rows = this.db
+      .prepare(`SELECT id, occurred_at, outcome, event_type, agent, subject_key, delivery_mode, attempt_count, run_id, session_key, error_summary, detail_json, workflow_state, plane, wake_id FROM operational_events WHERE wake_id = ? ORDER BY occurred_at ASC, id ASC`)
+      .all(wakeId) as Record<string, unknown>[];
+    return rows.map(rowToEvent);
+  }
 }

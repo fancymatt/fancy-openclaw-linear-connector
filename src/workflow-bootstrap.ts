@@ -18,6 +18,7 @@ import { componentLogger, createLogger } from "./logger.js";
 import { loadWorkflowRegistry, type WorkflowDef } from "./workflow-gate.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
 import { findOrCreateLabel } from "./linear-helpers.js";
+import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { LinearEvent, LinearIssueCreatedEvent, LinearIssueUpdatedEvent } from "./webhook/schema.js";
 import { getAgents, getAccessToken } from "./agents.js";
 
@@ -168,6 +169,7 @@ export async function issueUpdateAtomic(
 export async function maybeBootstrapWorkflow(
   event: LinearEvent,
   authToken: string,
+  enrolledTicketsStore?: EnrolledTicketsStore,
 ): Promise<BootstrapResult | null> {
   if (event.type !== "Issue" || (event.action !== "update" && event.action !== "create")) return null;
   // For create events updatedFrom is absent — previousLabelIds will be [] and all current labels
@@ -235,7 +237,7 @@ export async function maybeBootstrapWorkflow(
     // Idempotency: if state:* is already present, this ticket is already in-flight.
     if (currentStateLabels.length > 0) return null;
 
-    return applyBootstrapToIssue(issue, effectiveToken);
+    return applyBootstrapToIssue(issue, effectiveToken, undefined, enrolledTicketsStore);
   }
 
   // ── Demote path: wf:* was removed, state:* labels remain ─────────────────
@@ -284,6 +286,8 @@ export async function applyBootstrapToIssue(
   authToken: string,
   /** Optional registry override (used by the sweep). If absent, loads from file. */
   workflowRegistryOverride?: Map<string, WorkflowDef>,
+  /** AI-1799: optional mirror store — writes enrollment rows for board data. */
+  enrolledTicketsStore?: EnrolledTicketsStore,
 ): Promise<BootstrapResult | null> {
   // Defensive idempotency re-check — handles the webhook/sweep race.
   const currentStateLabels = issue.labels.filter((n) => n.name.startsWith("state:"));
@@ -370,6 +374,13 @@ export async function applyBootstrapToIssue(
     log.info(
       `workflow-bootstrap: bootstrapped ${issue.id} → ${workflowId}:${entryState}, delegate=${delegateLinearUserId ?? "none"}`,
     );
+    // AI-1799: write enrollment row to the mirror so the board read API has data.
+    enrolledTicketsStore?.enroll({
+      ticketId: issue.identifier ?? issue.id,
+      workflow: workflowId,
+      state: entryState,
+      delegate: delegateAgentName ?? null,
+    });
   }
 
   return {

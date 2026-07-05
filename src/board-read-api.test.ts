@@ -27,6 +27,8 @@ function getMirror(app: ReturnType<typeof createApp>): EnrolledTicketsStore {
   return mirror;
 }
 
+const ADMIN_SECRET = "board-test-secret";
+
 describe("AI-1799 AC4: GET /api/board — enrolled-tickets read API", () => {
   let app: ReturnType<typeof createApp>;
   let mirrorDbPath: string;
@@ -36,6 +38,7 @@ describe("AI-1799 AC4: GET /api/board — enrolled-tickets read API", () => {
   beforeEach(() => {
     mirrorDbPath = tmpDbPath("mirror");
     eventsDbPath = tmpDbPath("events");
+    process.env.ADMIN_SECRET = ADMIN_SECRET;
     app = createApp({
       enrolledTicketsDbPath: mirrorDbPath,
       operationalEventsDbPath: eventsDbPath,
@@ -44,6 +47,7 @@ describe("AI-1799 AC4: GET /api/board — enrolled-tickets read API", () => {
   });
 
   afterEach(() => {
+    delete process.env.ADMIN_SECRET;
     fs.rmSync(path.dirname(mirrorDbPath), { recursive: true, force: true });
     fs.rmSync(path.dirname(eventsDbPath), { recursive: true, force: true });
   });
@@ -51,7 +55,7 @@ describe("AI-1799 AC4: GET /api/board — enrolled-tickets read API", () => {
   it("returns an enrolled ticket with state, delegate, workflow, and terminal flag", async () => {
     mirror.enroll({ ticketId: "AI-5001", workflow: "dev-impl", state: "write-tests", delegate: "tdd" });
 
-    const res = await request(app).get("/api/board");
+    const res = await request(app.app).get("/admin/api/board").set("x-admin-secret", ADMIN_SECRET);
 
     expect(res.status).toBe(200);
     expect(res.body.tickets).toBeDefined();
@@ -66,7 +70,7 @@ describe("AI-1799 AC4: GET /api/board — enrolled-tickets read API", () => {
   it("returns time-in-state (entered_state_at relative to now)", async () => {
     mirror.enroll({ ticketId: "AI-5002", workflow: "dev-impl", state: "implementation", delegate: "igor" });
 
-    const res = await request(app).get("/api/board");
+    const res = await request(app.app).get("/admin/api/board").set("x-admin-secret", ADMIN_SECRET);
 
     expect(res.status).toBe(200);
     const ticket = res.body.tickets.find((t: { ticket_id: string }) => t.ticket_id === "AI-5002");
@@ -81,7 +85,7 @@ describe("AI-1799 AC4: GET /api/board — enrolled-tickets read API", () => {
     mirror.enroll({ ticketId: "AI-5003", workflow: "dev-impl", state: "done", delegate: "ai" });
     mirror.markTerminal("AI-5003", "complete");
 
-    const res = await request(app).get("/api/board");
+    const res = await request(app.app).get("/admin/api/board").set("x-admin-secret", ADMIN_SECRET);
 
     expect(res.status).toBe(200);
     const ticket = res.body.tickets.find((t: { ticket_id: string }) => t.ticket_id === "AI-5003");
@@ -103,7 +107,7 @@ describe("AI-1799 AC4: GET /api/board — enrolled-tickets read API", () => {
       plane: "connector",
     });
 
-    const res = await request(app).get("/api/board");
+    const res = await request(app.app).get("/admin/api/board").set("x-admin-secret", ADMIN_SECRET);
 
     expect(res.status).toBe(200);
     const ticket = res.body.tickets.find((t: { ticket_id: string }) => t.ticket_id === "AI-5004");
@@ -114,7 +118,7 @@ describe("AI-1799 AC4: GET /api/board — enrolled-tickets read API", () => {
   });
 
   it("returns an empty tickets array when nothing is enrolled (not an error)", async () => {
-    const res = await request(app).get("/api/board");
+    const res = await request(app.app).get("/admin/api/board").set("x-admin-secret", ADMIN_SECRET);
 
     expect(res.status).toBe(200);
     expect(res.body.tickets).toEqual([]);
@@ -125,7 +129,7 @@ describe("AI-1799 AC4: GET /api/board — enrolled-tickets read API", () => {
     mirror.enroll({ ticketId: "AI-5006", workflow: "dev-impl", state: "implementation", delegate: "igor" });
     mirror.enroll({ ticketId: "AI-5007", workflow: "vocab-image", state: "briefing", delegate: "caspar" });
 
-    const res = await request(app).get("/api/board");
+    const res = await request(app.app).get("/admin/api/board").set("x-admin-secret", ADMIN_SECRET);
 
     expect(res.status).toBe(200);
     expect(res.body.tickets).toHaveLength(3);
@@ -137,7 +141,7 @@ describe("AI-1799 AC4: GET /api/board — enrolled-tickets read API", () => {
     mirror.enroll({ ticketId: "AI-5008", workflow: "dev-impl", state: "write-tests", delegate: "tdd" });
     mirror.recordTransition({ ticketId: "AI-5008", toState: "implementation", delegate: "igor", eventKind: "tests-ready" });
 
-    const res = await request(app).get("/api/board");
+    const res = await request(app.app).get("/admin/api/board").set("x-admin-secret", ADMIN_SECRET);
     const ticket = res.body.tickets.find((t: { ticket_id: string }) => t.ticket_id === "AI-5008");
     expect(ticket.state).toBe("implementation");
     expect(ticket.delegate).toBe("igor");

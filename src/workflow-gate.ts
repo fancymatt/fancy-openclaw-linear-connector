@@ -51,6 +51,7 @@ import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./co
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
 import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
 import { recordAppliedState, clearAppliedState } from "./store/applied-state-store.js";
+import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { reposWithoutCiAutoDeploy, githubRepoFromUrl } from "./deploy-policy.js";
 import { notify } from "./alerts/alert-bus.js";
 
@@ -2086,6 +2087,8 @@ export interface ApplyStateTransitionOptions {
    * is aborted fail-closed.
    */
   cliTarget?: string;
+  /** AI-1799: enrolled-tickets mirror — writes state transitions to the board mirror. */
+  enrolledTicketsStore?: EnrolledTicketsStore;
 }
 
 export async function applyStateTransition(
@@ -2160,6 +2163,8 @@ export async function applyStateTransition(
     // AI-1534: ticket left the workflow — drop any cached state so it can't
     // override a later live read.
     clearAppliedState(issue.identifier);
+    // AI-1799: mirror — mark the ticket as having left the workflow.
+    options?.enrolledTicketsStore?.demoteEnrolled(issue.identifier ?? issueId);
     log.info(
       `workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels`,
     );
@@ -2563,6 +2568,24 @@ export async function applyStateTransition(
     // per-step delivery prefers it over a lag-prone live label read. Keyed by
     // the human identifier to match build-message's lookup key.
     recordAppliedState(issue.identifier, toStateName);
+
+    // AI-1799: mirror — record the transition (or mark terminal) in the enrolled-tickets store.
+    const mirror = options?.enrolledTicketsStore;
+    if (mirror) {
+      if (isTerminal) {
+        mirror.markTerminal(issue.identifier ?? issueId, intent);
+      } else {
+        // Resolve the agent name from the delegate linear user id for the mirror.
+        const allAgents = getAgents();
+        const delegateAgent = allAgents.find((a) => a.linearUserId === resolvedDelegateId);
+        mirror.recordTransition({
+          ticketId: issue.identifier ?? issueId,
+          toState: toStateName,
+          delegate: delegateAgent?.name ?? null,
+          eventKind: intent,
+        });
+      }
+    }
 
     // AI-1666: cache per-state no-activity timeout for the newly-entered state.
     const noActivityTimeoutSecs = destStateNode?.noActivityTimeout;
