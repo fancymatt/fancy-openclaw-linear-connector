@@ -28,6 +28,7 @@ import {
   type WorkflowDef,
 } from "./workflow-bootstrap.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
+import { registerCron, formatIntervalMs } from "./cron/registry.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "bootstrap-reconciliation");
 
@@ -306,6 +307,7 @@ export function registerBootstrapReconciliationCron(
   },
 ): NodeJS.Timeout {
   const intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
+  registerCron("bootstrap-reconciliation-sweep", `every ${formatIntervalMs(intervalMs)}`);
 
   if (!opts.authToken) {
     log.warn(

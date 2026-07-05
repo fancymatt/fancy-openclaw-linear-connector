@@ -28,6 +28,7 @@ import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
+import { getRegisteredCrons } from "./cron/registry.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { startRegistryPolicyCheck } from "./registry-policy.js";
@@ -186,6 +187,11 @@ export function createApp(options?: CreateAppOptions) {
       commit: getStartupCommit(),
       agents: agents.length,
       agentNames: agents.map((a) => a.name),
+      // AI-1810: live scheduling state. Every periodic/background driver
+      // registers at the moment its timer is created; an expected driver
+      // missing from this list means it shipped without bootstrap wiring
+      // (the AI-1773/AI-1775 dead-code-in-prod failure mode).
+      crons: getRegisteredCrons(),
     });
   });
 

@@ -52,6 +52,7 @@ import {
 // the existing isChildOfUxAuditParent (ux-audit only). The sla-sweep driver
 // must import and use this same function — not a parallel heuristic.
 import { isManagedBarrierChild } from "./barrier.js";
+import { getRegisteredCrons } from "./cron/registry.js";
 
 // AlertStore for restart-resilience assertions (dedup across instances)
 import { AlertStore } from "./alerts/alert-store.js";
@@ -1001,32 +1002,26 @@ describe("workflow def loader — directory mode", () => {
   });
 });
 
-// registerSlaSweepCron — liveness log (AI-1808: liveness observable at ac-validate)
+// registerSlaSweepCron — liveness signal (AI-1808: liveness observable at ac-validate)
 // ════════════════════════════════════════════════════════════════════════════
 
-describe("registerSlaSweepCron — liveness log", () => {
-  it("emits a startup log line so liveness is observable without a real breach", () => {
-    // The log line is the ac-validate liveness signal: it proves the cron
-    // registered without waiting for a breach to trigger.
-    const logs: string[] = [];
-    const origInfo = console.info;
-    console.info = (msg: string) => logs.push(String(msg));
-    try {
-      const timer = registerSlaSweepCron({
-        authToken: "lin_test_token",
-        workflowDefPath: writeWorkflowRegistry(),
-        cadenceMs: 999_999,
-        breachStorePath: path.join(os.tmpdir(), "sla-sweep-liveness-test.db"),
-        notify: jest.fn(),
-        wakeAgent: jest.fn(async () => {}),
-      });
-      clearInterval(timer as ReturnType<typeof setInterval>);
-    } finally {
-      console.info = origInfo;
-    }
-    // The component logger may or may not route through console.info depending
-    // on env; assert on the known log fragment.
-    expect(logs.some((l) => l.includes("sla-sweep") && l.includes("registered"))).toBe(true);
+describe("registerSlaSweepCron — liveness signal", () => {
+  it("registers in the cron registry so liveness is observable without a real breach", () => {
+    // AI-1810 superseded the startup log line with a cron-registry entry:
+    // registration proves the cron scheduled without waiting for a breach,
+    // and /health enumerates it for the ac-validate liveness check.
+    const timer = registerSlaSweepCron({
+      authToken: "lin_test_token",
+      workflowDefPath: writeWorkflowRegistry(),
+      cadenceMs: 999_999,
+      breachStorePath: path.join(os.tmpdir(), "sla-sweep-liveness-test.db"),
+      notify: jest.fn(),
+      wakeAgent: jest.fn(async () => {}),
+    });
+    clearInterval(timer as ReturnType<typeof setInterval>);
+    const entry = getRegisteredCrons().find((c) => c.name === "sla-sweep");
+    expect(entry).toBeDefined();
+    expect(entry?.schedule).toContain("every");
   });
 });
 

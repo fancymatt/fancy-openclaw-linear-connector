@@ -11,6 +11,7 @@
 import { runRescueSweep } from "../rescue-sweep.js";
 import { loadWorkflowRegistry } from "../workflow-gate.js";
 import { createLogger, componentLogger } from "../logger.js";
+import { registerCron, formatIntervalMs } from "./registry.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "rescue-sweep-cron");
 
@@ -40,6 +41,7 @@ const DEFAULT_INTERVAL_MS = parseIntervalMs(process.env.RESCUE_SWEEP_INTERVAL ??
  */
 export function registerRescueSweepCron(): void {
   const intervalMs = DEFAULT_INTERVAL_MS;
+  registerCron("rescue-sweep", `every ${formatIntervalMs(intervalMs)}`);
   const timer = setInterval(() => {
     void (async () => {
       try {

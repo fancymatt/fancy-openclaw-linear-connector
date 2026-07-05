@@ -23,6 +23,7 @@ import yaml from "js-yaml";
 import { getWorkflowId, getCurrentState, type WorkflowDef } from "./workflow-gate.js";
 import { isManagedBarrierFromLabels } from "./barrier.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
+import { registerCron, formatIntervalMs } from "./cron/registry.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -308,10 +309,13 @@ const DEFAULT_CADENCE_MS = 5 * 60 * 1000; // 5 minutes
  */
 export function registerSlaSweepCron(opts: SlaSweepOptions): ReturnType<typeof setInterval> {
   const cadenceMs = opts.cadenceMs ?? DEFAULT_CADENCE_MS;
-  console.info(`sla-sweep: registered (cadence=${cadenceMs}ms)`);
+  registerCron("sla-sweep", `every ${formatIntervalMs(cadenceMs)}`);
   const timer = setInterval(() => {
-    runSlaSweep(opts).catch(() => {
-      // sweep errors are non-fatal; result.errors captures per-ticket issues
+    runSlaSweep(opts).catch((err) => {
+      // Sweep errors are non-fatal (result.errors captures per-ticket issues),
+      // but a whole-sweep failure (e.g. unreadable workflowDefPath) must not
+      // be silent — that would be dead-code-in-prod with a registry entry.
+      console.error(`[sla-sweep] sweep failed: ${err instanceof Error ? err.message : String(err)}`);
     });
   }, cadenceMs);
   if (typeof timer.unref === "function") timer.unref();

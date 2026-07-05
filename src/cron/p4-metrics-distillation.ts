@@ -12,6 +12,7 @@
 
 import type { ObservationStore } from "../store/observation-store.js";
 import { createLogger, componentLogger } from "../logger.js";
+import { registerCron, formatIntervalMs } from "./registry.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "p4-metrics-distillation");
 
@@ -185,6 +186,7 @@ export async function runDistillation(observationStore: ObservationStore, thresh
  */
 export function registerDistillationCron(observationStore: ObservationStore): void {
   const intervalMs = DEFAULT_INTERVAL_MS;
+  registerCron("p4-metrics-distillation", `every ${formatIntervalMs(intervalMs)}`);
   const timer = setInterval(() => {
     runDistillation(observationStore).catch((err) => {
       log.error(`[P4-3] Scheduled distillation failed: ${err instanceof Error ? err.message : String(err)}`);
