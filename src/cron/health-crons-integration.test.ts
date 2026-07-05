@@ -31,6 +31,7 @@ const DIST_ENTRY = path.resolve(__dirname, "../../dist/index.js");
 const EXPECTED_CRONS = [
   "bootstrap-reconciliation-sweep",
   "g20-canary",
+  "oob-reconcile-sweep",
   "p4-metrics-distillation",
   "rescue-sweep",
   "sla-sweep",

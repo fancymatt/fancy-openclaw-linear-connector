@@ -28,6 +28,8 @@ import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
+import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
+import { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { getRegisteredCrons } from "./cron/registry.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
@@ -119,6 +121,8 @@ export interface CreateAppOptions {
   managingStateDbPath?: string;
   /** Override EnrolledTicketsStore database path (for testing). */
   enrolledTicketsDbPath?: string;
+  /** Override MutationAuditStore database path (for testing). AI-1838. */
+  mutationAuditDbPath?: string;
   /**
    * Test hook: override wake-up delivery for resignal/hold-retry dispatches.
    * When provided, replaces the real sendWakeUpSignal so tests don't hit the
@@ -155,6 +159,7 @@ export function createApp(options?: CreateAppOptions) {
     operationalEventStore,
     noActivityDetector,
     enrolledTicketsStore,
+    mutationAuditStore,
     onProxyCall: (agentId, ticketId) => {
       // Any proxy call = implicit acknowledgment. Prevents the dispatch watchdog from
       // re-signaling agents that are working silently (e.g. sessions_yield during image gen).
@@ -206,6 +211,7 @@ export function createApp(options?: CreateAppOptions) {
   const nudgeStore = new NudgeStore();
   const operationalEventStore = new OperationalEventStore(options?.operationalEventsDbPath);
   const enrolledTicketsStore = new EnrolledTicketsStore(options?.enrolledTicketsDbPath);
+  const mutationAuditStore = new MutationAuditStore(options?.mutationAuditDbPath);
   const agentQueue = new AgentQueue(options?.agentQueueDbPath);
   const bag = new PendingWorkBag(options?.bagDbPath);
   const wakeConfig = {
@@ -655,6 +661,7 @@ export function createApp(options?: CreateAppOptions) {
     // swallowed delivery self-heals via the watchdog.
     (agentId, ticketId) => ackTracker.ensurePending(agentId, ticketId),
     enrolledTicketsStore,
+    mutationAuditStore,
   ));
 
   // ── v1.1: Session-end callback endpoint ──────────────────────────────
@@ -849,7 +856,7 @@ export function createApp(options?: CreateAppOptions) {
     });
   });
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore };
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore };
 }
 
 /**
@@ -929,7 +936,7 @@ if (isEntryPoint) {
     startTokenRefresh();
   }
 
-  const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector } = createApp();
+  const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, mutationAuditStore } = createApp();
 
   // P4-3: periodic distillation of reject metrics into skill-workshop proposals
   registerDistillationCron(observationStore);
@@ -1015,6 +1022,10 @@ if (isEntryPoint) {
 
   // G-20: scheduled gate-silently-off canary (AI-1552, §5.1)
   registerG20CanaryCron();
+
+  // AI-1838: out-of-band mutation reconcile sweep. Detects state/label/delegate
+  // changes that bypassed the proxy gate (raw token → api.linear.app direct).
+  registerOobReconcileCron(mutationAuditStore, operationalEventStore);
 
   // Config-health healthy→unhealthy is the loudest structural signal we have
   // (bad policy/workflow/agents.json = engine fail-closed for workflow tickets).

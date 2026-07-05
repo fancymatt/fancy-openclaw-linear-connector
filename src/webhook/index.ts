@@ -7,6 +7,8 @@ import { EventStore } from "../store/event-store.js";
 import { NudgeStore } from "../store/nudge-store.js";
 import type { OperationalEventInput, OperationalEventStore } from "../store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "../store/enrolled-tickets-store.js";
+import type { MutationAuditStore } from "../store/mutation-audit-store.js";
+import { extractWebhookMutations } from "./mutation-extraction.js";
 import { routeEvent, routeEventAll, unresolvedRoutingCandidates } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
 import { deliverToAgent, DeliveryThrottle, type DeliveryConfig } from "../delivery/index.js";
@@ -149,6 +151,7 @@ export function createWebhookRouter(
   onAgentActivity?: (agentId: string, ticketId: string) => void,
   onDeliveryCommitted?: (agentId: string, ticketId: string) => void,
   enrolledTicketsStore?: EnrolledTicketsStore,
+  mutationAuditStore?: MutationAuditStore,
 ): Router {
   const router = Router();
 
@@ -244,6 +247,20 @@ export function createWebhookRouter(
 
       // Record event for dedup & restart recovery
       eventStore?.recordEvent(deliveryId, payload as object);
+
+      // AI-1838: Audit-log state/label/delegate changes from the webhook
+      // payload for the out-of-band reconcile sweep. Every mutation Linear
+      // tells us about gets a durable audit record.
+      if (mutationAuditStore) {
+        try {
+          const mutations = extractWebhookMutations(event, deliveryId);
+          if (mutations.length > 0) {
+            mutationAuditStore.appendBatch(mutations);
+          }
+        } catch (err) {
+          log.warn(`mutation audit extraction failed (non-blocking): ${errorSummary(err)}`);
+        }
+      }
 
       // ── 9. Route to agent ─────────────────────────────────────────────────
       log.info(`Normalized event: type=${event.type} hasData=${"data" in event} dataKeys=${event.data ? Object.keys(event.data as object).join(',') : 'none'}`);
