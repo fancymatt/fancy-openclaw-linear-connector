@@ -35,6 +35,7 @@ import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition,
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
+import type { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
 import type { NoActivityDetector } from "./bag/no-activity-detector.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
@@ -113,6 +114,26 @@ function parseBody(req: Request): GraphQLRequestBody | null {
     }
   } catch {
     // fall through
+  }
+  return null;
+}
+
+/**
+ * Best-effort extraction of a human-readable ticket identifier (e.g. "AI-1838")
+ * from GraphQL variables. Used for the proxy audit log so records match the
+ * webhook-side identifier. Returns null when only a UUID is available.
+ */
+function extractIssueIdentifier(body: GraphQLRequestBody | null): string | null {
+  if (!body) return null;
+  const vars = body.variables ?? {};
+  for (const key of ["identifier", "issueIdentifier"]) {
+    const v = (vars as Record<string, unknown>)[key];
+    if (typeof v === "string" && /^[A-Z]+-\d+$/.test(v)) return v;
+  }
+  // Check if the id field is actually an identifier (not a UUID)
+  for (const key of ["id", "issueId"]) {
+    const v = (vars as Record<string, unknown>)[key];
+    if (typeof v === "string" && /^[A-Z]+-\d+$/.test(v)) return v;
   }
   return null;
 }
@@ -265,6 +286,8 @@ export interface ProxyDeps {
   noActivityDetector?: NoActivityDetector;
   /** AI-1799: enrolled-tickets mirror — transitions write to the board mirror. */
   enrolledTicketsStore?: EnrolledTicketsStore;
+  /** AI-1838: mutation audit store — proxy-forwarded mutations recorded for out-of-band reconcile. */
+  mutationAuditStore?: MutationAuditStore;
   /**
    * Called on the first proxy call from an agent for a ticket — auto-acknowledges the
    * dispatch so the watchdog doesn't re-signal an agent that is actively working but
@@ -533,6 +556,27 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // field. A stderr-only warning beside a success payload is how AI-1773
       // was stranded half-applied (comment landed, label/delegate did not).
       if (upstreamRes.ok) {
+        // AI-1838: record proxy-forwarded mutation for out-of-band reconcile.
+        // The reconcile sweep matches these proxy records against webhook-observed
+        // changes; a webhook change with no matching proxy op is out-of-band.
+        if (deps?.mutationAuditStore && issueId) {
+          try {
+            const auditIdentifier = extractIssueIdentifier(body) ?? issueId;
+            deps.mutationAuditStore.append({
+              source: "proxy",
+              ticket: auditIdentifier,
+              ticketUuid: issueId,
+              changeType: "state",
+              field: effectiveIntent ? `intent:${effectiveIntent}` : `op:${opName}`,
+              agent: agentId,
+              intent: effectiveIntent,
+              opName,
+            });
+          } catch (auditErr) {
+            log.warn(`mutation audit proxy-op record failed (non-blocking): ${auditErr instanceof Error ? auditErr.message : String(auditErr)}`);
+          }
+        }
+
         let transitionResult: TransitionApplyResult | null = null;
         try {
           let feedback: TransitionFeedback | undefined;
