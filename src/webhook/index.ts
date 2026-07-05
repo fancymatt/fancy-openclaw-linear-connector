@@ -74,11 +74,13 @@ export async function enrichCommentEventForRouting(event: LinearEvent): Promise<
     }
     return undefined;
   })();
-  if (!token) return;
   try {
     const res = await fetch("https://api.linear.app/graphql", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: token.startsWith("Bearer") ? token : `Bearer ${token}` },
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: token.startsWith("Bearer") ? token : `Bearer ${token}` } : {}),
+      },
       body: JSON.stringify({
         query: `query CommentRouting($id: String!) { issue(id: $id) { delegate { id } assignee { id } } }`,
         variables: { id: issueId },

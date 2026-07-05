@@ -479,6 +479,44 @@ export function createAdminRouter(deps: AdminDeps): Router {
       }),
     });
   });
+  // Dead-letter view: dispatch/routing failures from alerts.db (AI-1772).
+  // kind query param maps to the store's source column; unfiltered results are
+  // scoped to dead-letter sources (dispatch + routing) only.
+  router.get("/api/dead-letters", (req: Request, res: Response) => {
+    const store = getAlertBus().getStore();
+    if (!store) {
+      res.json({ items: [] });
+      return;
+    }
+    const DEAD_LETTER_SOURCES = ["dispatch", "routing"];
+    const kindRaw = typeof req.query.kind === "string" ? req.query.kind : undefined;
+    const source = kindRaw && DEAD_LETTER_SOURCES.includes(kindRaw) ? kindRaw : undefined;
+    const limitRaw = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : undefined;
+    const limit = Number.isFinite(limitRaw ?? NaN) ? Math.min(limitRaw!, 500) : 100;
+    const rows = store.query({
+      source: source ?? undefined,
+      agent: typeof req.query.agent === "string" ? req.query.agent : undefined,
+      ticket: typeof req.query.ticket === "string" ? req.query.ticket : undefined,
+      since: typeof req.query.since === "string" ? req.query.since : undefined,
+      limit,
+    });
+    const deadLetterRows = source
+      ? rows
+      : rows.filter((r) => DEAD_LETTER_SOURCES.includes(r.source));
+    res.json({
+      items: deadLetterRows.map((r) => ({
+        id: r.id,
+        firstAt: r.firstAt,
+        lastAt: r.lastAt,
+        kind: r.source,
+        title: r.title,
+        agent: r.agent,
+        ticket: r.ticket,
+        dedupCount: r.count,
+        detail: r.detail,
+      })),
+    });
+  });
   // Fleet liveness matrix: registry rows + dispatch-ack state + policy drift,
   // one payload for the console's fleet page.
   router.get("/api/fleet", (_req: Request, res: Response) => {

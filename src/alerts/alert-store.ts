@@ -40,6 +40,7 @@ export interface AlertQuery {
   severity?: AlertSeverity;
   source?: string;
   agent?: string;
+  ticket?: string;
   unackedOnly?: boolean;
   since?: string;
   limit?: number;
@@ -199,6 +200,7 @@ export class AlertStore {
     if (q.severity) { clauses.push("severity = ?"); params.push(q.severity); }
     if (q.source) { clauses.push("source = ?"); params.push(q.source); }
     if (q.agent) { clauses.push("agent = ?"); params.push(q.agent); }
+    if (q.ticket) { clauses.push("ticket = ?"); params.push(q.ticket); }
     if (q.unackedOnly) { clauses.push("acked_at IS NULL"); }
     if (q.since) { clauses.push("last_at >= ?"); params.push(q.since); }
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";

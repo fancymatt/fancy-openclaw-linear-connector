@@ -41,6 +41,7 @@ const TABS: Array<[string, string]> = [
   ["/events", "Events"],
   ["/alerts", "Alerts"],
   ["/workflows", "Workflows"],
+  ["/dead-letters", "Dead Letters"],
 ];
 
 export function Tabs() {
