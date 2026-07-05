@@ -2182,7 +2182,8 @@ export interface TransitionApplyResult {
   code: string;
   /** Human-readable detail. */
   detail?: string;
-  from?: string;
+  /** The source state, or null when escaping from a label-stripped ticket (AI-1813). */
+  from?: string | null;
   to?: string;
 }
 
@@ -2224,18 +2225,21 @@ export async function applyStateTransition(
   // true source before forwarding and passes it as sourceStateOverride.
   const actualStateName = getCurrentState(labelNames);
   const currentStateName = options?.sourceStateOverride ?? actualStateName;
-  if (!currentStateName) {
-    log.warn(`workflow-gate: B2 apply: no state:* label on ${issueId} — skipping`);
-    return { status: "failed", code: "no-state-label", detail: `workflow ticket ${issueId} has no state:* label` };
-  }
 
   const breakGlassCommand = def.break_glass?.command ?? "escape";
   let toStateName: string;
   let matchedTransition: WorkflowTransition | undefined;
 
+  // AI-1813 fix: break-glass (escape) must be legal when no state:* label is
+  // present — that's precisely the corruption escape exists to recover from.
+  // The no-source-state guard below applies only to non-break-glass intents.
   if (intent === breakGlassCommand) {
     toStateName = def.break_glass?.to ?? "escape";
   } else {
+    if (!currentStateName) {
+      log.warn(`workflow-gate: B2 apply: no state:* label on ${issueId} — skipping`);
+      return { status: "failed", code: "no-state-label", detail: `workflow ticket ${issueId} has no state:* label` };
+    }
     const stateNode = def.states.find((s) => s.id === currentStateName);
     matchedTransition = stateNode?.transitions?.find((t) => t.command === intent);
     if (!matchedTransition) {
@@ -2354,7 +2358,7 @@ export async function applyStateTransition(
   // parent's own AC is verified, not the sum of children.
   // Fail-closed: if the AC gate cannot be evaluated (description fetch error),
   // block the transition to prevent premature done.
-  const disposition = resolveDisposition(workflowId, currentStateName, intent);
+  const disposition = resolveDisposition(workflowId, currentStateName ?? "", intent);
   if (disposition === "done") {
     try {
       log.info(`workflow-gate: B-4 review: evaluating parent-AC gate for ${issueId} (review → done)`);
@@ -2740,7 +2744,7 @@ export async function applyStateTransition(
   // AC3: parent auto-transitions to managing once children are minted (the
   // state transition to `managing` has already been applied above; the fan-out
   // creates the children and links them to the parent).
-  if (applied && shouldTriggerFanout(workflowId, currentStateName, intent)) {
+  if (applied && shouldTriggerFanout(workflowId, currentStateName ?? "", intent)) {
     try {
       log.info(`workflow-gate: B-2 fan-out: triggering fan-out for ${issueId} (spawning → managing)`);
       const fanoutResult = await executeFanout(issueId, authToken);
@@ -2811,7 +2815,7 @@ export async function applyStateTransition(
         options.observationStore.append({
           ticket: issueId,
           workflow: workflowId,
-          step: currentStateName,
+          step: currentStateName ?? "(none)",
           fromBody: options.feedback.fromBody,
           reviewerBody: options.bodyId ?? "unknown",
           reasonCode: validatedReason,
