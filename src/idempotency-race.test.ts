@@ -349,7 +349,7 @@ describe("AC1 (G-8) — proxy command replay: concurrent identical commands → 
       // IssueBranchAndPR (deploy gate, not needed here).
       if (q.includes("IssueBranchAndPR")) {
         return new Response(
-          JSON.stringify({ data: { issue: { branch: null, pullRequests: { nodes: [] } } } }),
+          JSON.stringify({ data: { issue: { attachments: { nodes: [] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -668,7 +668,7 @@ describe("AC3 (G-16) — concurrent distinct commands: exactly one applies, lose
       // IssueBranchAndPR.
       if (q.includes("IssueBranchAndPR")) {
         return new Response(
-          JSON.stringify({ data: { issue: { branch: null, pullRequests: { nodes: [] } } } }),
+          JSON.stringify({ data: { issue: { attachments: { nodes: [] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }

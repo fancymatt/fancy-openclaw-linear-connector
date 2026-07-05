@@ -587,10 +587,10 @@ describe("proxy enforcement — workflow-gate Phase 3 B1", () => {
           status: 200, headers: { "Content-Type": "application/json" },
         });
       }
-      // Done gate (AI-1475): branch/PR status check for deploy → done
+      // Done gate (AI-1475/AI-1797): branch/PR status via GitHub attachments
       if (parsed.query?.includes("IssueBranchAndPR")) {
         return new Response(JSON.stringify({
-          data: { issue: { branch: { id: "branch-1", name: "main", updatedAt: "2026-01-01" }, pullRequests: { nodes: [{ id: "pr-1", state: "merged" }] } } },
+          data: { issue: { attachments: { nodes: [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status: "merged" } }] } } },
         }), { status: 200, headers: { "Content-Type": "application/json" } });
       }
       return new Response(JSON.stringify(mainResponse), {

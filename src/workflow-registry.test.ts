@@ -176,7 +176,7 @@ function makeLabelFetch(labelNames: string[]): typeof globalThis.fetch {
     }
     if (body.includes("IssueBranchAndPR")) {
       return new Response(
-        JSON.stringify({ data: { issue: { branch: null, pullRequests: { nodes: [] } } } }),
+        JSON.stringify({ data: { issue: { attachments: { nodes: [] } } } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }

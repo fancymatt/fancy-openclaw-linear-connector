@@ -36,6 +36,8 @@ import {
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
+import { initAlertBus, _resetAlertBusForTests } from "./alerts/alert-bus.js";
+import { AlertStore } from "./alerts/alert-store.js";
 import { clearArtifactStore, getBoundArtifact, hasBoundArtifact } from "./artifact-store.js";
 import { runTransitionWalk } from "./canary.js";
 import { clearAcRecordStore, getAcRecord } from "./ac-record-store.js";
@@ -352,15 +354,20 @@ function makeLabelFetch(labelNames: string[], branchAndPR?: { hasBranch?: boolea
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
-    // Return branch/PR data when the query asks for it (AI-1475 D1 done gate)
+    // Return branch/PR data when the query asks for it (AI-1475 D1 done gate).
+    // AI-1797: status is now derived from GitHub PR attachments — hasBranch is
+    // implied by hasPR and branch-only evidence is not representable.
     if (bodyText.includes("IssueBranchAndPR")) {
       const prState = branch.hasMergedPR ? "merged" : "open";
       return new Response(
         JSON.stringify({
           data: {
             issue: {
-              branch: branch.hasBranch ? { id: "branch-id", name: "feature-branch", updatedAt: "2026-06-09T00:00:00Z" } : null,
-              pullRequests: branch.hasPR ? { nodes: [{ id: "pr-id", state: prState }] } : { nodes: [] },
+              attachments: {
+                nodes: branch.hasPR
+                  ? [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status: prState } }]
+                  : [],
+              },
             },
           },
         }),
@@ -869,15 +876,16 @@ function makeTransitionFetch(opts: {
   issueError?: boolean;
   /** Override to simulate a fetch error for the issueUpdate call. */
   updateError?: boolean;
-  /** Branch/PR status for done gate (AI-1475 D1 + AI-1492). Defaults to has branch + PR (pass gate). */
-  branchStatus?: { hasBranch?: boolean; hasPR?: boolean; hasMergedPR?: boolean } | null;
+  /** Branch/PR status for done gate (AI-1475 D1 + AI-1492). Defaults to has branch + PR (pass gate).
+   * null = fetch throws; "graphql-error" = schema-level rejection payload (AI-1797). */
+  branchStatus?: { hasBranch?: boolean; hasPR?: boolean; hasMergedPR?: boolean } | null | "graphql-error";
 }): { fetch: typeof globalThis.fetch; calls: FetchCall[] } {
   const calls: FetchCall[] = [];
   const teamId = opts.teamId ?? "team-uuid";
   const teamLabels = opts.teamLabels ?? [];
   const issueUpdateSuccess = opts.issueUpdateSuccess ?? true;
   // Default: branch pushed + PR exists (gate passes)
-  const branch = opts.branchStatus === null ? null : {
+  const branch = opts.branchStatus === null || opts.branchStatus === "graphql-error" ? opts.branchStatus : {
     hasBranch: opts.branchStatus?.hasBranch ?? true,
     hasPR: opts.branchStatus?.hasPR ?? true,
     hasMergedPR: opts.branchStatus?.hasMergedPR ?? false,
@@ -968,19 +976,30 @@ function makeTransitionFetch(opts: {
       );
     }
 
-    // AI-1475 D1 + AI-1492: Branch/PR status for done gate.
+    // AI-1475 D1 + AI-1492 + AI-1797: Branch/PR status for done gate,
+    // derived from GitHub PR attachments (hasBranch implied by hasPR).
     if (query.includes("IssueBranchAndPR")) {
       if (branch === null) {
         // Simulate fetch error for branch/PR query
         throw new Error("simulated branch/PR fetch error");
+      }
+      if (branch === "graphql-error") {
+        // AI-1797: persistent schema-level rejection (the silent fail-open bug)
+        return new Response(
+          JSON.stringify({ errors: [{ message: 'Cannot query field "branch" on type "Issue".', extensions: { code: "GRAPHQL_VALIDATION_FAILED" } }] }),
+          { status: 400, headers: { "Content-Type": "application/json" } },
+        );
       }
       const prState = branch.hasMergedPR ? "merged" : "open";
       return new Response(
         JSON.stringify({
           data: {
             issue: {
-              branch: branch.hasBranch ? { id: "branch-id", name: "feature-branch", updatedAt: "2026-06-09T00:00:00Z" } : null,
-              pullRequests: branch.hasPR ? { nodes: [{ id: "pr-id", state: prState }] } : { nodes: [] },
+              attachments: {
+                nodes: branch.hasPR
+                  ? [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status: prState } }]
+                  : [],
+              },
             },
           },
         }),
@@ -1595,20 +1614,49 @@ describe("checkWorkflowRules — AI-1475 D1: done gate (branch/PR verification)"
     expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 
-  it("blocks 'deploy' → done when branch is not pushed", async () => {
+  // AI-1797: branch/PR status comes from GitHub PR attachments; a PR attachment
+  // implies a pushed branch, so branch-only / PR-only partial evidence no longer
+  // exists and an open (unmerged) PR passes, matching prior branch+PR semantics.
+  it("allows 'deploy' → done with an open PR attachment (PR implies pushed branch, AI-1797)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: true });
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
-    expect(result).toContain("branch not pushed to origin");
+    expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 
-  it("blocks 'deploy' → done when no PR exists", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: true, hasPR: false });
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
-    expect(result).toContain("no pull request associated");
+  // AI-1797 regression: the original query used Issue.branch/pullRequests, which
+  // are not in Linear's public schema — every call returned a GRAPHQL_VALIDATION_FAILED
+  // errors payload, silently parsed as null, and the gate fail-opened with no signal.
+  // Errors payloads must fail-open loudly: warn log + deduped warning alert.
+  it("emits a deduped warning alert when the gate query returns GraphQL errors (AI-1797)", async () => {
+    _resetAlertBusForTests();
+    const alertStore = new AlertStore(":memory:");
+    initAlertBus({ store: alertStore, pushEnabled: false });
+    try {
+      globalThis.fetch = async (_url, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+          return new Response(JSON.stringify({
+            data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] }, delegate: null } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("IssueBranchAndPR")) {
+          return new Response(JSON.stringify({
+            errors: [{ message: 'Cannot query field "branch" on type "Issue".', extensions: { code: "GRAPHQL_VALIDATION_FAILED" } }],
+          }), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
+        throw new Error(`unexpected fetch call: ${bodyText.slice(0, 60)}`);
+      };
+      const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+      expect(result).toBeNull(); // fail-open — but no longer silent
+      const alerts = alertStore.query({ source: "done-gate" });
+      expect(alerts.length).toBeGreaterThanOrEqual(1);
+      const queryAlert = alerts.find((a) => a.dedupKey === "done-gate|query-failing");
+      expect(queryAlert).toBeDefined();
+      expect(queryAlert?.severity).toBe("warning");
+      // Retried once → same dedupKey folded, not a second row
+      expect(alerts.filter((a) => a.dedupKey === "done-gate|query-failing").length).toBe(1);
+    } finally {
+      _resetAlertBusForTests();
+    }
   });
 
   // AI-1497: Complete absence of evidence is now fail-open — data likely lost to auto-delete.
@@ -1661,12 +1709,6 @@ describe("checkWorkflowRules — AI-1475 D1: done gate (branch/PR verification)"
     expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 
-  it("still blocks 'deploy' → done when PR is open (not merged) and branch is deleted (AI-1492)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"], { hasBranch: false, hasPR: true, hasMergedPR: false });
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
-    expect(result).not.toBeNull();
-    expect(result).toContain("branch not pushed to origin");
-  });
 });
 
 // ── AI-1475 Defect 2: Submit requires reviewer ≠ author ──────────────────────
@@ -1703,7 +1745,10 @@ describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () =
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("blocks label swap to done when branch not pushed (defense-in-depth)", async () => {
+  // AI-1797: status is attachment-derived (hasBranch ≡ hasPR), so the old
+  // partial-evidence block cases (branch-only / PR-only) are unrepresentable.
+  // An open PR now passes B2 — same outcome as the prior branch+PR pass case.
+  it("allows label swap to done with an open PR attachment (PR implies branch, AI-1797)", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
@@ -1714,22 +1759,25 @@ describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () =
     });
     globalThis.fetch = mock;
     await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
-    // No ApplyAtomicTransition call — done gate blocked it
-    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
   });
 
-  it("blocks label swap to done when no PR exists (defense-in-depth)", async () => {
+  // AI-1797 regression: a schema-level errors payload (the silent fail-open bug)
+  // must fail-open in B2 too — the ticket is past code review; do not strand it.
+  it("fails open in B2 when the gate query returns GraphQL errors (AI-1797)", async () => {
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
         { id: "state-lbl", name: "state:deployment" },
       ],
       teamLabels: [{ id: "done-lbl", name: "state:done" }],
-      branchStatus: { hasBranch: true, hasPR: false },
+      branchStatus: "graphql-error",
     });
     globalThis.fetch = mock;
     await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
-    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
   });
 
   it("allows label swap to done when branch + PR exist", async () => {
@@ -1810,20 +1858,6 @@ describe("applyStateTransition — AI-1475 D1: done gate defense-in-depth", () =
     expect(updateCall).toBeDefined();
   });
 
-  it("still blocks label swap to done when PR is open (not merged) and branch is deleted (AI-1492)", async () => {
-    const { fetch: mock, calls } = makeTransitionFetch({
-      issueLabels: [
-        { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:deployment" },
-      ],
-      teamLabels: [{ id: "done-lbl", name: "state:done" }],
-      branchStatus: { hasBranch: false, hasPR: true, hasMergedPR: false },
-    });
-    globalThis.fetch = mock;
-    await applyStateTransition("deploy", "issue-uuid", "Bearer tok");
-    // No ApplyAtomicTransition call — done gate blocked it
-    expect(calls.some((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"))).toBe(false);
-  });
 });
 
 // ── AI-1402: Default-deny + needs-human blocking + unknown-caller ─────────
@@ -3225,8 +3259,7 @@ bodies:
           JSON.stringify({
             data: {
               issue: {
-                branch: { id: "branch-id", name: "feature-branch", updatedAt: "2026-06-09T00:00:00Z" },
-                pullRequests: { nodes: [{ id: "pr-id", state: "open" }] },
+                attachments: { nodes: [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status: "open" } }] },
               },
             },
           }),
@@ -5508,7 +5541,7 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
       // Branch/PR for done gate
       if (q.includes("IssueBranchAndPR")) {
         return new Response(
-          JSON.stringify({ data: { issue: { branch: { id: "branch-id", name: "feature", updatedAt: "2026-06-09T00:00:00Z" }, pullRequests: { nodes: [{ id: "pr-id", state: "open" }] } } } }),
+          JSON.stringify({ data: { issue: { attachments: { nodes: [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status: "open" } }] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -6143,14 +6176,15 @@ describe("checkWorkflowRules — AI-1576 AC3: demote blocked when ticket has in-
     expect(result).toContain("demote");
   });
 
-  it("AC3: demote from intake is blocked when branch is pushed but no PR (in-flight work)", async () => {
+  // AI-1797: branch-only evidence (pushed, no PR yet) is invisible via attachments —
+  // Linear's public schema has no branch data. The guard can only see PRs now, so a
+  // branch-without-PR ticket demotes like a fresh intake. Known coverage loss.
+  it("AC3: demote from intake is allowed when branch is pushed but no PR (invisible via attachments, AI-1797)", async () => {
     globalThis.fetch = makeLabelFetch(
       ["wf:dev-impl", "state:intake"],
       { hasBranch: true, hasPR: false, hasMergedPR: false },
     );
-    const result = await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
+    expect(await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid")).toBeNull();
   });
 
   // GREEN: no branch/PR evidence → genuinely fresh intake → demote is safe.
@@ -6781,8 +6815,7 @@ describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () 
           JSON.stringify({
             data: {
               issue: {
-                branch: { id: "br", name: "feat", updatedAt: "2026-01-01T00:00:00Z" },
-                pullRequests: { nodes: [{ id: "pr", state: "open" }] },
+                attachments: { nodes: [{ url: "https://github.com/fancymatt/repo/pull/2", sourceType: "github", metadata: { status: "open" } }] },
               },
             },
           }),

@@ -51,6 +51,7 @@ import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./co
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
 import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
 import { recordAppliedState, clearAppliedState } from "./store/applied-state-store.js";
+import { notify } from "./alerts/alert-bus.js";
 
 /**
  * Phase 6.5 / H-6: Label read-only projection + override path + drift reconciliation.
@@ -840,6 +841,19 @@ interface BranchAndPRStatus {
  * Used by the done gate (§5.6) to verify that implementation was actually
  * pushed and reviewed before allowing the terminal done transition.
  * Returns null on any error — caller decides fail-open vs fail-closed.
+ *
+ * AI-1797: `Issue.branch` / `Issue.pullRequests` are NOT in Linear's public
+ * GraphQL schema — the original query was rejected with
+ * GRAPHQL_VALIDATION_FAILED for the connector's authenticated OAuth actors
+ * too (verified live 2026-07-05), so this function returned null on every
+ * call and the gate silently fail-opened. PR/branch data is only surfaced
+ * via `attachments` created by Linear's GitHub integration; a GitHub PR
+ * attachment implies a pushed branch, so hasBranch mirrors hasPR and the
+ * branch-without-PR partial-evidence case is no longer observable.
+ * NOTE: the workspace currently has no GitHub integration installed, so
+ * attachments are empty on every issue and the gate passes evidence-free
+ * (AI-1497 fail-open) until the integration is enabled — see the
+ * no-evidence alert at the deploy gate.
  */
 async function fetchBranchAndPRStatus(
   issueId: string,
@@ -848,15 +862,11 @@ async function fetchBranchAndPRStatus(
   const query = `
     query IssueBranchAndPR($id: String!) {
       issue(id: $id) {
-        branch {
-          id
-          name
-          updatedAt
-        }
-        pullRequests {
+        attachments {
           nodes {
-            id
-            state
+            url
+            sourceType
+            metadata
           }
         }
       }
@@ -868,22 +878,49 @@ async function fetchBranchAndPRStatus(
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query, variables: { id: issueId } }),
     });
+    type AttachmentNode = {
+      url?: string | null;
+      sourceType?: string | null;
+      metadata?: Record<string, unknown> | null;
+    };
     type PRResp = {
-      data?: {
-        issue?: {
-          branch?: { id: string; name: string; updatedAt: string } | null;
-          pullRequests?: { nodes: Array<{ id: string; state: string }> };
-        };
-      };
+      data?: { issue?: { attachments?: { nodes: AttachmentNode[] } } };
+      errors?: Array<{ message?: string; extensions?: { code?: string } }>;
     };
     const data = (await res.json()) as PRResp;
+    if (data.errors?.length) {
+      // A validation/auth error here is persistent, not transient — the exact
+      // failure mode that went unnoticed before AI-1797. Never silent again.
+      const summary = data.errors.map((e) => e.message ?? e.extensions?.code ?? "unknown").join("; ");
+      log.warn(`workflow-gate: IssueBranchAndPR query returned errors for ${issueId}: ${summary}`);
+      notify({
+        severity: "warning",
+        source: "done-gate",
+        title: "IssueBranchAndPR gate query failing — done gate is fail-opening",
+        detail: `Query errors for ${issueId}: ${summary}`,
+        ticket: issueId,
+        dedupKey: "done-gate|query-failing",
+      });
+      return null;
+    }
     const issue = data.data?.issue;
-    if (!issue) return null;
-    const prs = issue.pullRequests?.nodes ?? [];
+    if (!issue) {
+      log.warn(`workflow-gate: IssueBranchAndPR returned no issue for ${issueId}`);
+      return null;
+    }
+    const nodes = issue.attachments?.nodes ?? [];
+    const prNodes = nodes.filter((n) => typeof n.url === "string" && /github\.com\/[^/]+\/[^/]+\/pull\/\d+/i.test(n.url));
+    const hasPR = prNodes.length > 0;
+    const hasMergedPR = prNodes.some((n) => {
+      const meta = n.metadata ?? {};
+      const status = (meta as { status?: unknown; state?: unknown }).status ?? (meta as { state?: unknown }).state;
+      return typeof status === "string" && status.toLowerCase() === "merged";
+    });
     return {
-      hasBranch: !!issue.branch?.id,
-      hasPR: prs.length > 0,
-      hasMergedPR: prs.some((pr) => pr.state === "merged"),
+      // Attachments cannot see branches directly; a PR implies a pushed branch.
+      hasBranch: hasPR,
+      hasPR,
+      hasMergedPR,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1511,9 +1548,23 @@ export async function checkWorkflowRules(
       // Fail-open: a ticket in deployment state has already passed code review,
       // so the PR almost certainly existed and was merged.
       log.info(`workflow-gate: done gate: ${issueId} passed (no branch/PR evidence — treating as merged, data likely lost to auto-delete)`);
+      // AI-1797: with no GitHub integration installed, EVERY ticket takes this
+      // path — an evidence-free gate. Constant dedup key: one folded alert row,
+      // count keeps rising until the integration lands, then it goes quiet.
+      notify({
+        severity: "warning",
+        source: "done-gate",
+        title: "done gate passed with no branch/PR evidence (GitHub integration missing?)",
+        detail: `Ticket ${issueId} passed '${intent}' with zero GitHub attachments. If this fires for every deploy, the Linear GitHub integration is not installed and the merged-PR gate is verifying nothing.`,
+        ticket: issueId,
+        dedupKey: "done-gate|no-evidence",
+      });
     } else {
       // Partial evidence exists (has branch but no PR, or similar).
       // Block: affirmative evidence that review was not completed.
+      // AI-1797: with attachment-derived status hasBranch ≡ hasPR, so this
+      // block is currently unreachable (open PR falls through to the pass
+      // log below). Kept for defense-in-depth if a richer source returns.
       const missing: string[] = [];
       if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
       if (!branchStatus.hasPR) missing.push('no pull request associated');
