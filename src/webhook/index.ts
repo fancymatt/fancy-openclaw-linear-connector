@@ -55,6 +55,90 @@ function appendOperationalEvent(store: OperationalEventStore | undefined, input:
 }
 
 /**
+ * AI-1838 AC1: Extract state/label/delegate changes from an Issue update webhook
+ * and record them as `state-change-observed` audit events. The reconcile cron
+ * (AC2) diffs these against `proxy-forwarded`/`transition-applied` events to
+ * detect out-of-band mutations — changes made directly via Linear UI or raw
+ * token API that bypassed the connector proxy.
+ *
+ * Linear's webhook payload for Issue updates includes `updatedFrom` containing
+ * the previous values of changed fields. We extract the relevant ones:
+ *   - state (native Linear state name/type)
+ *   - assigneeId (assignee changes)
+ *   - delegate (OAuth delegate changes)
+ *   - labelIds (label additions/removals — includes state:* workflow labels)
+ */
+function recordStateChangeAudit(store: OperationalEventStore | undefined, event: LinearEvent): void {
+  if (!store) return;
+  if (event.type !== "Issue" || event.action !== "update") return;
+
+  const data = event.data as Record<string, unknown> | null;
+  const updatedFrom = (event as { updatedFrom?: Record<string, unknown> }).updatedFrom;
+  if (!data) return;
+
+  const identifier = (data.identifier as string | undefined) ?? data.id as string | undefined;
+  if (!identifier) return;
+
+  const sessionKey = normalizeSessionKey(identifier);
+  const changes: Record<string, { from: unknown; to: unknown }> = {};
+
+  // Native state change
+  if (updatedFrom && updatedFrom.state !== undefined) {
+    const oldState = updatedFrom.state as Record<string, unknown> | undefined;
+    const newState = data.state as Record<string, unknown> | undefined;
+    changes.state = {
+      from: oldState ? { name: oldState.name, type: oldState.type } : null,
+      to: newState ? { name: newState.name, type: newState.type } : null,
+    };
+  }
+
+  // Delegate change
+  if (updatedFrom && updatedFrom.delegate !== undefined) {
+    changes.delegate = {
+      from: updatedFrom.delegate,
+      to: data.delegate ?? null,
+    };
+  }
+
+  // Assignee change
+  if (updatedFrom && updatedFrom.assigneeId !== undefined) {
+    changes.assigneeId = {
+      from: updatedFrom.assigneeId,
+      to: data.assigneeId ?? null,
+    };
+  }
+
+  // Label changes (includes state:* workflow labels)
+  if (updatedFrom && updatedFrom.labelIds !== undefined) {
+    const oldLabels = Array.isArray(updatedFrom.labelIds) ? updatedFrom.labelIds : [];
+    const newLabels = Array.isArray(data.labelIds) ? data.labelIds : [];
+    const added = newLabels.filter((l: unknown) => !oldLabels.includes(l));
+    const removed = oldLabels.filter((l: unknown) => !newLabels.includes(l));
+    if (added.length > 0 || removed.length > 0) {
+      changes.labels = { from: { removed: removed.map(String) }, to: { added: added.map(String) } };
+    }
+  }
+
+  if (Object.keys(changes).length === 0) return;
+
+  const actor = event.actor;
+  const isAgentActor = actor && actor.email && actor.email.includes("oauthapp.linear.app");
+
+  appendOperationalEvent(store, {
+    outcome: "state-change-observed",
+    type: event.type,
+    key: sessionKey,
+    sessionKey,
+    agent: isAgentActor ? actor.name : null,
+    detail: {
+      changes,
+      actor: { id: actor.id, name: actor.name, isAgent: !!isAgentActor },
+      identifier,
+    },
+  });
+}
+
+/**
  * Rebuild WS1 (2026-07-03, pilot finding): Comment webhooks carry no delegate,
  * so "a comment wakes the ticket's delegate" NEVER worked — every plain
  * comment no-routed (verified live: AI-1755/AI-1756). Before routing, fetch
@@ -244,6 +328,14 @@ export function createWebhookRouter(
 
       // Record event for dedup & restart recovery
       eventStore?.recordEvent(deliveryId, payload as object);
+
+      // AI-1838 AC1: Webhook payload audit — record every state/label/delegate
+      // change observed in an Issue update webhook. This is the durable record
+      // that the reconcile cron diffs against proxy ops to detect out-of-band
+      // mutations (changes that bypassed the connector proxy).
+      if (event.type === "Issue" && event.action === "update") {
+        recordStateChangeAudit(operationalEventStore, event);
+      }
 
       // ── 9. Route to agent ─────────────────────────────────────────────────
       log.info(`Normalized event: type=${event.type} hasData=${"data" in event} dataKeys=${event.data ? Object.keys(event.data as object).join(',') : 'none'}`);

@@ -2,7 +2,10 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 
-export const OPERATIONAL_EVENT_OUTCOMES = ["received", "signature-rejected", "duplicate", "normalized", "terminal-pruned", "no-route", "routed", "dedup-suppressed", "bag-added", "delivered", "dispatch-accepted", "queued", "delivery-failed", "delivery-unconfirmed", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "no-activity-warn", "no-activity-failed", "deferred-at-capacity", "deferred-capacity-rearm", "stuck-delegate-reprompt", "stale-c4-repoke", "stale-c4-repoke-failed", "engagement-thinking", "engagement-doing", "engagement-todo", "bootstrap-bootstrapped", "bootstrap-demoted", "bootstrap-wake-dispatched", "bootstrap-wake-delivered", "bootstrap-wake-failed", "enrollment-healed", "break-glass-used", "hold-retry-dispatch", "no-activity-redispatch", "watchdog-resignal", "comment-post-failed"] as const;
+export const OPERATIONAL_EVENT_OUTCOMES = ["received", "signature-rejected", "duplicate", "normalized", "terminal-pruned", "no-route", "routed", "dedup-suppressed", "bag-added", "delivered", "dispatch-accepted", "queued", "delivery-failed", "delivery-unconfirmed", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "no-activity-warn", "no-activity-failed", "deferred-at-capacity", "deferred-capacity-rearm", "stuck-delegate-reprompt", "stale-c4-repoke", "stale-c4-repoke-failed", "engagement-thinking", "engagement-doing", "engagement-todo", "bootstrap-bootstrapped", "bootstrap-demoted", "bootstrap-wake-dispatched", "bootstrap-wake-delivered", "bootstrap-wake-failed", "enrollment-healed", "break-glass-used", "hold-retry-dispatch", "no-activity-redispatch", "watchdog-resignal", "comment-post-failed",
+  // AI-1838: proxy op audit + out-of-band mutation detection
+  "proxy-forwarded", "proxy-blocked", "proxy-upstream-error", "proxy-rate-limited", "transition-applied", "transition-failed", "state-change-observed", "out-of-band-detected",
+] as const;
 export type OperationalEventOutcome = typeof OPERATIONAL_EVENT_OUTCOMES[number];
 
 export interface OperationalEventInput {
@@ -48,8 +51,8 @@ const SECRET_VALUE_PATTERNS: Array<[RegExp, string]> = [
   [/\blin_wh_[A-Za-z0-9_-]+\b/ig, "[REDACTED]"],
   [/\b[^\s,;]*?(?:token|secret|password|authorization|api[-_]?key)[^\s,;]*\b/ig, "[REDACTED]"],
 ];
-const SUCCESS_OUTCOMES = new Set<OperationalEventOutcome>(["received", "normalized", "routed", "bag-added", "delivered", "dispatch-accepted", "queued", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "deferred-capacity-rearm", "enrollment-healed"]);
-const ERROR_OUTCOMES = new Set<OperationalEventOutcome>(["signature-rejected", "delivery-failed", "no-route", "no-activity-warn", "no-activity-failed", "deferred-at-capacity"]);
+const SUCCESS_OUTCOMES = new Set<OperationalEventOutcome>(["received", "normalized", "routed", "bag-added", "delivered", "dispatch-accepted", "queued", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "deferred-capacity-rearm", "enrollment-healed", "proxy-forwarded", "transition-applied"]);
+const ERROR_OUTCOMES = new Set<OperationalEventOutcome>(["signature-rejected", "delivery-failed", "no-route", "no-activity-warn", "no-activity-failed", "deferred-at-capacity", "proxy-blocked", "proxy-upstream-error", "proxy-rate-limited", "transition-failed", "out-of-band-detected"]);
 
 function redactText(value: string): string {
   return SECRET_VALUE_PATTERNS.reduce((output, [pattern, replacement]) => output.replace(pattern, replacement), value);
