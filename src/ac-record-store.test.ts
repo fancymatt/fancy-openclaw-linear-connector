@@ -156,37 +156,68 @@ describe("ac-record-store", () => {
     });
   });
 
+  // AI-1825: The default path (data/ac-records.json) is a real file in the
+  // repo working directory, not a temp dir. These tests must not leak state
+  // to subsequent tests or back-to-back runs. We isolate by: backing up any
+  // pre-existing file in beforeEach, ensuring data/ exists (fresh CI checkouts
+  // don't have it since data/ is gitignored), guaranteeing cleanup via
+  // afterEach + try/finally, and restoring pre-existing content afterward.
   describe("default path durability", () => {
+    const defaultPath = "data/ac-records.json";
+    const defaultDir = "data";
+    let savedDefaultFile: string | null = null;
+
+    beforeEach(async () => {
+      // Ensure the data/ directory exists (persist() silently swallows ENOENT,
+      // so a missing dir would cause the file to never be written → false red)
+      await fs.mkdir(defaultDir, { recursive: true });
+      // Back up any pre-existing file so we can restore it after the test
+      try {
+        savedDefaultFile = await fs.readFile(defaultPath, "utf8");
+      } catch {
+        savedDefaultFile = null;
+      }
+    });
+
+    afterEach(async () => {
+      // Always restore pre-existing content (or remove if none existed before)
+      try {
+        if (savedDefaultFile !== null) {
+          await fs.writeFile(defaultPath, savedDefaultFile, "utf8");
+        } else {
+          await fs.unlink(defaultPath);
+        }
+      } catch {
+        // ignore cleanup errors
+      }
+    });
+
     it("does not default to /tmp (AI-1818 AC1)", async () => {
       // Verify that when no AC_RECORDS_PATH is set, the resolved path is durable
-      // (not /tmp). We test by clearing the env var, forcing a reload, and checking
-      // that persist writes to a non-/tmp location.
+      // (not /tmp). We clear the env var, force a reload, and check that persist
+      // writes to a non-/tmp location.
       const original = process.env.AC_RECORDS_PATH;
       delete process.env.AC_RECORDS_PATH;
       clearAcRecordStore();
 
-      await captureAc("AI-TEST-DURABLE", {
-        verbatimAc: "durable test",
-        capturedAt: "2026-07-05T00:00:00Z",
-        capturedBy: "test",
-        source: "description",
-      });
-
-      // The file should exist at data/ac-records.json relative to the repo root
-      const { existsSync } = await import("node:fs");
-      const defaultPath = "data/ac-records.json";
-      expect(existsSync(defaultPath)).toBe(true);
-
-      // Clean up test record from the default path
       try {
-        await fs.unlink(defaultPath);
-      } catch {
-        // ignore
-      }
+        await captureAc("AI-TEST-DURABLE", {
+          verbatimAc: "durable test",
+          capturedAt: "2026-07-05T00:00:00Z",
+          capturedBy: "test",
+          source: "description",
+        });
 
-      // Restore env
-      if (original !== undefined) process.env.AC_RECORDS_PATH = original;
-      clearAcRecordStore();
+        // The file should exist at a durable location (not under /tmp)
+        const { existsSync } = await import("node:fs");
+        expect(existsSync(defaultPath)).toBe(true);
+        expect(defaultPath).not.toContain("/tmp");
+      } finally {
+        // Restore env + in-memory state even if the assertion fails, so we
+        // don't cascade-pollute subsequent tests
+        if (original !== undefined) process.env.AC_RECORDS_PATH = original;
+        clearAcRecordStore();
+      }
     });
   });
 
