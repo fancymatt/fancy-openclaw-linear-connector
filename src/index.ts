@@ -39,6 +39,7 @@ import { startRegistryPolicyCheck } from "./registry-policy.js";
 import { resolveStartupCommit } from "./startup-commit.js";
 import { getAccessToken, getAgent, getLinearUserIdForAgent } from "./agents.js";
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
+import { createGuidanceRouter, getDocsLiveness } from "./docs/guidance-router.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
 import path from "path";
@@ -204,8 +205,14 @@ export function createApp(options?: CreateAppOptions) {
       // the canon file loaded and its version, observable at ac-validate
       // without waiting for a dispatch trigger.
       universalCanon: getCanonLiveness(),
+      // AI-1849 (Pillar 2 D2): docs endpoint liveness — confirms /docs is registered.
+      docs: getDocsLiveness(),
     });
   });
+
+  // AI-1849 (Pillar 2 D2): docs endpoint — serves instance-config docs to
+  // authenticated agents using their lpx proxy token (read-only, no admin secret).
+  app.use("/docs", createGuidanceRouter());
 
   // OAuth callback — handles Linear app authorization flow
   // Both paths supported: /callback (legacy) and /oauth/callback (registered with Linear)
