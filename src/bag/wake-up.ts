@@ -14,6 +14,7 @@
 
 import { deliverMessageToAgent, type DeliveryConfig, type DeliveryResult } from "../delivery/index.js";
 import { buildWorkflowAwareDeliveryMessage } from "../delivery/build-message.js";
+import { loadUniversalCanon, formatCanonBlock, getActiveCanonVersion, type CanonLoadResult } from "../policy/universal-canon.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
 
@@ -111,20 +112,37 @@ export async function sendWakeUpSignal(
   agentId: string,
   ticketIds: string[],
   config: WakeUpConfig,
-): Promise<{ runId?: string } | void> {
+): Promise<{ runId?: string; canonVersion?: string } | void> {
   let message: string;
+  let canonVersion: string | null = null;
 
   if (ticketIds.length === 1 && config.linearAuthToken) {
     const plainId = ticketIds[0].replace(/^linear-/i, "");
     const rich = await buildWorkflowAwareDeliveryMessage(plainId, config.linearAuthToken);
     if (rich) {
+      // buildWorkflowAwareDeliveryMessage already injects the canon via withCanonBlock.
       message = rich;
+      canonVersion = getActiveCanonVersion();
       log.info(`Rich workflow delivery for ${agentId} [${plainId}]`);
     } else {
       message = buildWakeUpMessage(ticketIds, config.signalTemplate);
     }
   } else {
     message = buildWakeUpMessage(ticketIds, config.signalTemplate);
+  }
+
+  // AI-1848 fix: inject canon into thin-template wake messages (multi-ticket,
+  // ad-hoc, mention). buildWorkflowAwareDeliveryMessage already handles canon
+  // for the rich workflow path above.
+  if (!canonVersion) {
+    const canon = await loadUniversalCanon();
+    if (canon) {
+      const block = formatCanonBlock(canon.text, canon.version);
+      if (block) {
+        message = message + block;
+        canonVersion = canon.version;
+      }
+    }
   }
 
   // Normalize to strip any legacy prefixes and enforce uppercase.
@@ -138,7 +156,7 @@ export async function sendWakeUpSignal(
     if (!result.dispatched) {
       throw new Error(result.hookErrorSummary ?? "wake-up delivery was not accepted");
     }
-    return result.runId ? { runId: result.runId } : undefined;
+    return { runId: result.runId, canonVersion: canonVersion ?? undefined };
   } catch (err) {
     log.error(
       `Wake-up signal failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`

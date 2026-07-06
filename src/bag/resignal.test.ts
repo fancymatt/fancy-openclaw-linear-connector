@@ -47,7 +47,7 @@ describe("resignalPendingTickets", () => {
 
     expect(results).toEqual([
       { ticketId: "linear-AI-501", dispatched: false, pruned: true },
-      { ticketId: "linear-AI-597", dispatched: true, runId: undefined },
+      { ticketId: "linear-AI-597", dispatched: true, runId: undefined, canonVersion: null },
     ]);
     expect(sentTickets).toEqual(["linear-AI-597"]);
     const remaining = bag.getPendingTickets("igor");

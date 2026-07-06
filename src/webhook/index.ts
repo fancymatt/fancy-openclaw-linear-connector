@@ -675,10 +675,15 @@ export function createWebhookRouter(
         // always hitting OPENCLAW_HOOKS_URL (which may belong to a different fleet).
         const wakeConfigForAgent = (agentIdLookup: string): WakeUpConfig => {
           const cfg = getAgent(agentIdLookup);
+          const rawToken = getAccessToken(agentIdLookup) ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+          const linearAuthToken = rawToken
+            ? (/^Bearer\s+/i.test(rawToken) ? rawToken : `Bearer ${rawToken}`)
+            : undefined;
           return {
             ...wakeConfig,
             hooksUrl: cfg?.hooksUrl ?? wakeConfig.hooksUrl,
             hooksToken: cfg?.hooksToken ?? wakeConfig.hooksToken,
+            linearAuthToken,
           };
         };
 
@@ -727,11 +732,13 @@ export function createWebhookRouter(
         const dispatchResults = await resignalPendingTickets(agentName, pendingIds, bag, sessionTracker, wakeConfigForAgent(agentName), { markActive: true, onDispatched });
         const dispatched = dispatchResults.filter(r => r.dispatched).length;
         const firstRunId = dispatchResults.find(r => r.runId)?.runId ?? null;
+        const firstCanonVersion = dispatchResults.find(r => r.canonVersion)?.canonVersion ?? null;
         appendOperationalEvent(operationalEventStore, {
           outcome: dispatched > 0 ? "dispatch-accepted" : "delivery-failed",
           type: event.type, agent: agentName, key: normalizedTicketId, sessionKey: normalizedTicketId,
           deliveryMode: "wake-up", attemptCount: pendingIds.length, runId: firstRunId,
-          errorSummary: dispatched > 0 ? null : "No wake-up signals dispatched", wakeId, plane: "connector"
+          errorSummary: dispatched > 0 ? null : "No wake-up signals dispatched", wakeId, plane: "connector",
+          detail: firstCanonVersion ? { canonVersion: firstCanonVersion } : undefined,
         });
         return;
       }

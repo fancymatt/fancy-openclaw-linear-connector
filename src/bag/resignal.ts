@@ -14,6 +14,8 @@ export interface DispatchResult {
   pruned?: boolean;
   /** True when dispatch was skipped because the routing check returned fail-open and failOpenBehavior is "defer". */
   deferred?: boolean;
+  /** Canon version injected into this dispatch (null when no canon loaded). */
+  canonVersion?: string | null;
 }
 
 export interface ResignalOptions {
@@ -22,7 +24,7 @@ export interface ResignalOptions {
   /** Optional test hook / policy override for pruning no-longer-actionable tickets. */
   isTicketActionable?: (ticketId: string, agentId: string) => boolean | Promise<boolean>;
   /** Optional test hook for delivery. */
-  sendWakeUp?: (agentId: string, ticketIds: string[], config: WakeUpConfig) => Promise<{ runId?: string } | void>;
+  sendWakeUp?: (agentId: string, ticketIds: string[], config: WakeUpConfig) => Promise<{ runId?: string; canonVersion?: string } | void>;
   /** Optional callback after successful dispatch — used for ack tracking. */
   onDispatched?: (agentId: string, ticketId: string) => void;
   /**
@@ -116,7 +118,7 @@ export async function resignalPendingTickets(
 
       const wakeResult = await sendWakeUp(agentId, [ticketId], ticketWakeConfig);
       options.onDispatched?.(agentId, ticketId);
-      results.push({ ticketId, dispatched: true, runId: (wakeResult as { runId?: string } | void | undefined)?.runId });
+      results.push({ ticketId, dispatched: true, runId: (wakeResult as { runId?: string; canonVersion?: string } | void | undefined)?.runId, canonVersion: (wakeResult as { runId?: string; canonVersion?: string } | void | undefined)?.canonVersion ?? null });
     } catch (err) {
       log.error(
         `Re-signal failed for ${agentId} [${ticketId}]: ${err instanceof Error ? err.message : String(err)}`,
