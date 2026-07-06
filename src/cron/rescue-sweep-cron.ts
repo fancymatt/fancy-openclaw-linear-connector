@@ -12,6 +12,7 @@ import { runRescueSweep } from "../rescue-sweep.js";
 import { loadWorkflowRegistry } from "../workflow-gate.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { registerCron, formatIntervalMs } from "./registry.js";
+import { recordRescueSweepRun } from "../rescue-sweep-state.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "rescue-sweep-cron");
 
@@ -52,6 +53,7 @@ export function registerRescueSweepCron(): void {
         }
         const workflowRegistry = await loadWorkflowRegistry();
         const result = await runRescueSweep({ authToken, workflowRegistry });
+        recordRescueSweepRun(result);
         if (result.rescued > 0 || result.errors.length > 0) {
           log.info(
             `[rescue-sweep] Sweep complete: scanned=${result.scanned} rescued=${result.rescued} errors=${result.errors.length}`,

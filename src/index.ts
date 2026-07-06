@@ -33,6 +33,7 @@ import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { getRegisteredCrons } from "./cron/registry.js";
+import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { startRegistryPolicyCheck } from "./registry-policy.js";
@@ -158,12 +159,17 @@ export function createApp(options?: CreateAppOptions) {
   // Intercepts every Linear CLI call from Nakazawa agents; forwards unchanged
   // for now. Future phases add per-step instruction injection and command
   // validation. ILL fleet runs the main branch and is unaffected.
+  // AI-1860: per-app authorization snapshot map — fresh per createApp() call so
+  // test isolation is guaranteed and snapshots never outlive the app instance.
+  const commandAuthSnapshots = new Map<string, { snapshotDelegateId: string | null; expiresAt: number }>();
+
   app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, {
     observationStore,
     operationalEventStore,
     noActivityDetector,
     enrolledTicketsStore,
     mutationAuditStore,
+    commandAuthSnapshots,
     onProxyCall: (agentId, ticketId) => {
       // Any proxy call = implicit acknowledgment. Prevents the dispatch watchdog from
       // re-signaling agents that are working silently (e.g. sessions_yield during image gen).
@@ -201,6 +207,8 @@ export function createApp(options?: CreateAppOptions) {
       // missing from this list means it shipped without bootstrap wiring
       // (the AI-1773/AI-1775 dead-code-in-prod failure mode).
       crons: getRegisteredCrons(),
+      // AI-1857 AC3: rescue-sweep last-run visibility — "did it run" without log access.
+      rescueSweep: getRescueSweepState(),
       // AI-1848 (Pillar 2 D1): universal policy canon liveness — confirms
       // the canon file loaded and its version, observable at ac-validate
       // without waiting for a dispatch trigger.

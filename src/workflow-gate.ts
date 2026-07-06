@@ -1279,6 +1279,11 @@ export async function checkWorkflowRules(
   breakGlassOverride: boolean = false,
   isMetaIntent: boolean = false,
   hasComment: boolean = false,
+  // AI-1860: when provided, used in place of the live-fetched delegateId for authorization
+  // checks so multi-step governed commands don't self-block after applyStateTransition
+  // reassigns the delegate. undefined = no snapshot (re-fetch live); null = caller was
+  // delegate but delegate field was empty at command start.
+  snapshotDelegateId?: string | null,
 ): Promise<string | null> {
   // TODO(AI-1347): fail-open on missing issueId is a Layer A carry-forward.
   // Harden by deriving issueId from the request body when headers are absent.
@@ -1295,7 +1300,14 @@ export async function checkWorkflowRules(
     }
   }
 
-  const { labels, delegateId, fetchFailed } = await fetchTicketContext(issueId, authToken);
+  const { labels, delegateId: fetchedDelegateId, fetchFailed } = await fetchTicketContext(issueId, authToken);
+
+  // AI-1860: use snapshotted delegateId for authorization checks when provided.
+  // snapshotDelegateId is the delegateId captured at command start (first mutation);
+  // it remains stable across applyStateTransition so subsequent mutations in the
+  // same multi-step command are not self-blocked by a post-transition delegate change.
+  // The fetched delegateId is still used for informational fields (legal-moves messages).
+  const delegateId = snapshotDelegateId !== undefined ? snapshotDelegateId : fetchedDelegateId;
 
   // Phase 6.5 / H-1: Fail-closed on context-fetch failure.
   // When we can't fetch the ticket's labels, we cannot determine whether
@@ -1910,6 +1922,18 @@ export async function checkRawMutationInterception(
       : undefined;
   const isClearingDelegate =
     hasDelegateChange && (inputDelegateId === null || /\bdelegateId\s*:\s*null\b/.test(q));
+  // AI-1857: Block delegate clears regardless of mutation shape. The combined
+  // {delegateId:null, assigneeId:null} shape (partial semantic-verb application)
+  // has hasAssigneeChange=true → delegateOnlyChange=false → bypasses the AI-1835 guard.
+  // Check isClearingDelegate before delegateOnlyChange so the combined shape is caught.
+  // Only applies when no state change is present (hasStateChange=true has its own message).
+  if (isClearingDelegate && delegateId && !hasStateChange) {
+    log.warn(`workflow-gate: raw delegate null (self-clear) block agent=${bodyId} ticket=${issueId}`);
+    return (
+      `[Proxy] Direct delegate clear blocked: the current delegate may re-route ${issueId} ` +
+      `but may not null the delegate field directly. Use undelegate or handoff-work to release ownership.`
+    );
+  }
   const delegateOnlyChange =
     hasDelegateChange && !hasStateChange && !hasAssigneeChange && !hasLabelChange;
   if (delegateOnlyChange) {
@@ -3285,4 +3309,18 @@ export async function setStateAtomic(
   }
 
   return { ok: true, ticketId: ticketIdentifier, from: fromState, to: targetState, ...(redispatched ? { redispatched } : {}) };
+}
+
+/**
+ * AI-1857 AC4: Fetch a gate-verification snapshot for a ticket.
+ * Used by the proxy to include post-transition ticket state in gate-decline responses
+ * so the CLI can verify "no partial state was written" without a separate fetch.
+ */
+export async function fetchTicketVerification(
+  issueId: string,
+  authToken: string,
+): Promise<{ labels: string[]; delegateId: string | null; stateLabel: string | null }> {
+  const { labels, delegateId } = await fetchTicketContext(issueId, authToken);
+  const stateLabel = labels.find((l) => l.startsWith("state:")) ?? null;
+  return { labels, delegateId, stateLabel };
 }

@@ -31,7 +31,7 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules } from "./escalation-gate.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, resolveMetaIntent, verifyCommentSatisfiedBy, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, resolveMetaIntent, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
@@ -254,6 +254,17 @@ function stripStateLabelDeltas(body: GraphQLRequestBody | null, stateLabelIds: S
 }
 
 /**
+ * AI-1857: Strip null delegateId/assigneeId from an intent-bearing issueUpdate input.
+ * The proxy owns delegate management; CLIs must not directly null these fields.
+ */
+function stripNullDelegateAssigneeFields(body: GraphQLRequestBody | null): void {
+  const input = issueUpdateInput(body);
+  if (!input) return;
+  if (input.delegateId === null) delete input.delegateId;
+  if (input.assigneeId === null) delete input.assigneeId;
+}
+
+/**
  * Build the ticket context string for log lines (empty string when no ID found).
  */
 function extractTicketContext(body: GraphQLRequestBody | null): string {
@@ -303,6 +314,15 @@ function isMutationRequest(body: GraphQLRequestBody | null): boolean {
   return /^mutation\b/.test(stripped);
 }
 
+// AI-1860: TTL for per-command authorization snapshots.
+const COMMAND_AUTH_SNAPSHOT_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+export interface CommandAuthSnapshot {
+  /** The caller's Linear user ID snapshotted at command start (used as effective delegateId). */
+  snapshotDelegateId: string | null;
+  expiresAt: number;
+}
+
 export interface ProxyDeps {
   /** Optional observation store for recording feedback observations (P4-1). */
   observationStore?: ObservationStore;
@@ -314,6 +334,13 @@ export interface ProxyDeps {
   enrolledTicketsStore?: EnrolledTicketsStore;
   /** AI-1838: mutation audit store — proxy-forwarded mutations recorded for out-of-band reconcile. */
   mutationAuditStore?: MutationAuditStore;
+  /**
+   * AI-1860: per-app authorization snapshot map for multi-step governed commands.
+   * Keyed by `${agentId}:${issueId}:${intent}` — stores the caller's Linear user ID
+   * verified as delegate at command start. Subsequent mutations reuse this snapshot
+   * instead of re-fetching, preventing self-blocking after a post-transition delegate change.
+   */
+  commandAuthSnapshots?: Map<string, CommandAuthSnapshot>;
   /**
    * Called on the first proxy call from an agent for a ticket — auto-acknowledges the
    * dispatch so the watchdog doesn't re-signal an agent that is actively working but
@@ -472,11 +499,44 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           log.warn(`comment-satisfied-by rejected agent=${agentId} intent=${effectiveIntent}${ticketCtx} comment=${satisfiedByHeader}`);
         }
       }
-      const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment);
+      // AI-1860: look up any existing authorization snapshot for this (agent, ticket, intent).
+      // A snapshot is stored on the first successful checkWorkflowRules pass and reused for
+      // subsequent mutations in the same multi-step governed command so the delegate check
+      // is not re-evaluated against post-transition state.
+      const snapshotKey = issueId ? `${agentId}:${issueId}:${effectiveIntent}` : null;
+      let snapshotDelegateId: string | null | undefined = undefined;
+      if (snapshotKey && deps?.commandAuthSnapshots) {
+        const existing = deps.commandAuthSnapshots.get(snapshotKey);
+        if (existing && Date.now() < existing.expiresAt) {
+          snapshotDelegateId = existing.snapshotDelegateId;
+          log.info(`auth-snapshot-hit agent=${agentId} intent=${effectiveIntent}${ticketCtx}`);
+        }
+      }
+
+      const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment, snapshotDelegateId);
       if (p3rejection) {
         log.warn(`workflow-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p3rejection}`);
-        res.status(200).json({ errors: [{ message: p3rejection }] });
+        // AI-1857 AC4: include gate-verification snapshot so CLI can verify "no partial state was written"
+        const gateDeclineResponse: Record<string, unknown> = { errors: [{ message: p3rejection }] };
+        if (issueId) {
+          try {
+            gateDeclineResponse._gateVerification = await fetchTicketVerification(issueId, authorization);
+          } catch {
+            // fail-open: don't suppress the rejection if verification fetch fails
+          }
+        }
+        res.status(200).json(gateDeclineResponse);
         return;
+      }
+
+      // AI-1860: first successful authorization — store snapshot so subsequent mutations
+      // in this multi-step command are not blocked by a post-transition delegate change.
+      if (snapshotKey && deps?.commandAuthSnapshots && snapshotDelegateId === undefined) {
+        deps.commandAuthSnapshots.set(snapshotKey, {
+          snapshotDelegateId: callerLinearUserId ?? null,
+          expiresAt: Date.now() + COMMAND_AUTH_SNAPSHOT_TTL_MS,
+        });
+        log.info(`auth-snapshot-stored agent=${agentId} intent=${effectiveIntent}${ticketCtx}`);
       }
 
       // AI-1498: snapshot the pre-forward workflow state for applyStateTransition.
@@ -512,6 +572,13 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             res.status(200).json({ errors: [{ message: `[Proxy] '${effectiveIntent}' blocked: workflow label safety check failed (${msg}). Try again or contact a steward.` }] });
             return;
           }
+        }
+
+        // AI-1857: Strip null delegateId/assigneeId from forwarded intent-bearing mutations.
+        // The proxy manages delegates; partial semantic-verb application (e.g. complete)
+        // bundles these null clears, which must not reach Linear directly.
+        if (isIssueUpdateMutation(body)) {
+          stripNullDelegateAssigneeFields(body);
         }
 
         // Layer 2 on intent path: run field-level interception after stripping.

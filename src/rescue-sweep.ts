@@ -412,8 +412,8 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
       rescuedIds.add(ticket.id);
     }
 
-    // Emit operational event for rescued and ambiguous outcomes (ambiguous needs visibility too)
-    if (rescueAction.outcome === "rescued" || rescueAction.outcome === "ambiguous") {
+    // Emit operational event for all outcomes — failed rescues are pillar-1 violations
+    if (rescueAction.outcome === "rescued" || rescueAction.outcome === "ambiguous" || rescueAction.outcome === "failed") {
       operationalEventStore?.record({
         outcome: `rescue:${rescueAction.outcome}`,
         type: "rescue",
