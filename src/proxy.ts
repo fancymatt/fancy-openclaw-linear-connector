@@ -35,7 +35,7 @@ import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition,
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
-import type { MutationAuditStore } from "./store/mutation-audit-store.js";
+import type { MutationAuditStore, MutationAuditInput, ChangeType } from "./store/mutation-audit-store.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
 import type { NoActivityDetector } from "./bag/no-activity-detector.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
@@ -206,6 +206,32 @@ function carriesLabelDelta(body: GraphQLRequestBody | null): boolean {
   return ["addedLabelIds", "removedLabelIds"].some(
     (k) => Array.isArray(input[k]) && (input[k] as unknown[]).length > 0,
   );
+}
+
+/**
+ * AI-1843: Map a workflow intent to the set of change types its
+ * `applyStateTransition` will produce. The OOB reconcile sweep matches
+ * webhook-observed changes against proxy records by exact `change_type`, so
+ * the proxy must append one audit record per change type the transition will
+ * trigger — not a single hard-coded `"state"` record.
+ *
+ * Every validated workflow transition applies an atomic mutation that changes:
+ *   - the `state:*` label  → webhook fires `label`
+ *   - the native stateId     → webhook fires `state`
+ *   - the delegateId         → webhook fires `delegate` (set to a user, or
+ *                              cleared to null on terminal states)
+ *
+ * Over-recording is harmless: unmatched proxy records sit idle. Under-recording
+ * causes false-positive OOB flags (the bug this fixes — a `handoff-work` that
+ * changes state + delegate produced only a `state` proxy record, so the
+ * webhook's `delegate` change had no match and was flagged as out-of-band).
+ *
+ * For non-intent proxy ops (null intent), fall back to `"state"` only — those
+ * are raw/unknown mutations and we have no transition model for them.
+ */
+function intentToChangeTypes(intent: string | null): ChangeType[] {
+  if (!intent) return ["state"];
+  return ["state", "label", "delegate"];
 }
 
 function stripStateLabelDeltas(body: GraphQLRequestBody | null, stateLabelIds: Set<string>): number {
@@ -556,22 +582,32 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // field. A stderr-only warning beside a success payload is how AI-1773
       // was stranded half-applied (comment landed, label/delegate did not).
       if (upstreamRes.ok) {
-        // AI-1838: record proxy-forwarded mutation for out-of-band reconcile.
+        // AI-1838/AI-1843: record proxy-forwarded mutation for out-of-band reconcile.
         // The reconcile sweep matches these proxy records against webhook-observed
-        // changes; a webhook change with no matching proxy op is out-of-band.
+        // changes by exact change_type; a webhook change with no matching proxy op
+        // is out-of-band. A workflow transition (e.g. handoff-work) changes state
+        // label + native stateId + delegate atomically, producing multiple webhook
+        // events — one per field. We must append one audit record per change type
+        // so each webhook observation finds a matching proxy record.
         if (deps?.mutationAuditStore && issueId) {
           try {
             const auditIdentifier = extractIssueIdentifier(body) ?? issueId;
-            deps.mutationAuditStore.append({
+            const fieldLabel = effectiveIntent ? `intent:${effectiveIntent}` : `op:${opName}`;
+            const auditRecords: MutationAuditInput[] = intentToChangeTypes(effectiveIntent).map((ct) => ({
               source: "proxy",
               ticket: auditIdentifier,
               ticketUuid: issueId,
-              changeType: "state",
-              field: effectiveIntent ? `intent:${effectiveIntent}` : `op:${opName}`,
+              changeType: ct,
+              field: fieldLabel,
               agent: agentId,
               intent: effectiveIntent,
               opName,
-            });
+            }));
+            if (auditRecords.length === 1) {
+              deps.mutationAuditStore.append(auditRecords[0]);
+            } else {
+              deps.mutationAuditStore.appendBatch(auditRecords);
+            }
           } catch (auditErr) {
             log.warn(`mutation audit proxy-op record failed (non-blocking): ${auditErr instanceof Error ? auditErr.message : String(auditErr)}`);
           }
