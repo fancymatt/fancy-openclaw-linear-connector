@@ -100,8 +100,8 @@ describe("AI-1800 AC1: GET /api/board — workflow column ordering", () => {
     expect(Array.isArray(devImpl.states)).toBe(true);
     // States should be strings, ordered as per the YAML
     expect(devImpl.states.length).toBeGreaterThan(0);
-    // dev-impl v9 states in order: intake, write-tests, implementation,
-    // code-review, deployment, host-deploy, ac-validate, done
+    // dev-impl v10 states in order: intake, write-tests, implementation,
+    // code-review, merge, deploy, ac-validate, done
     expect(devImpl.states[0]).toBe("intake");
     expect(devImpl.states[devImpl.states.length - 1]).toBe("done");
   });
@@ -197,8 +197,8 @@ describe("AI-1800 AC1: GET /api/board — workflow column ordering", () => {
       "write-tests",
       "implementation",
       "code-review",
-      "deployment",
-      "host-deploy",
+      "merge",
+      "deploy",
       "ac-validate",
       "done",
     ];

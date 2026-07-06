@@ -842,11 +842,11 @@ describe("buildConformanceMatrix — AC3: def changes auto-regenerate matrix", (
 // ── Canonical fixture integration ─────────────────────────────────────────
 // Smoke-check the generator against the checked-in canonical-dev-impl.yaml.
 
-describe("buildConformanceMatrix — canonical dev-impl fixture (v9)", () => {
+describe("buildConformanceMatrix — canonical dev-impl fixture (v10)", () => {
   const canonicalRaw = fs.readFileSync(CANONICAL_DEV_IMPL_FIXTURE, "utf8");
   const canonicalDef = yaml.load(canonicalRaw) as WorkflowDef;
 
-  it("produces cells for all 8 canonical states (intake, write-tests, implementation, code-review, deployment, host-deploy, ac-validate, done) — escape removed as state in AI-1710", () => {
+  it("produces cells for all 8 canonical states (intake, write-tests, implementation, code-review, merge, deploy, ac-validate, done)", () => {
     const cells = buildConformanceMatrix(canonicalDef, testPolicy);
     const stateSet = new Set(cells.map((c) => c.state));
     const expectedStates = [
@@ -854,8 +854,8 @@ describe("buildConformanceMatrix — canonical dev-impl fixture (v9)", () => {
       "write-tests",
       "implementation",
       "code-review",
-      "deployment",
-      "host-deploy",
+      "merge",
+      "deploy",
       "ac-validate",
       "done",
     ];
@@ -865,23 +865,23 @@ describe("buildConformanceMatrix — canonical dev-impl fixture (v9)", () => {
     expect(stateSet.has("escape")).toBe(false);
   });
 
-  it("deploy in deployment state has a cap-missing block cell (deploy:execute required)", () => {
+  it("continue in merge state has a cap-missing block cell (deploy:execute required)", () => {
     const cells = buildConformanceMatrix(canonicalDef, testPolicy);
-    const deployCapBlock = cells.filter(
+    const mergeCapBlock = cells.filter(
       (c) =>
-        c.state === "deployment" &&
-        c.command === "deploy" &&
+        c.state === "merge" &&
+        c.command === "continue" &&
         c.blockReason === "cap-missing",
     );
-    expect(deployCapBlock.length).toBeGreaterThan(0);
+    expect(mergeCapBlock.length).toBeGreaterThan(0);
   });
 
-  it("deploy in deployment state has a human-signoff block cell for high-stakes AI callers", () => {
+  it("continue in merge state has a human-signoff block cell for high-stakes AI callers", () => {
     const cells = buildConformanceMatrix(canonicalDef, testPolicy);
     const stakesBlock = cells.filter(
       (c) =>
-        c.state === "deployment" &&
-        c.command === "deploy" &&
+        c.state === "merge" &&
+        c.command === "continue" &&
         c.blockReason === "human-signoff",
     );
     expect(stakesBlock.length).toBeGreaterThan(0);

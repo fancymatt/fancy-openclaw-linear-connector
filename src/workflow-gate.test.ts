@@ -826,35 +826,35 @@ describe("checkWorkflowRules — canonical vault schema (src/__fixtures__/canoni
     }
   });
 
-  it("canonical: deployment state allows deploy and reject (not just deploy)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+  it("canonical: merge state allows continue and reject (not just continue)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"]);
     // 'reject' requires no capability — should pass through
     // AI-1731: reject now has requires_comment — pass hasComment=true to test legality, not the comment gate
     const result = await checkWorkflowRules("reject", "issue-uuid", "Bearer tok", "astrid", null, undefined, null, false, false, true);
     expect(result).toBeNull();
   });
 
-  it("canonical: deployment state blocks 'submit' (illegal), names deploy and reject as legal", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
+  it("canonical: merge state blocks 'submit' (illegal), names continue and reject as legal", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"]);
     const result = await checkWorkflowRules("submit", "issue-uuid", "Bearer tok", "charles");
     expect(result).not.toBeNull();
     expect(result).toContain("[Proxy]");
-    expect(result).toContain("deploy");
+    expect(result).toContain("continue");
     expect(result).toContain("reject");
     expect(result).toContain("escape");
   });
 
-  it("canonical: deploy in deployment state is blocked for non-deployment body (charles)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "charles");
+  it("canonical: continue in merge state is blocked for non-deployment body (charles)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"]);
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "charles");
     expect(result).not.toBeNull();
     expect(result).toContain("deploy:execute");
     expect(result).toContain("deployment");
   });
 
-  it("canonical: deploy in deployment state is allowed for Hanzo (deployment body)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment", "stakes:low"]);
-    expect(await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+  it("canonical: continue in merge state is allowed for Hanzo (deployment body)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge", "stakes:low"]);
+    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 });
 
@@ -3348,11 +3348,11 @@ bodies:
       hasParent: false,
       childLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
-        { id: "state-lbl", name: "state:deployment" },
+        { id: "state-lbl", name: "state:merge" },
       ],
     });
 
-    await applyStateTransition("deploy", "AI-2001", "Bearer tok");
+    await applyStateTransition("continue", "AI-2001", "Bearer tok");
 
     process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
 
@@ -4443,7 +4443,7 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
   // ── F4: Self-merge is structurally impossible ────────────────────────
 
   describe("F4: self-merge is structurally impossible (deploy:execute gate)", () => {
-    it("sprint-owner cannot deploy even if in deployment state", async () => {
+    it("sprint-owner cannot deploy even if in merge state", async () => {
       const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
       process.env.WORKFLOW_DEF_PATH = devImplFixture;
       resetWorkflowCache();
@@ -4453,8 +4453,8 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       process.env.CAPABILITY_POLICY_PATH = devImplPolicyFile;
       resetPolicyCache();
 
-      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment"]);
-      const result = await checkWorkflowRules("deploy", "AI-3001", "Bearer tok", "soren");
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"]);
+      const result = await checkWorkflowRules("continue", "AI-3001", "Bearer tok", "soren");
       expect(result).not.toBeNull();
       // Blocked — either unknown caller or deploy:execute. Both prove F4.
       expect(result!.includes("deploy:execute") || result!.includes("Unknown caller")).toBe(true);
@@ -4464,7 +4464,7 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       resetPolicyCache();
     });
 
-    it("only Hanzo (deployment body) can deploy", async () => {
+    it("only Hanzo (deployment body) can merge", async () => {
       const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
       process.env.WORKFLOW_DEF_PATH = devImplFixture;
       resetWorkflowCache();
@@ -4474,8 +4474,8 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       process.env.CAPABILITY_POLICY_PATH = devImplPolicyFile;
       resetPolicyCache();
 
-      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment", "stakes:low"], { hasBranch: true, hasPR: true });
-      expect(await checkWorkflowRules("deploy", "AI-3001", "Bearer tok", "hanzo")).toBeNull();
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge", "stakes:low"], { hasBranch: true, hasPR: true });
+      expect(await checkWorkflowRules("continue", "AI-3001", "Bearer tok", "hanzo")).toBeNull();
 
       process.env.WORKFLOW_DEF_PATH = CANONICAL_SPRINT_FIXTURE;
       process.env.CAPABILITY_POLICY_PATH = path.join(c3Dir, "capability-policy.yaml");
@@ -4497,7 +4497,7 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
 
     // AI-1497: deploy now fails open when no branch/PR evidence exists (data likely lost to auto-delete).
     // Previously this blocked, but the absence of evidence is not evidence of absence.
-    it("dev-impl deploy passes done gate when no branch/PR evidence (AI-1497 fail-open)", async () => {
+    it("dev-impl merge passes done gate when no branch/PR evidence (AI-1497 fail-open)", async () => {
       const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
       process.env.WORKFLOW_DEF_PATH = devImplFixture;
       resetWorkflowCache();
@@ -4507,8 +4507,8 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       process.env.CAPABILITY_POLICY_PATH = devImplPolicyFile;
       resetPolicyCache();
 
-      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deployment", "stakes:low"], { hasBranch: false, hasPR: false });
-      const result = await checkWorkflowRules("deploy", "AI-3001", "Bearer tok", "hanzo");
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge", "stakes:low"], { hasBranch: false, hasPR: false });
+      const result = await checkWorkflowRules("continue", "AI-3001", "Bearer tok", "hanzo");
       expect(result).toBeNull(); // AI-1497: fail-open on no evidence
 
       process.env.WORKFLOW_DEF_PATH = CANONICAL_SPRINT_FIXTURE;
@@ -5477,8 +5477,8 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     "write-tests": "todo",
     implementation: "todo",
     "code-review": "todo",
-    deployment: "todo",
-    "host-deploy": "todo",
+    merge: "todo",
+    deploy: "todo",
     "ac-validate": "todo",
     done: "done",
     escape: "invalid",
@@ -5580,14 +5580,15 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
   }
 
   it("every transition writes the correct native stateId atomically", async () => {
-    // Walk the full dev-impl v8 happy path:
-    //   intake → write-tests → implementation → code-review → deployment → ac-validate → done
+    // Walk the full dev-impl v10 happy path:
+    //   intake → write-tests → implementation → code-review → merge → deploy → ac-validate → done
     const transitions: Array<{ intent: string; fromLabels: string[]; toState: string }> = [
       { intent: "accept", fromLabels: ["wf:dev-impl", "state:intake"], toState: "write-tests" },
       { intent: "tests-ready", fromLabels: ["wf:dev-impl", "state:write-tests"], toState: "implementation" },
       { intent: "submit", fromLabels: ["wf:dev-impl", "state:implementation"], toState: "code-review" },
-      { intent: "approve", fromLabels: ["wf:dev-impl", "state:code-review"], toState: "deployment" },
-      { intent: "deploy", fromLabels: ["wf:dev-impl", "state:deployment"], toState: "ac-validate" },
+      { intent: "approve", fromLabels: ["wf:dev-impl", "state:code-review"], toState: "merge" },
+      { intent: "continue", fromLabels: ["wf:dev-impl", "state:merge"], toState: "deploy" },
+      { intent: "continue", fromLabels: ["wf:dev-impl", "state:deploy"], toState: "ac-validate" },
       { intent: "validated", fromLabels: ["wf:dev-impl", "state:ac-validate"], toState: "done" },
     ];
 
@@ -5635,7 +5636,7 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
   it("reject transition routes back to implementation with todo resting native state", async () => {
     resetWorkflowCache();
     resetNativeStateCache();
-    const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:deployment"]);
+    const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:merge"]);
     globalThis.fetch = fetch;
 
     await applyStateTransition("reject", "AI-CONF-REJ", "Bearer tok", {
@@ -5764,7 +5765,7 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
 
     resetWorkflowCache();
     resetNativeStateCache();
-    const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:deployment"]);
+    const { fetch, mutations } = makeConformanceFetch(["wf:dev-impl", "state:merge"]);
     globalThis.fetch = fetch;
 
     try {

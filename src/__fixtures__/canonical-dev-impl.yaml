@@ -33,9 +33,23 @@
 # v9 (2026-06-27, AI-1710): escape re-enters at intake instead of terminating.
 #   break_glass.to changed from escape → intake; escape state removed entirely.
 #   done remains the only terminal state. unescape verb retired (no escape state to exit).
+#
+# v10 (2026-07-06, AI-1872 — Matt directive): split deployment into merge + deploy
+#   states; generic verbs only. The old `deployment` state conflated two distinct
+#   operations (merging the PR vs deploying the artifact) behind state-specific
+#   custom verbs. Replaced with two explicit states using generic `continue`:
+#     - `merge` (owner: deployment/Hanzo): merges the PR → continue → deploy
+#     - `deploy` (owner: host-deploy/Grover for the connector fleet): deploys the
+#       artifact, or decides "no deploy needed" → continue → ac-validate
+#   Custom verbs `deploy`, `handoff-host-deploy`, `host-deployed` removed entirely;
+#   the full spine is now:
+#     write-tests → implementation → code-review → merge → deploy → ac-validate
+#   In-flight tickets at the old `state:deployment` / `state:host-deploy` labels
+#   are migrated via escape → re-intake (the state labels no longer exist in the
+#   def, so the gate rejects any command from them — operators must escape).
 
 id: dev-impl
-version: 9
+version: 10
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
@@ -92,8 +106,8 @@ states:
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
     sla: 72h                    # G-5: per-state SLA; longer than code-review (days of work vs 24h review cap)
     # entered from write-tests/tests-ready, code-review/request-changes,
-    # deployment/reject, host-deploy/reject, ac-validate/ac-fail — one dev
-    # work-phase, no awaiting-vs-doing split. Dev makes the failing tests pass.
+    # merge/reject, deploy/reject, ac-validate/ac-fail — one dev work-phase,
+    # no awaiting-vs-doing split. Dev makes the failing tests pass.
     transitions:
       - command: submit
         to: code-review
@@ -108,13 +122,14 @@ states:
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
     sla: 24h                    # time-in-state; breach → stall escalation (design.md §5.5)
-    # Review contract (v8): Charles runs the FULL test suite. Any red ⇒
+    # Review contract (v8): reviewer runs the FULL test suite. Any red ⇒
     # request-changes with the failing tests named in feedback. `approve` is
     # legal only when the suite is green AND code quality satisfies the reviewer.
+    # AI-1872: approve now routes to `merge` (not the old `deployment`).
     transitions:
       - command: approve
-        to: deployment
-        assign: { mode: auto }
+        to: merge
+        assign: { mode: auto }     # merge is singleton (Hanzo) — auto-assign
       - command: request-changes
         to: implementation
         generic: revision
@@ -128,29 +143,25 @@ states:
             - correctness
             - ac-mismatch
 
-  - id: deployment
+  - id: merge
     owner_role: deployment      # filled by Hanzo; the deployment container (§16.2)
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
-    sla: 4h                     # G-5: per-state SLA; deployment is automated/quick
-    # Hanzo MERGES the PR (deploy:execute, exclusive). Two exits forward:
-    #   - deploy: merge alone is sufficient (CI auto-deploys) → ac-validate.
-    #   - handoff-host-deploy: a bare-metal/host action is required (restart
-    #     connector + roll CLI, run migrations, TestFlight) → host-deploy. Hanzo's
-    #     container has NO host access, so this is structurally a hand-off, not a
-    #     same-state delegate swap (the deployment role is exclusive → Hanzo only).
+    sla: 4h                     # G-5: per-state SLA; merge is automated/quick
+    # AI-1872: Hanzo MERGES the PR (deploy:execute, exclusive). This state is
+    # purely about merging — it no longer conflates merging with deploy routing.
+    # `continue-workflow [deployer]` advances to the deploy state where the
+    # deployer decides whether a deploy is needed or not.
     transitions:
-      - command: deploy
-        to: ac-validate
+      - command: continue
+        to: deploy
+        generic: continue
         requires_capability: deploy:execute   # Layer A enforcement (design.md §16.2)
         # Phase 6.5 / H-7 (AI-1482): stakes-threshold gate. If the ticket's stakes
-        # level ≥ workflow.stakes.threshold, the deploy must come from a human
-        # sign-off (not an AI agent). Enforced by the connector proxy at deploy time.
+        # level ≥ workflow.stakes.threshold, the merge must come from a human
+        # sign-off (not an AI agent). Enforced by the connector proxy.
         requires_human_signoff_above_stakes: true
-        assign: { mode: auto }     # ac-validate steward is singleton (Astrid) — auto-assign
-      - command: handoff-host-deploy
-        to: host-deploy
-        assign: { mode: auto }     # host-deploy is singleton (Grover) — auto-assign
+        assign: { mode: auto }     # deploy is singleton (Grover for connector fleet) — auto-assign
       - command: reject
         to: implementation
         requires_comment: true
@@ -163,20 +174,23 @@ states:
             - correctness
             - ac-mismatch
 
-  - id: host-deploy
-    owner_role: host-deploy     # filled by Grover; host-side on Nakazawa (§16.2)
+  - id: deploy
+    owner_role: host-deploy     # filled by Grover for the connector fleet; configurable per project (§16.2)
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
-    sla: 8h                     # G-5: per-state SLA; host deploy needs more time than CI deploy
-    # Bare-metal half of deployment: restart the connector + roll the CLI to
-    # agent containers, run migrations, push TestFlight builds — whatever needs
-    # host access the deployment container lacks. The merge already happened in
-    # `deployment`; this requires host access (infra:ssh), NOT deploy:execute.
+    sla: 8h                     # G-5: per-state SLA; deploy may need host access
+    # AI-1872: Deploys the artifact (restart connector + roll CLI, run migrations,
+    # push TestFlight, etc.) — or decides "no deploy needed" (library release,
+    # CI auto-deploys) and continues forward. Either way the exit verb is the
+    # generic `continue-workflow`, identical to every other forward edge.
+    # Host-side operations require infra:ssh, NOT deploy:execute — the merge
+    # already happened in `merge`; this is the artifact-push half.
     transitions:
-      - command: host-deployed
+      - command: continue
         to: ac-validate
+        generic: continue
         requires_capability: infra:ssh
-        requires_human_signoff_above_stakes: true   # H-7 (AI-1482): high-stakes host release needs human sign-off
+        requires_human_signoff_above_stakes: true   # H-7 (AI-1482): high-stakes release needs human sign-off
         assign: { mode: auto }     # ac-validate steward is singleton (Astrid) — auto-assign
       - command: reject
         to: implementation
@@ -218,4 +232,3 @@ states:
     kind: terminal
     native_state: done           # targetState: "done" → Done
     satisfies_parent_barrier: true   # uniform terminal contract (design.md §5.4)
-

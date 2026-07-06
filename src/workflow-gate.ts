@@ -332,6 +332,38 @@ export function resetWorkflowCache(): void {
   _registryCache = null;
 }
 
+/**
+ * AI-1872: Workflow registry liveness for /health.
+ *
+ * Returns a compact map of `{ [workflowId]: { version, states[] } }` derived
+ * from the live registry cache, so ac-validate can confirm the updated
+ * workflow def is loaded without waiting for a dispatch trigger.
+ *
+ * Mirrors getCanonLiveness() / getDocsLiveness() pattern. Failures return an
+ * empty object — /health still responds 200; the absence of the expected entry
+ * is the ac-validate failure signal.
+ */
+export async function getWorkflowRegistryLiveness(): Promise<Record<string, {
+  version: number | undefined;
+  states: string[];
+}>> {
+  try {
+    const registry = await loadWorkflowRegistry();
+    const out: Record<string, { version: number | undefined; states: string[] }> = {};
+    for (const [id, def] of registry) {
+      out[id] = {
+        version: def.version,
+        states: (def.states ?? []).map((s) => s.id),
+      };
+    }
+    return out;
+  } catch {
+    // Fail-open: missing/unreadable def → empty registry. The config-health
+    // fail-closed path already handles the enforcement side.
+    return {};
+  }
+}
+
 // ── AI-1666: Per-ticket no-activity timeout cache ─────────────────────────
 // Populated by applyStateTransition when a ticket enters a state that declares
 // noActivityTimeout. Keyed by uppercase Linear identifier (e.g. "AI-1234").
@@ -1485,8 +1517,18 @@ export async function checkWorkflowRules(
 
   const stateNode = def.states.find((s) => s.id === currentState);
   if (!stateNode) {
-    log.warn(`workflow-gate: unknown state '${currentState}' on ${issueId} — failing open`);
-    return null;
+    // AI-1872: a state label that exists on the ticket but NOT in the workflow def
+    // means the state was removed (e.g. the old `deployment`/`host-deploy` labels
+    // after the merge+deploy split) or the def was replaced. Fail CLOSED — a
+    // defunct-state ticket must be migrated (escape → re-intake) before any
+    // command can proceed. Previously this failed open, which let defunct-state
+    // tickets mutate freely after a def change.
+    log.warn(`workflow-gate: unknown state '${currentState}' on ${issueId} — failing closed (state not in def)`);
+    return (
+      `[Proxy] '${intent}' blocked: ticket is in state '${currentState}' which is not defined in workflow '${workflowId}'. ` +
+      `This state was likely removed in a workflow def update. ` +
+      `Use break-glass ('escape') to re-enter the workflow at intake, or contact a steward to migrate the ticket.`
+    );
   }
 
   const transitions = stateNode.transitions ?? [];

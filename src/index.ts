@@ -18,7 +18,7 @@ import { deliverToAgent, deliverMessageToAgent, type DeliveryConfig, DeliveryThr
 import { buildWorkflowAwareDeliveryMessage } from "./delivery/build-message.js";
 import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, StuckDelegateDetector, HoldRetryTracker, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
-import { getTicketNoActivityTimeoutMs } from "./workflow-gate.js";
+import { getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness } from "./workflow-gate.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
@@ -186,7 +186,7 @@ export function createApp(options?: CreateAppOptions) {
   // the exact failure mode of the v1.5.0 deploy (AI-1767): the image booted,
   // /health returned 200, but 0 of 28 agents were loaded → fleet-wide 401s
   // and dropped webhooks.
-  app.get("/health", (_req: Request, res: Response) => {
+  app.get("/health", async (_req: Request, res: Response) => {
     const agents = getAgents();
     const healthy = agents.length > 0;
     res.status(healthy ? 200 : 503).json({
@@ -207,6 +207,10 @@ export function createApp(options?: CreateAppOptions) {
       universalCanon: getCanonLiveness(),
       // AI-1849 (Pillar 2 D2): docs endpoint liveness — confirms /docs is registered.
       docs: getDocsLiveness(),
+      // AI-1872: workflow registry liveness — exposes the loaded workflow defs
+      // (id → {version, states}) so ac-validate can confirm the updated def
+      // is live without waiting for a dispatch trigger.
+      workflowRegistry: await getWorkflowRegistryLiveness(),
     });
   });
 
