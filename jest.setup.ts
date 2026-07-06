@@ -41,3 +41,10 @@ process.env.OPENCLAW_HOOKS_TOKEN = "";
 // Deleted rather than blanked — those tests distinguish unset from empty —
 // and it is NOT in .env, so dotenv cannot re-add it.
 delete process.env.LINEAR_OAUTH_TOKEN;
+
+// The repo's agents.json is AES-256-GCM encrypted and unreadable without
+// the deployment key. agents.ts calls load() at module-init time; without
+// this pin it would throw before any test runs. Pinned to a path that
+// does not exist → existsSync returns false → load() returns [] cleanly.
+// Tests that need agents supply their own AGENTS_FILE in beforeEach.
+process.env.AGENTS_FILE = path.join(os.tmpdir(), "agents-test-nonexistent-do-not-create.json");
