@@ -49,6 +49,8 @@ import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
+import { validateDefStateRemovals } from "./def-state-migration.js";
+import { readDefStateSnapshot, writeDefStateSnapshot } from "./store/def-state-snapshot-store.js";
 import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
 import { recordAppliedState, clearAppliedState } from "./store/applied-state-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
@@ -288,6 +290,12 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
   const registry = new Map<string, WorkflowDef>();
   const dir = process.env.WORKFLOW_DEFS_DIR;
 
+  // AC3 (AI-1914): the state ids active in the previous version of each def,
+  // persisted to disk so this check survives a restart (where _registryCache is
+  // null). A def version that removes a state present here — without a migrations
+  // mapping or a strand_acknowledged entry — must not activate.
+  const prevSnapshot = await readDefStateSnapshot();
+
   if (dir) {
     let entries: string[];
     try {
@@ -309,6 +317,17 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
           log.warn(`workflow-gate: duplicate workflow id '${def.id}' (${full}) — keeping first, ignoring this file`);
           continue;
         }
+        // AC3: refuse to activate a def version that silently removes a state
+        // relative to its last-activated version. Throwing here routes through
+        // the same per-def fail-closed path as a native_state failure: the def
+        // is excluded from the registry and config-health goes unhealthy, while
+        // every other valid def still loads. The operator's remedy is to add a
+        // migrations mapping or a strand_acknowledged entry — which is exactly
+        // the sanctioned, non-lossy path AC1/AC2 provide.
+        const removalErrors = validateDefStateRemovals(prevSnapshot[def.id] ?? [], def);
+        if (removalErrors.length > 0) {
+          throw new Error(removalErrors.join("; "));
+        }
         registry.set(def.id, def);
       } catch (err) {
         // AC2: one bad def fails that def only — exclude it, keep the rest.
@@ -328,6 +347,13 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
     // loader did, so the current deploy's safety posture is unchanged.
     try {
       const def = await loadDefFromFile(workflowDefPath());
+      // AC3: single-file mode rethrows on removal (fail-closed), matching this
+      // path's existing posture — the primary deploy does not activate a def
+      // that would silently strand its in-flight tickets.
+      const removalErrors = validateDefStateRemovals(prevSnapshot[def.id] ?? [], def);
+      if (removalErrors.length > 0) {
+        throw new Error(removalErrors.join("; "));
+      }
       registry.set(def.id, def);
       recordSuccess("workflow-def");
     } catch (err) {
@@ -335,6 +361,20 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
       recordFailure("workflow-def", msg);
       throw err;
     }
+  }
+
+  // AC3: persist a durable snapshot of the ACTIVATED defs' state sets so the
+  // next load — including the first load after a restart — can detect removals
+  // relative to this version. Only defs that actually activated are updated;
+  // an excluded/rejected def keeps its prior snapshot entry, so a persistently
+  // unsafe def keeps being refused rather than being "accepted" by its own
+  // rejected state set overwriting the baseline.
+  if (registry.size > 0) {
+    const nextSnapshot = { ...prevSnapshot };
+    for (const [id, def] of registry) {
+      nextSnapshot[id] = def.states.map((s) => s.id);
+    }
+    await writeDefStateSnapshot(nextSnapshot);
   }
 
   _registryCache = registry;

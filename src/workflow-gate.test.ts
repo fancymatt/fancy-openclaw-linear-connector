@@ -42,6 +42,7 @@ import { clearArtifactStore, getBoundArtifact, hasBoundArtifact } from "./artifa
 import { runTransitionWalk } from "./canary.js";
 import { clearAcRecordStore, getAcRecord } from "./ac-record-store.js";
 import { resetConfigHealth } from "./config-health.js";
+import { defStateSnapshotPath } from "./store/def-state-snapshot-store.js";
 import { clearImplementerStore } from "./implementer-store.js";
 
 // Resolved from the project root (jest cwd) so it works under both the
@@ -325,6 +326,13 @@ beforeEach(() => {
   resetWorkflowCache();
   resetNativeStateCache();
   resetPolicyCache();
+  // AI-1914 AC3: the def-state-removal check reads a persisted "previous version"
+  // snapshot that (by design) survives resetWorkflowCache. These legacy cases
+  // reload the same `dev-impl` id with different state subsets across unrelated
+  // scenarios, which would otherwise read as a state removal. Clear the snapshot
+  // per test so each starts with no prior version (dedicated coverage for the
+  // removal path lives in ai-1914-ac3-load-validation.test.ts).
+  fs.rmSync(defStateSnapshotPath(), { force: true });
 });
 
 // ── Helpers ────────────────────────────────────────────────────────────────
