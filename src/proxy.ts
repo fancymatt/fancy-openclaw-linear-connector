@@ -30,8 +30,8 @@
 
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
-import { checkEnforcementRules } from "./escalation-gate.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, resolveMetaIntent, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
+import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
@@ -451,6 +451,74 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         }
         effectiveIntent = metaResult.resolved;
         log.info(`meta-intent-resolved agent=${agentId} ${intent}→${effectiveIntent}${ticketCtx}`);
+      }
+
+      // AI-1914 AC2: `migrate-state` — sanctioned, non-lossy steward migration of a
+      // ticket stranded at a removed state (the case with no def `migrations` map).
+      // Capability-gated to workflow:break-glass and audited like escape. The target
+      // state is carried in X-Openclaw-Migrate-Target and must be a live-def state.
+      // This is the sanctioned counterpart to the AC4 raw-path fail-close: it fully
+      // handles the request (authorize → validate target → forward → audit) and does
+      // not fall through to the normal transition-legality path (migrate-state is not
+      // a def transition, and the ticket's current state is by definition defunct).
+      if (effectiveIntent === "migrate-state") {
+        const migrateTarget = (req.headers["x-openclaw-migrate-target"] as string | undefined) ?? null;
+
+        // Capability gate — mirror the break-glass identity gate: name the caller
+        // and the capability so the denial is unambiguous (AC5).
+        let hasBreakGlass = false;
+        try {
+          hasBreakGlass = await bodyHasCapability(agentId, "workflow:break-glass");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`migrate-state-audit agent=${agentId} authorized=false result=identity-check-failed${ticketCtx}: ${msg}`);
+          res.status(200).json({ errors: [{ message: `[Proxy] migrate-state rejected: capability check failed (${msg}). Only a steward (workflow:break-glass) may migrate a stranded ticket.` }] });
+          return;
+        }
+        if (!hasBreakGlass) {
+          log.warn(`migrate-state-audit agent=${agentId} authorized=false${ticketCtx} target=${migrateTarget ?? "(none)"}`);
+          res.status(200).json({ errors: [{ message: `[Proxy] migrate-state rejected: caller '${agentId}' does not hold workflow:break-glass. Only the steward may migrate a stranded ticket to a live state.` }] });
+          return;
+        }
+
+        // Target must be a state in the live def for this ticket's workflow.
+        let def: Awaited<ReturnType<typeof loadWorkflowDefById>> = null;
+        try {
+          const labels = await fetchWorkflowLabels(issueId ?? "", authorization);
+          const workflowId = getWorkflowId(labels);
+          def = workflowId ? await loadWorkflowDefById(workflowId) : null;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`migrate-state-target-check-failed agent=${agentId}${ticketCtx}: ${msg}`);
+          res.status(200).json({ errors: [{ message: `[Proxy] migrate-state rejected: could not resolve the workflow def to validate the target (${msg}).` }] });
+          return;
+        }
+        if (!migrateTarget || !def || !def.states.some((s) => s.id === migrateTarget)) {
+          log.warn(`migrate-state-block agent=${agentId}${ticketCtx} target=${migrateTarget ?? "(none)"}: not a live-def state`);
+          res.status(200).json({ errors: [{ message: `[Proxy] migrate-state rejected: target '${migrateTarget ?? "(missing)"}' is not a state in the live workflow def. Migrate only to a state that exists in the current def.` }] });
+          return;
+        }
+
+        // Authorized + valid target — audit like escape and forward the migration.
+        log.warn(`migrate-state-audit agent=${agentId} authorized=true${ticketCtx} target=${migrateTarget}`);
+        deps?.operationalEventStore?.append({ outcome: "def-state-migrated", type: "def-state-migration", agent: agentId, key: issueId ?? undefined, detail: { target: migrateTarget, via: "steward-verb" } });
+
+        let migrateRes: globalThis.Response;
+        try {
+          migrateRes = await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authorization },
+            body: JSON.stringify(body),
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.error(`migrate-state upstream request failed: ${msg}`);
+          res.status(200).json({ errors: [{ message: `Linear API unreachable: ${msg}. No state was changed.`, extensions: { code: "UPSTREAM_TIMEOUT" } }] });
+          return;
+        }
+        const migrateText = await migrateRes.text();
+        res.status(migrateRes.status).set("Content-Type", "application/json").send(migrateText);
+        return;
       }
 
       // G-13a (AI-1551): identity gate — break-glass restricted to steward/human bodies.

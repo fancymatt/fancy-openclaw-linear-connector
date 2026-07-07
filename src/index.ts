@@ -18,7 +18,8 @@ import { deliverToAgent, deliverMessageToAgent, type DeliveryConfig, DeliveryThr
 import { buildWorkflowAwareDeliveryMessage } from "./delivery/build-message.js";
 import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, StuckDelegateDetector, HoldRetryTracker, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
-import { getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness } from "./workflow-gate.js";
+import { getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
+import { getDefStateMigrationLiveness, registerDefStateMigrationRunner } from "./def-state-migration.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
@@ -219,6 +220,10 @@ export function createApp(options?: CreateAppOptions) {
       // (id → {version, states}) so ac-validate can confirm the updated def
       // is live without waiting for a dispatch trigger.
       workflowRegistry: await getWorkflowRegistryLiveness(),
+      // AI-1914 AC6: def-load state-migration liveness — confirms the migration
+      // check ran on load (migratedCount 0 allowed), observable at ac-validate
+      // without waiting for a def change.
+      workflowMigrations: getDefStateMigrationLiveness(),
     });
   });
 
@@ -880,6 +885,37 @@ export function createApp(options?: CreateAppOptions) {
       activeSessions,
       activeSessionDetails: activeSessions.map((agentId) => sessionTracker.getActiveSessionInfo(agentId)),
     });
+  });
+
+  // AI-1914 AC1/AC6: def-load state-migration runner. On boot, auto-migrate any
+  // governed ticket stranded at a removed state per its def's `migrations` map
+  // (label swap + re-dispatch to the target owner). Registered here so it is
+  // reachable from the production entry point (createApp), with load-time
+  // liveness surfaced at /health.workflowMigrations. Fetches nothing unless a
+  // registered def actually declares a migration map.
+  const migrationAuthToken =
+    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const migrationWakeFn = async (agentName: string, ticketIdentifier: string) => {
+    const sessionKey = normalizeSessionKey(ticketIdentifier);
+    const agentCfg = getAgent(agentName);
+    const deliveryConfig: DeliveryConfig = {
+      nodeBin: process.execPath,
+      hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
+      hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
+      hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+      hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+    };
+    const actionText = `${ticketIdentifier} was migrated to a new workflow state (its previous state was removed by a def change)`;
+    const message =
+      (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, migrationAuthToken, actionText)) ??
+      actionText;
+    await deliverMessageToAgent(agentName, sessionKey, message, deliveryConfig);
+  };
+  registerDefStateMigrationRunner({
+    authToken: migrationAuthToken,
+    loadRegistry: () => loadWorkflowRegistry(),
+    operationalEventStore,
+    wakeFn: migrationWakeFn,
   });
 
   return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore };

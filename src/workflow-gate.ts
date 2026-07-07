@@ -161,6 +161,20 @@ export interface WorkflowDef {
   recovery_actor?: string | string[];
   /** Phase 6.5 / H-7 (AI-1482): stakes-threshold configuration for human sign-off gate. */
   stakes?: StakesLevel;
+  /**
+   * AI-1914 AC1: map of removed-state-id → target-state-id. When a def version
+   * removes a state, a mapping here lets the def-load migration runner atomically
+   * migrate any governed ticket stranded at the removed state to the target
+   * state (label swap + re-dispatch to the target state's owner role).
+   */
+  migrations?: Record<string, string>;
+  /**
+   * AI-1914 AC3: removed state ids explicitly acknowledged as lossy strands. A
+   * def that removes a state with neither a `migrations` mapping nor a
+   * `strand_acknowledged` entry fails validation (refuses to activate) rather
+   * than silently stranding in-flight tickets.
+   */
+  strand_acknowledged?: string[];
   states: WorkflowState[];
 }
 
@@ -2048,7 +2062,26 @@ export async function checkRawMutationInterception(
   }
 
   const stateNode = def.states.find((s) => s.id === currentState);
-  if (!stateNode) return null; // unknown state — fail-open
+  if (!stateNode) {
+    // AI-1914 AC4: fail CLOSED on a defunct state. The ticket is governed
+    // (wf:* present) but its state:* label names a state that no longer exists
+    // in the live def — it was removed by a def-version bump. The old fail-OPEN
+    // here let ANY known caller silently raw-swap the workflow state label on a
+    // stranded ticket (exactly how AI-1857 was migrated through this hole). Block
+    // it and point the caller at the sanctioned migration path so closing the
+    // hole does not recreate the AI-1857 admin-console-only deadlock: the
+    // def-load migration map (AC1) auto-migrates on load, and the steward
+    // `migrate-state` verb (AC2, workflow:break-glass) covers the no-map case.
+    log.warn(
+      `workflow-gate: raw mutation on defunct-state ticket ${issueId} state=${currentState} wf=${workflowId} agent=${bodyId} — blocking (fail-closed, AI-1914 AC4)`,
+    );
+    return (
+      `[Proxy] Direct status/label changes are blocked on ${issueId}: state '${currentState}' no longer exists ` +
+      `in workflow '${workflowId}' (removed by a def-version change), so this raw label swap cannot be safely ` +
+      `validated. Do not raw-swap the state label. The def-load migration map auto-migrates stranded tickets on ` +
+      `load; for a one-off, a steward must use the sanctioned \`migrate-state\` verb (requires workflow:break-glass).`
+    );
+  }
 
   // Build per-command help strings with assignment info.
   const helpLines = await Promise.all(
