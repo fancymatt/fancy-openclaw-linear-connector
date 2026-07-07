@@ -41,3 +41,12 @@ process.env.OPENCLAW_HOOKS_TOKEN = "";
 // Deleted rather than blanked — those tests distinguish unset from empty —
 // and it is NOT in .env, so dotenv cannot re-add it.
 delete process.env.LINEAR_OAUTH_TOKEN;
+
+// agents.json in the repo root is encrypted for production. Without clearing
+// the encryption key env vars, agents.ts throws at module import time (which
+// fails every test that imports any module transitively depending on agents.ts).
+// Point AGENTS_FILE at a non-existent path so agents.ts returns [] on boot;
+// tests set their own AGENTS_FILE (pointing to a temp fixture) in beforeAll.
+delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+process.env.AGENTS_FILE = path.join(os.tmpdir(), "connector-jest-no-agents.json");
