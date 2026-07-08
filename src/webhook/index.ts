@@ -28,6 +28,7 @@ import { isLinearIssueStillRoutedToAgent, isTerminalIssueEvent, issueIdentifierF
 import { onChildTerminal } from "../barrier.js";
 import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
 import { notify } from "../alerts/alert-bus.js";
+import { loadKnownHumans } from "../known-humans.js";
 import { emitStreamTopic } from "../admin-stream.js";
 
 const log = componentLogger(createLogger(), "webhook");
@@ -87,14 +88,17 @@ export async function enrichCommentEventForRouting(event: LinearEvent): Promise<
         ...(token ? { Authorization: token.startsWith("Bearer") ? token : `Bearer ${token}` } : {}),
       },
       body: JSON.stringify({
-        query: `query CommentRouting($id: String!) { issue(id: $id) { delegate { id } assignee { id } } }`,
+        query: `query CommentRouting($id: String!) { issue(id: $id) { identifier delegate { id } assignee { id } } }`,
         variables: { id: issueId },
       }),
     });
-    const json = (await res.json()) as { data?: { issue?: { delegate?: { id: string } | null; assignee?: { id: string } | null } } };
+    const json = (await res.json()) as { data?: { issue?: { identifier?: string | null; delegate?: { id: string } | null; assignee?: { id: string } | null } } };
     const issue = json.data?.issue;
     if (issue?.delegate?.id) data.delegate = { id: issue.delegate.id };
     if (issue?.assignee?.id) data.assignee = { id: issue.assignee.id };
+    // AI-1766 AC2: stamp the human-readable identifier so a later no-route
+    // operational event is keyed AI-nnnn instead of a raw issue UUID.
+    if (issue?.identifier && !data.identifier && !data.issueIdentifier) data.issueIdentifier = issue.identifier;
     if (issue?.delegate?.id || issue?.assignee?.id) {
       log.info(`Comment routing enrichment: issue ${issueId} delegate=${issue?.delegate?.id ?? "none"} assignee=${issue?.assignee?.id ?? "none"}`);
     }
@@ -447,18 +451,23 @@ export function createWebhookRouter(
       if (routes.length === 0) {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
         const noRouteData = (event as { data?: Record<string, unknown> }).data;
+        // AI-1766 AC2: attribute the event to a human-readable ticket
+        // identifier whenever the payload carries one (Comment payloads nest
+        // it under data.issue; enrichment stamps data.issueIdentifier). Only
+        // fall back to raw UUIDs when no identifier exists — and say why the
+        // event couldn't be attributed.
+        const noRouteIssue = noRouteData?.issue as Record<string, unknown> | undefined;
         const noRouteTicket =
           (noRouteData?.identifier as string) ||
           (noRouteData?.issueIdentifier as string) ||
-          (noRouteData?.issueId as string) ||
-          (noRouteData?.id as string) ||
+          (noRouteIssue?.identifier as string) ||
           null;
-        appendOperationalEvent(operationalEventStore, {
-          outcome: "no-route",
-          type: event.type,
-          key: noRouteTicket ? `linear-${noRouteTicket}` : null,
-          errorSummary: `No agent target for ${event.type}${noRouteTicket ? ` (${noRouteTicket})` : ""}`,
-        });
+        const noRouteRawId = (noRouteData?.issueId as string) || (noRouteData?.id as string) || null;
+        const attribution = noRouteTicket
+          ? ` (${noRouteTicket})`
+          : noRouteRawId
+            ? ` (unattributable: payload carries no issue identifier, raw id ${noRouteRawId})`
+            : " (unattributable: payload names no issue)";
         // Audit finding #1: this was the fully-silent "assigned it and nothing
         // happened" case — a delegate/assignee/mention matching no registered
         // agent left no artifact anywhere. Now it pushes — but only when the
@@ -466,14 +475,37 @@ export function createWebhookRouter(
         // routing candidates at all (IssueLabel/Project/... entity writes,
         // unassigned issues, plain comments, AgentSessionEvent UI widgets)
         // no-route by construction and stay log+store only.
+        // AI-1900: candidates resolving to a configured known human (Matt) are
+        // a *correct* no-route — humans are deliberately absent from
+        // agents.json — so they are dropped from the pager (distinct
+        // operational outcome, info log). Genuinely unknown ids keep paging;
+        // a mixed event pages listing only the genuinely unknown ids.
         const unresolved = unresolvedRoutingCandidates(event);
-        if (unresolved.length > 0) {
+        const knownHumans = loadKnownHumans();
+        const humans = unresolved.filter((id) => knownHumans.has(id));
+        const unknown = unresolved.filter((id) => !knownHumans.has(id));
+        const humanOnly = humans.length > 0 && unknown.length === 0;
+        appendOperationalEvent(operationalEventStore, {
+          outcome: humanOnly ? "no-route-human" : "no-route",
+          type: event.type,
+          key: noRouteTicket ? `linear-${noRouteTicket}` : noRouteRawId ? `linear-${noRouteRawId}` : null,
+          errorSummary:
+            `No agent target for ${event.type}${attribution}` +
+            (humans.length > 0 ? ` — known human: ${humans.map((id) => knownHumans.get(id)).join(", ")}` : ""),
+        });
+        if (humans.length > 0) {
+          log.info(
+            `no-route candidates resolved to known human(s): ${humans.map((id) => `${knownHumans.get(id)} (${id})`).join(", ")}` +
+            (humanOnly ? " — routing pager suppressed" : ""),
+          );
+        }
+        if (unknown.length > 0) {
           notify({
             severity: "warning",
             source: "routing",
             title: "no-route: event named a delegate/assignee/mention unknown to agents.json",
-            detail: `type=${event.type} action=${"action" in event ? event.action : "?"} unresolved=${unresolved.join(",")}`,
-            ticket: issueIdentifierFromEvent(event) ?? undefined,
+            detail: `type=${event.type} action=${"action" in event ? event.action : "?"} unresolved=${unknown.join(",")}`,
+            ticket: noRouteTicket ?? issueIdentifierFromEvent(event) ?? undefined,
           });
         }
         return;
