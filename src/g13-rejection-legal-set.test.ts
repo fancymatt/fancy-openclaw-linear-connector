@@ -156,6 +156,9 @@ bodies:
   - id: hanzo
     container: deployment
     fills_roles: [deployment]
+  - id: yuki
+    container: deployment
+    fills_roles: [deployment]
   - id: astrid
     container: steward
     fills_roles: [steward]
