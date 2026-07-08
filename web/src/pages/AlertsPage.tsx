@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { apiGet } from "../api";
 import { usePoll, ageLabel } from "../hooks";
+import { useLiveRefresh } from "../hooks/useLiveRefresh";
 import { Card, Chip, Diagnostics, Empty, ErrorBanner } from "../components";
 import type { AlertRow } from "../types";
 
@@ -12,6 +13,7 @@ export function AlertsPage() {
   if (severity !== "all") query.set("severity", severity);
 
   const alerts = usePoll(() => apiGet<{ alerts: AlertRow[] }>(`/admin/api/alerts?${query.toString()}`), 10000);
+  useLiveRefresh({ onAlerts: alerts.refresh });
 
   return (
     <>

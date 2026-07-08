@@ -4,6 +4,7 @@
  */
 import { usePoll } from "../hooks";
 import { apiGet } from "../api";
+import { useLiveRefresh } from "../hooks/useLiveRefresh";
 import { BoardCard } from "../components/BoardCard";
 import { ErrorBanner } from "../components";
 import type { BoardWorkflow, BoardTicket } from "../board-types";
@@ -21,6 +22,7 @@ interface BoardPageProps {
 /** For test renders — accepts props directly instead of fetching from API. */
 export function BoardPage({ workflows: propWorkflows, tickets: propTickets }: BoardPageProps) {
   const live = usePoll(() => apiGet<BoardResponse>("/admin/api/board"), 8000);
+  useLiveRefresh({ onBoard: live.refresh });
   const workflows = propWorkflows ?? live.data?.workflows ?? [];
   const tickets = propTickets ?? live.data?.tickets ?? [];
 

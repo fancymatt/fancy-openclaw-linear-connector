@@ -1,5 +1,6 @@
 import { apiGet } from "../api";
 import { usePoll, ageLabel } from "../hooks";
+import { useLiveRefresh } from "../hooks/useLiveRefresh";
 import { Card, Chip, Empty, ErrorBanner, Stat } from "../components";
 import type { DashboardResponse, StructureResponse, AlertRow } from "../types";
 
@@ -7,6 +8,7 @@ export function OverviewPage() {
   const dashboard = usePoll(() => apiGet<DashboardResponse>("/admin/api/dashboard"), 8000);
   const structure = usePoll(() => apiGet<StructureResponse>("/admin/api/structure"), 30000);
   const alerts = usePoll(() => apiGet<{ alerts: AlertRow[] }>("/admin/api/alerts?limit=8"), 15000);
+  useLiveRefresh({ onFleet: dashboard.refresh, onAlerts: alerts.refresh, onBoard: dashboard.refresh });
 
   const d = dashboard.data;
   const s = structure.data;

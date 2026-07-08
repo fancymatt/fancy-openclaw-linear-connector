@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { apiGet } from "../api";
 import { usePoll, ageLabel } from "../hooks";
+import { useLiveRefresh } from "../hooks/useLiveRefresh";
 import { Card, Chip, Diagnostics, Empty, ErrorBanner } from "../components";
 import type { OperationalEvent } from "../types";
 
@@ -25,6 +26,7 @@ export function EventsPage() {
     () => apiGet<{ events: OperationalEvent[] }>(`/admin/api/events?${query.toString()}`),
     6000,
   );
+  useLiveRefresh({ onEvents: events.refresh });
 
   return (
     <>
