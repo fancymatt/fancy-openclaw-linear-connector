@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { apiGet } from "../api";
 import { usePoll, ageLabel } from "../hooks";
+import { useLiveRefresh } from "../hooks/useLiveRefresh";
 import { Card, Chip, Diagnostics, Empty, ErrorBanner } from "../components";
 
 interface DeadLetterItem {
@@ -26,6 +27,7 @@ export function DeadLettersPage() {
     () => apiGet<{ items: DeadLetterItem[] }>(`/admin/api/dead-letters?${query.toString()}`),
     15000,
   );
+  useLiveRefresh({ onDeadLetters: result.refresh });
 
   return (
     <>

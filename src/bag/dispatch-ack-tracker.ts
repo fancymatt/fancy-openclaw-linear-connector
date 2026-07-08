@@ -20,6 +20,7 @@ import Database from "better-sqlite3";
 import path from "path";
 import { createLogger, componentLogger } from "../logger.js";
 import { normalizeSessionKey } from "../session-key.js";
+import { emitStreamTopic } from "../admin-stream.js";
 
 const log = componentLogger(createLogger(), "dispatch-ack-tracker");
 
@@ -90,6 +91,7 @@ export class DispatchAckTracker {
       )
       .run(agentId, normalizedId);
     log.info(`Dispatch recorded: ${agentId} [${normalizedId}]`);
+    emitStreamTopic("fleet");
   }
 
   /**

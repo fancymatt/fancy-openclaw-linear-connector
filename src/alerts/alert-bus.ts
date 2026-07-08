@@ -1,6 +1,7 @@
 import { componentLogger, createLogger, type Logger } from "../logger.js";
 import { AlertStore, defaultDedupKey, type AlertInput, type AlertSeverity } from "./alert-store.js";
 import { sendThroughChain } from "./push-transports.js";
+import { emitStreamTopic } from "../admin-stream.js";
 
 export type { AlertInput, AlertSeverity };
 
@@ -119,6 +120,7 @@ export class AlertBus {
       }
     }
 
+    emitStreamTopic("alerts");
     if (suppressed) return; // Folded into an active burst — no repeat push.
     if (!this.pushEnabled) return;
     if (SEVERITY_RANK[alert.severity] < SEVERITY_RANK[this.pushMinSeverity]) return;

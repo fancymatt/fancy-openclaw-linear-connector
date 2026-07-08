@@ -1,5 +1,6 @@
 import { apiGet } from "../api";
 import { usePoll, ageLabel } from "../hooks";
+import { useLiveRefresh } from "../hooks/useLiveRefresh";
 import { Card, Chip, Diagnostics, Empty, ErrorBanner } from "../components";
 import { CapacityStrip } from "../components/CapacityStrip";
 import type { FleetResponse } from "../types";
@@ -14,6 +15,7 @@ const ACK_TONE: Record<string, string> = {
 
 export function FleetPage() {
   const fleet = usePoll(() => apiGet<FleetResponse>("/admin/api/fleet"), 8000);
+  useLiveRefresh({ onFleet: fleet.refresh });
   const f = fleet.data;
 
   const openDispatches = f?.dispatches.filter((d) => d.ackStatus !== "acknowledged") ?? [];

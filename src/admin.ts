@@ -34,6 +34,7 @@ import {
   clearSessionCookie,
   LoginRateLimiter,
 } from "./admin-session.js";
+import { mountStreamRoute } from "./admin-stream.js";
 
 interface AdminDeps {
   agentQueue: AgentQueue;
@@ -457,6 +458,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
 
   // ── Authenticated API ────────────────────────────────────────────────────
   router.use("/api", adminAuth);
+  mountStreamRoute(router);
 
   router.get("/api/dashboard", (_req: Request, res: Response) => {
     res.json(buildDashboard(deps));

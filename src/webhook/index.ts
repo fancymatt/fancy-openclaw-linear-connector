@@ -28,6 +28,7 @@ import { isLinearIssueStillRoutedToAgent, isTerminalIssueEvent, issueIdentifierF
 import { onChildTerminal } from "../barrier.js";
 import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
 import { notify } from "../alerts/alert-bus.js";
+import { emitStreamTopic } from "../admin-stream.js";
 
 const log = componentLogger(createLogger(), "webhook");
 
@@ -246,6 +247,7 @@ export function createWebhookRouter(
 
       // ── 8. Acknowledge immediately ────────────────────────────────────────
       res.status(200).json({ ok: true });
+      emitStreamTopic("events");
 
       // Record event for dedup & restart recovery
       eventStore?.recordEvent(deliveryId, payload as object);
