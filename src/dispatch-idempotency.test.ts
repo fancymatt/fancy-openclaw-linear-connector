@@ -426,3 +426,65 @@ describe("AI-1918 — dispatch idempotency + stale guard", () => {
     });
   });
 });
+
+// ── AI-1969: workflow re-entry must re-dispatch ─────────────────────────────
+// Root cause of the AI-1965 incident (Hanzo merge-gate "unresponsive"): the
+// AI-1918 store suppressed same-OR-NEWER updatedAt for a previously seen
+// (ticket, state, agent) key, so a second legitimate handoff to the same agent
+// in the same state (merge-conflict bounce → rebase → re-approve) was swallowed
+// forever. Only an IDENTICAL updatedAt (true webhook replay / restart echo) may
+// be suppressed; a strictly newer snapshot is a new event and must wake.
+describe("AI-1969 — re-entry dispatch with a newer updatedAt is admitted", () => {
+  let dir: string | undefined;
+  let app: ReturnType<typeof createApp> | undefined;
+
+  afterEach(() => {
+    closeApp(app);
+    app = undefined;
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it("admits leg 2 (newer updatedAt, same ticket/state/agent), still suppresses its replay", async () => {
+    dir = tempDir("ai1969-reentry-");
+    app = bootApp(dir);
+    const store = app.operationalEventStore as OperationalEventStore;
+
+    // Leg 1: first handoff — admitted.
+    const leg1 = makeIssuePayload({
+      identifier: "AI-1969",
+      delegateId: AGENT_X.linearUserId,
+      updatedAt: "2026-07-07T15:54:10.000Z",
+    });
+    await post(app.app, leg1, "delivery-ai1969-leg1");
+    await waitForSettled(store, "linear-AI-1969");
+    expect(routedCount(store, AGENT_X.name)).toBe(1);
+
+    // Leg 2: bounce cycle re-enters the same state with the same delegate,
+    // hours later (strictly newer updatedAt) — MUST be admitted (the bug
+    // suppressed this forever).
+    const leg2 = makeIssuePayload({
+      identifier: "AI-1969",
+      delegateId: AGENT_X.linearUserId,
+      updatedAt: "2026-07-08T04:46:06.000Z",
+    });
+    await post(app.app, leg2, "delivery-ai1969-leg2");
+    await waitForSettled(store, "linear-AI-1969");
+    expect(routedCount(store, AGENT_X.name)).toBe(2);
+
+    // Replay of leg 2 (identical updatedAt, new delivery id) — suppressed.
+    const before = await request(app.app).get("/health");
+    await post(app.app, leg2, "delivery-ai1969-leg2-replay");
+    await waitForSettled(store, "linear-AI-1969");
+    expect(routedCount(store, AGENT_X.name)).toBe(2);
+    const after = await request(app.app).get("/health");
+    expect(after.body.dispatchIdempotency.suppressedDuplicates).toBeGreaterThan(
+      before.body?.dispatchIdempotency?.suppressedDuplicates ?? 0,
+    );
+
+    // A delayed OLDER snapshot (leg 1 again) — dropped stale, not re-dispatched.
+    await post(app.app, leg1, "delivery-ai1969-leg1-late");
+    await waitForSettled(store, "linear-AI-1969");
+    expect(routedCount(store, AGENT_X.name)).toBe(2);
+  });
+});

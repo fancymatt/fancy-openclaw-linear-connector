@@ -101,9 +101,18 @@ export class DispatchIdempotencyStore {
         this._droppedStale++;
         return { suppressed: false, stale: true };
       }
-      // Duplicate: same or newer — don't re-dispatch.
-      this._suppressedDuplicates++;
-      return { suppressed: true, stale: false };
+      // Duplicate: identical snapshot (webhook replay / restart echo) — don't
+      // re-dispatch. A strictly NEWER updatedAt is a genuinely new event
+      // (AI-1969: workflow re-entry — e.g. a second handoff to the same agent
+      // in the same state after a bounce cycle) and must be admitted; before
+      // this distinction, re-entry handoffs were suppressed forever and the
+      // target agent could never be woken again on that (ticket, state) key.
+      if (incomingUpdatedAt === existingUpdatedAt) {
+        this._suppressedDuplicates++;
+        return { suppressed: true, stale: false };
+      }
+      // Fall through to admit: the INSERT OR REPLACE below refreshes the
+      // stored updatedAt so the replay guard tracks the newest snapshot.
     }
 
     // ── Stale check: ticket-level across all agents/states. ──
