@@ -50,6 +50,8 @@ interface AdminDeps {
   wakeConfigForAgent?: (agentId: string) => WakeUpConfig;
   /** Override the SPA asset directory (tests). */
   webDistDir?: string;
+  /** Override forensics diagnostics base directory (for testing, AI-1953). */
+  forensicsDiagnosticsDir?: string;
 }
 
 type Severity = "green" | "yellow" | "red" | "gray";
@@ -903,10 +905,33 @@ export function createAdminRouter(deps: AdminDeps): Router {
       },
     });
   });
-  router.get("/api/stale-digest", (_req: Request, res: Response) => {
+  router.get("/api/stale-digest", async (_req: Request, res: Response) => {
     const daysBack = typeof _req.query.days === "string" ? Number.parseInt(_req.query.days, 10) : 7;
-    const summary = aggregateDigest(undefined, daysBack);
-    res.json(summary);
+    const forensicsConfig = deps.forensicsDiagnosticsDir
+      ? { diagnosticsDir: path.join(deps.forensicsDiagnosticsDir, "stale-sessions") }
+      : {};
+    const summary = aggregateDigest(forensicsConfig, daysBack);
+
+    const summaryMap = await loadBoardWorkflowSummaries();
+    const now = Date.now();
+    const enrichedEntries = summary.entries.map((e) => {
+      const row = deps.enrolledTicketsStore?.getByTicketId(e.ticket) ?? null;
+      if (!row) {
+        return { ...e, state: null, delegate: null, age_seconds: null, threshold_ms: null, last_comment_at: null };
+      }
+      const age_seconds = (now - new Date(row.entered_state_at).getTime()) / 1000;
+      const threshold_ms = summaryMap.get(row.workflow)?.slaMap.get(row.state) ?? null;
+      return {
+        ...e,
+        state: row.state,
+        delegate: row.delegate,
+        age_seconds,
+        threshold_ms,
+        last_comment_at: row.last_event_at ?? null,
+      };
+    });
+
+    res.json({ ...summary, entries: enrichedEntries });
   });
   router.get("/api/stale-digest/text", (_req: Request, res: Response) => {
     const daysBack = typeof _req.query.days === "string" ? Number.parseInt(_req.query.days, 10) : 7;
