@@ -129,6 +129,8 @@ export interface CreateAppOptions {
   enrolledTicketsDbPath?: string;
   /** Override MutationAuditStore database path (for testing). AI-1838. */
   mutationAuditDbPath?: string;
+  /** Override forensics diagnostics base directory (for testing, AI-1953). */
+  forensicsDiagnosticsDir?: string;
   /**
    * Test hook: override wake-up delivery for resignal/hold-retry dispatches.
    * When provided, replaces the real sendWakeUpSignal so tests don't hit the
@@ -663,7 +665,7 @@ export function createApp(options?: CreateAppOptions) {
   });
 
   // Management console (Phase 3): React SPA + JSON API, session or secret auth.
-  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME, enrolledTicketsStore }));
+  app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME, enrolledTicketsStore, forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir, mutationAuditStore }));
 
   app.use("/", createWebhookRouter(
     eventStore,

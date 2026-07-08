@@ -11,6 +11,7 @@ import { EventsPage } from "./pages/EventsPage";
 import { AlertsPage } from "./pages/AlertsPage";
 import { WorkflowsPage } from "./pages/WorkflowsPage";
 import { DeadLettersPage } from "./pages/DeadLettersPage";
+import { StallsPage } from "./pages/StallsPage";
 
 type AuthState = "checking" | "authenticated" | "anonymous";
 
@@ -67,6 +68,7 @@ export function App() {
           <Route path="/alerts" element={<AlertsPage />} />
           <Route path="/workflows" element={<WorkflowsPage />} />
           <Route path="/dead-letters" element={<DeadLettersPage />} />
+          <Route path="/stalls" element={<StallsPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </div>

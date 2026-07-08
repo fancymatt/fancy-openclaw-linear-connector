@@ -21,6 +21,7 @@ import { parseSlaToMs } from "./barrier.js";
 import { computeDispatchHealth } from "./dispatch-health.js";
 import type { DispatchAckEntry } from "./bag/dispatch-ack-tracker.js";
 import { recaptureAc } from "./ac-record-store.js";
+import type { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { getStatus as getConfigHealthStatus } from "./config-health.js";
 import { getRegistryPolicyStatus } from "./registry-policy.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
@@ -49,6 +50,10 @@ interface AdminDeps {
   wakeConfigForAgent?: (agentId: string) => WakeUpConfig;
   /** Override the SPA asset directory (tests). */
   webDistDir?: string;
+  /** AI-1953: base directory for forensics diagnostics (parent of stale-sessions/). */
+  forensicsDiagnosticsDir?: string;
+  /** AI-1954: mutation audit log for admin ops attribution. */
+  mutationAuditStore?: MutationAuditStore;
 }
 
 type Severity = "green" | "yellow" | "red" | "gray";
@@ -901,10 +906,33 @@ export function createAdminRouter(deps: AdminDeps): Router {
       },
     });
   });
-  router.get("/api/stale-digest", (_req: Request, res: Response) => {
+  router.get("/api/stale-digest", async (_req: Request, res: Response) => {
     const daysBack = typeof _req.query.days === "string" ? Number.parseInt(_req.query.days, 10) : 7;
-    const summary = aggregateDigest(undefined, daysBack);
-    res.json(summary);
+    const forensicsConfig = deps.forensicsDiagnosticsDir
+      ? { diagnosticsDir: path.join(deps.forensicsDiagnosticsDir, "stale-sessions") }
+      : {};
+    const summary = aggregateDigest(forensicsConfig, daysBack);
+
+    const summaryMap = await loadBoardWorkflowSummaries();
+    const now = Date.now();
+    const enrichedEntries = summary.entries.map((e) => {
+      const row = deps.enrolledTicketsStore?.getByTicketId(e.ticket) ?? null;
+      if (!row) {
+        return { ...e, state: null, delegate: null, age_seconds: null, threshold_ms: null, last_comment_at: null };
+      }
+      const age_seconds = (now - new Date(row.entered_state_at).getTime()) / 1000;
+      const threshold_ms = summaryMap.get(row.workflow)?.slaMap.get(row.state) ?? null;
+      return {
+        ...e,
+        state: row.state,
+        delegate: row.delegate,
+        age_seconds,
+        threshold_ms,
+        last_comment_at: row.last_event_at ?? null,
+      };
+    });
+
+    res.json({ ...summary, entries: enrichedEntries });
   });
   router.get("/api/stale-digest/text", (_req: Request, res: Response) => {
     const daysBack = typeof _req.query.days === "string" ? Number.parseInt(_req.query.days, 10) : 7;
@@ -960,6 +988,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
   // AI-1546 / G-6: Steward/human-only atomic set-state.
   // All admin API routes are protected by adminAuth (ADMIN_SECRET or console session).
   // AC2: agents cannot call this — they have no ADMIN_SECRET.
+  // AI-1954: invoker+reason now required for attribution; AC3 force guard added.
   router.post("/api/set-state", async (req: Request, res: Response) => {
     const body = parseJsonBody(req);
     if (body === null && (Buffer.isBuffer(req.body) || typeof req.body === "string")) {
@@ -974,9 +1003,21 @@ export function createAdminRouter(deps: AdminDeps): Router {
       delegateRaw === null ? null :
       typeof delegateRaw === "string" ? delegateRaw :
       undefined;
+    // AI-1954: invoker + reason are required for audit attribution.
+    const invoker = typeof body?.invoker === "string" ? body.invoker.trim() : "";
+    const reason = typeof body?.reason === "string" ? body.reason.trim() : "";
+    const force = body?.force === true;
 
     if (!ticketId || !targetState) {
       res.status(400).json({ ok: false, error: "ticketId and targetState are required" });
+      return;
+    }
+    if (!invoker) {
+      res.status(400).json({ ok: false, error: "invoker is required" });
+      return;
+    }
+    if (!reason) {
+      res.status(400).json({ ok: false, error: "reason is required" });
       return;
     }
 
@@ -998,14 +1039,45 @@ export function createAdminRouter(deps: AdminDeps): Router {
         }
       : undefined;
 
-    const result = await setStateAtomic(ticketId, targetState, delegate, authToken, { sendWakeUp });
-    res.status(result.ok ? 200 : 422).json(result);
+    const result = await setStateAtomic(ticketId, targetState, delegate, authToken, { sendWakeUp, force });
+    if (!result.ok) {
+      res.status(422).json(result);
+      return;
+    }
+
+    // AI-1954 AC1: write mutation_audit row recording op, invoker, reason.
+    deps.mutationAuditStore?.append({
+      source: "proxy",
+      ticket: ticketId,
+      changeType: "state",
+      oldValue: result.from,
+      newValue: targetState,
+      actorId: invoker,
+      opName: "set-state",
+      intent: reason,
+    });
+
+    // AI-1954 AC2: post audit comment naming the true invoker.
+    const auditCommentBody =
+      `[Admin set-state by ${invoker}] ${result.from ?? "?"} → ${targetState} — ${reason}`;
+    const auditIssueId = result.internalId ?? ticketId;
+    fetch("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({
+        query: `mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }`,
+        variables: { issueId: auditIssueId, body: auditCommentBody },
+      }),
+    }).catch(() => {});
+
+    res.status(200).json(result);
   });
 
   // POST /api/recapture-ac — steward-gated AC-of-record recapture (AI-1785).
   // Auth: adminAuth (ADMIN_SECRET or console session).  Authorization: the
   // steward gate inside recaptureAc() checks callerBodyId against
   // resolveBodiesForRole("steward").  No separate permission mechanism.
+  // AI-1954: invoker+reason now required for attribution.
   router.post("/api/recapture-ac", async (req: Request, res: Response) => {
     const body = parseJsonBody(req);
     if (body === null && (Buffer.isBuffer(req.body) || typeof req.body === "string")) {
@@ -1015,9 +1087,20 @@ export function createAdminRouter(deps: AdminDeps): Router {
     const ticketId = typeof body?.ticketId === "string" ? body.ticketId.trim() : "";
     const callerBodyId = typeof body?.callerBodyId === "string" ? body.callerBodyId.trim() : "";
     const force = body?.force === true;
+    // AI-1954: invoker + reason are required for audit attribution.
+    const invoker = typeof body?.invoker === "string" ? body.invoker.trim() : "";
+    const reason = typeof body?.reason === "string" ? body.reason.trim() : "";
 
     if (!ticketId || !callerBodyId) {
       res.status(400).json({ ok: false, error: "ticketId and callerBodyId are required" });
+      return;
+    }
+    if (!invoker) {
+      res.status(400).json({ ok: false, error: "invoker is required" });
+      return;
+    }
+    if (!reason) {
+      res.status(400).json({ ok: false, error: "reason is required" });
       return;
     }
 
@@ -1034,6 +1117,28 @@ export function createAdminRouter(deps: AdminDeps): Router {
 
     try {
       await recaptureAc(ticketId, authToken, callerBodyId, { force });
+
+      // AI-1954 AC1: write mutation_audit row recording op, invoker, reason.
+      deps.mutationAuditStore?.append({
+        source: "proxy",
+        ticket: ticketId,
+        changeType: "state",
+        actorId: invoker,
+        opName: "recapture-ac",
+        intent: reason,
+      });
+
+      // AI-1954 AC2: post audit comment naming the true invoker.
+      const auditCommentBody = `[Admin recapture-ac by ${invoker}] ${reason}`;
+      fetch("https://api.linear.app/graphql", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authToken },
+        body: JSON.stringify({
+          query: `mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }`,
+          variables: { issueId: ticketId, body: auditCommentBody },
+        }),
+      }).catch(() => {});
+
       res.status(200).json({ ok: true, ticketId, callerBodyId, force });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
