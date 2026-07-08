@@ -1502,15 +1502,25 @@ export async function checkWorkflowRules(
     );
   }
   if (callerLinearUserId && delegateId && callerLinearUserId !== delegateId) {
-    log.warn(`workflow-gate: delegate-only block agent=${bodyId} intent=${intent} ticket=${issueId}`);
-    const wdState = getCurrentState(labels);
-    const wdNode = wdState ? def.states.find((s) => s.id === wdState) : undefined;
-    const legalMoves = [...(wdNode?.transitions?.map((t) => cliVerbFor(t)) ?? []), breakGlassCommand].join(", ");
-    return (
-      `[Proxy] '${intent}' blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
-      `Only the ticket delegate may mutate its state. ` +
-      `Legal moves: ${legalMoves}.`
-    );
+    // AI-1936 Defect 2: steward break-glass exception — the delegate-only gate must
+    // allow the recovery steward (workflow:break-glass) to advance a stranded ticket
+    // without becoming the current delegate first. Without this exception, the steward
+    // must use raw escape (full spine restart via intake) for every forward recovery,
+    // losing all ticket context and forcing re-verification. Check break-glass capability
+    // before blocking so the steward can use continue-workflow / request-revision directly.
+    const hasBreakGlass = await bodyHasCapability(bodyId, "workflow:break-glass");
+    if (!hasBreakGlass) {
+      log.warn(`workflow-gate: delegate-only block agent=${bodyId} intent=${intent} ticket=${issueId}`);
+      const wdState = getCurrentState(labels);
+      const wdNode = wdState ? def.states.find((s) => s.id === wdState) : undefined;
+      const legalMoves = [...(wdNode?.transitions?.map((t) => cliVerbFor(t)) ?? []), breakGlassCommand].join(", ");
+      return (
+        `[Proxy] '${intent}' blocked: ${bodyId} is not the current delegate for ${issueId}. ` +
+        `Only the ticket delegate may mutate its state. ` +
+        `Legal moves: ${legalMoves}.`
+      );
+    }
+    log.info(`workflow-gate: break-glass delegate bypass agent=${bodyId} intent=${intent} ticket=${issueId} (workflow:break-glass holder, not current delegate)`);
   }
 
   const currentState = getCurrentState(labels);
