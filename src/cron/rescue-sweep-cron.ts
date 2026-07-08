@@ -6,13 +6,26 @@
  * net that fires independently of the auto-entry hook.
  *
  * Pattern mirrors src/cron/p4-metrics-distillation.ts.
+ *
+ * AI-1970 fix:
+ *   - Auth now uses getAccessToken("ai") ?? env (matching every sibling caller),
+ *     fixing the bug where the deployment's encrypted token was never read.
+ *   - Skip and fail outcomes are recorded to /health state so a dead safety net
+ *     no longer looks identical to a never-due one.
+ *   - A first run fires immediately after registration (timer.unref'd) rather than
+ *     waiting a full interval.
  */
 
 import { runRescueSweep } from "../rescue-sweep.js";
 import { loadWorkflowRegistry } from "../workflow-gate.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { registerCron, formatIntervalMs } from "./registry.js";
-import { recordRescueSweepRun } from "../rescue-sweep-state.js";
+import { getAccessToken } from "../agents.js";
+import {
+  recordRescueSweepRun,
+  recordRescueSweepSkip,
+  recordRescueSweepFail,
+} from "../rescue-sweep-state.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "rescue-sweep-cron");
 
@@ -36,38 +49,62 @@ function parseIntervalMs(value: string): number {
 const DEFAULT_INTERVAL_MS = parseIntervalMs(process.env.RESCUE_SWEEP_INTERVAL ?? "1h");
 
 /**
+ * Run one sweep iteration: resolve auth token, load registry, execute, record.
+ * Extracted so it can be called both on-interval and on-first-run.
+ */
+async function runSweepIteration(): Promise<void> {
+  try {
+    // AI-1970: canonical auth pattern — getAccessToken("ai") ?? env, matching every sibling.
+    const authToken =
+      getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+    if (!authToken) {
+      const reason = "No LINEAR_OAUTH_TOKEN or LINEAR_API_KEY configured";
+      log.warn(`[rescue-sweep] ${reason} — skipping sweep`);
+      recordRescueSweepSkip(reason);
+      return;
+    }
+    const workflowRegistry = await loadWorkflowRegistry();
+    const result = await runRescueSweep({ authToken, workflowRegistry });
+    recordRescueSweepRun(result);
+    if (result.rescued > 0 || result.errors.length > 0) {
+      log.info(
+        `[rescue-sweep] Sweep complete: scanned=${result.scanned} rescued=${result.rescued} errors=${result.errors.length}`,
+      );
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.error(`[rescue-sweep] Scheduled sweep failed: ${msg}`);
+    recordRescueSweepFail(msg);
+  }
+}
+
+/**
  * Register the rescue sweep as an in-process recurring job.
  * Interval is controlled by RESCUE_SWEEP_INTERVAL env var (default: 1h).
  * The timer is unref'd so it won't prevent graceful shutdown.
+ *
+ * A first run fires via setImmediate-style setTimeout after registration
+ * (also unref'd) so the sweep doesn't wait a full interval before initial
+ * execution.
  */
 export function registerRescueSweepCron(): void {
   const intervalMs = DEFAULT_INTERVAL_MS;
   registerCron("rescue-sweep", `every ${formatIntervalMs(intervalMs)}`);
+
+  // AI-1970: first run shortly after startup (unref'd).
+  const firstRunTimer = setTimeout(() => {
+    void runSweepIteration();
+  }, 0);
+  firstRunTimer.unref();
+
+  // Recurring interval.
   const timer = setInterval(() => {
-    void (async () => {
-      try {
-        const authToken = process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
-        if (!authToken) {
-          log.warn("[rescue-sweep] No LINEAR_OAUTH_TOKEN or LINEAR_API_KEY — skipping sweep");
-          return;
-        }
-        const workflowRegistry = await loadWorkflowRegistry();
-        const result = await runRescueSweep({ authToken, workflowRegistry });
-        recordRescueSweepRun(result);
-        if (result.rescued > 0 || result.errors.length > 0) {
-          log.info(
-            `[rescue-sweep] Sweep complete: scanned=${result.scanned} rescued=${result.rescued} errors=${result.errors.length}`,
-          );
-        }
-      } catch (err) {
-        log.error(
-          `[rescue-sweep] Scheduled sweep failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    })();
+    void runSweepIteration();
   }, intervalMs);
   timer.unref();
+
   log.info(
-    `[rescue-sweep] Rescue sweep scheduled every ${intervalMs}ms (RESCUE_SWEEP_INTERVAL=${process.env.RESCUE_SWEEP_INTERVAL ?? "1h"})`,
+    `[rescue-sweep] Rescue sweep scheduled every ${intervalMs}ms (RESCUE_SWEEP_INTERVAL=${process.env.RESCUE_SWEEP_INTERVAL ?? "1h"})` +
+      " — first run queued immediately",
   );
 }

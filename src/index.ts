@@ -226,6 +226,8 @@ export function createApp(options?: CreateAppOptions) {
         active: true,
         suppressedDuplicates: idempotencyStore.counters.suppressedDuplicates,
         droppedStale: idempotencyStore.counters.droppedStale,
+        delegateChangeCleared: idempotencyStore.counters.delegateChangeCleared,
+        ttlExpiredAdmits: idempotencyStore.counters.ttlExpiredAdmits,
       },
       // AI-1872: workflow registry liveness — exposes the loaded workflow defs
       // (id → {version, states}) so ac-validate can confirm the updated def

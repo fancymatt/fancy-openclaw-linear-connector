@@ -315,11 +315,15 @@ describe("AI-1857 AC3: /health includes rescue-sweep lastRunAt and lastOutcome c
     const body = res.body as Record<string, unknown>;
 
     // AC3: rescue-sweep must have a lastRunAt field showing when it last ran
-    // (currently fails: no rescueSweep field exists in /health)
     expect(body).toHaveProperty("rescueSweep");
     const sweep = body.rescueSweep as Record<string, unknown>;
     expect(sweep).toHaveProperty("lastRunAt");
     expect(sweep).toHaveProperty("lastOutcome");
+
+    // AI-1970: additive fields for non-success outcomes
+    expect(sweep).toHaveProperty("lastOutcomeType");
+    expect(sweep).toHaveProperty("lastSkipReason");
+    expect(sweep).toHaveProperty("lastError");
   });
 
   it("/health rescueSweep.lastOutcome includes per-classification counts", async () => {
