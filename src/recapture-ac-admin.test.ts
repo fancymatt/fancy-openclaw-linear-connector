@@ -212,7 +212,7 @@ describeTop("POST /admin/api/recapture-ac (AI-1785)", () => {
     const res = await request(appState.app)
       .post("/admin/api/recapture-ac")
       .set("x-admin-secret", ADMIN_SECRET)
-      .send({ ticketId: "AI-1785", callerBodyId: "astrid" })
+      .send({ ticketId: "AI-1785", callerBodyId: "astrid", invoker: "astrid", reason: "re-capturing AC post spec change" })
       .expect(200);
 
     expect(res.body.ok).toBe(true);
@@ -227,7 +227,7 @@ describeTop("POST /admin/api/recapture-ac (AI-1785)", () => {
     const res = await request(appState.app)
       .post("/admin/api/recapture-ac")
       .set("x-admin-secret", ADMIN_SECRET)
-      .send({ ticketId: "AI-1785", callerBodyId: "charles" })
+      .send({ ticketId: "AI-1785", callerBodyId: "charles", invoker: "charles", reason: "attempting re-capture" })
       .expect(403);
 
     expect(res.body.ok).toBe(false);
@@ -240,7 +240,7 @@ describeTop("POST /admin/api/recapture-ac (AI-1785)", () => {
     const res = await request(appState.app)
       .post("/admin/api/recapture-ac")
       .set("x-admin-secret", ADMIN_SECRET)
-      .send({ ticketId: "AI-1785", callerBodyId: "nobody" })
+      .send({ ticketId: "AI-1785", callerBodyId: "nobody", invoker: "nobody", reason: "attempting re-capture" })
       .expect(403);
 
     expect(res.body.ok).toBe(false);
@@ -255,14 +255,14 @@ describeTop("POST /admin/api/recapture-ac (AI-1785)", () => {
     await request(appState.app)
       .post("/admin/api/recapture-ac")
       .set("x-admin-secret", ADMIN_SECRET)
-      .send({ ticketId: "AI-1785", callerBodyId: "astrid" })
+      .send({ ticketId: "AI-1785", callerBodyId: "astrid", invoker: "astrid", reason: "initial capture" })
       .expect(200);
 
     // Second attempt without force → rejected
     const res = await request(appState.app)
       .post("/admin/api/recapture-ac")
       .set("x-admin-secret", ADMIN_SECRET)
-      .send({ ticketId: "AI-1785", callerBodyId: "astrid" })
+      .send({ ticketId: "AI-1785", callerBodyId: "astrid", invoker: "astrid", reason: "second capture attempt" })
       .expect(422);
 
     expect(res.body.ok).toBe(false);
@@ -275,14 +275,14 @@ describeTop("POST /admin/api/recapture-ac (AI-1785)", () => {
     await request(appState.app)
       .post("/admin/api/recapture-ac")
       .set("x-admin-secret", ADMIN_SECRET)
-      .send({ ticketId: "AI-1785", callerBodyId: "astrid" })
+      .send({ ticketId: "AI-1785", callerBodyId: "astrid", invoker: "astrid", reason: "initial capture" })
       .expect(200);
 
     // Force overwrite
     const res = await request(appState.app)
       .post("/admin/api/recapture-ac")
       .set("x-admin-secret", ADMIN_SECRET)
-      .send({ ticketId: "AI-1785", callerBodyId: "astrid", force: true })
+      .send({ ticketId: "AI-1785", callerBodyId: "astrid", invoker: "astrid", reason: "force overwrite after spec update", force: true })
       .expect(200);
 
     expect(res.body.ok).toBe(true);
@@ -295,7 +295,7 @@ describeTop("POST /admin/api/recapture-ac (AI-1785)", () => {
     const res = await request(appState.app)
       .post("/admin/api/recapture-ac")
       .set("x-admin-secret", ADMIN_SECRET)
-      .send({ ticketId: "AI-1785", callerBodyId: "charles", force: true })
+      .send({ ticketId: "AI-1785", callerBodyId: "charles", invoker: "charles", reason: "force bypass attempt", force: true })
       .expect(403);
 
     expect(res.body.ok).toBe(false);
@@ -310,7 +310,7 @@ describeTop("POST /admin/api/recapture-ac (AI-1785)", () => {
     const res = await request(appState.app)
       .post("/admin/api/recapture-ac")
       .set("x-admin-secret", ADMIN_SECRET)
-      .send({ ticketId: "AI-1785", callerBodyId: "astrid" })
+      .send({ ticketId: "AI-1785", callerBodyId: "astrid", invoker: "astrid", reason: "re-capture after spec revision" })
       .expect(422);
 
     expect(res.body.ok).toBe(false);

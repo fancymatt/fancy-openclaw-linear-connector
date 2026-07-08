@@ -233,7 +233,7 @@ describe("setStateAtomic (AI-1546)", () => {
       updateSuccess: true,
       consistencyLabels: ["wf:dev-impl", "state:done"],
     });
-    const result = await setStateAtomic("AI-9999", "done", undefined, "Bearer test-token");
+    const result = await setStateAtomic("AI-9999", "done", undefined, "Bearer test-token", { force: true });
     expect(result.ok).toBe(true);
     expect(result.from).toBe("implementation");
     expect(result.to).toBe("done");
@@ -248,7 +248,7 @@ describe("setStateAtomic (AI-1546)", () => {
       updateSuccess: true,
       consistencyLabels: ["wf:dev-impl", "state:implementation"], // old label still there
     });
-    const result = await setStateAtomic("AI-9999", "done", undefined, "Bearer test-token");
+    const result = await setStateAtomic("AI-9999", "done", undefined, "Bearer test-token", { force: true });
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/consistency check failed/);
   });
@@ -285,7 +285,7 @@ describe("setStateAtomic (AI-1546)", () => {
       fromLabels: ["wf:dev-impl", "state:implementation"],
       updateSuccess: false,
     });
-    const result = await setStateAtomic("AI-9999", "done", undefined, "Bearer test-token");
+    const result = await setStateAtomic("AI-9999", "done", undefined, "Bearer test-token", { force: true });
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/atomic issueUpdate mutation failed/);
   });
@@ -349,7 +349,7 @@ describe("setStateAtomic (AI-1546)", () => {
       }
       return baseMock(_url, init);
     };
-    const result = await setStateAtomic("AI-9999", "done", "igor", "Bearer test-token");
+    const result = await setStateAtomic("AI-9999", "done", "igor", "Bearer test-token", { force: true });
     expect(result.ok).toBe(true);
     expect(mutationBody).toBeDefined();
     expect(mutationBody).toContain("user-igor-linear-id");
@@ -373,7 +373,7 @@ describe("setStateAtomic (AI-1546)", () => {
       }
       return baseMock(_url, init);
     };
-    const result = await setStateAtomic("AI-9999", "done", null, "Bearer test-token");
+    const result = await setStateAtomic("AI-9999", "done", null, "Bearer test-token", { force: true });
     expect(result.ok).toBe(true);
     expect(mutationBody).toBeDefined();
     // delegateId: null should appear in the mutation variables
@@ -386,7 +386,7 @@ describe("setStateAtomic (AI-1546)", () => {
       updateSuccess: true,
       consistencyLabels: ["wf:dev-impl", "state:done"],
     });
-    const result = await setStateAtomic("AI-9999", "done", "nonexistent-agent", "Bearer test-token");
+    const result = await setStateAtomic("AI-9999", "done", "nonexistent-agent", "Bearer test-token", { force: true });
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/delegate agent.*not found/);
   });
@@ -430,7 +430,7 @@ describe("setStateAtomic (AI-1546)", () => {
       wakeCalls.push({ agentId, ticketId });
     };
 
-    const result = await setStateAtomic("AI-9999", "done", undefined, "Bearer test-token", { sendWakeUp });
+    const result = await setStateAtomic("AI-9999", "done", undefined, "Bearer test-token", { sendWakeUp, force: true });
     expect(result.ok).toBe(true);
     expect(wakeCalls).toHaveLength(0);
     expect(result.redispatched).toBeUndefined();
@@ -534,7 +534,7 @@ describe("POST /admin/api/set-state (AI-1546 / AC2)", () => {
     const res = await request(appState.app)
       .post("/admin/api/set-state")
       .set("x-admin-secret", ADMIN_SECRET)
-      .send({ ticketId: "AI-9999", targetState: "done" });
+      .send({ ticketId: "AI-9999", targetState: "done", invoker: "astrid", reason: "admin correction", force: true });
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
     expect(res.body.to).toBe("done");
@@ -557,7 +557,7 @@ describe("POST /admin/api/set-state (AI-1546 / AC2)", () => {
     const res = await request(appState.app)
       .post("/admin/api/set-state")
       .set("x-admin-secret", ADMIN_SECRET)
-      .send({ ticketId: "AI-9999", targetState: "done" });
+      .send({ ticketId: "AI-9999", targetState: "done", invoker: "astrid", reason: "admin correction", force: true });
     expect(res.status).toBe(422);
     expect(res.body.ok).toBe(false);
   });
@@ -572,7 +572,7 @@ describe("POST /admin/api/set-state (AI-1546 / AC2)", () => {
     const res = await request(appState.app)
       .post("/admin/api/set-state")
       .set("x-admin-secret", ADMIN_SECRET)
-      .send({ ticketId: "AI-9999", targetState: "intake" });
+      .send({ ticketId: "AI-9999", targetState: "intake", invoker: "astrid", reason: "re-open from escape" });
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
     expect(res.body.from).toBe("escape");
@@ -587,7 +587,7 @@ describe("POST /admin/api/set-state (AI-1546 / AC2)", () => {
     const res = await request(appState.app)
       .post("/admin/api/set-state")
       .auth("admin", ADMIN_SECRET)
-      .send({ ticketId: "AI-9999", targetState: "done" });
+      .send({ ticketId: "AI-9999", targetState: "done", invoker: "astrid", reason: "admin correction", force: true });
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
   });
