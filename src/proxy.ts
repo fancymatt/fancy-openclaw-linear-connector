@@ -31,7 +31,7 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
 import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
@@ -607,6 +607,11 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         log.info(`auth-snapshot-stored agent=${agentId} intent=${effectiveIntent}${ticketCtx}`);
       }
 
+      // AI-1977: delegateOverride is computed inside the issueId block below
+      // (from the delegate pre-resolution), but needs to survive for use in the
+      // applyStateTransition call further down, which is outside that block.
+      let delegateOverride: string | null | undefined;
+
       // AI-1498: snapshot the pre-forward workflow state for applyStateTransition.
       // Fail-open: on any fetch error leave it undefined and let applyStateTransition
       // fall back to the ticket's current state:* label (legacy behavior).
@@ -647,6 +652,69 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // bundles these null clears, which must not reach Linear directly.
         if (isIssueUpdateMutation(body)) {
           stripNullDelegateAssigneeFields(body);
+        }
+
+        // AI-1977: Pre-resolve the delegateId and inject it into the forwarded mutation
+        // BEFORE the forward, so webhook #1 carries the correct delegate from the start.
+        // Previously applyStateTransition set the delegate as a separate API call after
+        // the forward, meaning webhook #1 fired with the OLD delegate — the new delegate
+        // was invisible until webhook #2 (which sometimes never arrived or was misrouted).
+        //
+        // This block:
+        //   1. Resolves the delegate using the same def-driven logic as applyStateTransition
+        //   2. Injects it into the forwarded issueUpdate mutation (input.delegateId)
+        //   3. Captures the result for applyStateTransition's delegateOverride option
+        //
+        // If resolution fails (multi-body, no target), we skip injection and let
+        // applyStateTransition handle it the old way.
+        if (isIssueUpdateMutation(body) && issueId && effectiveIntent !== 'migrate-state') {
+          try {
+            const preLabels = sourceStateOverride
+              ? [] // we already have pre-forward labels
+              : await fetchWorkflowLabels(issueId, authorization);
+            const wfLabels = sourceStateOverride ? [] : preLabels;
+            const wfId = sourceStateOverride
+              ? await (async () => {
+                  const fetched = await fetchWorkflowLabels(issueId, authorization);
+                  return getWorkflowId(fetched);
+                })()
+              : getWorkflowId(wfLabels);
+            if (wfId) {
+              const def = await loadWorkflowDefById(wfId);
+              if (def) {
+                const currentStateName = sourceStateOverride ?? getCurrentState(preLabels);
+                if (currentStateName) {
+                  const stateNode = def.states.find((s) => s.id === currentStateName);
+                  const matchedTransition = stateNode?.transitions?.find(
+                    (t) => t.command === effectiveIntent,
+                  );
+                  if (matchedTransition) {
+                    const resolved = await resolveTransitionDelegate(
+                      matchedTransition.to,
+                      matchedTransition,
+                      def,
+                      issueId,
+                      target ?? undefined,
+                    );
+                    if (resolved !== undefined) {
+                      delegateOverride = resolved;
+                      // Inject into the forwarded mutation's input.
+                      const input = issueUpdateInput(body);
+                      if (input) {
+                        input.delegateId = resolved;
+                        log.info(
+                          `delegate-pre-resolve agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected delegateId=${resolved} into forwarded mutation`,
+                        );
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.warn(`delegate-pre-resolve failed agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg} — skipping injection`);
+          }
         }
 
         // Layer 2 on intent path: run field-level interception after stripping.
@@ -768,6 +836,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             cliTarget: target ?? undefined,
             enrolledTicketsStore: deps?.enrolledTicketsStore,
             operationalEventStore: deps?.operationalEventStore,
+            delegateOverride,
           });
           if (transitionResult.status === "failed") {
             log.error(`state-transition FAILED agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${transitionResult.code}${transitionResult.detail ? ` — ${transitionResult.detail}` : ""}`);
