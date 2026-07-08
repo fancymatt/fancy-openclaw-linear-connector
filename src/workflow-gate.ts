@@ -56,6 +56,7 @@ import { recordAppliedState, clearAppliedState } from "./store/applied-state-sto
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { reposWithoutCiAutoDeploy, githubRepoFromUrl } from "./deploy-policy.js";
 import { notify } from "./alerts/alert-bus.js";
+import type { OperationalEventStore } from "./store/operational-event-store.js";
 
 /**
  * Phase 6.5 / H-6: Label read-only projection + override path + drift reconciliation.
@@ -2297,6 +2298,8 @@ export interface ApplyStateTransitionOptions {
   cliTarget?: string;
   /** AI-1799: enrolled-tickets mirror — writes state transitions to the board mirror. */
   enrolledTicketsStore?: EnrolledTicketsStore;
+  /** AI-1762: operational-event sink for transition-write-failed events. */
+  operationalEventStore?: OperationalEventStore;
 }
 
 /**
@@ -2793,14 +2796,18 @@ export async function applyStateTransition(
     return { status: "failed", code: "native-state-missing", detail: `destination state '${toStateName}' has no native_state field`, from: currentStateName, to: toStateName };
   }
 
-  // Step 5: Apply the FULL transition atomically (labels + delegate + native state in one mutation).
-  const applied = await issueUpdateAtomic(
+  // Step 5: Apply the FULL transition atomically (labels + delegate + native state in one
+  // mutation), verified read-after-write with bounded internal retry (AI-1762) — Linear can
+  // report success while silently dropping facets (live: app-user delegateId, AI-1759).
+  const writeOutcome = await issueUpdateAtomicVerified(
     issue.internalId,
     newLabelIds,
     authToken,
     resolvedDelegateId,
     resolvedNativeStateId,
+    toStateName,
   );
+  const applied = writeOutcome.ok;
 
   if (applied) {
     // AI-1534: record the authoritative destination state so the outbound
@@ -2844,9 +2851,23 @@ export async function applyStateTransition(
     );
   } else {
     log.error(
-      `workflow-gate: B2 apply: atomic mutation FAILED for ${issueId} — all facets rolled back (no partial state)`,
+      `workflow-gate: B2 apply: transition write FAILED for ${issueId} after ${writeOutcome.attempts} attempt(s) (${writeOutcome.failureKind})` +
+      (writeOutcome.divergent.length ? ` — ${writeOutcome.divergent.join("; ")}` : ""),
     );
-    return { status: "failed", code: "atomic-mutation-failed", detail: "atomic issueUpdate (label + delegate + native state) did not apply", from: currentStateName, to: toStateName };
+    // AI-1762 AC2: fail LOUDLY — operational event + alert, never a silent partial apply.
+    emitTransitionWriteFailure({
+      identifier: issue.identifier ?? issueId,
+      from: currentStateName,
+      to: toStateName,
+      intent,
+      agent: options?.bodyId ?? null,
+      outcome: writeOutcome,
+      operationalEventStore: options?.operationalEventStore,
+    });
+    if (writeOutcome.failureKind === "verification") {
+      return { status: "failed", code: "transition-write-unverified", detail: `transition write did not persist after ${writeOutcome.attempts} attempt(s) — ${writeOutcome.divergent.join("; ")}`, from: currentStateName, to: toStateName };
+    }
+    return { status: "failed", code: "atomic-mutation-failed", detail: `atomic issueUpdate (label + delegate + native state) did not apply after ${writeOutcome.attempts} attempt(s)`, from: currentStateName, to: toStateName };
   }
 
   // ── §5.7 item 1 / C-2: Artifact-binding recording ────────────────────
@@ -3083,6 +3104,202 @@ async function issueUpdateAtomic(
 }
 
 /**
+ * AI-1762: bounded retry + read-after-write verification policy for governed
+ * transition writes. Linear has been observed returning HTTP 200 / success:true
+ * while silently dropping facets of the update (live: app-user delegateId on
+ * AI-1759), so trusting the mutation's own success flag is not enough.
+ */
+export interface TransitionWritePolicy {
+  maxAttempts: number;
+  retryDelayMs: number;
+}
+const DEFAULT_TRANSITION_WRITE_POLICY: TransitionWritePolicy = { maxAttempts: 3, retryDelayMs: 250 };
+let transitionWritePolicy: TransitionWritePolicy = { ...DEFAULT_TRANSITION_WRITE_POLICY };
+
+/** Test hook: override (or reset, with no args) the transition write retry policy. */
+export function _setTransitionWritePolicyForTests(policy?: Partial<TransitionWritePolicy>): void {
+  transitionWritePolicy = { ...DEFAULT_TRANSITION_WRITE_POLICY, ...(policy ?? {}) };
+}
+
+/**
+ * AI-1762: read-after-write check for a transition write. Fetches the issue and
+ * compares the facets we just wrote:
+ *   - state:* label — by NAME (label ids differ per team; the name is the contract)
+ *   - delegate — by user id, only when the write set one (null = expect cleared)
+ *   - native workflow state — by state id, only when the write set one
+ * Returns the list of divergent facets (empty = fully persisted), or null when
+ * the issue could not be read back (unverifiable — caller decides posture).
+ */
+async function verifyTransitionWritePersisted(
+  internalId: string,
+  expected: { stateName: string; delegateId?: string | null; nativeStateId?: string | null },
+  authToken: string,
+): Promise<string[] | null> {
+  const query = `query VerifyTransitionWrite($id: String!) { issue(id: $id) { labels { nodes { name } } delegate { id } state { id } } }`;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: internalId } }),
+    });
+    type Resp = {
+      data?: {
+        issue?: {
+          labels?: { nodes: Array<{ name: string }> };
+          delegate?: { id: string } | null;
+          state?: { id: string } | null;
+        };
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const issue = data.data?.issue;
+    if (!issue) return null;
+
+    const divergent: string[] = [];
+    const labelNames = (issue.labels?.nodes ?? []).map((n) => n.name);
+    if (!labelNames.includes(`state:${expected.stateName}`)) {
+      const got = labelNames.find((n) => n.startsWith("state:")) ?? "(none)";
+      divergent.push(`state-label expected 'state:${expected.stateName}' got '${got}'`);
+    }
+    if (expected.delegateId !== undefined) {
+      const got = issue.delegate?.id ?? null;
+      if (got !== expected.delegateId) {
+        divergent.push(`delegate expected '${expected.delegateId ?? "null"}' got '${got ?? "null"}'`);
+      }
+    }
+    if (expected.nativeStateId !== undefined && expected.nativeStateId !== null) {
+      const got = issue.state?.id ?? null;
+      if (got !== expected.nativeStateId) {
+        divergent.push(`native-state expected '${expected.nativeStateId}' got '${got ?? "null"}'`);
+      }
+    }
+    return divergent;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: AI-1762: transition write verification read failed for ${internalId}: ${msg}`);
+    return null;
+  }
+}
+
+/** Outcome of a verified transition write (AI-1762). */
+interface VerifiedWriteOutcome {
+  ok: boolean;
+  attempts: number;
+  /** What the final failure was: the mutation itself, or the read-back verification. */
+  failureKind: "none" | "mutation" | "verification";
+  /** Divergent facets from the last verification (verification failures only). */
+  divergent: string[];
+  /** True when the write was accepted without a successful read-back (fail-open). */
+  unverified: boolean;
+}
+
+/**
+ * AI-1762: issueUpdateAtomic wrapped in read-after-write verification and a
+ * bounded internal retry. Each attempt re-issues the FULL bundled mutation
+ * (labels + delegate + native state — the shape empirically observed to
+ * persist), then reads the issue back and confirms every written facet landed.
+ *
+ * Fail-open only on an unreadable verification (network error on the read-back):
+ * the mutation reported success and we cannot prove otherwise — rejecting it
+ * would fail transitions that almost certainly applied (AI-1775 lesson).
+ * A readable divergence always retries, and exhausted retries always fail loudly.
+ */
+async function issueUpdateAtomicVerified(
+  internalId: string,
+  labelIds: string[],
+  authToken: string,
+  delegateId: string | null | undefined,
+  nativeStateId: string | null | undefined,
+  expectedStateName: string,
+): Promise<VerifiedWriteOutcome> {
+  const { maxAttempts, retryDelayMs } = transitionWritePolicy;
+  let failureKind: "mutation" | "verification" = "mutation";
+  let divergent: string[] = [];
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (attempt > 1 && retryDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs * (attempt - 1)));
+    }
+    const applied = await issueUpdateAtomic(internalId, labelIds, authToken, delegateId, nativeStateId);
+    if (!applied) {
+      failureKind = "mutation";
+      divergent = [];
+      log.warn(`workflow-gate: AI-1762: atomic mutation attempt ${attempt}/${maxAttempts} failed for ${internalId}${attempt < maxAttempts ? " — retrying" : ""}`);
+      continue;
+    }
+    const verification = await verifyTransitionWritePersisted(
+      internalId,
+      { stateName: expectedStateName, delegateId, nativeStateId },
+      authToken,
+    );
+    if (verification === null) {
+      log.warn(`workflow-gate: AI-1762: write for ${internalId} reported success but could not be read back — accepting unverified (attempt ${attempt})`);
+      return { ok: true, attempts: attempt, failureKind: "none", divergent: [], unverified: true };
+    }
+    if (verification.length === 0) {
+      return { ok: true, attempts: attempt, failureKind: "none", divergent: [], unverified: false };
+    }
+    failureKind = "verification";
+    divergent = verification;
+    log.warn(`workflow-gate: AI-1762: write attempt ${attempt}/${maxAttempts} for ${internalId} reported success but did NOT fully persist — ${verification.join("; ")}${attempt < maxAttempts ? " — retrying" : ""}`);
+  }
+
+  return { ok: false, attempts: maxAttempts, failureKind, divergent, unverified: false };
+}
+
+/**
+ * AI-1762 AC2: a transition that cannot fully apply after retries must fail
+ * LOUDLY — operational event + alert-bus warning — never a silent partial apply.
+ * Both sinks are best-effort: emitting must never mask the transition failure.
+ */
+function emitTransitionWriteFailure(args: {
+  identifier: string;
+  from: string | null | undefined;
+  to: string;
+  intent: string;
+  agent: string | null;
+  outcome: VerifiedWriteOutcome;
+  operationalEventStore?: OperationalEventStore;
+}): void {
+  const { identifier, from, to, intent, agent, outcome } = args;
+  const summary =
+    outcome.failureKind === "verification"
+      ? `facets did not persist: ${outcome.divergent.join("; ")}`
+      : "atomic issueUpdate mutation failed";
+  const detail = {
+    intent,
+    from: from ?? null,
+    to,
+    attempts: outcome.attempts,
+    failureKind: outcome.failureKind,
+    divergent: outcome.divergent,
+  };
+  try {
+    args.operationalEventStore?.append({
+      outcome: "transition-write-failed",
+      type: "workflow-transition",
+      agent,
+      key: identifier,
+      workflowState: to,
+      plane: "connector",
+      errorSummary: summary,
+      detail,
+    });
+  } catch (err) {
+    log.warn(`workflow-gate: AI-1762: failed to append transition-write-failed event for ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  notify({
+    severity: "warning",
+    source: "workflow-gate",
+    title: `transition write failed after ${outcome.attempts} attempt(s): ${identifier} ${from ?? "?"} → ${to} — ${summary}`,
+    agent,
+    ticket: identifier,
+    detail,
+    dedupKey: `transition-write-failed|${identifier}`,
+  });
+}
+
+/**
  * Legacy label-only update, kept for non-atomic paths (ad_hoc demote, re-stamp).
  */
 async function issueUpdateLabels(
@@ -3239,6 +3456,8 @@ export interface SetStateAtomicOptions {
    * never cause the set-state to return ok:false.
    */
   sendWakeUp?: (agentId: string, ticketId: string) => Promise<void>;
+  /** AI-1762: operational-event sink for transition-write-failed events. */
+  operationalEventStore?: OperationalEventStore;
 }
 
 /**
@@ -3323,31 +3542,39 @@ export async function setStateAtomic(
     resolvedDelegateId = agent.linearUserId;
   }
 
-  // Step 7: Atomic write (AC4 — single mutation).
-  const applied = await issueUpdateAtomic(
+  // Step 7+8: Atomic write (AC4 — single mutation), verified read-after-write with
+  // bounded internal retry (AI-1762). Verification covers all three facets — state
+  // label, delegate, native state — superseding the label-only consistency check.
+  const writeOutcome = await issueUpdateAtomicVerified(
     issue.internalId,
     newLabelIds,
     authToken,
     resolvedDelegateId,
     resolvedNativeStateId,
+    targetState,
   );
-  if (!applied) return fail("atomic issueUpdate mutation failed", fromState);
+  if (!writeOutcome.ok) {
+    emitTransitionWriteFailure({
+      identifier: ticketIdentifier,
+      from: fromState,
+      to: targetState,
+      intent: "set-state",
+      agent: null,
+      outcome: writeOutcome,
+      operationalEventStore: options?.operationalEventStore,
+    });
+    if (writeOutcome.failureKind === "verification") {
+      log.warn(`workflow-gate: set-state: consistency check FAILED for ${ticketIdentifier} after ${writeOutcome.attempts} attempt(s) — ${writeOutcome.divergent.join("; ")}`);
+      return fail(`consistency check failed: write did not persist after ${writeOutcome.attempts} attempt(s) — ${writeOutcome.divergent.join("; ")}`, fromState);
+    }
+    return fail("atomic issueUpdate mutation failed", fromState);
+  }
 
   log.info(
     `workflow-gate: set-state (G-6): ${ticketIdentifier} ${fromState ?? "(unknown)"} → ${targetState}` +
     (resolvedDelegateId != null ? ` delegate=${resolvedDelegateId}` : resolvedDelegateId === null ? ` delegate=cleared` : ``) +
     (resolvedNativeStateId ? ` native=${resolvedNativeStateId}` : ``),
   );
-
-  // Step 8: Consistency assertion (AC1) — re-fetch and confirm state:* label landed.
-  const recheck = await fetchIssueWithLabels(ticketIdentifier, authToken);
-  if (recheck) {
-    const landed = getCurrentState(recheck.labels.map((l) => l.name));
-    if (landed !== targetState) {
-      log.warn(`workflow-gate: set-state: consistency check FAILED for ${ticketIdentifier} — expected state:${targetState}, got state:${landed ?? "(none)"}`);
-      return fail(`consistency check failed: label '${targetLabelName}' not present after mutation (got '${landed ?? "none"}')`, fromState);
-    }
-  }
 
   // Step 9: Re-dispatch to the new state's owner (AI-1607).
   // Fail-open: errors are logged but never block the set-state result.

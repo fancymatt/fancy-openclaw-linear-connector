@@ -130,6 +130,31 @@ function makeSetStateFetch(opts: MockOptions): typeof globalThis.fetch {
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
+    // AI-1762 read-after-write verification: report the post-mutation facets.
+    // Labels mirror the consistency behavior; the native state id follows the
+    // state label so a persisted write verifies and a desynced one diverges.
+    if (bodyText.includes("VerifyTransitionWrite")) {
+      const labels = consistencyLabels ?? afterLabels;
+      const landedState = labels.find((l) => l.startsWith("state:"))?.slice("state:".length) ?? "";
+      const nativeByState: Record<string, string> = {
+        done: "state-done-uuid",
+        implementation: "state-todo-uuid",
+        intake: "state-todo-uuid",
+        escape: "state-invalid-uuid",
+      };
+      return new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              labels: { nodes: labels.map((name) => ({ name })) },
+              delegate: null,
+              state: { id: nativeByState[landedState] ?? "state-todo-uuid" },
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
     // Label lookup (findOrCreateLabel — TeamLabels query)
     if (bodyText.includes("TeamLabels")) {
       return new Response(
@@ -303,6 +328,22 @@ describe("setStateAtomic (AI-1546)", () => {
         mutationBody = bodyText;
         return new Response(
           JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      // AI-1762 read-after-write: echo the delegate the mutation wrote so verification passes.
+      if (bodyText.includes("VerifyTransitionWrite")) {
+        const written = mutationBody ? (JSON.parse(mutationBody) as { variables?: { delegateId?: string } }).variables?.delegateId : undefined;
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:done" }] },
+                delegate: written ? { id: written } : null,
+                state: { id: "state-done-uuid" },
+              },
+            },
+          }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }

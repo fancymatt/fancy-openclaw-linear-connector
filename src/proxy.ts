@@ -767,6 +767,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             sourceStateOverride,
             cliTarget: target ?? undefined,
             enrolledTicketsStore: deps?.enrolledTicketsStore,
+            operationalEventStore: deps?.operationalEventStore,
           });
           if (transitionResult.status === "failed") {
             log.error(`state-transition FAILED agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${transitionResult.code}${transitionResult.detail ? ` — ${transitionResult.detail}` : ""}`);
