@@ -32,7 +32,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
-import { resetWorkflowCache } from "./workflow-gate.js";
+import { resetWorkflowCache, type WorkflowDef } from "./workflow-gate.js";
 import { resetConfigHealth } from "./config-health.js";
 import { extractFindings, shouldTriggerFanout } from "./fanout.js";
 import { isChildTerminal, evaluateBarrier, onChildTerminal, detectStalledChildren, surfaceStalledChildren, isTerminalState } from "./barrier.js";
@@ -207,10 +207,26 @@ describe("AC1: Real walk — end-to-end milestone validation", () => {
     expect(findings[1].title).toBe("Finding 2");
     expect(findings[2].title).toBe("Finding 3");
 
-    // ── Step 2: Fan-out should trigger for ux-audit spawning + spawn command ─
-    expect(shouldTriggerFanout("ux-audit", "spawning", "spawn")).toBe(true);
-    expect(shouldTriggerFanout("dev-impl", "spawning", "spawn")).toBe(false);
-    expect(shouldTriggerFanout("ux-audit", "managing", "spawn")).toBe(false);
+    // ── Step 2: Fan-out should trigger for a spawning state that declares a
+    //   fanout block (AI-1992: config-driven, not a workflow-id allowlist) ────
+    const uxAuditDef = {
+      id: "ux-audit",
+      break_glass: { command: "escape", to: "escape" },
+      states: [
+        { id: "spawning", fanout: { spec_source: "findings", child_workflow: "wf:dev-impl" }, transitions: [{ command: "spawn", to: "managing" }] },
+        { id: "managing", barrier: true, transitions: [{ command: "complete", to: "review" }] },
+      ],
+    } as unknown as WorkflowDef;
+    const devImplDef = {
+      id: "dev-impl",
+      break_glass: { command: "escape", to: "escape" },
+      states: [
+        { id: "spawning", transitions: [{ command: "spawn", to: "managing" }] },
+      ],
+    } as unknown as WorkflowDef;
+    expect(shouldTriggerFanout(uxAuditDef, "spawning", "spawn")).toBeTruthy();
+    expect(shouldTriggerFanout(devImplDef, "spawning", "spawn")).toBeFalsy();
+    expect(shouldTriggerFanout(uxAuditDef, "managing", "spawn")).toBeFalsy();
 
     // ── Step 3: Children run dev-impl to terminal ────────────────────────
     expect(isChildTerminal(["wf:dev-impl", "state:intake"])).toBe(false);

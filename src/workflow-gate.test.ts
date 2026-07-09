@@ -3282,9 +3282,11 @@ bodies:
   }
 
   it("triggers barrier check when child transitions to done via matching workflow", async () => {
-    // Use dev-impl workflow def for this test since the child is wf:dev-impl
-    const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
-    process.env.WORKFLOW_DEF_PATH = devImplFixture;
+    // AI-1992: barrier-ness is config-driven — the barrier check on the parent
+    // needs the PARENT's (ux-audit) def, while the child transition needs the
+    // dev-impl def. Load the whole fixtures dir so both are in the registry
+    // (single-file mode could only serve one).
+    process.env.WORKFLOW_DEFS_DIR = path.resolve(process.cwd(), "src/__fixtures__");
     resetWorkflowCache();
 
     globalThis.fetch = makeBarrierIntegrationFetch({
@@ -3297,8 +3299,10 @@ bodies:
     // v8: validated from ac-validate → done (terminal)
     await applyStateTransition("validated", "AI-2001", "Bearer tok");
 
-    // Restore ux-audit workflow def
+    // Restore single-file ux-audit workflow def for sibling tests
+    delete process.env.WORKFLOW_DEFS_DIR;
     process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
+    resetWorkflowCache();
 
     // Should have done state transition
     const stateTransition = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
@@ -4457,12 +4461,18 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       resetPolicyCache();
     });
 
-    it("fan-out triggers for sprint just like ux-audit", async () => {
+    it("fan-out triggers for sprint just like ux-audit (AI-1992: config-driven)", async () => {
       const { shouldTriggerFanout } = await import("./fanout.js");
-      expect(shouldTriggerFanout("sprint", "spawning", "spawn")).toBe(true);
-      expect(shouldTriggerFanout("sprint", "managing", "spawn")).toBe(false);
-      expect(shouldTriggerFanout("sprint", "spawning", "complete")).toBe(false);
-      expect(shouldTriggerFanout("ux-audit", "spawning", "spawn")).toBe(true);
+      const yamlMod = await import("js-yaml");
+      const fsMod = await import("node:fs");
+      const loadFixture = (name: string) =>
+        yamlMod.load(fsMod.readFileSync(path.resolve(process.cwd(), "src/__fixtures__", name), "utf8")) as Awaited<ReturnType<typeof import("./workflow-gate.js").loadWorkflowDef>>;
+      const sprintDef = loadFixture("canonical-sprint.yaml");
+      const uxAuditDef = loadFixture("canonical-ux-audit.yaml");
+      expect(shouldTriggerFanout(sprintDef, "spawning", "spawn")).toBeTruthy();
+      expect(shouldTriggerFanout(sprintDef, "managing", "spawn")).toBeFalsy();
+      expect(shouldTriggerFanout(sprintDef, "spawning", "complete")).toBeFalsy();
+      expect(shouldTriggerFanout(uxAuditDef, "spawning", "spawn")).toBeTruthy();
     });
   });
 

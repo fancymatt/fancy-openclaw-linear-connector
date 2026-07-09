@@ -52,6 +52,7 @@ import {
 // the existing isChildOfUxAuditParent (ux-audit only). The sla-sweep driver
 // must import and use this same function — not a parallel heuristic.
 import { isManagedBarrierChild } from "./barrier.js";
+import { resetWorkflowCache } from "./workflow-gate.js";
 import { getRegisteredCrons } from "./cron/registry.js";
 
 // AlertStore for restart-resilience assertions (dedup across instances)
@@ -89,20 +90,48 @@ function writeWorkflowRegistry(overrides: { devImpl?: Record<string, unknown>; u
     ],
     ...overrides.devImpl,
   };
+  // AI-1992: barrier-ness is config-driven — the managing state declares
+  // `barrier: true` (migrated from the removed BARRIER_WORKFLOWS set).
   const uxAudit = {
     id: "ux-audit",
     entry_state: "intake",
     archetype: "orchestrator",
     states: [
       { id: "intake",   owner_role: "steward",       native_state: "todo" },
-      { id: "managing", owner_role: "dev",            native_state: "managing" },
+      { id: "managing", owner_role: "dev",            native_state: "managing", barrier: true },
       { id: "review",   owner_role: "code-review",   native_state: "thinking" },
       { id: "done",     native_state: "done" },
     ],
     ...overrides.uxAudit,
   };
+  const sprint = {
+    id: "sprint",
+    entry_state: "intake",
+    archetype: "feature-initiative",
+    states: [
+      { id: "intake",     owner_role: "steward",     native_state: "todo" },
+      { id: "managing",   owner_role: "dev",         native_state: "managing", barrier: true },
+      { id: "validating", owner_role: "steward",     native_state: "thinking" },
+      { id: "done",       native_state: "done" },
+    ],
+  };
+  const vocabBuilder = {
+    id: "vocab-builder",
+    entry_state: "intake",
+    archetype: "orchestrator",
+    states: [
+      { id: "intake",   owner_role: "steward",     native_state: "todo" },
+      { id: "managing", owner_role: "dev",         native_state: "managing", barrier: true },
+      { id: "review",   owner_role: "steward",     native_state: "thinking" },
+      { id: "done",     native_state: "done" },
+    ],
+  };
   const p = path.join(tmpDir, `wf-defs-${Math.random().toString(36).slice(2)}.yaml`);
-  fs.writeFileSync(p, `---\n${yaml.dump(devImpl)}\n---\n${yaml.dump(uxAudit)}`, "utf8");
+  fs.writeFileSync(
+    p,
+    `---\n${yaml.dump(devImpl)}\n---\n${yaml.dump(uxAudit)}\n---\n${yaml.dump(sprint)}\n---\n${yaml.dump(vocabBuilder)}`,
+    "utf8",
+  );
   return p;
 }
 
@@ -478,8 +507,25 @@ describe("AC2 — managed-child exclusion: barrier stall path owns it", () => {
   // exists and correctly identifies managed vs non-managed children.
   describe("isManagedBarrierChild — shared predicate (imported from barrier.ts)", () => {
     let savedFetch: typeof globalThis.fetch;
+    let origDefsDir: string | undefined;
+
+    // AI-1992: isManagedBarrierChild loads the process workflow registry to read
+    // the parent's barrier flag. Point it at the migrated canonical fixtures
+    // (ux-audit/sprint carry managing barrier: true; dev-impl does not).
+    beforeAll(() => {
+      origDefsDir = process.env.WORKFLOW_DEFS_DIR;
+      process.env.WORKFLOW_DEFS_DIR = path.resolve(process.cwd(), "src/__fixtures__");
+      resetWorkflowCache();
+    });
+
+    afterAll(() => {
+      if (origDefsDir !== undefined) process.env.WORKFLOW_DEFS_DIR = origDefsDir;
+      else delete process.env.WORKFLOW_DEFS_DIR;
+      resetWorkflowCache();
+    });
 
     beforeEach(() => {
+      resetWorkflowCache();
       savedFetch = globalThis.fetch;
     });
 

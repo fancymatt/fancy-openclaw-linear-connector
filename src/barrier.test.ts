@@ -18,6 +18,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { isChildTerminal, isTerminalState, evaluateBarrier, attemptBarrierTransition, onChildTerminal, buildShepherdingMessage, detectStalledChildren, surfaceStalledChildren, parseStallConfig, type ChildState, type StalledChild } from "./barrier.js";
+import { resetWorkflowCache } from "./workflow-gate.js";
+
+// AI-1992: barrier-ness is now config-driven — the barrier engine reads the
+// parent's workflow def to confirm its current state declares `barrier: true`.
+// Point the registry at the migrated canonical fixtures (ux-audit/sprint carry
+// the barrier config) so these barrier-transition tests resolve real defs.
+const FIXTURES_DEFS_DIR = path.resolve(process.cwd(), "src/__fixtures__");
 
 // ── isChildTerminal ────────────────────────────────────────────────────────
 
@@ -196,8 +203,21 @@ describe("evaluateBarrier — mocked Linear API", () => {
 describe("attemptBarrierTransition — mocked Linear API", () => {
   let originalFetch: typeof globalThis.fetch;
   let fetchCalls: Array<{ url: string; body: Record<string, unknown> }>;
+  let origDefsDir: string | undefined;
+
+  beforeAll(() => {
+    origDefsDir = process.env.WORKFLOW_DEFS_DIR;
+    process.env.WORKFLOW_DEFS_DIR = FIXTURES_DEFS_DIR;
+  });
+
+  afterAll(() => {
+    if (origDefsDir !== undefined) process.env.WORKFLOW_DEFS_DIR = origDefsDir;
+    else delete process.env.WORKFLOW_DEFS_DIR;
+    resetWorkflowCache();
+  });
 
   beforeEach(() => {
+    resetWorkflowCache();
     originalFetch = globalThis.fetch;
     fetchCalls = [];
   });
@@ -409,8 +429,21 @@ describe("attemptBarrierTransition — mocked Linear API", () => {
 describe("onChildTerminal — webhook entry point", () => {
   let originalFetch: typeof globalThis.fetch;
   let fetchCalls: Array<{ url: string; body: Record<string, unknown> }>;
+  let origDefsDir: string | undefined;
+
+  beforeAll(() => {
+    origDefsDir = process.env.WORKFLOW_DEFS_DIR;
+    process.env.WORKFLOW_DEFS_DIR = FIXTURES_DEFS_DIR;
+  });
+
+  afterAll(() => {
+    if (origDefsDir !== undefined) process.env.WORKFLOW_DEFS_DIR = origDefsDir;
+    else delete process.env.WORKFLOW_DEFS_DIR;
+    resetWorkflowCache();
+  });
 
   beforeEach(() => {
+    resetWorkflowCache();
     originalFetch = globalThis.fetch;
     fetchCalls = [];
   });

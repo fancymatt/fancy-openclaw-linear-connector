@@ -20,7 +20,118 @@
  * tested via the exported barrier functions that the gate calls.
  */
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { evaluateBarrier, attemptBarrierTransition, isChildTerminal, type BarrierResult, type BarrierTransitionResult } from "./barrier.js";
+import { resetWorkflowCache } from "./workflow-gate.js";
+
+// AI-1992: barrier-ness is config-driven — the barrier engine reads the parent's
+// workflow def to confirm its current state declares `barrier: true`. Build an
+// isolated defs dir with the migrated ux-audit/sprint/dev-impl fixtures plus
+// minimal vocab-builder/word-build defs (whose managing states are barriers),
+// and point the registry at it for this whole file.
+const MINIMAL_VOCAB_BUILDER_YAML = `
+id: vocab-builder
+version: 1
+archetype: orchestrator
+entry_state: intake
+break_glass: { command: escape, to: escape, owner_role: steward }
+states:
+  - id: intake
+    owner_role: steward
+    native_state: todo
+    transitions:
+      - { command: accept, to: spawning, assign: { mode: required } }
+  - id: spawning
+    owner_role: engine
+    native_state: doing
+    fanout:
+      spec_source: findings
+      child_workflow: wf:word-build
+    transitions:
+      - { command: spawn, to: managing }
+  - id: managing
+    owner_role: engine
+    native_state: managing
+    barrier: true
+    transitions:
+      - { command: complete, to: review }
+  - id: review
+    owner_role: steward
+    native_state: thinking
+    transitions:
+      - { command: approve, to: done }
+  - id: done
+    kind: terminal
+    native_state: done
+  - id: escape
+    kind: terminal
+    native_state: invalid
+`;
+
+const MINIMAL_WORD_BUILD_YAML = `
+id: word-build
+version: 1
+archetype: orchestrator
+entry_state: intake
+break_glass: { command: escape, to: escape, owner_role: steward }
+states:
+  - id: intake
+    owner_role: steward
+    native_state: todo
+    transitions:
+      - { command: accept, to: spawning, assign: { mode: required } }
+  - id: spawning
+    owner_role: engine
+    native_state: doing
+    fanout:
+      spec_source: findings
+      child_workflow: wf:vocab-image
+    transitions:
+      - { command: spawn, to: managing }
+  - id: managing
+    owner_role: engine
+    native_state: managing
+    barrier: true
+    transitions:
+      - { command: complete, to: review }
+  - id: review
+    owner_role: steward
+    native_state: thinking
+    transitions:
+      - { command: approve, to: done }
+  - id: done
+    kind: terminal
+    native_state: done
+  - id: escape
+    kind: terminal
+    native_state: invalid
+`;
+
+let _zeroChildDefsDir: string;
+let _origZeroChildDefsDir: string | undefined;
+
+beforeAll(() => {
+  _origZeroChildDefsDir = process.env.WORKFLOW_DEFS_DIR;
+  _zeroChildDefsDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai1730-defs-"));
+  const fixturesDir = path.resolve(process.cwd(), "src/__fixtures__");
+  for (const f of ["canonical-ux-audit.yaml", "canonical-sprint.yaml", "canonical-dev-impl.yaml"]) {
+    fs.copyFileSync(path.join(fixturesDir, f), path.join(_zeroChildDefsDir, f));
+  }
+  fs.writeFileSync(path.join(_zeroChildDefsDir, "vocab-builder.yaml"), MINIMAL_VOCAB_BUILDER_YAML, "utf8");
+  fs.writeFileSync(path.join(_zeroChildDefsDir, "word-build.yaml"), MINIMAL_WORD_BUILD_YAML, "utf8");
+  process.env.WORKFLOW_DEFS_DIR = _zeroChildDefsDir;
+  resetWorkflowCache();
+});
+
+afterAll(() => {
+  if (_origZeroChildDefsDir !== undefined) process.env.WORKFLOW_DEFS_DIR = _origZeroChildDefsDir;
+  else delete process.env.WORKFLOW_DEFS_DIR;
+  resetWorkflowCache();
+});
+
+beforeEach(() => resetWorkflowCache());
 
 // Dynamic import for onManagingEntry — not yet exported from barrier.ts.
 // Using the module namespace avoids a static ESM import failure so the

@@ -12,10 +12,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { extractFindings, executeFanout, shouldTriggerFanout, type Finding } from "./fanout.js";
-import { applyStateTransition, resetWorkflowCache } from "./workflow-gate.js";
+import { applyStateTransition, resetWorkflowCache, type WorkflowDef, type FanoutConfig } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 
 const CANONICAL_UX_AUDIT_FIXTURE = path.resolve(process.cwd(), "src/__fixtures__/canonical-ux-audit.yaml");
+
+// AI-1992: the fan-out is now config-driven. The canonical dev-impl child config
+// (spec_source=findings, wf:dev-impl child) that ux-audit/sprint migrated to.
+const DEV_IMPL_FANOUT_CONFIG = { spec_source: "findings", child_workflow: "wf:dev-impl" } as FanoutConfig;
 
 // ── Test capability policy with ux-audit roles ────────────────────────────
 
@@ -202,25 +206,45 @@ describe("extractFindings", () => {
 
 // ── shouldTriggerFanout ────────────────────────────────────────────────────
 
-describe("shouldTriggerFanout", () => {
-  it("returns true for ux-audit + spawning + spawn", () => {
-    expect(shouldTriggerFanout("ux-audit", "spawning", "spawn")).toBe(true);
+describe("shouldTriggerFanout (AI-1992: config-driven)", () => {
+  // A ux-audit-shaped def: spawning declares a fanout block; auditing/managing do not.
+  const uxAuditDef = {
+    id: "ux-audit",
+    break_glass: { command: "escape", to: "escape" },
+    states: [
+      { id: "auditing", transitions: [{ command: "complete-audit", to: "spawning" }] },
+      { id: "spawning", fanout: { spec_source: "findings", child_workflow: "wf:dev-impl" }, transitions: [{ command: "spawn", to: "managing" }] },
+      { id: "managing", barrier: true, transitions: [{ command: "complete", to: "review" }] },
+    ],
+  } as unknown as WorkflowDef;
+  // A dev-impl-shaped def: no fanout blocks anywhere.
+  const devImplDef = {
+    id: "dev-impl",
+    break_glass: { command: "escape", to: "escape" },
+    states: [
+      { id: "spawning", transitions: [{ command: "spawn", to: "managing" }] },
+      { id: "implementation", transitions: [{ command: "submit", to: "code-review" }] },
+    ],
+  } as unknown as WorkflowDef;
+
+  it("returns the fanout config for a state that declares a fanout block on its command", () => {
+    expect(shouldTriggerFanout(uxAuditDef, "spawning", "spawn")).toBeTruthy();
   });
 
-  it("returns false for wrong workflow", () => {
-    expect(shouldTriggerFanout("dev-impl", "spawning", "spawn")).toBe(false);
+  it("returns falsy for a def whose state has no fanout block", () => {
+    expect(shouldTriggerFanout(devImplDef, "spawning", "spawn")).toBeFalsy();
   });
 
-  it("returns false for wrong state", () => {
-    expect(shouldTriggerFanout("ux-audit", "auditing", "spawn")).toBe(false);
+  it("returns falsy for a state with no fanout block", () => {
+    expect(shouldTriggerFanout(uxAuditDef, "auditing", "spawn")).toBeFalsy();
   });
 
-  it("returns false for wrong command", () => {
-    expect(shouldTriggerFanout("ux-audit", "spawning", "complete-audit")).toBe(false);
+  it("returns falsy for a command that is not the fanout state's forward transition", () => {
+    expect(shouldTriggerFanout(uxAuditDef, "spawning", "complete-audit")).toBeFalsy();
   });
 
-  it("returns false for all wrong", () => {
-    expect(shouldTriggerFanout("dev-impl", "implementation", "submit")).toBe(false);
+  it("returns falsy for all wrong", () => {
+    expect(shouldTriggerFanout(devImplDef, "implementation", "submit")).toBeFalsy();
   });
 });
 
@@ -371,7 +395,7 @@ describe("executeFanout — mocked Linear API", () => {
 
     globalThis.fetch = makeFanoutFetch({});
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings, { skipPreview: true });
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
     expect(result.created).toBe(3);
     expect(result.childIdentifiers).toEqual(["AI-2001", "AI-2002", "AI-2003"]);
@@ -403,13 +427,13 @@ describe("executeFanout — mocked Linear API", () => {
       },
     });
 
-    const result = await executeFanout("AI-1439", "Bearer tok", undefined, { skipPreview: true });
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true });
 
     expect(result.created).toBe(2);
     expect(result.childIdentifiers).toHaveLength(2);
   });
 
-  it("uses fallback title when description has no findings", async () => {
+  it("AI-1992 (AC5): refuses — no children — when the description has no parseable spec", async () => {
     globalThis.fetch = makeFanoutFetch({
       parentContext: {
         teamId: "team-uuid",
@@ -419,11 +443,15 @@ describe("executeFanout — mocked Linear API", () => {
       },
     });
 
-    const result = await executeFanout("AI-1439", "Bearer tok", undefined, { skipPreview: true });
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true });
 
-    // Fallback: 1 child with the parent title
-    expect(result.created).toBe(1);
-    expect(result.childIdentifiers).toHaveLength(1);
+    // AI-1992: the strict config-driven extractor has NO title fallback — an
+    // empty/unparseable spec refuses rather than spawning a guessed child.
+    expect(result.created).toBe(0);
+    expect(result.childIdentifiers).toHaveLength(0);
+    expect(result.refused).toBe(true);
+    const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
+    expect(createCalls).toHaveLength(0);
   });
 
   it("uses existing team labels when available", async () => {
@@ -435,7 +463,7 @@ describe("executeFanout — mocked Linear API", () => {
       ],
     });
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings, { skipPreview: true });
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
     expect(result.created).toBe(1);
     // Should NOT have created new labels (teamLabels already has them)
@@ -452,7 +480,7 @@ describe("executeFanout — mocked Linear API", () => {
   it("returns errors when parent context fetch fails", async () => {
     globalThis.fetch = async () => { throw new Error("network error"); };
 
-    const result = await executeFanout("AI-1439", "Bearer tok", [{ title: "Test" }], { skipPreview: true });
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: [{ title: "Test" }] });
 
     expect(result.created).toBe(0);
     expect(result.childIdentifiers).toHaveLength(0);
@@ -471,7 +499,7 @@ describe("executeFanout — mocked Linear API", () => {
       );
     };
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings, { skipPreview: true });
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
     expect(result.created).toBe(0);
     expect(result.errors.length).toBeGreaterThan(0);
@@ -487,7 +515,7 @@ describe("executeFanout — mocked Linear API", () => {
     // Only first child succeeds
     globalThis.fetch = makeFanoutFetch({ successCount: 1 });
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings, { skipPreview: true });
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
     expect(result.created).toBe(1);
     expect(result.childIdentifiers).toEqual(["AI-2001"]);
@@ -505,7 +533,7 @@ describe("executeFanout — mocked Linear API", () => {
 
     globalThis.fetch = makeFanoutFetch({});
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings, { skipPreview: true });
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
     expect(result.created).toBe(2);
     const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
@@ -525,7 +553,7 @@ describe("executeFanout — mocked Linear API", () => {
 
     globalThis.fetch = makeFanoutFetch({});
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings, { skipPreview: true });
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
     expect(result.created).toBe(2);
     const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
@@ -547,7 +575,7 @@ describe("executeFanout — mocked Linear API", () => {
 
     globalThis.fetch = makeFanoutFetch({ parentInternalId: "parent-uuid-123" });
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings, { skipPreview: true });
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
     expect(result.created).toBe(2);
     const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
@@ -586,7 +614,7 @@ describe("executeFanout — mocked Linear API", () => {
       return baseFetch(url, init);
     };
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings);
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { findingsOverride: findings });
 
     expect(result.refused).toBe(true);
     expect(result.created).toBe(0);
@@ -620,7 +648,7 @@ describe("executeFanout — mocked Linear API", () => {
       return baseFetch(url, init);
     };
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings);
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { findingsOverride: findings });
 
     expect(result.pendingApproval).toBe(true);
     expect(result.created).toBe(0); // No children created until approval
@@ -649,7 +677,7 @@ describe("executeFanout — mocked Linear API", () => {
       return baseFetch(url, init);
     };
 
-    const result = await executeFanout("AI-1439", "Bearer tok", findings);
+    const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { findingsOverride: findings });
 
     // Should have created children (within caps, no approval needed)
     expect(result.created).toBe(2);

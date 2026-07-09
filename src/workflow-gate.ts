@@ -43,7 +43,7 @@ import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
 import { ObservationStore, type ReasonCode } from "./store/observation-store.js";
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent, getAgents } from "./agents.js";
-import { executeFanout, shouldTriggerFanout } from "./fanout.js";
+import { executeFanout, shouldTriggerFanout, validateFanoutSpec, type Finding } from "./fanout.js";
 import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
@@ -111,10 +111,42 @@ export interface WorkflowTransition {
   generic?: 'continue' | 'revision';
 }
 
+/**
+ * AI-1992: Declarative fan-out configuration for a workflow state.
+ *
+ * A state that declares a `fanout` block spawns N child workflow tickets when
+ * its (non-break-glass) transition command fires. The child workflow type,
+ * spec source, initial delegate, and sibling-blocking behavior are all driven
+ * by this config — replacing the hardcoded `ux-audit`/`sprint` allowlist and
+ * the hardcoded `wf:dev-impl` child label in fanout.ts.
+ */
+export interface FanoutConfig {
+  /** Structured section of the parent ticket description that supplies the
+   *  fan-out cardinality (e.g. "findings" → the `## Findings` section). */
+  spec_source: string;
+  /** Child workflow label to mint each child under. MUST be a `wf:*` label —
+   *  validated at config-load AND at spawn time (AC7). Non-wf child types are
+   *  rejected: a wf ticket spawns only wf tickets (Matt, 2026-07-08, Option B). */
+  child_workflow: string;
+  /** Optional body id to delegate each spawned child to at creation time. */
+  initial_delegate?: string;
+  /** When true, create sibling blocking relations between the spawned children
+   *  at spawn time (each sibling blocks the next). */
+  block_siblings?: boolean;
+}
+
 export interface WorkflowState {
   id: string;
   owner_role?: string;
   kind?: string;
+  /** AI-1992: declarative fan-out config. When present, the state's forward
+   *  (non-break-glass) transition mints N children per {@link FanoutConfig}. */
+  fanout?: FanoutConfig;
+  /** AI-1992: when true, this managing state is an N→1 barrier — the engine
+   *  auto-advances the parent along this state's forward transition once every
+   *  linked child reaches a terminal state. Replaces the hardcoded
+   *  BARRIER_WORKFLOWS set; barrier-ness is now per-state, any workflow id. */
+  barrier?: boolean;
   /** AI-1490: semantic native Linear state this workflow state projects to.
    *  Must be a key in the CLI's SEMANTIC_STATE_MAP (doing, thinking, done, invalid, etc.)
    *  or a literal Linear state name. Validated at connector startup. */
@@ -210,6 +242,18 @@ async function loadDefFromFile(file: string): Promise<WorkflowDef> {
   if (warnings.length > 0) {
     throw new Error(
       `Workflow definition '${def.id}' has ${warnings.length} invalid native_state mapping(s): ${warnings.join("; ")}`,
+    );
+  }
+  // AI-1992: fanout/barrier config validation (fail-closed). A def whose fanout
+  // child_workflow is not a wf:* label, or whose barrier field is non-boolean,
+  // is excluded from the registry — the engine never spawns a non-wf child.
+  const fbWarnings = validateFanoutBarrierConfig(def);
+  for (const w of fbWarnings) {
+    log.error(`workflow-gate: fanout/barrier validation FAILURE (${def.id}): ${w}`);
+  }
+  if (fbWarnings.length > 0) {
+    throw new Error(
+      `Workflow definition '${def.id}' has ${fbWarnings.length} invalid fanout/barrier config(s): ${fbWarnings.join("; ")}`,
     );
   }
   return def;
@@ -494,6 +538,49 @@ export function validateNativeStateMappings(def: WorkflowDef): string[] {
     }
   }
   return warnings;
+}
+
+/**
+ * AI-1992: Validate the fanout/barrier config of a workflow def (fail-closed).
+ *
+ * A fanout block's `child_workflow` MUST be a `wf:*` label — a wf ticket spawns
+ * only wf tickets (Matt, 2026-07-08, Option B). A `barrier` field, when present,
+ * MUST be a boolean. Returns diagnostic errors; a non-empty result excludes the
+ * def from the registry (the loader throws), so the engine can never fan out to
+ * a non-workflow child type or misread a malformed barrier flag.
+ */
+export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
+  const errors: string[] = [];
+  const wfLabelPattern = /^wf:.+/;
+  for (const state of def.states) {
+    if (state.fanout !== undefined) {
+      const fo = state.fanout as unknown;
+      if (fo === null || typeof fo !== "object") {
+        errors.push(`Workflow state '${state.id}' has a non-object fanout block.`);
+      } else {
+        const cfg = fo as Partial<FanoutConfig>;
+        if (typeof cfg.spec_source !== "string" || cfg.spec_source.trim() === "") {
+          errors.push(`Workflow state '${state.id}' fanout is missing a non-empty 'spec_source'.`);
+        }
+        if (typeof cfg.child_workflow !== "string" || !wfLabelPattern.test(cfg.child_workflow)) {
+          errors.push(
+            `Workflow state '${state.id}' fanout child_workflow '${String(cfg.child_workflow)}' is not a wf:* label. ` +
+            `A workflow ticket may spawn only workflow children (wf:*).`,
+          );
+        }
+        if (cfg.initial_delegate !== undefined && typeof cfg.initial_delegate !== "string") {
+          errors.push(`Workflow state '${state.id}' fanout initial_delegate must be a string when present.`);
+        }
+        if (cfg.block_siblings !== undefined && typeof cfg.block_siblings !== "boolean") {
+          errors.push(`Workflow state '${state.id}' fanout block_siblings must be a boolean when present.`);
+        }
+      }
+    }
+    if (state.barrier !== undefined && typeof state.barrier !== "boolean") {
+      errors.push(`Workflow state '${state.id}' barrier field must be a boolean when present.`);
+    }
+  }
+  return errors;
 }
 
 // ── AI-1498: Native state resolution cache ────────────────────────────────
@@ -2418,6 +2505,53 @@ export interface TransitionApplyResult {
   to?: string;
 }
 
+/**
+ * AI-1992: Fetch just the parent issue description for the pre-transition
+ * fan-out spec gate. Query name includes `IssueTeamParent` so it shares the
+ * fanout module's fetch shape. Returns null on any failure (caller treats a
+ * null/empty description as an unvalidatable spec → refuse).
+ */
+async function fetchFanoutSpecDescription(issueId: string, authToken: string): Promise<string | null> {
+  const query = `
+    query IssueTeamParent($id: String!) {
+      issue(id: $id) { id description }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    const data = (await res.json()) as { data?: { issue?: { description?: string | null } | null } };
+    return data.data?.issue?.description ?? null;
+  } catch (err) {
+    log.warn(`workflow-gate: AI-1992: failed to fetch description for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/**
+ * AI-1992: Post a plain workflow comment on a governed ticket (e.g. the
+ * fan-out refusal notice). Fail-open — a failed comment never changes control flow.
+ */
+async function postComment(internalIssueId: string, body: string, authToken: string): Promise<void> {
+  const mutation = `
+    mutation($issueId: ID!, $body: String!) {
+      commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
+    }
+  `;
+  try {
+    await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId: internalIssueId, body } }),
+    });
+  } catch (err) {
+    log.warn(`workflow-gate: failed to post comment on ${internalIssueId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 export async function applyStateTransition(
   intent: string,
   issueId: string | null,
@@ -2499,6 +2633,42 @@ export async function applyStateTransition(
       `workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels`,
     );
     return { status: "applied", code: "demoted-ad-hoc", from: currentStateName, to: "__ad_hoc__" };
+  }
+
+  // ── AI-1992: Pre-transition fan-out spec gate (AC5) ──────────────────────
+  // When the current state declares a `fanout` block, the spawn spec must be
+  // fully validated BEFORE the atomic state mutation. A malformed, ambiguous,
+  // or empty spec refuses the transition outright — no state change, no partial
+  // spawn — and posts an actionable error comment. The validated findings are
+  // stashed and reused post-transition so the engine never re-guesses the spec.
+  let pendingFanout: { config: FanoutConfig; findings: Finding[] } | null = null;
+  const fanoutConfig = intent === breakGlassCommand
+    ? null
+    : shouldTriggerFanout(def, currentStateName ?? "", intent);
+  if (fanoutConfig) {
+    const specDescription = await fetchFanoutSpecDescription(issueId, authToken);
+    const validation = validateFanoutSpec(specDescription, fanoutConfig);
+    if (!validation.ok) {
+      log.warn(
+        `workflow-gate: AI-1992: fan-out spec REFUSED for ${issueId} (state '${currentStateName}' → '${toStateName}'): ${validation.reason}`,
+      );
+      await postComment(
+        issue.internalId,
+        `⛔️ **Fan-out refused — transition not applied.**\n\n` +
+        `The \`${intent}\` transition out of \`${currentStateName}\` fans out into \`${fanoutConfig.child_workflow}\` children, ` +
+        `but the spawn spec could not be validated:\n\n> ${validation.reason}\n\n` +
+        `No state change was made and no children were created. Fix the spec and re-run \`${intent}\`.`,
+        authToken,
+      );
+      return {
+        status: "failed",
+        code: "fanout-spec-invalid",
+        detail: validation.reason,
+        from: currentStateName,
+        to: toStateName,
+      };
+    }
+    pendingFanout = { config: fanoutConfig, findings: validation.findings };
   }
 
   // ── Idempotency check (AI-1490 hardened) ────────────────────────────────
@@ -2998,17 +3168,18 @@ export async function applyStateTransition(
     await removeImplementer(issueId);
   }
 
-  // ── Phase 5 / B-2: Fan-out edge (spawning 1→N) ──────────────────────
-  // After a successful state transition to `managing` via the `spawn` command
-  // on a ux-audit ticket, execute the fan-out to create N dev-impl children.
+  // ── Phase 5 / B-2 + AI-1992: Fan-out edge (spawning 1→N) ────────────
+  // After a successful state transition out of a state that declares a `fanout`
+  // block, mint N children under the configured child_workflow. The spec was
+  // already validated pre-transition (AC5) and the findings stashed in
+  // `pendingFanout`, so this never re-guesses the spec.
   // Fail-open: fan-out errors are logged and never block the transition.
-  // AC3: parent auto-transitions to managing once children are minted (the
-  // state transition to `managing` has already been applied above; the fan-out
-  // creates the children and links them to the parent).
-  if (applied && shouldTriggerFanout(workflowId, currentStateName ?? "", intent)) {
+  if (applied && pendingFanout) {
     try {
-      log.info(`workflow-gate: B-2 fan-out: triggering fan-out for ${issueId} (spawning → managing)`);
-      const fanoutResult = await executeFanout(issueId, authToken);
+      log.info(`workflow-gate: AI-1992 fan-out: triggering fan-out for ${issueId} (${currentStateName} → ${toStateName}, child=${pendingFanout.config.child_workflow})`);
+      const fanoutResult = await executeFanout(issueId, authToken, pendingFanout.config, {
+        findingsOverride: pendingFanout.findings,
+      });
       if (fanoutResult.created > 0) {
         log.info(
           `workflow-gate: B-2 fan-out: ${fanoutResult.created} child(ren) created for ${issueId}: ${fanoutResult.childIdentifiers.join(", ")}`,
@@ -3026,12 +3197,12 @@ export async function applyStateTransition(
     }
   }
 
-  // ── AI-1730: Zero-child barrier auto-advance on managing entry ────────
-  // After the fan-out block (which may create 0..N children), check if
-  // the barrier is already satisfied. This is a no-op when children are
-  // in-progress — it only fires when all children are terminal or none exist.
-  // Called unconditionally; the barrier module handles early exit.
-  if (applied && toStateName === "managing") {
+  // ── AI-1730 + AI-1992: Zero-child barrier auto-advance on barrier entry ──
+  // After the fan-out block (which may create 0..N children), check if the
+  // barrier is already satisfied. This is a no-op when children are in-progress
+  // — it only fires when all children are terminal or none exist. Barrier-ness
+  // is config-driven (any state declaring `barrier: true`), not just "managing".
+  if (applied && destStateNode?.barrier === true) {
     try {
       const barrierResult = await onManagingEntry(issueId, authToken);
       if (barrierResult) {

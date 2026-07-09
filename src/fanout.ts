@@ -21,6 +21,7 @@
 
 import { componentLogger, createLogger } from "./logger.js";
 import { generateSpawnPreview, checkCaps, formatPreviewComment, formatCapRefusalComment, parseSpawnCaps, type SpawnPreview, type CapCheckResult, type SpawnCaps } from "./spawn-preview.js";
+import type { FanoutConfig, WorkflowDef } from "./workflow-gate.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "fanout");
 
@@ -150,6 +151,101 @@ export function extractFindings(description: string | null | undefined, fallback
   }
 
   return findings;
+}
+
+/**
+ * AI-1992: Strict, config-driven spec extraction — NO title fallback.
+ *
+ * The declarative fan-out (AC5) refuses the transition on a malformed, ambiguous,
+ * or empty spawn spec: the engine never guesses or partially spawns. Unlike
+ * {@link extractFindings} (which always yields ≥1 finding via the ticket title),
+ * this returns an EMPTY array when the parent description has no parseable spec
+ * section named by `spec_source`. The caller treats [] as "refuse the transition".
+ *
+ * `spec_source` names the description section to read (e.g. "findings" → a
+ * `## Findings` / `### Findings` markdown section). Parsing strategies mirror
+ * extractFindings (markdown bullets/numbered list, JSON block, inline markers)
+ * but are scoped to the named section and carry no fallback.
+ */
+export function extractSpecFindings(
+  description: string | null | undefined,
+  specSource: string,
+): Finding[] {
+  if (!description || !specSource) return [];
+  const findings: Finding[] = [];
+
+  // Section header keyed by spec_source (case-insensitive). Escape regex meta.
+  const safeName = specSource.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const sectionRegex = new RegExp(
+    `(?:#{1,4}\\s+${safeName})\\s*\\n([\\s\\S]*?)(?=\\n#{1,4}\\s|\\n*$)`,
+    "i",
+  );
+  const sectionMatch = sectionRegex.exec(description);
+  if (sectionMatch) {
+    const sectionBody = sectionMatch[1];
+    const lineRegex = /[-*]\s+\*\*(.+?)\*\*(?:[:\s-]+(.*))?|[-*]\s+(.+?)(?:\n|$)|\d+\.\s+(.+?)(?:\n|$)/g;
+    let match: RegExpExecArray | null;
+    while ((match = lineRegex.exec(sectionBody)) !== null) {
+      const title = (match[1] ?? match[3] ?? match[4] ?? "").trim();
+      const desc = (match[2] ?? "").trim();
+      if (title) findings.push({ title, description: desc || undefined });
+    }
+  }
+
+  // JSON block fallback (still scoped — no title fallback).
+  if (findings.length === 0) {
+    const jsonMatch = /```json\s*\n([\s\S]*?)\n```/.exec(description);
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[1]);
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) {
+            if (typeof item === "string" && item.trim()) {
+              findings.push({ title: item.trim() });
+            } else if (item && typeof item === "object" && item.title) {
+              findings.push({
+                title: String(item.title).trim(),
+                description: item.description ? String(item.description).trim() : undefined,
+              });
+            }
+          }
+        }
+      } catch {
+        /* not valid JSON — no findings */
+      }
+    }
+  }
+
+  return findings;
+}
+
+/**
+ * AI-1992: Validate a fan-out spec ahead of the atomic transition (AC5).
+ *
+ * Returns the extracted findings when the spec is well-formed, or a structured
+ * refusal reason otherwise. Used by the workflow engine to refuse the transition
+ * BEFORE any state mutation or child spawn when the spec cannot be fully validated.
+ */
+export function validateFanoutSpec(
+  description: string | null | undefined,
+  config: FanoutConfig,
+): { ok: true; findings: Finding[] } | { ok: false; reason: string } {
+  if (!config || !/^wf:.+/.test(config.child_workflow ?? "")) {
+    return {
+      ok: false,
+      reason: `fan-out child_workflow '${String(config?.child_workflow)}' is not a wf:* label — a workflow ticket spawns only workflow children`,
+    };
+  }
+  const findings = extractSpecFindings(description, config.spec_source);
+  if (findings.length === 0) {
+    return {
+      ok: false,
+      reason:
+        `fan-out spec is empty or unparseable: no '${config.spec_source}' entries found in the ticket description. ` +
+        `Add a '## ${config.spec_source}' section with at least one bullet (e.g. "- **Title**: detail") and retry the spawn.`,
+    };
+  }
+  return { ok: true, findings };
 }
 
 // ── Linear API helpers ────────────────────────────────────────────────────
@@ -284,7 +380,8 @@ async function createChildIssue(
   parentIssueId: string,
   labelIds: string[],
   authToken: string,
-): Promise<string | null> {
+  delegateId?: string | null,
+): Promise<{ internalId: string; identifier: string } | null> {
   const mutation = `
     mutation CreateChild($input: IssueCreateInput!) {
       issueCreate(input: $input) {
@@ -300,6 +397,7 @@ async function createChildIssue(
     labelIds,
     parentId: parentIssueId,
   };
+  if (delegateId) input.delegateId = delegateId;
 
   try {
     const res = await fetch(LINEAR_API_URL, {
@@ -318,12 +416,59 @@ async function createChildIssue(
     const data = (await res.json()) as Resp;
     const result = data.data?.issueCreate;
     if (result?.success && result.issue) {
-      return result.issue.identifier;
+      return { internalId: result.issue.id, identifier: result.issue.identifier };
     }
     log.warn(`fanout: issueCreate returned non-success for '${title}': ${JSON.stringify(result)}`);
     return null;
   } catch (err) {
     log.error(`fanout: issueCreate failed for '${title}': ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/**
+ * AI-1992: create a "blocks" relation between two child issues (best-effort).
+ * Used when a fanout state declares `block_siblings: true`. Fail-open — a failed
+ * relation is logged but never aborts the spawn.
+ */
+async function createBlockingRelation(
+  blockerInternalId: string,
+  blockedInternalId: string,
+  authToken: string,
+): Promise<void> {
+  const mutation = `
+    mutation SiblingBlocks($input: IssueRelationCreateInput!) {
+      issueRelationCreate(input: $input) { success }
+    }
+  `;
+  try {
+    await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({
+        query: mutation,
+        variables: { input: { issueId: blockerInternalId, relatedIssueId: blockedInternalId, type: "blocks" } },
+      }),
+    });
+  } catch (err) {
+    log.warn(`fanout: sibling blocking relation failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * AI-1992: resolve a body id (e.g. "igor") to a Linear user id for
+ * `initial_delegate`. Uses a lazy import of the agent registry to avoid a
+ * static import cycle with workflow-gate. Returns null when unresolvable
+ * (fail-open — the child simply starts undelegated, as before).
+ */
+async function resolveInitialDelegate(bodyId: string): Promise<string | null> {
+  try {
+    const mod = await import("./agents.js");
+    const getAgents = (mod as { getAgents?: () => Array<{ name?: string; linearUserId?: string | null }> }).getAgents;
+    if (typeof getAgents !== "function") return null;
+    const agent = getAgents().find((a) => a.name?.toLowerCase() === bodyId.toLowerCase());
+    return agent?.linearUserId ?? null;
+  } catch {
     return null;
   }
 }
@@ -353,8 +498,8 @@ async function createChildIssue(
 export async function executeFanout(
   parentIssueId: string,
   authToken: string,
-  findingsOverride?: Finding[],
-  options?: { caps?: SpawnCaps; skipPreview?: boolean },
+  config: FanoutConfig,
+  options?: { caps?: SpawnCaps; skipPreview?: boolean; findingsOverride?: Finding[] },
 ): Promise<FanoutResult> {
   const result: FanoutResult = {
     created: 0,
@@ -364,6 +509,19 @@ export async function executeFanout(
     refused: false,
     pendingApproval: false,
   };
+
+  // AI-1992 AC7 (spawn time): the child workflow type is config-driven and MUST
+  // be a wf:* label. Refuse up front — never partially spawn a non-wf child.
+  if (!config || typeof config.child_workflow !== "string" || !/^wf:.+/.test(config.child_workflow)) {
+    result.refused = true;
+    result.errors.push({
+      findingIndex: -1,
+      message: `Refusing fan-out: child_workflow '${String(config?.child_workflow)}' is not a wf:* label`,
+    });
+    log.warn(`fanout: REFUSED — non-wf child_workflow '${String(config?.child_workflow)}' for ${parentIssueId}`);
+    return result;
+  }
+  const childWorkflowLabel = config.child_workflow;
 
   // 1. Fetch parent issue context
   const parentCtx = await fetchIssueTeamAndParent(parentIssueId, authToken);
@@ -375,14 +533,17 @@ export async function executeFanout(
     return result;
   }
 
-  // 2. Extract findings
-  const findings = findingsOverride ?? extractFindings(parentCtx.description, parentCtx.title ?? "Untitled finding");
-  log.info(`fanout: extracted ${findings.length} finding(s) from parent ${parentIssueId}`);
+  // 2. Extract findings from the config-named spec source (AC5 strict — no
+  //    title fallback). A pre-flight validated caller may pass findingsOverride.
+  const findings = options?.findingsOverride ?? extractSpecFindings(parentCtx.description, config.spec_source);
+  log.info(`fanout: extracted ${findings.length} finding(s) from parent ${parentIssueId} (spec_source=${config.spec_source})`);
 
   if (findings.length === 0) {
+    // AC5: an empty/unparseable spec refuses — never partially spawns.
+    result.refused = true;
     result.errors.push({
       findingIndex: -1,
-      message: "No findings extracted — fan-out requires at least one finding",
+      message: `No '${config.spec_source}' entries found — fan-out requires at least one parseable spec entry`,
     });
     return result;
   }
@@ -437,14 +598,15 @@ export async function executeFanout(
     }
   }
 
-  // 3. Ensure required labels exist
-  const wfLabelId = await ensureLabel(parentCtx.teamId, "wf:dev-impl", authToken);
+  // 3. Ensure required labels exist — the child workflow label is config-driven
+  //    (AC2: no longer the hardcoded wf:dev-impl).
+  const wfLabelId = await ensureLabel(parentCtx.teamId, childWorkflowLabel, authToken);
   const stateLabelId = await ensureLabel(parentCtx.teamId, "state:intake", authToken);
 
   if (!wfLabelId || !stateLabelId) {
     result.errors.push({
       findingIndex: -1,
-      message: `Failed to resolve required labels (wf:dev-impl: ${wfLabelId ?? "missing"}, state:intake: ${stateLabelId ?? "missing"})`,
+      message: `Failed to resolve required labels (${childWorkflowLabel}: ${wfLabelId ?? "missing"}, state:intake: ${stateLabelId ?? "missing"})`,
     });
     return result;
   }
@@ -456,6 +618,18 @@ export async function executeFanout(
   // No additional API call needed — we already have parentCtx.internalId.
   const parentInternalId = parentCtx.internalId;
 
+  // AI-1992: optional initial delegate (config-driven). Resolve once; children
+  // are all delegated to the same body id when configured. Fail-open.
+  let initialDelegateId: string | null = null;
+  if (config.initial_delegate) {
+    initialDelegateId = await resolveInitialDelegate(config.initial_delegate);
+    if (!initialDelegateId) {
+      log.warn(`fanout: initial_delegate '${config.initial_delegate}' did not resolve to a Linear user — spawning children undelegated`);
+    }
+  }
+
+  const createdInternalIds: string[] = [];
+
   for (let i = 0; i < findings.length; i++) {
     const finding = findings[i];
     const childTitle = finding.title;
@@ -466,19 +640,21 @@ export async function executeFanout(
       finding.description ? `\n${finding.description}` : "",
     ].join("\n");
 
-    const childId = await createChildIssue(
+    const child = await createChildIssue(
       parentCtx.teamId,
       childTitle,
       childDescription,
       parentInternalId,
       labelIds,
       authToken,
+      initialDelegateId,
     );
 
-    if (childId) {
+    if (child) {
       result.created++;
-      result.childIdentifiers.push(childId);
-      log.info(`fanout: created child ${childId} — "${childTitle}" (finding ${i + 1}/${findings.length})`);
+      result.childIdentifiers.push(child.identifier);
+      createdInternalIds.push(child.internalId);
+      log.info(`fanout: created child ${child.identifier} — "${childTitle}" (finding ${i + 1}/${findings.length})`);
     } else {
       result.errors.push({
         findingIndex: i,
@@ -486,6 +662,16 @@ export async function executeFanout(
       });
       log.warn(`fanout: failed to create child for finding ${i + 1}/${findings.length}: "${childTitle}"`);
     }
+  }
+
+  // AI-1992: optional sibling blocking relations (config-driven) — each sibling
+  // blocks the next so the managed children run in a defined order. Fail-open:
+  // a failed relation never aborts the spawn.
+  if (config.block_siblings && createdInternalIds.length > 1) {
+    for (let i = 0; i < createdInternalIds.length - 1; i++) {
+      await createBlockingRelation(createdInternalIds[i], createdInternalIds[i + 1], authToken);
+    }
+    log.info(`fanout: created ${createdInternalIds.length - 1} sibling blocking relation(s) for ${parentIssueId}`);
   }
 
   log.info(
@@ -525,20 +711,28 @@ async function postPreviewComment(
 // (resolveInternalId removed — internal UUID is now returned directly by fetchIssueTeamAndParent.)
 
 /**
- * Determine if the fan-out should be triggered for a given workflow + state + command.
- * Returns true when:
- *   - The workflow is ux-audit or sprint (any archetype that fans out 1→N)
- *   - The state is spawning
- *   - The command is spawn
+ * AI-1992: Config-driven fan-out trigger — replaces the hardcoded ux-audit/sprint
+ * allowlist. The fan-out fires when the current state declares a `fanout` block
+ * and the incoming intent is that state's forward (non-break-glass) transition
+ * command. Behavior is entirely YAML-driven: ANY workflow id fans out if its
+ * state declares the config; a state with no fanout block never fans out.
  *
- * Phase 6 / C-3 (AI-1473): generalized from ux-audit-only to archetype-agnostic.
- * Both orchestrator (ux-audit) and feature-initiative (sprint) archetypes use
- * the same fan-out pattern: spawning state, spawn command → mint dev-impl children.
+ * Returns the {@link FanoutConfig} (truthy) when the fan-out should fire, else
+ * null. Returning the config lets the caller mint children under the configured
+ * child_workflow and spec_source without re-reading the def.
  */
 export function shouldTriggerFanout(
-  workflowId: string,
+  def: WorkflowDef,
   currentState: string,
   intent: string,
-): boolean {
-  return (workflowId === "ux-audit" || workflowId === "sprint") && currentState === "spawning" && intent === "spawn";
+): FanoutConfig | null {
+  const state = def?.states?.find((s) => s.id === currentState);
+  if (!state || !state.fanout) return null;
+  // Never fan out on the break-glass (escape) edge out of a fanout state.
+  const breakGlass = def.break_glass?.command ?? "escape";
+  if (intent === breakGlass) return null;
+  // The intent must be a real forward transition command declared on this state.
+  const isForwardCommand = (state.transitions ?? []).some((t) => t.command === intent);
+  if (!isForwardCommand) return null;
+  return state.fanout;
 }

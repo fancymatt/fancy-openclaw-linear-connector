@@ -47,6 +47,12 @@ states:
     owner_role: engine
     kind: normal
     native_state: doing
+    # AI-1992: declarative fan-out (migrated from the hardcoded ux-audit/sprint
+    # allowlist + wf:dev-impl child label). Identical behavior: spawn mints
+    # wf:dev-impl children, one per finding in the description's Findings section.
+    fanout:
+      spec_source: findings
+      child_workflow: wf:dev-impl
     transitions:
       - command: spawn
         to: managing
@@ -55,6 +61,7 @@ states:
     owner_role: ux-researcher   # co-owned with engine (engine fills engine role)
     kind: normal
     native_state: managing
+    barrier: true               # AI-1992: N→1 barrier (migrated from BARRIER_WORKFLOWS)
     transitions:
       - command: complete
         to: review              # barrier auto-advances to review (B-3), not done

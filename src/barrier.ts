@@ -36,7 +36,7 @@
  */
 
 import { componentLogger, createLogger } from "./logger.js";
-import { loadWorkflowDef, loadWorkflowDefById, getWorkflowId, getCurrentState, type WorkflowDef } from "./workflow-gate.js";
+import { loadWorkflowDef, loadWorkflowDefById, loadWorkflowRegistry, getWorkflowId, getCurrentState, type WorkflowDef, type WorkflowState } from "./workflow-gate.js";
 import {
   LINEAR_API_URL,
   findOrCreateLabel,
@@ -50,15 +50,17 @@ import {
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "barrier");
 
-/** Barrier workflow ids — the set of orchestrator workflows whose managing state
- *  owns stall detection for managed children. The sla-sweep driver imports this
- *  set to avoid re-implementing the predicate (AI-1773). */
-export const BARRIER_WORKFLOWS = new Set([
-  "ux-audit",
-  "sprint",
-  "vocab-builder",
-  "word-build",
-]);
+/**
+ * AI-1992: barrier-ness is now declared per-state in YAML (`barrier: true`), not
+ * a hardcoded workflow-id allowlist. The old `BARRIER_WORKFLOWS` set has been
+ * removed; any workflow whose current state declares `barrier: true` is a barrier
+ * (evaluated against the loaded workflow def / registry).
+ *
+ * Pure predicate: does this state def declare an N→1 barrier?
+ */
+export function isBarrierState(state: { barrier?: boolean } | undefined | null): boolean {
+  return state?.barrier === true;
+}
 
 /**
  * Parse a per-state SLA duration string into milliseconds.
@@ -480,20 +482,43 @@ export async function attemptBarrierTransition(
     result.error = "No workflow ID found on parent labels";
     return result;
   }
-  if (!BARRIER_WORKFLOWS.has(workflowId)) {
-    log.info(`barrier: parent ${parentIdentifier} workflow wf:${workflowId} is not a barrier workflow — skipping`);
-    result.error = `Parent workflow is '${workflowId}', not a barrier workflow`;
-    return result;
-  }
 
   const currentState = getCurrentState(parentState.labels);
-  if (currentState !== "managing") {
-    log.info(`barrier: parent ${parentIdentifier} is in '${currentState}', not 'managing' — skipping`);
-    result.error = `Parent state is '${currentState}', expected 'managing'`;
+  if (!currentState) {
+    result.error = "No state:* label found on parent";
     return result;
   }
 
-  // 3. Atomic label swap: state:managing → state:review
+  // AI-1992: barrier-ness is config-driven. Load the parent's workflow def and
+  // confirm its CURRENT state declares `barrier: true`. No hardcoded workflow-id
+  // allowlist and no hardcoded "managing" state name — a def may have multiple
+  // barrier states (two-phase) under any workflow id.
+  let wfDef: WorkflowDef | null = workflowDef ?? null;
+  if (!wfDef) {
+    try {
+      wfDef = await loadWorkflowDefById(workflowId);
+    } catch {
+      wfDef = null;
+    }
+  }
+  const currentStateDef = wfDef?.states.find((s) => s.id === currentState);
+  if (!isBarrierState(currentStateDef)) {
+    log.info(`barrier: parent ${parentIdentifier} state '${currentState}' (wf:${workflowId}) is not a barrier state — skipping`);
+    result.error = `Parent state '${currentState}' on wf:${workflowId} is not a barrier state`;
+    return result;
+  }
+
+  // Barrier target: advance along THIS barrier state's forward transition —
+  // prefer the `complete` command, else the first non-break-glass transition.
+  // This is what makes two-phase (managing-arm → impl, managing-impl → done)
+  // work without any hardcoded managing → review/validating assumption.
+  const barrierTarget = resolveBarrierTarget(wfDef!, currentStateDef!);
+  if (!barrierTarget) {
+    result.error = `Barrier state '${currentState}' has no forward transition to advance to`;
+    return result;
+  }
+
+  // 3. Atomic label swap: state:<currentState> → state:<barrierTarget>
   // We need the label IDs, not just the names — re-fetch with IDs
   const parentWithLabels = await fetchParentWithLabelIds(parentIdentifier, authToken);
   if (!parentWithLabels) {
@@ -501,44 +526,24 @@ export async function attemptBarrierTransition(
     return result;
   }
 
-  const managingLabelNode = parentWithLabels.labels.find((l) => l.name === "state:managing");
-  if (!managingLabelNode) {
-    result.error = "No state:managing label found on parent";
+  const currentStateLabelNode = parentWithLabels.labels.find((l) => l.name === `state:${currentState}`);
+  if (!currentStateLabelNode) {
+    result.error = `No state:${currentState} label found on parent`;
     return result;
   }
 
-  // Phase 6 / C-3 + AI-1730: Determine barrier target from workflow def.
-  // ux-audit → review, sprint → validating, vocab-builder/word-build → from def.
-  // Fallback: try to load the workflow def for the managing state's 'complete' transition.
-  let barrierTarget: string | undefined;
-  try {
-    const wfDef = await loadWorkflowDefById(workflowId);
-    if (wfDef) {
-      const managingState = wfDef.states.find((s) => s.id === "managing");
-      const completeTransition = managingState?.transitions?.find((t) => t.command === "complete");
-      if (completeTransition) {
-        barrierTarget = completeTransition.to;
-      }
-    }
-  } catch {
-    // Workflow def unavailable — fall back to known archetypes
-  }
-  if (!barrierTarget) {
-    // Hardcoded fallback for known archetypes
-    barrierTarget = workflowId === "ux-audit" ? "review" : "validating";
-  }
   const reviewLabelId = await findOrCreateLabel(
     parentWithLabels.teamId,
     `state:${barrierTarget}`,
     authToken,
   );
   if (!reviewLabelId) {
-    result.error = "Failed to resolve state:review label";
+    result.error = `Failed to resolve state:${barrierTarget} label`;
     return result;
   }
 
   const newLabelIds = [
-    ...parentWithLabels.labels.filter((l) => l.id !== managingLabelNode.id).map((l) => l.id),
+    ...parentWithLabels.labels.filter((l) => l.id !== currentStateLabelNode.id).map((l) => l.id),
     reviewLabelId,
   ];
 
@@ -554,15 +559,30 @@ export async function attemptBarrierTransition(
     .join("\n");
   const commentBody =
     `[Barrier] All ${barrier.totalChildren} child(ren) reached terminal state. ` +
-    `Auto-advancing parent managing → ${barrierTarget}.\n\n${childSummary}`;
+    `Auto-advancing parent ${currentState} → ${barrierTarget}.\n\n${childSummary}`;
   await postComment(parentWithLabels.internalId, commentBody, authToken);
 
   result.transitioned = true;
   log.info(
-    `barrier: ${parentIdentifier} managing → ${barrierTarget} ` +
+    `barrier: ${parentIdentifier} ${currentState} → ${barrierTarget} ` +
     `(${barrier.terminalCount}/${barrier.totalChildren} children terminal)`,
   );
   return result;
+}
+
+/**
+ * AI-1992: Resolve a barrier state's forward target — the state it auto-advances
+ * to when the barrier is satisfied. Prefers the `complete` command (the canonical
+ * barrier edge), else the first transition that is not the def's break-glass
+ * command. Returns undefined when the state has no eligible forward transition.
+ */
+function resolveBarrierTarget(def: WorkflowDef, state: WorkflowState): string | undefined {
+  const transitions = state.transitions ?? [];
+  const complete = transitions.find((t) => t.command === "complete");
+  if (complete) return complete.to;
+  const breakGlass = def.break_glass?.command ?? "escape";
+  const forward = transitions.find((t) => t.command !== breakGlass);
+  return forward?.to;
 }
 
 /**
@@ -629,18 +649,26 @@ export async function onChildTerminal(
   if (!parentState) return null;
 
   const workflowId = getWorkflowId(parentState.labels);
-  // Phase 6 / C-3: support both ux-audit and sprint archetypes.
-  if (workflowId !== "ux-audit" && workflowId !== "sprint") return null;
+  if (!workflowId) return null;
 
+  // AI-1992: config-driven — the parent's current state must declare barrier:true.
   const currentState = getCurrentState(parentState.labels);
-  if (currentState !== "managing") {
-    log.info(`barrier: parent ${parentIdentifier} in '${currentState}' (not managing) — skipping`);
+  if (!currentState) return null;
+  let wfDef: WorkflowDef | null = null;
+  try {
+    wfDef = await loadWorkflowDefById(workflowId);
+  } catch {
+    wfDef = null;
+  }
+  const currentStateDef = wfDef?.states.find((s) => s.id === currentState);
+  if (!isBarrierState(currentStateDef)) {
+    log.info(`barrier: parent ${parentIdentifier} state '${currentState}' (wf:${workflowId}) is not a barrier state — skipping`);
     return null;
   }
 
-  // 3. Attempt the barrier transition, passing pre-fetched parent state
+  // 3. Attempt the barrier transition, passing pre-fetched parent state + def
   log.info(`barrier: child ${childIdentifier} terminal, checking barrier for parent ${parentIdentifier}`);
-  return attemptBarrierTransition(parentIdentifier, authToken, undefined, parentState);
+  return attemptBarrierTransition(parentIdentifier, authToken, wfDef ?? undefined, parentState);
 }
 
 // ── Label fetch with IDs ──────────────────────────────────────────────────
@@ -733,15 +761,24 @@ export async function isChildOfUxAuditParent(
 
 /**
  * Pure predicate: returns true if the given parent labels indicate the parent
- * is a barrier workflow currently in managing state.
+ * is currently in a barrier state (config-driven).
+ *
+ * AI-1992: barrier-ness is per-state (`barrier: true`), not a workflow-id
+ * allowlist. The caller supplies the loaded workflow-def registry (the sla-sweep
+ * batch path already has it in scope) so this stays a synchronous predicate.
  *
  * Shared by isManagedBarrierChild (async/fetch path) and the sla-sweep driver
  * (batch-embedded path) so both paths use the same logic — no re-implementation.
  */
-export function isManagedBarrierFromLabels(parentLabels: string[]): boolean {
+export function isManagedBarrierFromLabels(
+  parentLabels: string[],
+  defs: Map<string, WorkflowDef>,
+): boolean {
   const wfId = getWorkflowId(parentLabels);
   const state = getCurrentState(parentLabels);
-  return wfId !== null && BARRIER_WORKFLOWS.has(wfId) && state === "managing";
+  if (!wfId || !state) return false;
+  const stateDef = defs.get(wfId)?.states.find((s) => s.id === state);
+  return isBarrierState(stateDef);
 }
 
 /**
@@ -781,7 +818,10 @@ export async function isManagedBarrierChild(
     const data = (await res.json()) as Resp;
     const parent = data.data?.issue?.parent;
     if (!parent) return false;
-    return isManagedBarrierFromLabels(parent.labels.nodes.map((l) => l.name));
+    // AI-1992: config-driven — load the registry and evaluate the parent's
+    // current state's barrier flag against its workflow def.
+    const registry = await loadWorkflowRegistry();
+    return isManagedBarrierFromLabels(parent.labels.nodes.map((l) => l.name), registry);
   } catch {
     return false;
   }

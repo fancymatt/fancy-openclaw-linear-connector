@@ -257,7 +257,7 @@ export async function runSlaSweep(opts: SlaSweepOptions): Promise<SlaSweepResult
       // The batch response already includes parent labels — no extra fetch needed.
       if (node.parent) {
         const parentLabels = node.parent.labels.nodes.map((l) => l.name);
-        if (isManagedBarrierFromLabels(parentLabels)) {
+        if (isManagedBarrierFromLabels(parentLabels, defs)) {
           result.managedChildrenExcluded++;
           continue;
         }
