@@ -406,16 +406,15 @@ describe("routeEvent", () => {
     expect(ts).toBeLessThanOrEqual(Date.now());
   });
 
-  it("returns null when no agent target found", async () => {
+  it("returns null when no agent target found (no roster: fail-open no-route)", async () => {
     const event = makeIssueEvent({});
     const result = await routeEvent(event);
-    // With no roster, no delegate/assignee/mention, and no department match,
-    // the functionary escalates to steward. But since there's no roster and
-    // no agent matching the steward in the test agents, it routes to "astrid".
-    // In the test setup, astrid IS configured as an agent, so it should route.
-    expect(result).not.toBeNull();
-    expect(result?.agentId).toBe("astrid");
-    expect(result?.routingReason).toBe("steward-escalation");
+    // AI-1479: steward escalation (AC2) is an ACTIVE-functionary behavior. When
+    // no roster is loaded the functionary is inactive and routeEvent fails open
+    // to the pre-AI-1479 agent-map behavior — an event that resolves to no agent
+    // simply no-routes. (Escalation-to-steward when a roster IS loaded is covered
+    // by the "department roster" describe block and department-roster.test.ts.)
+    expect(result).toBeNull();
   });
 
   it("suppresses self-triggered events (actor is delegate, no roster)", async () => {

@@ -374,17 +374,13 @@ function buildRouteResult(
  * Returns a RouteResult if routing succeeded, null only when the event is a
  * self-trigger that should be suppressed.
  */
-export async function routeEvent(event: LinearEvent): Promise<RouteResult | null> {
+export function routeEvent(event: LinearEvent): RouteResult | null {
   const identifier = extractIssueIdentifier(event);
   const mechanicalTarget = extractAgentTarget(event);
 
   // Load department roster (cached in-process; null when unavailable).
-  let roster: DepartmentRoster | null = null;
-  try {
-    roster = await loadRoster();
-  } catch {
-    // Fail-open: roster unavailable → skip department routing.
-  }
+  // loadRoster is synchronous and fail-open (returns null on any error).
+  const roster: DepartmentRoster | null = loadRoster();
 
   const actorId = event.actor?.id;
   const agentMap = buildAgentMap();
@@ -439,6 +435,22 @@ export async function routeEvent(event: LinearEvent): Promise<RouteResult | null
 
   // Run the routing functionary.
   const functionaryResult = resolveRoute(identifier, event.type, roster, mechanicalTarget);
+
+  // Steward escalation (AC2) is an ACTIVE-functionary behavior: it only fires
+  // when a roster is loaded. Fail open otherwise — an event that resolves to no
+  // agent simply no-routes (pre-AI-1479 agent-map behavior), matching the
+  // fail-open contract documented in department-roster.ts. Additionally,
+  // AgentSessionEvent widget events with no resolvable owner never escalate —
+  // they route to their owner or nobody (audit #16). Events that name nobody
+  // (entity writes, unassigned issues, plain comments) no-route by construction
+  // and are not routing failures.
+  if (
+    functionaryResult.reason === "steward-escalation" &&
+    (!roster || event.type === "AgentSessionEvent")
+  ) {
+    return null;
+  }
+
   return buildRouteResult(event, functionaryResult.target, identifier, functionaryResult.reason);
 }
 
@@ -448,8 +460,8 @@ export async function routeEvent(event: LinearEvent): Promise<RouteResult | null
  * escalation) plus one mention route per additional registered agent mentioned
  * in the event (audit #3 — previously only the first mentioned agent was woken).
  */
-export async function routeEventAll(event: LinearEvent): Promise<RouteResult[]> {
-  const primary = await routeEvent(event);
+export function routeEventAll(event: LinearEvent): RouteResult[] {
+  const primary = routeEvent(event);
   if (!primary) return [];
   const routes = [primary];
   // Exclude the mechanical primary and the acting agent from the fan-out.

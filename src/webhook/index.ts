@@ -447,7 +447,7 @@ export function createWebhookRouter(
       }
 
       await enrichCommentEventForRouting(event);
-      const routes = await routeEventAll(event);
+      const routes = routeEventAll(event);
       if (routes.length === 0) {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
         const noRouteData = (event as { data?: Record<string, unknown> }).data;

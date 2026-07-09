@@ -25,7 +25,7 @@
  * be loaded, the system falls back to the existing agent-map routing.
  */
 
-import fs from "node:fs/promises";
+import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger } from "./logger.js";
@@ -82,12 +82,17 @@ let _rosterCache: DepartmentRoster | null = null;
 
 /**
  * Load the department roster from disk.
- * Results are cached in-process; call `resetRosterCache()` to force reload.
+ *
+ * Synchronous by design: the roster is a small local config file loaded once
+ * and cached. Keeping it sync lets routeEvent()/routeEventAll() stay sync so the
+ * webhook completes routing within its post-ack handler continuation (Linear
+ * webhooks ack 200 first, then route) — an async load would defer routing past
+ * the response and race no-route alerting. Call `resetRosterCache()` to reload.
  */
-export async function loadRoster(): Promise<DepartmentRoster | null> {
+export function loadRoster(): DepartmentRoster | null {
   if (_rosterCache) return _rosterCache;
   try {
-    const raw = await fs.readFile(rosterPath(), "utf8");
+    const raw = fs.readFileSync(rosterPath(), "utf8");
     const parsed = yaml.load(raw) as DepartmentRoster;
     if (!parsed.version || !parsed.departments || !parsed.steward) {
       log.warn(`department-roster: invalid roster structure at ${rosterPath()} — missing required fields`);
