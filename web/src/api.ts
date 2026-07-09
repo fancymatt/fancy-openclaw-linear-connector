@@ -40,6 +40,10 @@ export function apiPost<T>(path: string, body?: unknown): Promise<T> {
   return requestJson<T>(path, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) });
 }
 
+export function apiDelete<T>(path: string): Promise<T> {
+  return requestJson<T>(path, { method: "DELETE" });
+}
+
 export interface MeResponse {
   authenticated: boolean;
   secretConfigured: boolean;
