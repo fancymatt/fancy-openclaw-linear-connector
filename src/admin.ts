@@ -858,12 +858,36 @@ export function createAdminRouter(deps: AdminDeps): Router {
       wake_cycles: wakeCycles,
     }];
 
+    // AI-2008 AC4: per-ticket dispatch timeline. Project delivery-lifecycle
+    // events into normalized statuses (delivered / failed / retrying /
+    // undeliverable) so the console shows how each dispatch actually landed —
+    // not just raw event summaries.
+    const DISPATCH_STATUS: Record<string, string> = {
+      delivered: "delivered",
+      "delivery-failed": "failed",
+      "delivery-unconfirmed": "retrying",
+      "dispatch-undeliverable": "undeliverable",
+    };
+    const dispatchTimeline = events
+      .filter((e) => e.outcome in DISPATCH_STATUS)
+      .map((e) => ({
+        status: DISPATCH_STATUS[e.outcome],
+        outcome: e.outcome,
+        attempt: e.attemptCount ?? null,
+        dispatch_id: e.wakeId ?? null,
+        delegate: e.agent ?? null,
+        timestamp: e.occurredAt,
+      }))
+      // Oldest-first so the timeline reads in dispatch order.
+      .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
     res.json({
       ticket_id: row.ticket_id,
       workflow: row.workflow,
       state: row.state,
       delegate: row.delegate,
       state_transitions: stateTransitions,
+      dispatch_timeline: dispatchTimeline,
     });
   });
   router.get("/api/events", (req: Request, res: Response) => {
