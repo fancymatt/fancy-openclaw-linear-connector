@@ -27,6 +27,14 @@ const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "fano
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
+/**
+ * AI-1994: prefix of the HTML-comment marker embedded in each spawned child's
+ * description, binding it to the spec entry that minted it. Full form:
+ * `<!-- ai-1994:spec-entry-id: <id> -->`. Read back on re-entry to dedup.
+ */
+const SPEC_ENTRY_MARKER_PREFIX = "<!-- ai-1994:spec-entry-id: ";
+const SPEC_ENTRY_MARKER_RE = /<!--\s*ai-1994:spec-entry-id:\s*(\S+?)\s*-->/;
+
 // ── Types ─────────────────────────────────────────────────────────────────
 
 /** A single finding to fan out into its own child issue. */
@@ -35,6 +43,30 @@ export interface Finding {
   title: string;
   /** Detailed description (optional). */
   description?: string;
+  /**
+   * AI-1994: engine-derived stable id for this spec entry. Deterministic from
+   * the entry's content (title + description), so it is stable across re-entry
+   * and independent of position — appending a new entry never shifts existing
+   * ids. Used by {@link dedupeSpawnSpec} to match against already-spawned
+   * children (`child.specEntryId === finding.id`). Set by
+   * {@link extractSpecFindings}; the spec format itself (AI-1992) has no
+   * authored id field.
+   */
+  id?: string;
+}
+
+/**
+ * AI-1994: a child ticket already spawned from a prior fan-out of the same spec.
+ * `specEntryId` is the {@link Finding.id} of the spec entry that minted it,
+ * persisted on the child at creation time and read back on re-entry.
+ */
+export interface ExistingChild {
+  /** Human-readable identifier (e.g. "AI-3001"). */
+  identifier: string;
+  /** The spec entry id this child was spawned from. */
+  specEntryId: string;
+  /** Current workflow state (any state suppresses re-spawn — informational). */
+  state?: string;
 }
 
 /** Result of a fan-out operation. */
@@ -51,11 +83,54 @@ export interface FanoutResult {
   refused: boolean;
   /** Phase 6.5 / H-2: whether steward approval is pending. */
   pendingApproval: boolean;
+  /**
+   * AI-1994: identifiers of existing children whose spec entry was removed on
+   * re-entry. These are NEVER cancelled (destructive actions stay
+   * human/steward-driven) — the engine posts a note listing them instead.
+   */
+  unmatchedChildren: string[];
 }
 
 export interface FanoutError {
   findingIndex: number;
   message: string;
+}
+
+// ── Stable spec-entry ids (AI-1994) ────────────────────────────────────────
+
+/**
+ * AI-1994: derive a deterministic, content-addressed id for a spec entry.
+ *
+ * Requirements pinned by the ACs:
+ *  - DETERMINISTIC: identical entry content → identical id (survives re-entry).
+ *  - STABLE under append: the id depends only on the entry's own content, never
+ *    its position, so adding a sibling entry cannot shift it.
+ *  - DISTINCT: distinct entries (different title/description) get distinct ids.
+ *
+ * Implementation: FNV-1a over `title\ndescription`, rendered as fixed-width hex
+ * and prefixed with a readable title slug. The slug aids human debugging; the
+ * hash guarantees uniqueness even when two titles slugify identically.
+ */
+function deriveFindingId(title: string, description?: string): string {
+  const material = `${title}\n${description ?? ""}`;
+  // FNV-1a 32-bit.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < material.length; i++) {
+    h ^= material.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  const hex = (h >>> 0).toString(16).padStart(8, "0");
+  const slug = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32) || "entry";
+  return `${slug}-${hex}`;
+}
+
+/** Attach a stable, engine-derived id to each finding (AI-1994). */
+function withStableIds(findings: Finding[]): Finding[] {
+  return findings.map((f) => ({ ...f, id: deriveFindingId(f.title, f.description) }));
 }
 
 // ── Finding extraction ────────────────────────────────────────────────────
@@ -216,7 +291,39 @@ export function extractSpecFindings(
     }
   }
 
-  return findings;
+  // AI-1994: every extracted entry carries a stable, engine-derived id so the
+  // fan-out can dedup against already-spawned children on re-entry.
+  return withStableIds(findings);
+}
+
+// ── Incremental re-spawn dedup (AI-1994) ────────────────────────────────────
+
+/**
+ * AI-1994: pure dedup core for incremental re-spawn.
+ *
+ * The dev-sprint rework loop re-enters a fan-out state. Without dedup, re-entry
+ * would duplicate already-spawned children. This partitions the current spec
+ * against the children that already exist:
+ *
+ *  - `toSpawn` — spec entries with NO existing child (matched by
+ *    `finding.id === child.specEntryId`). Only these are minted; existing
+ *    children in ANY state (including terminal) suppress re-spawn.
+ *  - `unmatchedChildren` — existing children whose spec entry is gone from the
+ *    current spec. These are NEVER cancelled here — destructive actions stay
+ *    human/steward-driven — the caller surfaces them in a note instead.
+ *
+ * Pure and side-effect free: given the same inputs it always returns the same
+ * partition, which is what makes re-entry idempotent.
+ */
+export function dedupeSpawnSpec(
+  findings: Finding[],
+  existingChildren: ExistingChild[],
+): { toSpawn: Finding[]; unmatchedChildren: ExistingChild[] } {
+  const existingIds = new Set(existingChildren.map((c) => c.specEntryId));
+  const specIds = new Set(findings.map((f) => f.id));
+  const toSpawn = findings.filter((f) => !existingIds.has(f.id as string));
+  const unmatchedChildren = existingChildren.filter((c) => !specIds.has(c.specEntryId));
+  return { toSpawn, unmatchedChildren };
 }
 
 /**
@@ -499,7 +606,18 @@ export async function executeFanout(
   parentIssueId: string,
   authToken: string,
   config: FanoutConfig,
-  options?: { caps?: SpawnCaps; skipPreview?: boolean; findingsOverride?: Finding[] },
+  options?: {
+    caps?: SpawnCaps;
+    skipPreview?: boolean;
+    findingsOverride?: Finding[];
+    /**
+     * AI-1994: authoritative list of already-spawned children (test seam,
+     * mirroring `findingsOverride` / `skipPreview`). When omitted, the engine
+     * fetches the parent's existing spawn-children from Linear so re-entry
+     * dedups in production too.
+     */
+    existingChildren?: ExistingChild[];
+  },
 ): Promise<FanoutResult> {
   const result: FanoutResult = {
     created: 0,
@@ -508,6 +626,7 @@ export async function executeFanout(
     preview: null,
     refused: false,
     pendingApproval: false,
+    unmatchedChildren: [],
   };
 
   // AI-1992 AC7 (spawn time): the child workflow type is config-driven and MUST
@@ -548,18 +667,51 @@ export async function executeFanout(
     return result;
   }
 
+  // ── AI-1994: incremental re-spawn dedup ────────────────────────────
+  // The rework loop re-enters this fan-out state. Partition the spec against
+  // already-spawned children: mint only entries with no child yet; leave every
+  // existing child untouched; surface spec entries that were removed (their
+  // child is now "unmatched") in a note rather than cancelling them.
+  // `existingChildren` is a test seam; in production we read them back from the
+  // parent's children (fail-open → first spawn sees none, spawns everything).
+  const existingChildren =
+    options?.existingChildren ?? (await fetchExistingSpawnChildren(parentCtx.internalId, authToken));
+  const { toSpawn, unmatchedChildren } = dedupeSpawnSpec(findings, existingChildren);
+  result.unmatchedChildren = unmatchedChildren.map((c) => c.identifier);
+
+  if (unmatchedChildren.length > 0) {
+    // AC2: never cancel — just post a note listing the orphaned children.
+    await postUnmatchedChildrenNote(parentCtx.internalId, unmatchedChildren, authToken);
+    log.info(
+      `fanout: ${unmatchedChildren.length} unmatched child(ren) for ${parentIssueId} ` +
+      `(spec entry removed, child preserved): ${result.unmatchedChildren.join(", ")}`,
+    );
+  }
+
+  if (toSpawn.length === 0) {
+    // AC3: unchanged spec re-entry (or every entry already has a child) spawns
+    // nothing. This is a legitimate no-op, not a refusal.
+    log.info(
+      `fanout: incremental dedup — nothing new to spawn for ${parentIssueId} ` +
+      `(${findings.length} spec entr${findings.length === 1 ? "y" : "ies"}, all already spawned)`,
+    );
+    return result;
+  }
+
   // ── Phase 6.5 / H-2: Spawn-preview gate + hard recursion caps ──────
   // Before any child is instantiated, generate a preview and check caps.
   // AC1: exceeding max_children → REFUSED (not truncated).
   // AC2: above approval_above → steward approval required.
   // AC3: preview shows proposed child list before any child ticket exists.
+  // Only the NEW children (toSpawn) are previewed/capped — already-spawned
+  // siblings don't re-count against the cap on re-entry.
   if (!options?.skipPreview) {
     const caps = options?.caps ?? parseSpawnCaps();
 
     const previewResult = await generateSpawnPreview(
       parentIssueId,
       authToken,
-      findings.map((f) => ({ title: f.title, description: f.description })),
+      toSpawn.map((f) => ({ title: f.title, description: f.description })),
       caps,
     );
 
@@ -630,15 +782,21 @@ export async function executeFanout(
 
   const createdInternalIds: string[] = [];
 
-  for (let i = 0; i < findings.length; i++) {
-    const finding = findings[i];
+  // AI-1994: only the deduped `toSpawn` set is minted — existing children are
+  // left untouched.
+  for (let i = 0; i < toSpawn.length; i++) {
+    const finding = toSpawn[i];
     const childTitle = finding.title;
 
-    // Build child description: include finding details + parent reference
+    // Build child description: parent reference + a machine-readable spec-entry
+    // marker (AI-1994) so a later re-entry can match this child back to its spec
+    // entry and skip re-spawning it. The marker is an HTML comment — invisible
+    // in Linear's rendered markdown.
     const childDescription = [
       `Parent: ${parentIssueId}`,
+      finding.id ? `${SPEC_ENTRY_MARKER_PREFIX}${finding.id} -->` : "",
       finding.description ? `\n${finding.description}` : "",
-    ].join("\n");
+    ].filter(Boolean).join("\n");
 
     const child = await createChildIssue(
       parentCtx.teamId,
@@ -654,13 +812,13 @@ export async function executeFanout(
       result.created++;
       result.childIdentifiers.push(child.identifier);
       createdInternalIds.push(child.internalId);
-      log.info(`fanout: created child ${child.identifier} — "${childTitle}" (finding ${i + 1}/${findings.length})`);
+      log.info(`fanout: created child ${child.identifier} — "${childTitle}" (finding ${i + 1}/${toSpawn.length})`);
     } else {
       result.errors.push({
         findingIndex: i,
         message: `Failed to create child for finding: "${childTitle}"`,
       });
-      log.warn(`fanout: failed to create child for finding ${i + 1}/${findings.length}: "${childTitle}"`);
+      log.warn(`fanout: failed to create child for finding ${i + 1}/${toSpawn.length}: "${childTitle}"`);
     }
   }
 
@@ -675,7 +833,7 @@ export async function executeFanout(
   }
 
   log.info(
-    `fanout: completed for ${parentIssueId} — ${result.created}/${findings.length} children created` +
+    `fanout: completed for ${parentIssueId} — ${result.created}/${toSpawn.length} children created` +
     (result.errors.length > 0 ? `, ${result.errors.length} error(s)` : ""),
   );
 
@@ -706,6 +864,77 @@ async function postPreviewComment(
   } catch (err) {
     log.warn(`fanout: failed to post spawn-preview comment: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+/**
+ * AI-1994: read back the parent's already-spawned children so a re-entry of the
+ * fan-out state can dedup against them. Only children carrying the spec-entry
+ * marker (i.e. minted by a prior fan-out of this spec) are returned; pre-marker
+ * or hand-created children have no marker and are ignored — they neither
+ * suppress a spawn nor surface as unmatched.
+ *
+ * Fail-open: any error (network, unmocked query in a test) yields an empty list,
+ * so dedup degrades to "spawn everything" — the pre-AI-1994 behaviour.
+ */
+async function fetchExistingSpawnChildren(
+  parentInternalId: string,
+  authToken: string,
+): Promise<ExistingChild[]> {
+  const query = `
+    query FanoutChildren($id: String!) {
+      issue(id: $id) {
+        children { nodes { identifier description state { name } } }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: parentInternalId } }),
+    });
+    type Resp = {
+      data?: {
+        issue?: {
+          children?: {
+            nodes?: Array<{ identifier: string; description?: string | null; state?: { name?: string } | null }>;
+          } | null;
+        } | null;
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const nodes = data.data?.issue?.children?.nodes ?? [];
+    const children: ExistingChild[] = [];
+    for (const n of nodes) {
+      const m = SPEC_ENTRY_MARKER_RE.exec(n.description ?? "");
+      if (m) {
+        children.push({ identifier: n.identifier, specEntryId: m[1], state: n.state?.name });
+      }
+    }
+    return children;
+  } catch (err) {
+    log.warn(`fanout: failed to fetch existing children for dedup (${parentInternalId}): ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+}
+
+/**
+ * AI-1994: post a note listing children whose spec entry was removed on re-entry.
+ * These are preserved (never cancelled) — the note hands the destructive decision
+ * to a human/steward. Fail-open.
+ */
+async function postUnmatchedChildrenNote(
+  parentInternalId: string,
+  unmatched: ExistingChild[],
+  authToken: string,
+): Promise<void> {
+  const list = unmatched.map((c) => `- ${c.identifier}${c.state ? ` (${c.state})` : ""}`).join("\n");
+  const body =
+    `**Fan-out re-entry: ${unmatched.length} unmatched child${unmatched.length === 1 ? "" : "ren"}.**\n\n` +
+    `The following child ticket${unmatched.length === 1 ? "" : "s"} no longer ${unmatched.length === 1 ? "has" : "have"} a matching spec entry ` +
+    `(the entry was removed from the spec). They were **not** cancelled — the engine never takes destructive action on a re-entry. ` +
+    `Review and close/cancel manually if they are no longer needed:\n\n${list}`;
+  await postPreviewComment(parentInternalId, body, authToken);
 }
 
 // (resolveInternalId removed — internal UUID is now returned directly by fetchIssueTeamAndParent.)
