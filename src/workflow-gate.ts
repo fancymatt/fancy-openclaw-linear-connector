@@ -1335,6 +1335,12 @@ export async function resolveMetaIntent(
   intent: string,
   issueId: string,
   authToken: string,
+  // AI-1860: source state snapshotted at command start. When a non-empty string is
+  // provided, the meta-intent is resolved against it instead of the live-fetched
+  // state, so a multi-step governed command (e.g. continue-workflow) does not
+  // re-resolve against its own post-transition state on a follow-up mutation
+  // (the AI-1872 "no continue transition in state 'done'" repro).
+  snapshotState?: string | null,
 ): Promise<{ resolved: string } | { error: string }> {
   if (intent !== 'continue-workflow' && intent !== 'request-revision') {
     return { resolved: intent };
@@ -1363,7 +1369,10 @@ export async function resolveMetaIntent(
     return { error: `[Proxy] '${intent}' blocked: workflow registry unavailable (${msg}).` };
   }
 
-  const currentState = getCurrentState(labels);
+  const currentState =
+    typeof snapshotState === "string" && snapshotState.length > 0
+      ? snapshotState
+      : getCurrentState(labels);
   if (!currentState) {
     return { error: `[Proxy] '${intent}' blocked: ticket has no current workflow state label.` };
   }
@@ -1494,6 +1503,12 @@ export async function checkWorkflowRules(
   // reassigns the delegate. undefined = no snapshot (re-fetch live); null = caller was
   // delegate but delegate field was empty at command start.
   snapshotDelegateId?: string | null,
+  // AI-1860: source state snapshotted at command start. When a non-empty string is
+  // provided, the transition-legality check runs against it instead of the live
+  // state label, so a multi-step governed command's follow-up mutation is not
+  // re-gated against its own post-transition state (the "'<intent>' is not a legal
+  // command in state '<new-state>'" repro on ac-fail / request-revision / needs-human).
+  snapshotState?: string | null,
 ): Promise<string | null> {
   // TODO(AI-1347): fail-open on missing issueId is a Layer A carry-forward.
   // Harden by deriving issueId from the request body when headers are absent.
@@ -1719,7 +1734,15 @@ export async function checkWorkflowRules(
     log.info(`workflow-gate: break-glass delegate bypass agent=${bodyId} intent=${intent} ticket=${issueId} (workflow:break-glass holder, not current delegate)`);
   }
 
-  const currentState = getCurrentState(labels);
+  // AI-1860: prefer the command-start source-state snapshot for the transition-legality
+  // check. On a multi-step governed command's follow-up mutation the live label has
+  // already advanced to the post-transition state; re-checking legality against it
+  // self-blocks the command (exit 1) after its own transition applied. The live state
+  // is still used above for informational legal-moves hints in block messages.
+  const currentState =
+    typeof snapshotState === "string" && snapshotState.length > 0
+      ? snapshotState
+      : getCurrentState(labels);
   if (!currentState) {
     // AI-1402: For needs-human, fail-closed even without a state label.
     // We cannot determine if there is a forward path, so treat the ticket as actionable.

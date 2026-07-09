@@ -173,7 +173,7 @@ export function createApp(options?: CreateAppOptions) {
   // validation. ILL fleet runs the main branch and is unaffected.
   // AI-1860: per-app authorization snapshot map — fresh per createApp() call so
   // test isolation is guaranteed and snapshots never outlive the app instance.
-  const commandAuthSnapshots = new Map<string, { snapshotDelegateId: string | null; expiresAt: number }>();
+  const commandAuthSnapshots = new Map<string, { snapshotDelegateId: string | null; snapshotState: string | null; expiresAt: number }>();
 
   app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, {
     observationStore,

@@ -334,6 +334,13 @@ const COMMAND_AUTH_SNAPSHOT_TTL_MS = 10 * 60 * 1000; // 10 minutes
 export interface CommandAuthSnapshot {
   /** The caller's Linear user ID snapshotted at command start (used as effective delegateId). */
   snapshotDelegateId: string | null;
+  /**
+   * AI-1860: the ticket's workflow source state snapshotted at command start. Reused for
+   * meta-intent resolution and transition-legality checks on subsequent mutations so a
+   * multi-step governed command is not re-gated against its own post-transition state.
+   * null when the source state could not be determined at command start (fail-open to live).
+   */
+  snapshotState: string | null;
   expiresAt: number;
 }
 
@@ -391,6 +398,9 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   const feedbackCategoryHeader = (req.headers["x-openclaw-feedback-category"] as string | undefined) ?? null;
   const artifactRefHeader = (req.headers["x-openclaw-artifact-ref"] as string | undefined) ?? null;
   const cliVersion = (req.headers["x-openclaw-linear-cli-version"] as string | undefined) ?? null;
+  // AI-1860 AC7: invoking session identity, recorded on governed proxy audit rows so
+  // "who ran this mutation" is a one-query lookup (the AI-1909 forensics gap).
+  const sessionKeyHeader = (req.headers["x-openclaw-session-key"] as string | undefined) ?? null;
   const breakGlassHeader = req.headers["x-openclaw-break-glass"];
   const breakGlassOverride = breakGlassHeader === "true" || breakGlassHeader === "1";
   const body = parseBody(req);
@@ -462,13 +472,33 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // AI-1498: capture the ticket's workflow state BEFORE forwarding.
       let sourceStateOverride: string | undefined;
 
+      // AI-1860: look up any existing authorization snapshot for this multi-step
+      // governed command BEFORE meta-intent resolution. The snapshot is keyed by the
+      // RAW intent header (stable across every mutation of one command, and available
+      // before resolveMetaIntent runs) and carries both the caller's delegate identity
+      // and the ticket's source state at command start. Reusing them means neither the
+      // meta-intent resolution, the delegate check, nor the transition-legality check is
+      // re-evaluated against the command's own post-transition state — the AI-1848 /
+      // AI-1872 / AI-1924 "apply-then-self-block, comment dropped, exit 1" repros.
+      const snapshotKey = issueId && intent ? `${agentId}:${issueId}:${intent}` : null;
+      let snapshotDelegateId: string | null | undefined = undefined;
+      let snapshotState: string | null | undefined = undefined;
+      if (snapshotKey && deps?.commandAuthSnapshots) {
+        const existing = deps.commandAuthSnapshots.get(snapshotKey);
+        if (existing && Date.now() < existing.expiresAt) {
+          snapshotDelegateId = existing.snapshotDelegateId;
+          snapshotState = existing.snapshotState;
+          log.info(`auth-snapshot-hit agent=${agentId} intent=${intent}${ticketCtx}`);
+        }
+      }
+
       // Resolve meta-intents (continue-workflow, request-revision) to actual workflow
       // command names before any enforcement layer sees them. The original intent is
       // preserved in the header for logging; effectiveIntent drives all validation and
       // state transition logic.
       let effectiveIntent = intent!;
       if ((intent === 'continue-workflow' || intent === 'request-revision') && issueId) {
-        const metaResult = await resolveMetaIntent(intent, issueId, authorization);
+        const metaResult = await resolveMetaIntent(intent, issueId, authorization, snapshotState);
         if ('error' in metaResult) {
           log.warn(`meta-intent-block agent=${agentId} intent=${intent}${ticketCtx}: ${metaResult.error}`);
           res.status(200).json({ errors: [{ message: metaResult.error }] });
@@ -592,21 +622,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           log.warn(`comment-satisfied-by rejected agent=${agentId} intent=${effectiveIntent}${ticketCtx} comment=${satisfiedByHeader}`);
         }
       }
-      // AI-1860: look up any existing authorization snapshot for this (agent, ticket, intent).
-      // A snapshot is stored on the first successful checkWorkflowRules pass and reused for
-      // subsequent mutations in the same multi-step governed command so the delegate check
-      // is not re-evaluated against post-transition state.
-      const snapshotKey = issueId ? `${agentId}:${issueId}:${effectiveIntent}` : null;
-      let snapshotDelegateId: string | null | undefined = undefined;
-      if (snapshotKey && deps?.commandAuthSnapshots) {
-        const existing = deps.commandAuthSnapshots.get(snapshotKey);
-        if (existing && Date.now() < existing.expiresAt) {
-          snapshotDelegateId = existing.snapshotDelegateId;
-          log.info(`auth-snapshot-hit agent=${agentId} intent=${effectiveIntent}${ticketCtx}`);
-        }
-      }
-
-      const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment, snapshotDelegateId);
+      const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment, snapshotDelegateId, snapshotState);
       if (p3rejection) {
         log.warn(`workflow-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p3rejection}`);
         // AI-1857 AC4: include gate-verification snapshot so CLI can verify "no partial state was written"
@@ -622,14 +638,31 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         return;
       }
 
-      // AI-1860: first successful authorization — store snapshot so subsequent mutations
-      // in this multi-step command are not blocked by a post-transition delegate change.
+      // AI-1860: first successful authorization — store the snapshot so subsequent
+      // mutations in this multi-step command are not re-gated against its own
+      // post-transition state. The source state is captured here (before the forward /
+      // applyStateTransition runs, so the live label still holds the command-start
+      // state) and reused for meta-intent resolution + transition-legality on follow-up
+      // mutations, alongside the delegate identity. Fail-open on capture error: leave
+      // snapshotState null so follow-up mutations fall back to the live state.
       if (snapshotKey && deps?.commandAuthSnapshots && snapshotDelegateId === undefined) {
+        let capturedState: string | null = null;
+        if (issueId) {
+          try {
+            const preLabels = await fetchWorkflowLabels(issueId, authorization);
+            capturedState = getCurrentState(preLabels) ?? null;
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.warn(`auth-snapshot source-state capture failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
+          }
+        }
         deps.commandAuthSnapshots.set(snapshotKey, {
           snapshotDelegateId: callerLinearUserId ?? null,
+          snapshotState: capturedState,
           expiresAt: Date.now() + COMMAND_AUTH_SNAPSHOT_TTL_MS,
         });
-        log.info(`auth-snapshot-stored agent=${agentId} intent=${effectiveIntent}${ticketCtx}`);
+        snapshotState = capturedState;
+        log.info(`auth-snapshot-stored agent=${agentId} intent=${intent}${ticketCtx} state=${capturedState ?? "unknown"}`);
       }
 
       // AI-1977: delegateOverride is computed inside the issueId block below
@@ -830,6 +863,9 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
               agent: agentId,
               intent: effectiveIntent,
               opName,
+              // AI-1860 AC7: invoking session identity so governed-intent audit rows
+              // answer "who ran this" in one query (the AI-1909 forensics gap).
+              sessionKey: sessionKeyHeader,
             }));
             if (auditRecords.length === 1) {
               deps.mutationAuditStore.append(auditRecords[0]);

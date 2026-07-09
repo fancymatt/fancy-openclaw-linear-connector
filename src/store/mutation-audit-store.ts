@@ -50,6 +50,12 @@ export interface MutationAuditInput {
   opName?: string | null;
   /** UUID of the issue (for cross-referencing when proxy only has UUID and webhook has identifier). */
   ticketUuid?: string | null;
+  /**
+   * AI-1860 AC7: invoking session key (proxy source) — the OpenClaw session that
+   * ran the governed intent, e.g. "agent:astrid:linear-ai-1848". Recording it makes
+   * "who ran this governed mutation" a one-query lookup (the AI-1909 forensics gap).
+   */
+  sessionKey?: string | null;
   /** ISO timestamp; defaults to now. */
   recordedAt?: string;
 }
@@ -69,6 +75,7 @@ export interface MutationAuditRecord {
   webhookEventId: string | null;
   opName: string | null;
   ticketUuid: string | null;
+  sessionKey: string | null;
   correlated: number;
   correlatedAt: string | null;
 }
@@ -153,6 +160,9 @@ export class MutationAuditStore {
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS idx_mutation_audit_ticket_uuid ON mutation_audit(ticket_uuid)`,
     );
+
+    // AI-1860 AC7: invoking session identity for governed proxy mutations.
+    addColumnIfMissing("session_key", "TEXT");
   }
 
   prune(): number {
@@ -175,8 +185,8 @@ export class MutationAuditStore {
     const result = this.db.prepare(`
       INSERT INTO mutation_audit (
         recorded_at, source, ticket, change_type, field, old_value, new_value,
-        actor_id, agent, intent, webhook_event_id, op_name, ticket_uuid
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        actor_id, agent, intent, webhook_event_id, op_name, ticket_uuid, session_key
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.recordedAt ?? new Date().toISOString(),
       input.source,
@@ -191,6 +201,7 @@ export class MutationAuditStore {
       input.webhookEventId ?? null,
       input.opName ?? null,
       input.ticketUuid ?? null,
+      input.sessionKey ?? null,
     );
     this.writeCount++;
     if (this.writeCount % this.pruneEveryN === 0) this.prune();
@@ -203,8 +214,8 @@ export class MutationAuditStore {
     const insert = this.db.prepare(`
       INSERT INTO mutation_audit (
         recorded_at, source, ticket, change_type, field, old_value, new_value,
-        actor_id, agent, intent, webhook_event_id, op_name, ticket_uuid
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        actor_id, agent, intent, webhook_event_id, op_name, ticket_uuid, session_key
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const ids: number[] = [];
     const tx = this.db.transaction(() => {
@@ -223,6 +234,7 @@ export class MutationAuditStore {
           input.webhookEventId ?? null,
           input.opName ?? null,
           input.ticketUuid ?? null,
+          input.sessionKey ?? null,
         );
         ids.push(Number(result.lastInsertRowid));
       }
@@ -355,6 +367,7 @@ function rowToRecord(row: Record<string, unknown>): MutationAuditRecord {
     webhookEventId: (row.webhook_event_id as string | null) ?? null,
     opName: (row.op_name as string | null) ?? null,
     ticketUuid: (row.ticket_uuid as string | null) ?? null,
+    sessionKey: (row.session_key as string | null) ?? null,
     correlated: Number(row.correlated),
     correlatedAt: (row.correlated_at as string | null) ?? null,
   };
