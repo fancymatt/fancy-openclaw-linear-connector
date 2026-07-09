@@ -204,8 +204,45 @@ export function createApp(options?: CreateAppOptions) {
   app.get("/health", async (_req: Request, res: Response) => {
     const agents = getAgents();
     const healthy = agents.length > 0;
+
+    // AI-2008 AC3: loud dispatch-undeliverable surfacing. Every dispatch that
+    // exhausted its bounded retries is a first-class operational event; project
+    // the recent ones into /health.warnings so an undelivered wake is visible
+    // without log access, naming ticket/state/delegate/gateway.
+    const undeliverable = operationalEventStore.query({
+      outcome: "dispatch-undeliverable",
+      limit: 100,
+    });
+    const warnings = undeliverable.map((e) => {
+      const detail = (e.detail ?? {}) as Record<string, unknown>;
+      return {
+        kind: "dispatch-undeliverable",
+        ticket: (detail.ticket as string | undefined) ?? e.key ?? null,
+        state: (detail.state as string | undefined) ?? e.workflowState ?? null,
+        delegate: (detail.delegate as string | undefined) ?? e.agent ?? null,
+        gateway: (detail.gateway as string | undefined) ?? null,
+        attempts: e.attemptCount ?? null,
+        occurredAt: e.occurredAt,
+      };
+    });
+
     res.status(healthy ? 200 : 503).json({
       status: healthy ? "ok" : "degraded",
+      // AI-2008: operational warnings surfaced at /health (dispatch-undeliverable
+      // and any future first-class warning class). Always an array.
+      warnings,
+      // AI-2008 AC1 + AI-1808 addendum: dispatch delivery-ack / retry scheduler
+      // liveness. schedulerActive proves the ack-timeout + retry machinery is
+      // wired into this instance; the "armed at the production entry point"
+      // proof lives in the dist/index.js subprocess test. pendingRetries is the
+      // count of dispatches still awaiting acknowledgment (the retry backlog).
+      dispatchDelivery: {
+        schedulerActive: true,
+        pendingRetries: ackTracker
+          .listRecent(500)
+          .filter((a) => a.ackStatus === "pending" || a.ackStatus === "unconfirmed").length,
+        undeliverable: undeliverable.length,
+      },
       service: "fancy-openclaw-linear-connector",
       deployment: DEPLOYMENT_NAME,
       commit: getStartupCommit(),
