@@ -129,6 +129,18 @@ describe("AI-2008: production entry point arms the dispatch retry/ack scheduler"
       expect(body.dispatchDelivery).toBeDefined();
       expect(body.dispatchDelivery.schedulerActive).toBe(true);
       expect(typeof body.dispatchDelivery.pendingRetries).toBe("number");
+
+      // Non-cosmetic liveness proof (cra re-review 10:17Z): schedulerActive must
+      // reflect a driver that actually registered at bootstrap, not a hardcoded
+      // literal. The AI-1810 cron registry only lists a driver if its start()
+      // ran and created its timer at the production entry point — so requiring
+      // the scheduler by name here fails if the retry/ack layer is not wired
+      // into the live bootstrap block (exactly the constant-assertion gap the
+      // reviewer flagged).
+      const cronNames = Array.isArray(body.crons)
+        ? body.crons.map((c: { name: string }) => c.name)
+        : [];
+      expect(cronNames).toContain("dispatch-delivery-scheduler");
     },
     60_000,
   );

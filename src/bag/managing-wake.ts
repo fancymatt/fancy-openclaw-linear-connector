@@ -13,6 +13,7 @@
 import { deliverMessageToAgent, type DeliveryConfig, type DeliveryResult } from "../delivery/index.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
+import { randomUUID } from "node:crypto";
 
 const log = componentLogger(createLogger(), "managing-wake");
 
@@ -79,7 +80,31 @@ export async function sendManagingWakeSignal(
     `Managing wake → ${agentId} [${sessionKey}] bundling ${tickets.length} ticket(s): ${tickets.map((t) => t.identifier).join(", ")}`,
   );
   try {
-    const result: DeliveryResult = await deliverMessageToAgent(agentId, sessionKey, message, config);
+    const deliverOnce = (): Promise<DeliveryResult> =>
+      deliverMessageToAgent(agentId, sessionKey, message, config);
+
+    // AI-2008: on the production path a scheduler is injected via the delivery
+    // config, so the stewardship wake goes through the acknowledged
+    // retry/loud-failure layer — no fire-and-forget. Isolated unit tests omit
+    // it and keep the legacy single-attempt path.
+    if (config.deliveryScheduler) {
+      const outcome = await config.deliveryScheduler.dispatch({
+        agentId,
+        ticketId: sessionKey,
+        workflowState: config.workflowState ?? "managing",
+        gateway: config.gateway,
+        dispatchId: `managing-${sessionKey}-${randomUUID()}`,
+        deliver: deliverOnce,
+      });
+      if (outcome.status !== "delivered") {
+        throw new Error(
+          `managing wake undeliverable after ${outcome.attempts} attempt(s)`,
+        );
+      }
+      return undefined;
+    }
+
+    const result: DeliveryResult = await deliverOnce();
     if (!result.dispatched) {
       throw new Error(result.hookErrorSummary ?? "managing wake delivery was not accepted");
     }

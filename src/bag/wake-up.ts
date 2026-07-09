@@ -21,24 +21,6 @@ import { randomUUID } from "node:crypto";
 
 const log = componentLogger(createLogger(), "wakeup");
 
-/**
- * AI-2008: minimal structural interface for the acknowledged-delivery front door
- * (DispatchDeliveryScheduler). Declared here rather than imported to keep
- * wake-up delivery free of a hard dependency on the scheduler module.
- */
-export interface WakeDeliveryScheduler {
-  dispatch(params: {
-    agentId: string;
-    ticketId: string;
-    workflowState?: string;
-    gateway?: string;
-    dispatchId: string;
-    deliver: (ctx: { attempt: number; dispatchId: string }) => Promise<DeliveryResult>;
-    maxRetries?: number;
-    backoffMs?: (attempt: number) => number;
-  }): Promise<{ status: "delivered" | "undeliverable"; attempts: number; dispatchId: string }>;
-}
-
 export interface WakeUpConfig extends DeliveryConfig {
   /** Signal message template. {count} and {tickets} are replaced. */
   signalTemplate?: string;
@@ -50,19 +32,9 @@ export interface WakeUpConfig extends DeliveryConfig {
    * "run consider-work" prompt that is blocked on workflow tickets.
    */
   linearAuthToken?: string;
-  /**
-   * AI-2008: when present, the wake is delivered through the acknowledged
-   * retry/loud-failure layer instead of a single fire-and-forget attempt.
-   * Every dispatch then records a delivery outcome, retries on failure, and
-   * emits a `dispatch-undeliverable` warning on exhaustion. Injected by the
-   * production bootstrap (createApp); absent in isolated unit tests, which keep
-   * the legacy single-attempt path.
-   */
-  deliveryScheduler?: WakeDeliveryScheduler;
-  /** AI-2008: gateway/host the delegate runs on, named in the undeliverable warning. */
-  gateway?: string;
-  /** AI-2008: workflow state at dispatch time, recorded on delivery outcomes. */
-  workflowState?: string;
+  // AI-2008: `deliveryScheduler`, `gateway`, and `workflowState` are inherited
+  // from DeliveryConfig — the acknowledged-delivery front door is shared across
+  // every delivery path, not just wake-up.
 }
 
 export const SINGLE_TICKET_TEMPLATE =

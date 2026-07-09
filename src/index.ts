@@ -586,13 +586,20 @@ export function createApp(options?: CreateAppOptions) {
     operationalEventStore,
     deliveryConfig: wakeConfig,
     sendWake: async (agentOpenclawName, ticketId, prompt) => {
-      const result = await deliverMessageToAgent(
-        agentOpenclawName,
-        normalizeSessionKey(ticketId),
-        prompt,
-        wakeConfigForAgent(agentOpenclawName),
-      );
-      return result.dispatched;
+      const sessionKey = normalizeSessionKey(ticketId);
+      const cfg = wakeConfigForAgent(agentOpenclawName);
+      // AI-2008: the stuck-delegate re-poke is a workflow dispatch — route it
+      // through the acknowledged retry/loud-failure layer so a re-poke that the
+      // gateway drops is retried and, on exhaustion, surfaces a loud
+      // dispatch-undeliverable warning rather than silently vanishing.
+      const outcome = await dispatchDeliveryScheduler.dispatch({
+        agentId: agentOpenclawName,
+        ticketId: sessionKey,
+        gateway: cfg.gateway,
+        dispatchId: `stuck-repoke-${sessionKey}-${crypto.randomUUID()}`,
+        deliver: () => deliverMessageToAgent(agentOpenclawName, sessionKey, prompt, cfg),
+      });
+      return outcome.status === "delivered";
     },
   });
   stuckDelegateDetector.start();

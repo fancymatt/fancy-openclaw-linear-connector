@@ -7,6 +7,25 @@ import { getActiveCanonVersion } from "../policy/universal-canon.js";
 
 const log = componentLogger(createLogger(), "delivery");
 
+/**
+ * AI-2008: minimal structural interface for the acknowledged-delivery front door
+ * (DispatchDeliveryScheduler). Declared structurally here so any delivery path
+ * carrying a DeliveryConfig can route through the retry/loud-failure layer
+ * without a hard dependency on the scheduler module.
+ */
+export interface DispatchDeliverySchedulerLike {
+  dispatch(params: {
+    agentId: string;
+    ticketId: string;
+    workflowState?: string;
+    gateway?: string;
+    dispatchId: string;
+    deliver: (ctx: { attempt: number; dispatchId: string }) => Promise<DeliveryResult>;
+    maxRetries?: number;
+    backoffMs?: (attempt: number) => number;
+  }): Promise<{ status: "delivered" | "undeliverable"; attempts: number; dispatchId: string }>;
+}
+
 export interface DeliveryConfig {
   nodeBin: string;
   hooksUrl?: string;
@@ -16,6 +35,19 @@ export interface DeliveryConfig {
   timeoutMs?: number;
   retryDelayMs?: number;
   maxRetries?: number;
+  /**
+   * AI-2008: acknowledged-delivery front door. When present, a workflow wake is
+   * delivered through the bounded-retry / loud-failure layer (deliverWithAck)
+   * instead of a single fire-and-forget attempt: every dispatch records a
+   * delivery outcome, retries on failure, and emits a `dispatch-undeliverable`
+   * warning on exhaustion. Injected by the production bootstrap (createApp);
+   * absent in isolated unit tests, which keep the legacy single-attempt path.
+   */
+  deliveryScheduler?: DispatchDeliverySchedulerLike;
+  /** AI-2008: gateway/host the delegate runs on, named in the undeliverable warning. */
+  gateway?: string;
+  /** AI-2008: workflow state at dispatch time, recorded on delivery outcomes. */
+  workflowState?: string;
 }
 
 export interface DeliveryResult {
