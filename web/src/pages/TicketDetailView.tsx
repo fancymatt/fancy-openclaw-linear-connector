@@ -6,6 +6,15 @@ import { useState } from "react";
 import { usePoll } from "../hooks";
 import { apiGet } from "../api";
 import { ErrorBanner } from "../components";
+import { OpsActions } from "../components/OpsActions";
+
+/**
+ * Invoker identity for admin-mutation attribution. The console authenticates
+ * with a single shared ADMIN_SECRET (no per-user identity), so console-originated
+ * admin ops are attributed to "console" — distinguishing them from the true
+ * agent bodies, which was the AI-1909 attribution defect this ticket fixes.
+ */
+const CONSOLE_INVOKER = "console";
 
 export interface WakeCycle {
   wake_id: string;
@@ -58,6 +67,8 @@ export function TicketDetailView({ data: propData, ticketId }: TicketDetailViewP
             <span>Workflow: {data.workflow}</span>
             {data.delegate && <span>Delegate: {data.delegate}</span>}
           </div>
+          {/* AI-1954 AC4/AC5: ops actions (redispatch / set-state / recapture-ac / deploy). */}
+          <OpsActions ticketId={data.ticket_id} invoker={CONSOLE_INVOKER} />
         </div>
 
         {/* State transitions as headings with collapsed wake cycles. */}

@@ -1,9 +1,14 @@
+import { Link } from "react-router-dom";
 import { apiGet } from "../api";
 import { usePoll, ageLabel } from "../hooks";
 import { useLiveRefresh } from "../hooks/useLiveRefresh";
 import { Card, Chip, Diagnostics, Empty, ErrorBanner } from "../components";
 import { CapacityStrip } from "../components/CapacityStrip";
+import { OpsActions } from "../components/OpsActions";
 import type { FleetResponse } from "../types";
+
+/** Console-session invoker identity for admin-mutation attribution (see TicketDetailView). */
+const CONSOLE_INVOKER = "console";
 
 const ACK_TONE: Record<string, string> = {
   pending: "yellow",
@@ -13,10 +18,15 @@ const ACK_TONE: Record<string, string> = {
   acknowledged: "green",
 };
 
-export function FleetPage() {
+interface FleetPageProps {
+  /** For test renders — accepts fleet data directly instead of fetching. */
+  data?: FleetResponse;
+}
+
+export function FleetPage({ data: propData }: FleetPageProps = {}) {
   const fleet = usePoll(() => apiGet<FleetResponse>("/admin/api/fleet"), 8000);
   useLiveRefresh({ onFleet: fleet.refresh });
-  const f = fleet.data;
+  const f = propData ?? fleet.data;
 
   const openDispatches = f?.dispatches.filter((d) => d.ackStatus !== "acknowledged") ?? [];
 
@@ -61,17 +71,19 @@ export function FleetPage() {
           {openDispatches.length ? (
             <table>
               <thead>
-                <tr><th>Agent</th><th>Ticket</th><th>Status</th><th>Attempts</th><th>Dispatched</th><th>Last signal</th></tr>
+                <tr><th>Agent</th><th>Ticket</th><th>Status</th><th>Attempts</th><th>Dispatched</th><th>Last signal</th><th>Actions</th></tr>
               </thead>
               <tbody>
                 {openDispatches.map((d) => (
                   <tr key={d.id}>
                     <td>{d.agentId}</td>
-                    <td className="mono">{d.ticketId}</td>
+                    <td className="mono"><Link to={`/ticket/${d.ticketId}`}>{d.ticketId}</Link></td>
                     <td><Chip tone={ACK_TONE[d.ackStatus] ?? "gray"}>{d.ackStatus}</Chip></td>
                     <td>{d.attemptCount}</td>
                     <td className="muted">{ageLabel(d.dispatchedAt)}</td>
                     <td className="muted">{ageLabel(d.lastSignalAt)}</td>
+                    {/* AI-1954 AC4: redispatch on the fleet page (redispatch-only variant). */}
+                    <td><OpsActions variant="redispatch" ticketId={d.ticketId} invoker={CONSOLE_INVOKER} /></td>
                   </tr>
                 ))}
               </tbody>

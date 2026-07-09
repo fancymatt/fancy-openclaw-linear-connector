@@ -25,6 +25,7 @@ import type { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { getStatus as getConfigHealthStatus } from "./config-health.js";
 import { getRegistryPolicyStatus } from "./registry-policy.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
+import { runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
 import type { AlertSeverity } from "./alerts/alert-store.js";
 import {
@@ -1147,6 +1148,63 @@ export function createAdminRouter(deps: AdminDeps): Router {
       // Authorization failures → 403; other recapture errors → 422.
       const isAuthError = msg.includes("not authorized");
       res.status(isAuthError ? 403 : 422).json({ ok: false, error: msg });
+    }
+  });
+
+  // POST /api/redispatch — AI-1954: cookie-authed redispatch for the console.
+  // The app-root POST /redispatch (AI-1807) is x-admin-secret-gated (header),
+  // which the browser console (cookie session) cannot supply. This mounts the
+  // same delegation-reconciliation sweep behind adminAuth so the console
+  // Redispatch button (OpsActions) works end-to-end for a single ticket. The
+  // wake path reuses deps.wakeConfigForAgent + sendWakeUpSignal, the same
+  // mechanism set-state (AI-1607) uses to re-dispatch from the admin router.
+  router.post("/api/redispatch", async (req: Request, res: Response) => {
+    const body = parseJsonBody(req);
+    if (body === null && (Buffer.isBuffer(req.body) || typeof req.body === "string")) {
+      res.status(400).json({ success: false, error: "Malformed JSON body" });
+      return;
+    }
+    const ticketId = typeof body?.ticketId === "string" ? body.ticketId.trim() : "";
+    if (!ticketId) {
+      res.status(400).json({ success: false, error: "ticketId is required" });
+      return;
+    }
+
+    const agents = getAgents();
+    const authToken =
+      (agents.length > 0 ? getAccessToken(agents[0].name) : undefined) ??
+      process.env.LINEAR_OAUTH_TOKEN ??
+      process.env.LINEAR_API_KEY;
+    if (!authToken) {
+      res.status(503).json({ success: false, error: "no Linear auth token available" });
+      return;
+    }
+    if (!deps.operationalEventStore) {
+      res.status(503).json({ success: false, error: "operational event store not configured" });
+      return;
+    }
+    if (!deps.wakeConfigForAgent) {
+      res.status(503).json({ success: false, error: "redispatch wake mechanism not configured" });
+      return;
+    }
+
+    const wakeConfigForAgent = deps.wakeConfigForAgent;
+    const wakeFn = async (agentId: string, ticketIdentifier: string) => {
+      await sendWakeUpSignal(agentId, [ticketIdentifier], wakeConfigForAgent(agentId));
+    };
+
+    try {
+      const result = await runDelegationReconciliationSweep({
+        authToken,
+        operationalEventStore: deps.operationalEventStore,
+        alertBus: getAlertBus(),
+        wakeFn,
+        ticketIdentifiers: [ticketId],
+      });
+      res.status(200).json({ success: true, ...result });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ success: false, error: msg });
     }
   });
 

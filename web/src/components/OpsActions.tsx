@@ -12,11 +12,17 @@ export interface OpsActionsProps {
   ticketId: string;
   /** Console session username used as the invoker identity for audit attribution. */
   invoker: string;
+  /**
+   * "full" (default) renders redispatch + set-state + recapture-ac + deploy —
+   * used on the ticket-detail view. "redispatch" renders only the Redispatch
+   * action, for per-row use on the fleet page (ticket scope: fleet = redispatch).
+   */
+  variant?: "full" | "redispatch";
 }
 
 type DialogKind = "redispatch" | "set-state" | "recapture-ac" | null;
 
-export function OpsActions({ ticketId, invoker }: OpsActionsProps) {
+export function OpsActions({ ticketId, invoker, variant = "full" }: OpsActionsProps) {
   const [dialog, setDialog] = useState<DialogKind>(null);
   const [targetState, setTargetState] = useState("");
   const [reason, setReason] = useState("");
@@ -63,22 +69,26 @@ export function OpsActions({ ticketId, invoker }: OpsActionsProps) {
   return (
     <div className="ops-actions">
       <button type="button" onClick={() => openDialog("redispatch")}>Redispatch</button>
-      <button type="button" onClick={() => openDialog("set-state")}>Set State</button>
-      <button
-        type="button"
-        onClick={() => openDialog("recapture-ac")}
-      >
-        Recapture AC
-      </button>
-      {/* AC5: deploy disabled — deploy-policy.yaml sets ci_auto_deploy:false for this repo */}
-      <button
-        type="button"
-        disabled
-        aria-disabled="true"
-        title="Deploy is disabled: deploy-policy.yaml sets ci_auto_deploy:false for fancy-openclaw-linear-connector. Use the handoff-host deploy path."
-      >
-        Deploy
-      </button>
+      {variant === "full" && (
+        <>
+          <button type="button" onClick={() => openDialog("set-state")}>Set State</button>
+          <button
+            type="button"
+            onClick={() => openDialog("recapture-ac")}
+          >
+            Recapture AC
+          </button>
+          {/* AC5: deploy disabled — deploy-policy.yaml sets ci_auto_deploy:false for this repo */}
+          <button
+            type="button"
+            disabled
+            aria-disabled="true"
+            title="Deploy is disabled: deploy-policy.yaml sets ci_auto_deploy:false for fancy-openclaw-linear-connector. Use the handoff-host deploy path."
+          >
+            Deploy
+          </button>
+        </>
+      )}
 
       {dialog !== null && (
         <div role="dialog" aria-modal="true" aria-label={`Confirm ${dialog}`}>

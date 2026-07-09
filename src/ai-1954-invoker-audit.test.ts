@@ -573,4 +573,47 @@ describe("AI-1954 — invoker+reason attribution on admin mutation endpoints", (
       expect(res.body.ok).toBe(true);
     });
   });
+
+  // ── AC4: cookie/secret-authed redispatch endpoint ──────────────────────
+  // The console Redispatch button posts to /admin/api/redispatch (cookie-authed),
+  // since the app-root /redispatch is x-admin-secret-header-gated and unreachable
+  // from a browser session. This mounts the same delegation-reconciliation sweep.
+  describe("AC4 — POST /admin/api/redispatch", () => {
+    it("returns 400 when ticketId is missing", async () => {
+      const res = await request(appState.app)
+        .post("/admin/api/redispatch")
+        .set("x-admin-secret", ADMIN_SECRET)
+        .send({})
+        .expect(400);
+
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toMatch(/ticketId/i);
+    });
+
+    it("rejects an unauthenticated session (no admin secret / cookie)", async () => {
+      await request(appState.app)
+        .post("/admin/api/redispatch")
+        .send({ ticketId: "AI-1954" })
+        .expect(401);
+    });
+
+    it("runs the delegation-reconciliation sweep for the single ticket and returns success", async () => {
+      // Stub the governed-ticket query to return an empty set — the sweep then
+      // scans nothing and returns a clean result without waking any agent.
+      globalThis.fetch = (async (_url, _init) =>
+        new Response(JSON.stringify({ data: { issues: { nodes: [] } } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })) as typeof globalThis.fetch;
+
+      const res = await request(appState.app)
+        .post("/admin/api/redispatch")
+        .set("x-admin-secret", ADMIN_SECRET)
+        .send({ ticketId: "AI-1954" })
+        .expect(200);
+
+      expect(res.body.success).toBe(true);
+      expect(res.body.scanned).toBe(0);
+    });
+  });
 });

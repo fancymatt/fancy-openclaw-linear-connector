@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useParams } from "react-router-dom";
 import { fetchMe, logout, setUnauthorizedHandler } from "./api";
 import { Tabs } from "./components";
 import { LoginPage } from "./pages/LoginPage";
@@ -12,8 +12,15 @@ import { AlertsPage } from "./pages/AlertsPage";
 import { WorkflowsPage } from "./pages/WorkflowsPage";
 import { DeadLettersPage } from "./pages/DeadLettersPage";
 import { StallsPage } from "./pages/StallsPage";
+import { TicketDetailView } from "./pages/TicketDetailView";
 
 type AuthState = "checking" | "authenticated" | "anonymous";
+
+/** Reads :ticketId from the route and renders the ticket-detail view (with ops actions). */
+function TicketDetailRoute() {
+  const { ticketId } = useParams<{ ticketId: string }>();
+  return <TicketDetailView ticketId={ticketId} />;
+}
 
 export function App() {
   const [auth, setAuth] = useState<AuthState>("checking");
@@ -62,6 +69,7 @@ export function App() {
         <Routes>
           <Route path="/" element={<OverviewPage />} />
           <Route path="/fleet" element={<FleetPage />} />
+          <Route path="/ticket/:ticketId" element={<TicketDetailRoute />} />
           <Route path="/board" element={<BoardPage />} />
           <Route path="/tasks" element={<TasksPage />} />
           <Route path="/events" element={<EventsPage />} />

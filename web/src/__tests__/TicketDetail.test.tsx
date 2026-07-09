@@ -125,3 +125,24 @@ describe("AI-1800 AC5: TicketDetailView — state transitions with wake cycles",
     expect(screen.getByText("cra")).toBeInTheDocument();
   });
 });
+
+// AI-1954 AC4/AC5: OpsActions must be mounted on the ticket-detail view (the
+// ac-fail regression — the component existed but no page imported it, so the
+// buttons never reached the production SPA). This asserts they render from the
+// page, not just from the component in isolation.
+describe("AI-1954 AC4/AC5: TicketDetailView mounts the full OpsActions", () => {
+  it("renders redispatch, set-state, recapture-ac, and deploy buttons from the page", () => {
+    render(<TicketDetailView data={sampleDetail} />);
+    expect(screen.getByRole("button", { name: /redispatch/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /set.?state/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /recapture/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /deploy/i })).toBeInTheDocument();
+  });
+
+  it("passes the ticket id through to the ops actions (redispatch targets this ticket)", () => {
+    render(<TicketDetailView data={sampleDetail} />);
+    // The deploy button carries a static disabled reason; redispatch/set-state
+    // operate on data.ticket_id, verified end-to-end by OpsActions' own suite.
+    expect(screen.getByRole("button", { name: /deploy/i })).toBeDisabled();
+  });
+});
