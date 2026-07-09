@@ -11,7 +11,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 // OpsActions does not exist yet — this import will fail until implemented.
@@ -200,8 +200,11 @@ describe("AC4 — OpsActions renders ops buttons with confirmation dialogs", () 
         screen.queryByText(/unauthorized/i) ??
         screen.queryByText(/not authorized/i) ??
         screen.queryByRole("alert");
-      // At minimum the call was attempted, not silently dropped.
+      // The call was attempted, not silently dropped...
       expect(mockApiPost).toHaveBeenCalled();
+      // ...and — the actual AC4 behavior — the 401 was *surfaced* to the user,
+      // not swallowed. A silent success would leave errorEl null.
+      expect(errorEl).toBeTruthy();
     });
   });
 
