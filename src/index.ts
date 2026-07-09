@@ -14,7 +14,7 @@ import { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { ObservationStore } from "./store/observation-store.js";
 import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
-import { deliverToAgent, deliverMessageToAgent, type DeliveryConfig, DeliveryThrottle } from "./delivery/index.js";
+import { deliverToAgent, deliverMessageToAgent, type DeliveryConfig, DeliveryThrottle, DispatchDeliveryScheduler } from "./delivery/index.js";
 import { buildWorkflowAwareDeliveryMessage } from "./delivery/build-message.js";
 import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, StuckDelegateDetector, HoldRetryTracker, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
@@ -232,15 +232,14 @@ export function createApp(options?: CreateAppOptions) {
       // and any future first-class warning class). Always an array.
       warnings,
       // AI-2008 AC1 + AI-1808 addendum: dispatch delivery-ack / retry scheduler
-      // liveness. schedulerActive proves the ack-timeout + retry machinery is
-      // wired into this instance; the "armed at the production entry point"
-      // proof lives in the dist/index.js subprocess test. pendingRetries is the
-      // count of dispatches still awaiting acknowledgment (the retry backlog).
+      // liveness sourced from the real DispatchDeliveryScheduler. schedulerActive
+      // is true only after the driver is armed at bootstrap (start()), and false
+      // if it was never wired — not a hardcoded literal. pendingRetries is the
+      // live count of in-flight backoff waits in the delivery layer. The
+      // "armed at the production entry point" proof lives in the dist/index.js
+      // subprocess test (ai-2008-bootstrap-wiring).
       dispatchDelivery: {
-        schedulerActive: true,
-        pendingRetries: ackTracker
-          .listRecent(500)
-          .filter((a) => a.ackStatus === "pending" || a.ackStatus === "unconfirmed").length,
+        ...dispatchDeliveryScheduler.liveness(),
         undeliverable: undeliverable.length,
       },
       service: "fancy-openclaw-linear-connector",
@@ -321,6 +320,11 @@ export function createApp(options?: CreateAppOptions) {
       hooksUrl: cfg?.hooksUrl ?? wakeConfig.hooksUrl,
       hooksToken: cfg?.hooksToken ?? wakeConfig.hooksToken,
       linearAuthToken,
+      // AI-2008: route every real workflow wake through the acknowledged
+      // retry/loud-failure layer. Evaluated at dispatch time, so referencing the
+      // scheduler declared below is safe.
+      deliveryScheduler: dispatchDeliveryScheduler,
+      gateway: cfg?.host ?? "local",
     };
   };
   const resignalOptions = {
@@ -441,6 +445,19 @@ export function createApp(options?: CreateAppOptions) {
   const ackTracker = new DispatchAckTracker(
     options?.bagDbPath ? path.join(path.dirname(options.bagDbPath), "dispatch-acks.db") : undefined,
   );
+
+  // ── AI-2008: acknowledged dispatch delivery + bounded retry + loud failure ──
+  // The armed front door every real workflow wake routes through (attached to
+  // wakeConfigForAgent below). deliverWithAck records an outcome per attempt,
+  // retries on failure, and emits a dispatch-undeliverable warning on
+  // exhaustion — so no workflow dispatch remains fire-and-forget (AC1). Its
+  // liveness feeds /health.dispatchDelivery; start() arms the driver and
+  // registers it in the cron registry (AI-1808 dead-code-in-prod guard).
+  const dispatchDeliveryScheduler = new DispatchDeliveryScheduler({
+    eventStore: operationalEventStore,
+    ackTracker,
+  });
+  dispatchDeliveryScheduler.start();
 
   /**
    * Post a comment on a Linear ticket via the GraphQL API.
@@ -975,7 +992,7 @@ export function createApp(options?: CreateAppOptions) {
     wakeFn: migrationWakeFn,
   });
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore };
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore };
 }
 
 /**

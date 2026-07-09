@@ -6,3 +6,8 @@ export {
   type DeliverWithAckParams,
   type DeliverWithAckOutcome,
 } from "./deliver-with-ack.js";
+export {
+  DispatchDeliveryScheduler,
+  type SchedulerDispatchParams,
+  type DispatchDeliverySchedulerDeps,
+} from "./dispatch-delivery-scheduler.js";

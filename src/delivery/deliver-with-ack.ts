@@ -45,6 +45,14 @@ export interface DeliverWithAckParams {
   backoffMs?: (attempt: number) => number;
   /** Sleep primitive. Injected so backoff is deterministic in tests. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * AI-2008: retry-depth observers so the DispatchDeliveryScheduler can report a
+   * genuine live `pendingRetries` (in-flight backoff waits in the delivery
+   * layer), not a value derived from a pre-existing store. Called around each
+   * backoff wait; no-ops when a caller invokes deliverWithAck directly.
+   */
+  onRetryScheduled?: () => void;
+  onRetryResolved?: () => void;
 }
 
 export interface DeliverWithAckOutcome {
@@ -130,7 +138,12 @@ export async function deliverWithAck(params: DeliverWithAckParams): Promise<Deli
 
     // Bounded retry with backoff — only wait when another attempt follows.
     if (attempt < totalAttempts) {
-      await sleep(backoffMs(attempt));
+      params.onRetryScheduled?.();
+      try {
+        await sleep(backoffMs(attempt));
+      } finally {
+        params.onRetryResolved?.();
+      }
     }
   }
 

@@ -17,8 +17,27 @@ import { buildWorkflowAwareDeliveryMessage } from "../delivery/build-message.js"
 import { loadUniversalCanon, formatCanonBlock, getActiveCanonVersion, type CanonLoadResult } from "../policy/universal-canon.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { createLogger, componentLogger } from "../logger.js";
+import { randomUUID } from "node:crypto";
 
 const log = componentLogger(createLogger(), "wakeup");
+
+/**
+ * AI-2008: minimal structural interface for the acknowledged-delivery front door
+ * (DispatchDeliveryScheduler). Declared here rather than imported to keep
+ * wake-up delivery free of a hard dependency on the scheduler module.
+ */
+export interface WakeDeliveryScheduler {
+  dispatch(params: {
+    agentId: string;
+    ticketId: string;
+    workflowState?: string;
+    gateway?: string;
+    dispatchId: string;
+    deliver: (ctx: { attempt: number; dispatchId: string }) => Promise<DeliveryResult>;
+    maxRetries?: number;
+    backoffMs?: (attempt: number) => number;
+  }): Promise<{ status: "delivered" | "undeliverable"; attempts: number; dispatchId: string }>;
+}
 
 export interface WakeUpConfig extends DeliveryConfig {
   /** Signal message template. {count} and {tickets} are replaced. */
@@ -31,6 +50,19 @@ export interface WakeUpConfig extends DeliveryConfig {
    * "run consider-work" prompt that is blocked on workflow tickets.
    */
   linearAuthToken?: string;
+  /**
+   * AI-2008: when present, the wake is delivered through the acknowledged
+   * retry/loud-failure layer instead of a single fire-and-forget attempt.
+   * Every dispatch then records a delivery outcome, retries on failure, and
+   * emits a `dispatch-undeliverable` warning on exhaustion. Injected by the
+   * production bootstrap (createApp); absent in isolated unit tests, which keep
+   * the legacy single-attempt path.
+   */
+  deliveryScheduler?: WakeDeliveryScheduler;
+  /** AI-2008: gateway/host the delegate runs on, named in the undeliverable warning. */
+  gateway?: string;
+  /** AI-2008: workflow state at dispatch time, recorded on delivery outcomes. */
+  workflowState?: string;
 }
 
 export const SINGLE_TICKET_TEMPLATE =
@@ -152,7 +184,33 @@ export async function sendWakeUpSignal(
   log.info(`Sending wake-up signal to ${agentId}: ${ticketIds.length} ticket(s) [${ticketIds.join(", ")}]`);
 
   try {
-    const result: DeliveryResult = await deliverMessageToAgent(agentId, sessionKey, message, config);
+    const deliverOnce = (): Promise<DeliveryResult> =>
+      deliverMessageToAgent(agentId, sessionKey, message, config);
+
+    // AI-2008: on the production path a scheduler is injected, so the wake goes
+    // through the acknowledged retry/loud-failure layer — no fire-and-forget.
+    if (config.deliveryScheduler) {
+      const outcome = await config.deliveryScheduler.dispatch({
+        agentId,
+        ticketId: sessionKey,
+        workflowState: config.workflowState,
+        gateway: config.gateway,
+        dispatchId: `wake-${sessionKey}-${randomUUID()}`,
+        deliver: deliverOnce,
+        // Honor the delivery config's retry bound so the test env (maxRetries: 0)
+        // keeps single-attempt semantics; production leaves it undefined so the
+        // scheduler applies its bounded backoff default.
+        maxRetries: config.maxRetries,
+      });
+      if (outcome.status !== "delivered") {
+        throw new Error(
+          `wake-up delivery undeliverable after ${outcome.attempts} attempt(s)`,
+        );
+      }
+      return { canonVersion: canonVersion ?? undefined };
+    }
+
+    const result: DeliveryResult = await deliverOnce();
     if (!result.dispatched) {
       throw new Error(result.hookErrorSummary ?? "wake-up delivery was not accepted");
     }
