@@ -54,10 +54,15 @@ describe("AI-2008 — /health + /admin delivery-outcome surface", () => {
     expect(Array.isArray(res.body.warnings)).toBe(true);
   });
 
-  it("AC1: /health reports dispatch-delivery ack liveness (proves the layer is wired)", async () => {
+  it("AC1: /health exposes a well-formed dispatchDelivery liveness field", async () => {
+    // Field-presence + shape check from createApp. The "scheduler is actually
+    // armed at the production entry point" proof lives in the subprocess test
+    // (ai-2008-bootstrap-wiring.test.ts), mirroring how universalCanon splits
+    // field-presence (here) from bootstrap-armed (the dist/index.js boot).
     const res = await request(app.app).get("/health");
     expect(res.body.dispatchDelivery).toBeDefined();
-    expect(res.body.dispatchDelivery.active).toBe(true);
+    expect(typeof res.body.dispatchDelivery.schedulerActive).toBe("boolean");
+    expect(typeof res.body.dispatchDelivery.pendingRetries).toBe("number");
   });
 
   it("AC3: an undeliverable dispatch surfaces as a /health warning naming ticket/state/delegate/gateway", async () => {
