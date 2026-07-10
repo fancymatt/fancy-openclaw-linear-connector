@@ -16,7 +16,10 @@ import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { ObservationStore, ReasonCode, MetricSummary } from "./store/observation-store.js";
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
-import { setStateAtomic, loadWorkflowRegistry } from "./workflow-gate.js";
+import { setStateAtomic, loadWorkflowRegistry, resetWorkflowCache } from "./workflow-gate.js";
+import { instanceConfigRoot } from "./instance-config.js";
+import { retryApply } from "./proposal/apply-pipeline.js";
+import type { ProposalStore } from "./store/proposal-store.js";
 import { parseSlaToMs } from "./barrier.js";
 import { computeDispatchHealth } from "./dispatch-health.js";
 import { getFirstActionLadder } from "./first-action-watchdog-state.js";
@@ -58,6 +61,8 @@ interface AdminDeps {
   forensicsDiagnosticsDir?: string;
   /** AI-1954: mutation audit log for admin ops attribution. */
   mutationAuditStore?: MutationAuditStore;
+  /** AI-2039: learning-loop proposal queue + apply-outcome store (C4/C5 console). */
+  proposalStore?: ProposalStore;
 }
 
 type Severity = "green" | "yellow" | "red" | "gray";
@@ -511,6 +516,46 @@ export function createAdminRouter(deps: AdminDeps): Router {
       res.json({ workflows: [], error: err instanceof Error ? err.message : String(err) });
     }
   });
+  // ── AI-2039 (P4-C4/C5): learning-loop proposal review queue ──────────────
+  // GET lists the queue for the /admin/proposals console; POST retry-apply is
+  // the operator's retry affordance on an apply-failed proposal (AC4.8). Both
+  // return JSON; a missing store yields an empty queue rather than a 5xx so the
+  // console degrades gracefully before C3 begins writing proposals.
+  router.get("/api/proposals", (_req: Request, res: Response) => {
+    const store = deps.proposalStore;
+    res.json({ proposals: store ? store.list() : [] });
+  });
+
+  router.post("/api/proposals/:id/retry-apply", async (req: Request, res: Response) => {
+    const store = deps.proposalStore;
+    if (!store) {
+      res.status(503).json({ ok: false, error: "proposal store is not configured" });
+      return;
+    }
+    const row = store.getById(req.params.id);
+    if (!row || !row.proposal) {
+      res.status(404).json({ ok: false, error: "unknown proposal" });
+      return;
+    }
+    try {
+      const configRoot = instanceConfigRoot();
+      const observationStore = deps.observationStore;
+      const result = await retryApply(row.proposal, {
+        configRoot,
+        store,
+        captureMetrics: () => ({
+          snapshot: observationStore ? observationStore.metrics({}) : {},
+          window: { since: row.updatedAt, until: new Date().toISOString() },
+        }),
+        reloadWorkflowDefs: resetWorkflowCache,
+        now: () => Date.now(),
+      });
+      res.status(result.status === "apply-failed" ? 502 : 200).json({ ok: result.status === "applied", ...result });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   // Alert feed from alerts.db (docs/alert-bus.md) — what has been pushed,
   // folded, or stored silently.
   router.get("/api/alerts", (req: Request, res: Response) => {
