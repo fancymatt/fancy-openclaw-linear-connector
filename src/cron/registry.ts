@@ -28,6 +28,12 @@ export interface CronRegistryEntry {
   schedule: string;
   /** ISO timestamp of when the driver registered in this process. */
   registeredAt: string;
+  /**
+   * ISO timestamp of the driver's most recent run, or null if it has not run
+   * yet in this process. `registeredAt` proves the timer was armed; only this
+   * proves the job actually fires (AI-2037 / AC2.4).
+   */
+  lastRunAt: string | null;
 }
 
 const entries = new Map<string, CronRegistryEntry>();
@@ -52,7 +58,21 @@ export function registerCron(name: string, schedule: string): void {
     name,
     schedule,
     registeredAt: new Date().toISOString(),
+    // A hot-reload re-registers the driver but does not un-run it.
+    lastRunAt: entries.get(name)?.lastRunAt ?? null,
   });
+}
+
+/**
+ * Stamp a driver as having just run. Call at the END of each invocation, from
+ * the same code path that does the work — a driver that throws before reaching
+ * this call has not run, and its stale lastRunAt is the signal.
+ * No-op for an unregistered name: liveness cannot precede scheduling.
+ */
+export function markCronRun(name: string, now = new Date()): void {
+  const entry = entries.get(name);
+  if (!entry) return;
+  entry.lastRunAt = now.toISOString();
 }
 
 /** All drivers registered in this process, sorted by name. */

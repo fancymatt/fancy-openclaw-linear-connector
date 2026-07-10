@@ -12,13 +12,16 @@
 
 import type { ObservationStore } from "../store/observation-store.js";
 import { createLogger, componentLogger } from "../logger.js";
-import { registerCron, formatIntervalMs } from "./registry.js";
+import { registerCron, markCronRun, formatIntervalMs } from "./registry.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "p4-metrics-distillation");
 
 const DEFAULT_THRESHOLD = parseInt(process.env.P4_DISTILL_THRESHOLD ?? "3", 10);
 const MAX_PROPOSALS_PER_RUN = parseInt(process.env.MAX_PROPOSALS_PER_RUN ?? "10", 10);
 const DEFAULT_INTERVAL_MS = parseIntervalMs(process.env.P4_DISTILL_INTERVAL ?? "1h");
+
+/** Registry key — shared by the registrar and the post-run liveness stamp. */
+const DISTILLATION_CRON_NAME = "p4-metrics-distillation";
 
 export interface DistillationResult {
   proposalsCreated: number;
@@ -186,11 +189,13 @@ export async function runDistillation(observationStore: ObservationStore, thresh
  */
 export function registerDistillationCron(observationStore: ObservationStore): void {
   const intervalMs = DEFAULT_INTERVAL_MS;
-  registerCron("p4-metrics-distillation", `every ${formatIntervalMs(intervalMs)}`);
+  registerCron(DISTILLATION_CRON_NAME, `every ${formatIntervalMs(intervalMs)}`);
   const timer = setInterval(() => {
-    runDistillation(observationStore).catch((err) => {
-      log.error(`[P4-3] Scheduled distillation failed: ${err instanceof Error ? err.message : String(err)}`);
-    });
+    runDistillation(observationStore)
+      .then(() => markCronRun(DISTILLATION_CRON_NAME))
+      .catch((err) => {
+        log.error(`[P4-3] Scheduled distillation failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
   }, intervalMs);
   timer.unref();
   log.info(`[P4-3] Distillation scheduled every ${intervalMs}ms (P4_DISTILL_INTERVAL=${process.env.P4_DISTILL_INTERVAL ?? "1h"})`);
