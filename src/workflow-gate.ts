@@ -40,7 +40,8 @@ import yaml from "js-yaml";
 import { componentLogger, createLogger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
 import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
-import { ObservationStore, type ReasonCode } from "./store/observation-store.js";
+import type { ObservationStore } from "./store/observation-store.js";
+import { recordObservation } from "./store/observation-write-path.js";
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout, validateFanoutSpec, type Finding } from "./fanout.js";
@@ -2448,12 +2449,22 @@ export async function buildStateTransitionReminder(
  *   escape     — terminal break-glass state; transitions to state:escape normally.
  */
 export interface TransitionFeedback {
-  /** The body (agent) that was the implementer / from-state owner. */
+  /**
+   * The implementer / from-state owner, from X-Openclaw-From-Body.
+   * AI-2036: optional — the implementer store supplies it when the header is absent.
+   */
   fromBody?: string | null;
-  /** The reason code from X-Openclaw-Feedback-Category header. */
-  reasonCode: ReasonCode;
+  /**
+   * The raw reason code from X-Openclaw-Feedback-Category.
+   * AI-2036: optional and unvalidated — no client sends this header today, so the
+   * write path resolves the category from the comment or falls back. Validation
+   * happens in resolveReasonCode(), not here.
+   */
+  reasonCode?: string | null;
   /** Free-text feedback from the comment body. */
   freeText?: string | null;
+  /** Dispatch-cycle correlation id, when the caller knows it. */
+  wakeId?: string | null;
 }
 
 export interface ApplyStateTransitionOptions {
@@ -2936,6 +2947,15 @@ export async function applyStateTransition(
   // Before any mutation, resolve ALL facets: {label swap, delegate}.
   // If any facet cannot be resolved for deterministic transitions, fail CLOSED.
 
+  // AI-2036: capture the implementer BEFORE Step 3 overwrites it with the
+  // destination delegate. The observation's from_body is "whose work was
+  // rejected", which is the record standing at the moment of rejection — not
+  // whoever the ticket is being routed to (a reviewer may redirect with
+  // --target, and Step 3's fallback records the reviewer's own id).
+  const priorImplementerAtFeedback = matchedTransition?.feedback?.required
+    ? await getImplementer(issueId).catch(() => null)
+    : null;
+
   // Step 1: Resolve label IDs for the state swap.
   const newLabelId = await findOrCreateLabel(
     issue.teamId,
@@ -3285,41 +3305,37 @@ export async function applyStateTransition(
   }
 
   // ── Phase 4 / P4-1: Record feedback observation ──────────────────────
-  // After a successful state transition, if the transition has a feedback
-  // block and feedback data was provided, write one append-only observation.
-  // Fail-open: observation errors are logged and never block the transition.
-  if (matchedTransition?.feedback?.required && options?.observationStore && options?.feedback) {
-    try {
-      const validatedReason = ObservationStore.validateReasonCode(options.feedback.reasonCode);
-      if (!validatedReason) {
-        log.warn(
-          `workflow-gate: P4-1: invalid reason code '${options.feedback.reasonCode}' — observation skipped for ${issueId}`,
-        );
-      } else if (!options.feedback.fromBody) {
-        // The implementer body ID must be provided (via X-Openclaw-From-Body header from
-        // the CLI). Without it, from_body == reviewer_body, which produces useless data
-        // for P4-2/3/4 aggregation. Skip the row rather than write garbage.
-        log.warn(
-          `workflow-gate: P4-1: fromBody not provided (X-Openclaw-From-Body header absent) — observation skipped for ${issueId}`,
-        );
-      } else {
-        options.observationStore.append({
-          ticket: issueId,
-          workflow: workflowId,
-          step: currentStateName ?? "(none)",
-          fromBody: options.feedback.fromBody,
-          reviewerBody: options.bodyId ?? "unknown",
-          reasonCode: validatedReason,
-          freeText: options.feedback.freeText ?? null,
-        });
-        log.info(
-          `workflow-gate: P4-1: observation recorded for ${issueId} reason=${validatedReason}`,
-        );
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.warn(`workflow-gate: P4-1: observation write failed for ${issueId}: ${msg}`);
-    }
+  // Every feedback-required transition produces exactly one observation — or a
+  // counted, logged skip. AI-2036: the guard used to also require
+  // `options.feedback`, which the proxy only built when the request carried
+  // X-Openclaw-Feedback-Category. No client has ever sent that header, so the
+  // block never ran and, having no `else`, said nothing about it. The write no
+  // longer depends on any header: the category degrades to `unclassified` and
+  // the from-body falls back to the implementer store.
+  //
+  // Fail-open: recordObservation never throws — an observation must not be able
+  // to block the transition it describes. Gated on `applied` like the barrier
+  // blocks below: today every write failure returns early, but an observation
+  // describes a rejection that actually happened, so it must never outlive the
+  // transition it records.
+  if (applied && matchedTransition?.feedback?.required) {
+    await recordObservation({
+      store: options?.observationStore,
+      events: options?.operationalEventStore,
+      // The human identifier ("AI-2036"), not the internal UUID the proxy
+      // extracts from the mutation's `id` variable. Clustering groups by ticket
+      // and the admin API filters on it; a UUID here is a populated column that
+      // nothing can join on. Mirrors the mutation-audit path's `?? issueId`.
+      ticket: issue.identifier ?? issueId,
+      workflow: workflowId,
+      step: currentStateName ?? "(none)",
+      reviewerBody: options?.bodyId ?? "unknown",
+      headerReasonCode: options?.feedback?.reasonCode,
+      headerFromBody: options?.feedback?.fromBody,
+      freeText: options?.feedback?.freeText ?? null,
+      wakeId: options?.feedback?.wakeId ?? null,
+      resolveImplementer: async () => priorImplementerAtFeedback,
+    });
   }
 
   // ── Phase 5 / B-3: Barrier (N→1) — event-driven parent auto-advance ─

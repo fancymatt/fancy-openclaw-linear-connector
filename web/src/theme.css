@@ -270,3 +270,209 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 .wake-cycle { padding: 4px 8px; margin: 2px 0; font-size: 12px; border-left: 2px solid var(--border, #2d3240); }
 .wake-cycle.connector { color: var(--muted); opacity: 0.7; }
 .toggle-connector { background: none; border: 1px solid var(--border, #2d3240); color: var(--muted); font-size: 11px; padding: 2px 8px; border-radius: 3px; cursor: pointer; margin: 4px 0; }
+
+/* ── Review queue (AI-2040) ─────────────────────────────────────────────────
+   Tones are additive on top of .chip: the status badge carries data-tone so a
+   state reads the same in the list card and the detail header. Amber = pending
+   ("action needed"); approved is muted green, applied solid green — a change of
+   intensity rather than a new hue. */
+
+nav.tabs a { display: inline-flex; align-items: center; gap: 7px; }
+.nav-pending-badge {
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--yellow);
+  color: #241d0f;
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.chip[data-tone="amber"] { color: var(--yellow); border-color: #67562d; background: #241d0f; }
+.chip[data-tone="blue"] { color: var(--blue); border-color: #3d5570; background: #16202c; }
+.chip[data-tone="green"] { color: var(--green); border-color: #315b43; background: #102019; }
+.chip[data-tone="green-solid"] { color: #0b0f14; border-color: var(--green); background: var(--green); }
+.chip[data-tone="orange"] { color: #ffb27d; border-color: #7a5330; background: #2a1a0f; }
+.chip[data-tone="red"] { color: var(--red); border-color: #72413f; background: #271514; }
+.chip[data-tone="gray"] { color: var(--gray); border-color: #4a525b; background: #1a2028; }
+
+.proposals-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.tablist { display: flex; gap: 6px; }
+.tablist [role="tab"] {
+  background: #0f151d;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  font-size: 13px;
+  padding: 7px 14px;
+  cursor: pointer;
+}
+.tablist [role="tab"].active { background: #203044; border-color: #3d5570; }
+.proposals-filters { display: flex; gap: 12px; flex-wrap: wrap; }
+.proposals-filters label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+
+/* The list pane is fixed; the detail pane takes the rest. Below the narrow
+   breakpoint the panes stack, list first. */
+.proposals-layout {
+  display: grid;
+  grid-template-columns: var(--proposal-list-width) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+.proposals-layout[data-layout="stacked"] { grid-template-columns: minmax(0, 1fr); }
+
+.proposal-list-pane { min-width: 0; }
+.proposal-listbox { display: flex; flex-direction: column; gap: 8px; }
+.proposal-listbox:empty::after {
+  content: "Nothing here.";
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.proposal-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-left: 3px solid transparent;
+  border-radius: 12px;
+  background: #0e151d;
+  cursor: pointer;
+}
+.proposal-card:hover { border-color: #3d5570; background: #111a24; }
+.proposal-card:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.proposal-card.selected { border-left-color: var(--blue); background: #131d29; }
+.proposal-card-row { display: flex; align-items: center; gap: 8px; }
+.proposal-card-row .relative-age { margin-left: auto; font-size: 12px; }
+.proposal-card-title { font-weight: 650; line-height: 1.35; }
+.proposal-card-reason { font-size: 12px; font-style: italic; }
+.workflow-state-pill { color: var(--muted); font-size: 12px; }
+.diff-stat { font-size: 12px; color: var(--muted); }
+.severity-badge { font-size: 11px; margin-left: auto; }
+
+.proposal-detail-pane {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel-glass);
+  padding: 16px;
+}
+.proposal-detail-header h2 { margin: 0 0 8px; font-size: 18px; }
+.confidence { margin-top: 10px; display: flex; gap: 8px; align-items: baseline; font-size: 13px; }
+
+.diff-block { margin-top: 16px; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.diff-block-header {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 12px;
+  background: #0e151d;
+  border-bottom: 1px solid var(--line);
+}
+.diff-kind-label { font-size: 12px; font-weight: 700; }
+.diff-lines { background: #080d12; }
+.diff-line { display: flex; gap: 8px; padding: 1px 12px; white-space: pre-wrap; word-break: break-word; }
+.diff-gutter { flex: none; width: 1ch; color: var(--muted); user-select: none; }
+.diff-content { min-width: 0; }
+.diff-added { background: #10241a; color: #b7e7c9; }
+.diff-added .diff-gutter { color: var(--green); }
+.diff-removed { background: #27151a; color: #f0bdbb; }
+.diff-removed .diff-gutter { color: var(--red); }
+.diff-hunk { color: var(--muted); background: #0d141c; padding: 3px 12px; }
+
+.yaml-diff { margin: 0; padding: 8px 12px; background: #080d12; }
+.yaml-row { display: flex; gap: 12px; padding: 3px 0; align-items: baseline; }
+.yaml-row.changed .yaml-key { color: var(--blue); font-weight: 700; }
+.yaml-key { margin: 0; min-width: 12ch; color: var(--muted); }
+.yaml-values { margin: 0; display: flex; gap: 14px; flex-wrap: wrap; }
+.yaml-before { color: var(--red); }
+.yaml-after { color: var(--green); }
+
+.evidence-cluster, .revision-history, .rejection-reason { margin-top: 18px; }
+.evidence-cluster h3, .revision-history h3, .rejection-reason h3 { font-size: 13px; margin: 0 0 8px; }
+.evidence-entry { padding: 8px 0; border-top: 1px solid var(--line); font-size: 13px; }
+.evidence-tickets { margin-top: 6px; }
+.evidence-tickets a { color: var(--blue); font-size: 12px; }
+.revision-history ol { margin: 0; padding-left: 18px; }
+.revision-history li { margin-bottom: 8px; font-size: 13px; }
+.revision-history li span { font-size: 11px; }
+
+.defer-presets { display: flex; align-items: center; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
+
+.action-bar {
+  display: flex;
+  gap: 8px;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.action-bar[data-sticky="true"] {
+  position: sticky;
+  bottom: 0;
+  background: var(--panel-glass);
+  backdrop-filter: blur(6px);
+}
+.action-bar .primary { border-color: #315b43; background: #102019; color: var(--green); }
+.action-bar .danger { border-color: #72413f; background: #271514; color: var(--red); }
+
+.proposal-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(4, 7, 10, 0.66);
+  z-index: 20;
+}
+.proposal-modal {
+  width: min(520px, calc(100vw - 32px));
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 18px;
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.45);
+}
+.proposal-modal-title { margin: 0 0 12px; font-size: 16px; }
+.proposal-modal-field { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; font-size: 13px; }
+.proposal-modal-field textarea {
+  width: 100%;
+  resize: vertical;
+  background: #0b1119;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--text);
+  font: inherit;
+  padding: 8px 10px;
+}
+.proposal-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.proposal-modal-actions .primary { border-color: #315b43; background: #102019; color: var(--green); }
+.proposal-modal-actions .danger { border-color: #72413f; background: #271514; color: var(--red); }
+.quick-picks { display: flex; flex-wrap: wrap; gap: 6px; }
+.quick-picks button { font-size: 12px; padding: 5px 10px; border-radius: 999px; }
+
+.proposal-toast {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 11px 15px;
+  border: 1px solid #315b43;
+  border-radius: 12px;
+  background: #102019;
+  color: var(--green);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.35);
+  z-index: 30;
+}
+.proposal-form-error { margin-top: 10px; color: var(--red); font-size: 12px; }

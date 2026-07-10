@@ -23,6 +23,7 @@ import { createLogger, componentLogger } from "./logger.js";
 import { getAccessToken } from "./agents.js";
 import { loadWorkflowDefById, getWorkflowId, getCurrentState } from "./workflow-gate.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
+import { notify } from "./alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(), "routing-guard");
 
@@ -35,6 +36,14 @@ export interface RoleGuardResult {
   reason?: string;
   /** Legal target body IDs when blocked and there is a singleton legal target. */
   correctedTo?: string;
+  /** All legal body IDs for the state's owner_role when blocked. */
+  legalBodies?: string[];
+  /**
+   * AI-2044: true when the dispatch was blocked but the ticket's current
+   * delegate fills the owner_role (or could not be verified), so the guard
+   * left delegate/assignee untouched and posted nothing.
+   */
+  delegatePreserved?: boolean;
 }
 
 // ── Sync advisory helper (kept for tests / callers that only have labels) ───
@@ -178,6 +187,7 @@ export async function checkRoleGuardEnforced(
   const result: RoleGuardResult = {
     blocked: true,
     reason,
+    legalBodies,
   };
 
   // Surface the correction target so the caller can update the delegate.
@@ -191,16 +201,26 @@ export async function checkRoleGuardEnforced(
 // ── Public dispatch-guard (replaces checkRoleGuardAndWarn) ────────────────
 
 /**
- * Run the enforcement-mode role-guard. When a violation is detected:
- *   1. Post a blocking comment on the ticket.
- *   2. Attempt to correct the delegate.
- *      - Singleton legal target: update the delegate to that body.
- *      - Multiple legal targets: clear the delegate and flag for human routing.
+ * Run the enforcement-mode role-guard. When a violation is detected the guard
+ * first checks who currently holds the ticket (AI-2044):
+ *
+ *   - Current delegate fills the owner_role (or cannot be verified): block
+ *     delivery ONLY. No comment, no mutation — a blocked dispatch (e.g. a
+ *     comment @-mentioning a non-role agent) must never evict a legal,
+ *     in-flight delegate. This is the AI-2040 failure mode.
+ *   - No delegate, or a delegate that verifiably does not fill the role:
+ *     post a blocking comment, then correct — singleton legal target: update
+ *     the delegate to that body; multiple legal targets: clear (if set) and
+ *     raise a loud alert for manual routing.
+ *
  * Returns the guard result; callers must check `result.blocked` and skip
  * delivery when true.
  *
- * Auth strategy (same as before): prefer the target agent's own token, then
- * fall back to the global LINEAR_OAUTH_TOKEN / LINEAR_API_KEY env vars.
+ * Auth strategy (AI-2044): prefer the connector's own service token so
+ * guard-issued writes are never attributed to an agent that took no action
+ * (the 05:54:11Z delegate-null on AI-2040 was recorded under the blocked
+ * target's OAuth token, producing a false audit trail). The blocked target's
+ * token is a last resort.
  */
 /**
  * Resolver that maps a body name (e.g. "igor") to its Linear user ID.
@@ -222,11 +242,11 @@ export async function checkRoleGuardAndBlock(
     return result;
   }
 
-  // Resolve auth token.
+  // Resolve auth token — connector service token first (see docstring).
   const rawToken =
-    getAccessToken(targetAgentId) ??
     process.env.LINEAR_OAUTH_TOKEN ??
-    process.env.LINEAR_API_KEY;
+    process.env.LINEAR_API_KEY ??
+    getAccessToken(targetAgentId);
   if (!rawToken) {
     log.warn(`routing-guard: no token available to post blocking comment for ${issueIdentifier}`);
     return result;
@@ -240,13 +260,53 @@ export async function checkRoleGuardAndBlock(
     return result;
   }
 
+  // AI-2044: the enforcement check answers "is the dispatch TARGET legal for
+  // this state?" — not "is the current DELEGATE legal?". Read the current
+  // delegate before any mutation, and only correct/clear when the delegate
+  // itself is verifiably absent or illegal.
+  const delegateRead = await fetchCurrentDelegate(internalId, authHeader);
+  if (!delegateRead.ok) {
+    // Cannot see who holds the ticket — mutating blind risks evicting a legal
+    // in-flight delegate. Block delivery only.
+    result.delegatePreserved = true;
+    log.warn(`routing-guard: delegate read failed for ${issueIdentifier} — blocking delivery only, no correction`);
+    return result;
+  }
+  const currentDelegateId = delegateRead.delegateId;
+
+  if (currentDelegateId) {
+    const legalIds = delegateLinearUserIdResolver
+      ? (result.legalBodies ?? [])
+          .map((b) => delegateLinearUserIdResolver(b))
+          .filter((id): id is string => id !== null)
+      : [];
+    if (legalIds.length === 0) {
+      // No way to verify the current delegate's legality — preserve it.
+      result.delegatePreserved = true;
+      log.warn(`routing-guard: dispatch to ${targetAgentId} blocked for ${issueIdentifier}; current delegate could not be verified — left untouched`);
+      return result;
+    }
+    if (legalIds.includes(currentDelegateId)) {
+      // The ticket is already held by a legal body. The blocked dispatch was
+      // an artifact (e.g. body-mention in a third-party comment) — silently
+      // skip delivery and leave the delegate alone.
+      result.delegatePreserved = true;
+      log.info(`routing-guard: dispatch to ${targetAgentId} blocked for ${issueIdentifier}; current delegate fills '${result.legalBodies?.join(", ")}' role set — left untouched`);
+      return result;
+    }
+  }
+
+  // From here the current delegate is verifiably absent or illegal.
+  const correctionNote = result.correctedTo
+    ? `Delegate has been automatically corrected to **${result.correctedTo}**.`
+    : currentDelegateId
+      ? `Delegate did not fill the required role and has been cleared — manual routing required.`
+      : `Ticket has no delegate — manual routing required.`;
+
   // 1. Post blocking comment.
-  await postBlockingComment(internalId, targetAgentId, issueIdentifier, result, authHeader);
+  await postBlockingComment(internalId, targetAgentId, issueIdentifier, result, correctionNote, authHeader);
 
   // 2. Correct the delegate.
-  // If a singleton correctedTo is set, the caller (webhook) should resolve the
-  // body's linearUserId and call updateDelegateForIssue; we expose that helper.
-  // For the no-token path we skip correction here; the caller must handle it.
   if (result.correctedTo && delegateLinearUserIdResolver) {
     const newDelegateLinearId = delegateLinearUserIdResolver(result.correctedTo);
     if (newDelegateLinearId) {
@@ -260,14 +320,28 @@ export async function checkRoleGuardAndBlock(
       log.warn(`routing-guard: could not resolve Linear user ID for corrected target '${result.correctedTo}' — skipping delegate update`);
     }
   } else if (!result.correctedTo) {
-    // Multiple legal targets — clear the delegate so the ticket surfaces for
-    // manual routing, rather than leaving it on the wrong body.
-    const cleared = await clearDelegate(internalId, authHeader);
-    if (cleared) {
-      log.info(`routing-guard: delegate cleared for ${issueIdentifier} (multiple legal targets; requires manual routing)`);
-    } else {
-      log.warn(`routing-guard: delegate clear failed for ${issueIdentifier}`);
+    if (currentDelegateId) {
+      // Multiple legal targets — clear the illegal delegate so the ticket
+      // surfaces for manual routing, rather than leaving it on the wrong body.
+      const cleared = await clearDelegate(internalId, authHeader);
+      if (cleared) {
+        log.info(`routing-guard: delegate cleared for ${issueIdentifier} (illegal delegate; multiple legal targets; requires manual routing)`);
+      } else {
+        log.warn(`routing-guard: delegate clear failed for ${issueIdentifier}`);
+      }
     }
+    // A governed ticket with no (remaining) delegate in a working state is
+    // exactly the orphaned shape AI-2040 exposed: nothing re-wakes the ticket
+    // on its own. Raise a loud signal instead of failing silently (AI-2044).
+    notify({
+      severity: "warning",
+      source: "routing-guard",
+      title: currentDelegateId
+        ? `illegal delegate cleared on governed ticket (multiple legal targets) — manual routing required`
+        : `governed ticket has no delegate in a working state — dispatch to ${targetAgentId} blocked, manual routing required`,
+      agent: targetAgentId,
+      ticket: issueIdentifier,
+    });
   }
 
   return result;
@@ -315,12 +389,9 @@ async function postBlockingComment(
   illegalTarget: string,
   issueIdentifier: string,
   result: RoleGuardResult,
+  correctionNote: string,
   authHeader: string,
 ): Promise<void> {
-  const correctionNote = result.correctedTo
-    ? `Delegate has been automatically corrected to **${result.correctedTo}**.`
-    : `Delegate has been cleared — manual routing required.`;
-
   const body =
     `[Connector] Dispatch blocked: illegal routing target detected on **${issueIdentifier}**.\n\n` +
     `**Illegal target:** ${illegalTarget}\n` +
@@ -350,16 +421,38 @@ async function postBlockingComment(
   }
 }
 
+/**
+ * Read the issue's current delegate. `ok: false` means the read itself failed
+ * (network/API error) and the caller must not mutate based on the result.
+ */
+async function fetchCurrentDelegate(
+  issueId: string,
+  authHeader: string,
+): Promise<{ ok: boolean; delegateId: string | null }> {
+  const query = `query CurrentDelegate($id: String!) { issue(id: $id) { delegate { id } } }`;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: authHeader },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    type Resp = { data?: { issue?: { delegate?: { id: string } | null } | null }; errors?: unknown[] };
+    const data = (await res.json()) as Resp;
+    if (!data.data?.issue) {
+      return { ok: false, delegateId: null };
+    }
+    return { ok: true, delegateId: data.data.issue.delegate?.id ?? null };
+  } catch (err) {
+    log.error(`routing-guard: delegate read failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+    return { ok: false, delegateId: null };
+  }
+}
+
 async function updateDelegate(
   issueId: string,
   delegateLinearUserId: string,
   authHeader: string,
 ): Promise<boolean> {
-  const mutation = `
-    mutation UpdateDelegate($issueId: String!, $delegateId: String!) {
-      issueUpdate(id: $issueId, input: { dueDate: null }) { success }
-    }
-  `;
   // Linear uses `subscriberIds` for delegate-adjacent fields, but the actual
   // delegate is set via the undocumented `delegateId` on issueUpdate.
   const delegateMutation = `

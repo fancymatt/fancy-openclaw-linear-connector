@@ -32,7 +32,7 @@ import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
-import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
+import type { ObservationStore } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { MutationAuditStore, MutationAuditInput, ChangeType } from "./store/mutation-audit-store.js";
@@ -880,13 +880,19 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
 
         let transitionResult: TransitionApplyResult | null = null;
         try {
+          // AI-2036: build the feedback payload for every feedback-carrying intent,
+          // not just the ones arriving with X-Openclaw-Feedback-Category. No client
+          // sends that header, so gating on it meant `feedback` was always undefined
+          // and the observation write in workflow-gate never ran. The headers are now
+          // hints the write path prefers when present; the comment body and the
+          // implementer store cover their absence.
           let feedback: TransitionFeedback | undefined;
-          if (feedbackCategoryHeader && (effectiveIntent === "request-changes" || effectiveIntent === "reject" || effectiveIntent === "ac-fail")) {
-            const fromBodyHeader = (req.headers["x-openclaw-from-body"] as string | undefined) ?? null;
+          if (effectiveIntent === "request-changes" || effectiveIntent === "reject" || effectiveIntent === "ac-fail") {
             feedback = {
-              fromBody: fromBodyHeader,
-              reasonCode: feedbackCategoryHeader as ReasonCode,
+              fromBody: (req.headers["x-openclaw-from-body"] as string | undefined) ?? null,
+              reasonCode: feedbackCategoryHeader,
               freeText: extractCommentBody(body),
+              wakeId: (req.headers["x-openclaw-wake-id"] as string | undefined) ?? null,
             };
           }
           transitionResult = await applyStateTransition(effectiveIntent, issueId, authorization, {

@@ -12,6 +12,7 @@ import { NudgeStore } from "./store/nudge-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { ObservationStore } from "./store/observation-store.js";
+import { registerObservationWritePath, getObservationWritePathState } from "./store/observation-write-path.js";
 import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, type DeliveryConfig, DeliveryThrottle, DispatchDeliveryScheduler } from "./delivery/index.js";
@@ -157,6 +158,14 @@ export function createApp(options?: CreateAppOptions) {
   // Create stores early — needed before route registration.
   const observationStore = new ObservationStore(options?.observationsDbPath);
 
+  // AI-2036 AC1.5/AC1.6: register the observation write path here, on the same
+  // code path that hands the store to the proxy's transition options below.
+  // The registry entry — surfaced at /health.observations — therefore exists if
+  // and only if production bootstrap really wired it, which is the check that
+  // AI-1773/AI-1775 shipped without. `subscribed` records the second half: the
+  // transition handler in workflow-gate receives this exact instance.
+  registerObservationWritePath(observationStore, { subscribed: true });
+
   // Raw body capture for webhook signature validation.
   app.use(
     "/",
@@ -257,6 +266,13 @@ export function createApp(options?: CreateAppOptions) {
       // missing from this list means it shipped without bootstrap wiring
       // (the AI-1773/AI-1775 dead-code-in-prod failure mode).
       crons: getRegisteredCrons(),
+      // AI-2036 AC1.6: observation write-path liveness. `wired`/`subscribed` are
+      // true only because bootstrap called registerObservationWritePath() — never
+      // hardcoded — and `rows` is read from the live table, so a broken schema
+      // shows up as null. Visible at ac-validate without waiting for a reviewer
+      // to reject something. `skippedByReason` names every silent failure the
+      // old code swallowed.
+      observations: getObservationWritePathState(),
       // AI-1857 AC3: rescue-sweep last-run visibility — "did it run" without log access.
       rescueSweep: getRescueSweepState(),
       // AI-2009 AC7: first-action watchdog liveness — scheduled + armedCount,

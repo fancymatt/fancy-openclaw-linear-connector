@@ -123,12 +123,19 @@ export function extractAgentTarget(event: LinearEvent): { name: string; reason: 
 
   // 4. Body-based mention detection for Comment events
   if (!target && event.type === "Comment" && data?.body && typeof data.body === "string") {
-    const nameMap = buildNameMap();
-    const bodyMention = detectMentionInBody(data.body, nameMap);
-    if (bodyMention) {
-      target = nameMap[bodyMention];
-      reason = "body-mention";
-      log.info(`Routed via body mention: @${bodyMention} → ${target}`);
+    // AI-2044: connector-authored notices (routing-guard blocks, escalations)
+    // name agents in their body. They are informational — never treat them as
+    // routable mentions, or a guard comment can itself wake the agents it names.
+    if (data.body.startsWith("[Connector]")) {
+      log.info(`Skipping body-mention detection for connector-authored comment`);
+    } else {
+      const nameMap = buildNameMap();
+      const bodyMention = detectMentionInBody(data.body, nameMap);
+      if (bodyMention) {
+        target = nameMap[bodyMention];
+        reason = "body-mention";
+        log.info(`Routed via body mention: @${bodyMention} → ${target}`);
+      }
     }
   }
 

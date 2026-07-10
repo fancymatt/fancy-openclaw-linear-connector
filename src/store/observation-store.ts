@@ -19,14 +19,27 @@ import { componentLogger, createLogger } from "../logger.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "observation-store");
 
-/** The validated reason codes from the workflow definition. */
+/**
+ * The reason codes a row may carry.
+ *
+ * The first five mirror `feedback.category_enum` in the workflow definitions.
+ * `unclassified` is the connector's own fallback: a reviewer who rejects work
+ * without naming a category still produces a row (AI-2036). Losing the
+ * rejection entirely — the pre-AI-2036 behaviour — is strictly worse than
+ * recording one whose cause is unknown. Consumers that cluster by cause
+ * should filter it out explicitly rather than assume every row is categorized.
+ */
 export const REASON_CODES = [
   "missing-tests",
   "style",
   "scope-creep",
   "correctness",
   "ac-mismatch",
+  "unclassified",
 ] as const;
+
+/** The fallback used when no category is supplied by header or comment. */
+export const UNCLASSIFIED_REASON_CODE = "unclassified" satisfies (typeof REASON_CODES)[number];
 
 export type ReasonCode = (typeof REASON_CODES)[number];
 
@@ -46,6 +59,8 @@ export interface ObservationInput {
   reasonCode: ReasonCode;
   /** Optional free-text feedback from the reviewer. */
   freeText?: string | null;
+  /** Dispatch-cycle correlation id (AI-2036 AC1.4); null when unknown. */
+  wakeId?: string | null;
   /** ISO-8601 timestamp; defaults to now. */
   timestamp?: string;
 }
@@ -60,6 +75,7 @@ export interface Observation {
   reviewerBody: string;
   reasonCode: string;
   freeText: string | null;
+  wakeId: string | null;
   createdAt: string;
 }
 
@@ -142,6 +158,20 @@ export class ObservationStore {
       CREATE INDEX IF NOT EXISTS idx_observations_created_at
         ON observations(created_at);
     `);
+
+    // AI-2036 AC1.4: nullable wake_id, correlating a reviewer rejection with the
+    // dispatch cycle that produced it (operational_events.wake_id). Forward-only —
+    // rows written before this migration keep NULL. ALTER TABLE ADD COLUMN is the
+    // only additive path SQLite offers, and it throws if the column already
+    // exists, so guard on the live schema rather than swallowing every error.
+    if (!this.hasColumn("observations", "wake_id")) {
+      this.db.exec(`ALTER TABLE observations ADD COLUMN wake_id TEXT`);
+    }
+  }
+
+  private hasColumn(table: string, column: string): boolean {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    return cols.some((c) => c.name === column);
   }
 
   /**
@@ -163,8 +193,8 @@ export class ObservationStore {
   append(input: ObservationInput): number {
     const result = this.db
       .prepare(
-        `INSERT INTO observations (ticket, workflow, step, from_body, reviewer_body, reason_code, free_text, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO observations (ticket, workflow, step, from_body, reviewer_body, reason_code, free_text, wake_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.ticket,
@@ -174,6 +204,7 @@ export class ObservationStore {
         input.reviewerBody,
         input.reasonCode,
         input.freeText ?? null,
+        input.wakeId ?? null,
         input.timestamp ?? new Date().toISOString(),
       );
     const id = Number(result.lastInsertRowid);
@@ -224,7 +255,7 @@ export class ObservationStore {
 
     const rows = this.db
       .prepare(
-        `SELECT id, ticket, workflow, step, from_body, reviewer_body, reason_code, free_text, created_at
+        `SELECT id, ticket, workflow, step, from_body, reviewer_body, reason_code, free_text, wake_id, created_at
          FROM observations ${where}
          ORDER BY created_at DESC, id DESC
          LIMIT ?`,
@@ -232,6 +263,16 @@ export class ObservationStore {
       .all(...params, limit) as Record<string, unknown>[];
 
     return rows.map(rowToObservation);
+  }
+
+  /**
+   * Total row count. Cheap, and reachable only if the table really exists —
+   * so /health can prove the write path's storage is live (AI-2036 AC1.6)
+   * rather than merely that an object was constructed.
+   */
+  total(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) AS c FROM observations`).get() as { c: number };
+    return Number(row.c);
   }
 
   /**
@@ -445,6 +486,7 @@ function rowToObservation(row: Record<string, unknown>): Observation {
     reviewerBody: String(row.reviewer_body),
     reasonCode: String(row.reason_code),
     freeText: row.free_text === null || row.free_text === undefined ? null : String(row.free_text),
+    wakeId: row.wake_id === null || row.wake_id === undefined ? null : String(row.wake_id),
     createdAt: String(row.created_at),
   };
 }

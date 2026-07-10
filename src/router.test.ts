@@ -148,6 +148,14 @@ describe("extractAgentTarget", () => {
     expect(result?.reason).toBe("body-mention");
   });
 
+  it("does NOT route a [Connector]-authored comment via body-mention (AI-2044)", () => {
+    const event = makeIssueEvent({
+      commentBody: "[Connector] Dispatch blocked: illegal routing target detected on **AI-2040**. Legal target(s): @charles.",
+    });
+    const result = extractAgentTarget(event);
+    expect(result).toBeNull();
+  });
+
   it("returns null when no agents are configured", () => {
     const emptyFile = makeTempAgentsFile([]);
     process.env.AGENTS_FILE = emptyFile;
