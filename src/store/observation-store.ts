@@ -82,6 +82,8 @@ export interface MetricRow {
   count: number;
   fromBody?: string;
   exceedsThreshold: boolean;
+  /** Distinct tickets contributing to this group, sorted ascending. */
+  tickets: string[];
 }
 
 /** Summary statistics for the metric rollup. */
@@ -241,6 +243,7 @@ export class ObservationStore {
     step: string;
     reasonCode: string;
     count: number;
+    tickets: string[];
   }> {
     const clauses: string[] = [];
     const params: unknown[] = [];
@@ -270,7 +273,8 @@ export class ObservationStore {
 
     const rows = this.db
       .prepare(
-        `SELECT workflow, step, reason_code, COUNT(*) as cnt
+        `SELECT workflow, step, reason_code, COUNT(*) as cnt,
+                GROUP_CONCAT(DISTINCT ticket) as tickets
          FROM observations ${where}
          GROUP BY workflow, step, reason_code
          ORDER BY cnt DESC`,
@@ -280,6 +284,7 @@ export class ObservationStore {
       step: string;
       reason_code: string;
       cnt: number;
+      tickets: string | null;
     }>;
 
     return rows.map((r) => ({
@@ -287,6 +292,7 @@ export class ObservationStore {
       step: r.step,
       reasonCode: r.reason_code,
       count: r.cnt,
+      tickets: splitTickets(r.tickets),
     }));
   }
 
@@ -307,6 +313,7 @@ export class ObservationStore {
     reasonCode: string;
     fromBody: string;
     count: number;
+    tickets: string[];
   }> {
     const clauses: string[] = [];
     const params: unknown[] = [];
@@ -336,7 +343,8 @@ export class ObservationStore {
 
     const rows = this.db
       .prepare(
-        `SELECT workflow, step, reason_code, from_body, COUNT(*) as cnt
+        `SELECT workflow, step, reason_code, from_body, COUNT(*) as cnt,
+                GROUP_CONCAT(DISTINCT ticket) as tickets
          FROM observations ${where}
          GROUP BY workflow, step, reason_code, from_body
          ORDER BY cnt DESC`,
@@ -347,6 +355,7 @@ export class ObservationStore {
       reason_code: string;
       from_body: string;
       cnt: number;
+      tickets: string | null;
     }>;
 
     return rows.map((r) => ({
@@ -355,6 +364,7 @@ export class ObservationStore {
       reasonCode: r.reason_code,
       fromBody: r.from_body,
       count: r.cnt,
+      tickets: splitTickets(r.tickets),
     }));
   }
 
@@ -387,6 +397,7 @@ export class ObservationStore {
       ...("fromBody" in row ? { fromBody: (row as { fromBody: string }).fromBody } : {}),
       exceedsThreshold:
         threshold !== undefined && row.count >= threshold,
+      tickets: row.tickets,
     }));
 
     // Compute totals per workflow+step for summary
@@ -416,6 +427,12 @@ export class ObservationStore {
   close(): void {
     this.db.close();
   }
+}
+
+/** GROUP_CONCAT emits a comma-joined string, or NULL for an empty group. */
+function splitTickets(concatenated: string | null): string[] {
+  if (!concatenated) return [];
+  return concatenated.split(",").filter((t) => t.length > 0).sort();
 }
 
 function rowToObservation(row: Record<string, unknown>): Observation {
