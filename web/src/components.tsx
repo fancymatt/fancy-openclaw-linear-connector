@@ -42,17 +42,23 @@ const TABS: Array<[string, string]> = [
   ["/events", "Events"],
   ["/alerts", "Alerts"],
   ["/workflows", "Workflows"],
+  ["/proposals", "Proposals"],
   ["/dead-letters", "Dead Letters"],
   ["/stalls", "Stalls"],
   ["/webhooks", "Webhooks"],
 ];
 
-export function Tabs() {
+export function Tabs({ pendingProposals = 0 }: { pendingProposals?: number } = {}) {
   return (
     <nav className="tabs">
       {TABS.map(([to, label]) => (
         <NavLink key={to} to={to} end={to === "/"} className={({ isActive }) => (isActive ? "active" : "")}>
           {label}
+          {to === "/proposals" && pendingProposals > 0 && (
+            <span className="nav-pending-badge" data-testid="nav-pending-badge">
+              {pendingProposals}
+            </span>
+          )}
         </NavLink>
       ))}
     </nav>
