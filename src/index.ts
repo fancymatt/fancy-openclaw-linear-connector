@@ -12,6 +12,7 @@ import { NudgeStore } from "./store/nudge-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { ObservationStore } from "./store/observation-store.js";
+import { registerObservationWriter, getObservationLiveness } from "./observation-wiring.js";
 import { ManagingStateStore } from "./store/managing-state-store.js";
 import { AgentQueue } from "./queue/index.js";
 import { deliverToAgent, deliverMessageToAgent, type DeliveryConfig, DeliveryThrottle, DispatchDeliveryScheduler } from "./delivery/index.js";
@@ -155,7 +156,13 @@ export function createApp(options?: CreateAppOptions) {
   app.set("trust proxy", true);
 
   // Create stores early — needed before route registration.
-  const observationStore = new ObservationStore(options?.observationsDbPath);
+  //
+  // AI-2036 AC1.5: the observation write path is registered at bootstrap, and
+  // registration is the ONLY way to obtain the store the proxy writes through
+  // (see observation-wiring.ts). Drop this call and the write path goes dark
+  // loudly — /health.observations.registered flips false and every
+  // feedback-required transition emits a counted `store-unwired` skip.
+  const observationStore = registerObservationWriter(new ObservationStore(options?.observationsDbPath));
 
   // Raw body capture for webhook signature validation.
   app.use(
@@ -291,6 +298,12 @@ export function createApp(options?: CreateAppOptions) {
       // check ran on load (migratedCount 0 allowed), observable at ac-validate
       // without waiting for a def change.
       workflowMigrations: getDefStateMigrationLiveness(),
+      // AI-2036 AC1.6: observation write-path liveness. `registered` is set by
+      // the bootstrap call in createApp() — never a literal — and `rows` is read
+      // live from SQLite, so ac-validate can confirm the path is wired without
+      // waiting for a feedback-required transition to occur. `skipped` /
+      // `skipsByReason` make a silently-dead write path impossible (AC1.3).
+      observations: getObservationLiveness(),
     });
   });
 

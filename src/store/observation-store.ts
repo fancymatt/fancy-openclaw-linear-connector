@@ -30,6 +30,24 @@ export const REASON_CODES = [
 
 export type ReasonCode = (typeof REASON_CODES)[number];
 
+/**
+ * AI-2036: the reason code written when a feedback-required transition is
+ * observed but no reviewer-supplied category could be resolved.
+ *
+ * Before AI-2036 the write path skipped the row entirely in this case, which is
+ * how `observations` sat at 0 rows for its whole life. A row carrying
+ * (ticket, workflow, step, from_body) with an honest `unspecified` category is
+ * strictly more useful to the learning loop than no row at all — and every
+ * degraded write is counted, so the gap stays visible rather than invisible.
+ *
+ * It is deliberately NOT a member of REASON_CODES: `validateReasonCode` must
+ * keep rejecting it as a reviewer-supplied value.
+ */
+export const DEGRADED_REASON_CODE = "unspecified" as const;
+
+/** A reason code as persisted — a reviewer category, or the degraded sentinel. */
+export type StoredReasonCode = ReasonCode | typeof DEGRADED_REASON_CODE;
+
 /** Input for a new observation row. */
 export interface ObservationInput {
   /** Ticket identifier (e.g. "AI-1378"). */
@@ -42,10 +60,12 @@ export interface ObservationInput {
   fromBody: string;
   /** The body (agent) that gave the feedback (reviewer). */
   reviewerBody: string;
-  /** Validated category_enum value. */
-  reasonCode: ReasonCode;
+  /** Validated category_enum value, or the degraded sentinel. */
+  reasonCode: StoredReasonCode;
   /** Optional free-text feedback from the reviewer. */
   freeText?: string | null;
+  /** AI-2036: dispatch-cycle correlation id, when the transition carried one. */
+  wakeId?: string | null;
   /** ISO-8601 timestamp; defaults to now. */
   timestamp?: string;
 }
@@ -60,6 +80,7 @@ export interface Observation {
   reviewerBody: string;
   reasonCode: string;
   freeText: string | null;
+  wakeId: string | null;
   createdAt: string;
 }
 
@@ -101,6 +122,8 @@ export interface MetricRollup {
 
 export class ObservationStore {
   private db: Database.Database;
+  /** Absolute path of the backing SQLite file — surfaced at /health for liveness. */
+  readonly dbPath: string;
 
   constructor(dbPath?: string) {
     const resolvedPath =
@@ -111,9 +134,16 @@ export class ObservationStore {
       );
     const dir = path.dirname(resolvedPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    this.dbPath = resolvedPath;
     this.db = new Database(resolvedPath);
     this.db.pragma("journal_mode = WAL");
     this.migrate();
+  }
+
+  /** Total rows currently in the table. Used for /health liveness. */
+  count(): number {
+    const row = this.db.prepare(`SELECT COUNT(*) AS c FROM observations`).get() as { c: number };
+    return Number(row.c);
   }
 
   private migrate(): void {
@@ -140,6 +170,16 @@ export class ObservationStore {
       CREATE INDEX IF NOT EXISTS idx_observations_created_at
         ON observations(created_at);
     `);
+
+    // AI-2036 AC1.4: additive, nullable `wake_id` — no backfill. Existing rows
+    // keep NULL. Guarded so the ALTER is a no-op on an already-migrated file.
+    // The (workflow, step, reason_code) index above is untouched by the ALTER.
+    const columns = this.db
+      .prepare(`PRAGMA table_info(observations)`)
+      .all() as Array<{ name: string }>;
+    if (!columns.some((c) => c.name === "wake_id")) {
+      this.db.exec(`ALTER TABLE observations ADD COLUMN wake_id TEXT`);
+    }
   }
 
   /**
@@ -161,8 +201,8 @@ export class ObservationStore {
   append(input: ObservationInput): number {
     const result = this.db
       .prepare(
-        `INSERT INTO observations (ticket, workflow, step, from_body, reviewer_body, reason_code, free_text, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO observations (ticket, workflow, step, from_body, reviewer_body, reason_code, free_text, wake_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.ticket,
@@ -172,6 +212,7 @@ export class ObservationStore {
         input.reviewerBody,
         input.reasonCode,
         input.freeText ?? null,
+        input.wakeId ?? null,
         input.timestamp ?? new Date().toISOString(),
       );
     const id = Number(result.lastInsertRowid);
@@ -222,7 +263,7 @@ export class ObservationStore {
 
     const rows = this.db
       .prepare(
-        `SELECT id, ticket, workflow, step, from_body, reviewer_body, reason_code, free_text, created_at
+        `SELECT id, ticket, workflow, step, from_body, reviewer_body, reason_code, free_text, wake_id, created_at
          FROM observations ${where}
          ORDER BY created_at DESC, id DESC
          LIMIT ?`,
@@ -428,6 +469,7 @@ function rowToObservation(row: Record<string, unknown>): Observation {
     reviewerBody: String(row.reviewer_body),
     reasonCode: String(row.reason_code),
     freeText: row.free_text === null || row.free_text === undefined ? null : String(row.free_text),
+    wakeId: row.wake_id === null || row.wake_id === undefined ? null : String(row.wake_id),
     createdAt: String(row.created_at),
   };
 }

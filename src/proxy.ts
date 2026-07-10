@@ -32,7 +32,7 @@ import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
-import type { ObservationStore, ReasonCode } from "./store/observation-store.js";
+import type { ObservationStore } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { MutationAuditStore, MutationAuditInput, ChangeType } from "./store/mutation-audit-store.js";
@@ -397,6 +397,10 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   const intent = (req.headers["x-openclaw-linear-intent"] as string | undefined) ?? null;
   const target = (req.headers["x-openclaw-linear-target"] as string | undefined) ?? null;
   const feedbackCategoryHeader = (req.headers["x-openclaw-feedback-category"] as string | undefined) ?? null;
+  // AI-2036 AC1.4: correlation id for the dispatch cycle this transition answers.
+  // No released CLI sends it yet; observations.wake_id stays NULL until one does,
+  // which the AC permits (nullable, no backfill).
+  const wakeIdHeader = (req.headers["x-openclaw-wake-id"] as string | undefined) ?? null;
   const artifactRefHeader = (req.headers["x-openclaw-artifact-ref"] as string | undefined) ?? null;
   const cliVersion = (req.headers["x-openclaw-linear-cli-version"] as string | undefined) ?? null;
   // AI-1860 AC7: invoking session identity, recorded on governed proxy audit rows so
@@ -880,19 +884,23 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
 
         let transitionResult: TransitionApplyResult | null = null;
         try {
-          let feedback: TransitionFeedback | undefined;
-          if (feedbackCategoryHeader && (effectiveIntent === "request-changes" || effectiveIntent === "reject" || effectiveIntent === "ac-fail")) {
-            const fromBodyHeader = (req.headers["x-openclaw-from-body"] as string | undefined) ?? null;
-            feedback = {
-              fromBody: fromBodyHeader,
-              reasonCode: feedbackCategoryHeader as ReasonCode,
-              freeText: extractCommentBody(body),
-            };
-          }
+          // AI-2036: always hand the gate the raw feedback materials. Which
+          // transitions are feedback-required is a property of the workflow def,
+          // not of an intent allow-list here — the old header-and-intent guard
+          // meant `feedback` was never built (no CLI sends the category header),
+          // so the gate's observation block never ran and `observations` stayed
+          // empty in silence. Both headers remain the highest-priority source;
+          // the gate derives from_body and reason_code when they are absent.
+          const feedback: TransitionFeedback = {
+            fromBody: (req.headers["x-openclaw-from-body"] as string | undefined) ?? null,
+            reasonCode: feedbackCategoryHeader,
+            freeText: extractCommentBody(body),
+          };
           transitionResult = await applyStateTransition(effectiveIntent, issueId, authorization, {
             bodyId: agentId,
             observationStore: deps?.observationStore,
             feedback,
+            wakeId: wakeIdHeader,
             artifactRef: artifactRefHeader,
             sourceStateOverride,
             cliTarget: target ?? undefined,

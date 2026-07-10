@@ -40,7 +40,8 @@ import yaml from "js-yaml";
 import { componentLogger, createLogger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
 import { bodyHasCapability, resolveBodiesForRole } from "./escalation-gate.js";
-import { ObservationStore, type ReasonCode } from "./store/observation-store.js";
+import type { ObservationStore } from "./store/observation-store.js";
+import { recordFeedbackObservation } from "./observation-hook.js";
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout, validateFanoutSpec, type Finding } from "./fanout.js";
@@ -2448,10 +2449,20 @@ export async function buildStateTransitionReminder(
  *   escape     — terminal break-glass state; transitions to state:escape normally.
  */
 export interface TransitionFeedback {
-  /** The body (agent) that was the implementer / from-state owner. */
+  /**
+   * The implementer body, from the X-Openclaw-From-Body header.
+   * AI-2036: optional and normally absent — no released CLI sends this header.
+   * When absent the gate derives the implementer from the resolved delegate.
+   */
   fromBody?: string | null;
-  /** The reason code from X-Openclaw-Feedback-Category header. */
-  reasonCode: ReasonCode;
+  /**
+   * Reviewer-supplied category from the X-Openclaw-Feedback-Category header.
+   * AI-2036: optional and unvalidated here — no released CLI sends this header
+   * either. `recordFeedbackObservation` validates it against the transition's
+   * `category_enum`, falls back to a `Category:` directive in the comment body,
+   * and degrades to `unspecified` rather than dropping the row.
+   */
+  reasonCode?: string | null;
   /** Free-text feedback from the comment body. */
   freeText?: string | null;
 }
@@ -2463,6 +2474,8 @@ export interface ApplyStateTransitionOptions {
   observationStore?: ObservationStore;
   /** Structured feedback data for transitions with feedback.required. */
   feedback?: TransitionFeedback;
+  /** AI-2036 AC1.4: dispatch-cycle correlation id, persisted to observations.wake_id. */
+  wakeId?: string | null;
   /** §5.7 item 1 / C-2: artifact ref to bind at intake.accept (sprint-plan doc path). */
   artifactRef?: string | null;
   /**
@@ -3284,42 +3297,40 @@ export async function applyStateTransition(
     }
   }
 
-  // ── Phase 4 / P4-1: Record feedback observation ──────────────────────
-  // After a successful state transition, if the transition has a feedback
-  // block and feedback data was provided, write one append-only observation.
-  // Fail-open: observation errors are logged and never block the transition.
-  if (matchedTransition?.feedback?.required && options?.observationStore && options?.feedback) {
-    try {
-      const validatedReason = ObservationStore.validateReasonCode(options.feedback.reasonCode);
-      if (!validatedReason) {
-        log.warn(
-          `workflow-gate: P4-1: invalid reason code '${options.feedback.reasonCode}' — observation skipped for ${issueId}`,
-        );
-      } else if (!options.feedback.fromBody) {
-        // The implementer body ID must be provided (via X-Openclaw-From-Body header from
-        // the CLI). Without it, from_body == reviewer_body, which produces useless data
-        // for P4-2/3/4 aggregation. Skip the row rather than write garbage.
-        log.warn(
-          `workflow-gate: P4-1: fromBody not provided (X-Openclaw-From-Body header absent) — observation skipped for ${issueId}`,
-        );
-      } else {
-        options.observationStore.append({
-          ticket: issueId,
-          workflow: workflowId,
-          step: currentStateName ?? "(none)",
-          fromBody: options.feedback.fromBody,
-          reviewerBody: options.bodyId ?? "unknown",
-          reasonCode: validatedReason,
-          freeText: options.feedback.freeText ?? null,
-        });
-        log.info(
-          `workflow-gate: P4-1: observation recorded for ${issueId} reason=${validatedReason}`,
-        );
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.warn(`workflow-gate: P4-1: observation write failed for ${issueId}: ${msg}`);
-    }
+  // ── Phase 4 / P4-1 + AI-2036: Record feedback observation ────────────
+  // Every transition whose def carries `feedback.required` writes exactly one
+  // append-only observation row. The def is the sole gate — AI-2036: the old
+  // condition also required `options.feedback`, which the proxy only built when
+  // the (never-sent) X-Openclaw-Feedback-Category header was present. That extra
+  // clause is why the store held 0 rows and why the skip was silent.
+  //
+  // `from_body` is the implementer. For every feedback-required transition in the
+  // canonical defs the destination IS the worker state, so the delegate we just
+  // resolved for this transition is exactly that implementer — no header needed.
+  //
+  // Fail-open: observation errors are counted and logged, never block a transition.
+  if (matchedTransition?.feedback?.required) {
+    const delegateAgentName = resolvedDelegateId
+      ? getAgents().find((a) => a.linearUserId === resolvedDelegateId)?.name
+      : undefined;
+
+    recordFeedbackObservation({
+      issueId,
+      workflowId,
+      step: currentStateName ?? "(none)",
+      reviewerBody: options?.bodyId ?? "unknown",
+      allowedCategories: matchedTransition.feedback.category_enum,
+      rawReasonCode: options?.feedback?.reasonCode ?? null,
+      freeText: options?.feedback?.freeText ?? null,
+      fromBodyCandidates: [
+        options?.feedback?.fromBody,
+        delegateAgentName,
+        await getImplementer(issueId),
+      ],
+      wakeId: options?.wakeId ?? null,
+      observationStore: options?.observationStore,
+      operationalEventStore: options?.operationalEventStore,
+    });
   }
 
   // ── Phase 5 / B-3: Barrier (N→1) — event-driven parent auto-advance ─
