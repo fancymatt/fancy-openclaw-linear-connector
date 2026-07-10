@@ -1792,6 +1792,22 @@ export async function checkWorkflowRules(
 
   if (!match) {
     const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
+    // AI-2055: `needs-human` is not a transition in any workflow def, so a governed
+    // ticket rejects it here — before the mutation, so nothing is half-applied and no
+    // delegate is stranded. The bare "not a legal command" text left an agent that is
+    // genuinely blocked on a human with no idea what to do, and the delegate-clear guard
+    // (Layer 2) used to answer that question with `undelegate`, which it also blocks.
+    // Name the sanctioned exit: break-glass hands the ticket to the steward, who owns
+    // the human escalation from there.
+    if (intent === "needs-human") {
+      return (
+        `[Proxy] 'needs-human' is not a legal command in state '${currentState}' — governed tickets ` +
+        `escalate by exiting the workflow, not by clearing the delegate. ` +
+        `Run \`linear ${breakGlassCommand} ${issueId} --comment "<why you are blocked>"\` to hand it to the ` +
+        `workflow steward (re-enters at '${def.break_glass?.to ?? "intake"}'), who owns the human escalation. ` +
+        `Legal moves: ${legalMoves}.`
+      );
+    }
     return (
       `[Proxy] '${intent}' is not a legal command in state '${currentState}'. ` +
       `Legal moves: ${legalMoves}.`
@@ -2145,11 +2161,11 @@ export async function checkRawMutationInterception(
 
   // AI-1535: a *delegate-only* raw change (delegateId changed, no state/assignee/
   // label) gets delegate-only semantics rather than the blanket block below. The
-  // delegate-routing meta-commands (handoff-work, undelegate) write delegateId
-  // with no intent header, and they are LEGITIMATE for the current delegate —
-  // blanket-blocking them would break re-routing. But a non-delegate (e.g. a prior
-  // owner's lingering session, as in the AI-1531 dogfood) must not be able to yank
-  // the delegate. Mirror the intent-path delegate-only rule (lines ~912-925):
+  // delegate-routing meta-command `handoff-work` writes delegateId with no intent
+  // header, and it is LEGITIMATE for the current delegate — blanket-blocking it
+  // would break re-routing. But a non-delegate (e.g. a prior owner's lingering
+  // session, as in the AI-1531 dogfood) must not be able to yank the delegate.
+  // Mirror the intent-path delegate-only rule (lines ~912-925):
   //   - caller IS the current delegate            → allow (legitimate re-route)
   //   - caller is a known non-delegate            → block
   //   - caller unverifiable + ticket has delegate → block (AI-1400 B2 parity)
@@ -2159,13 +2175,40 @@ export async function checkRawMutationInterception(
   // delegate (delegateId → null). A null write is a self-clear, not a re-route
   // — it is the shape of the ungoverned direct-Done bypass (the `complete` verb
   // clears delegate + assignee + state). A non-null delegateId write remains
-  // legitimate (handoff-work, undelegate).
-  const inputDelegateId =
-    vars?.input && typeof vars.input === "object"
-      ? (vars.input as Record<string, unknown>).delegateId
-      : undefined;
+  // legitimate (handoff-work).
+  //
+  // AI-2055: `undelegate` is NOT a way past this guard and never was. It issues an
+  // intent-free {delegateId:null, assigneeId:null}, which lands here and is caught by
+  // the isClearingDelegate check below (deliberately ordered before delegateOnlyChange,
+  // per AI-1857). Because this whole function has already returned null for ad-hoc
+  // tickets (`!workflowId`) and unregistered defs (`!def`), every message emitted from
+  // here is on a governed ticket — where `undelegate` is always blocked. Recommending it
+  // sent agents in a circle (AI-2048, AI-2050). Name the two paths that do work instead.
+  // AI-2055: detect the null the same way `hasDelegateChange` detects the key —
+  // by deep-scanning the variables. The old check only read `variables.input
+  // .delegateId`, but GraphQL input-object *variables* can be named anything
+  // (`issueUpdate(id: $id, input: $patch)` is legal and `variables.input` is then
+  // undefined). That shape was seen as a delegate change but not as a *clear*, so it
+  // fell through to the delegate-only rule and the current delegate was allowed to
+  // self-clear — the exact bypass AI-1835 exists to stop. Input-object *keys* cannot
+  // be aliased, so a query-text `delegateId: null` literal is still caught by the regex.
+  const varsHaveNullField = (obj: unknown, key: string): boolean => {
+    if (!obj || typeof obj !== "object") return false;
+    if (Array.isArray(obj)) return obj.some((v) => varsHaveNullField(v, key));
+    const rec = obj as Record<string, unknown>;
+    if (key in rec && rec[key] === null) return true;
+    return Object.values(rec).some((v) => varsHaveNullField(v, key));
+  };
   const isClearingDelegate =
-    hasDelegateChange && (inputDelegateId === null || /\bdelegateId\s*:\s*null\b/.test(q));
+    hasDelegateChange && (varsHaveNullField(vars, "delegateId") || /\bdelegateId\s*:\s*null\b/.test(q));
+  const breakGlass = def.break_glass?.command ?? "escape";
+  const delegateClearRejection = () =>
+    `[Proxy] Direct delegate clear blocked: the current delegate may re-route ${issueId} ` +
+    `but may not null the delegate field directly. ` +
+    `On a governed ticket \`undelegate\` is blocked by this same guard — it is not the remedy. ` +
+    `To release ownership: \`linear ${breakGlass} ${issueId}\` (break-glass; exits the workflow to ` +
+    `'${def.break_glass?.to ?? "intake"}' under the steward), or \`linear handoff-work ${issueId} <agent>\` ` +
+    `to re-route to another agent.`;
   // AI-1857: Block delegate clears regardless of mutation shape. The combined
   // {delegateId:null, assigneeId:null} shape (partial semantic-verb application)
   // has hasAssigneeChange=true → delegateOnlyChange=false → bypasses the AI-1835 guard.
@@ -2173,10 +2216,7 @@ export async function checkRawMutationInterception(
   // Only applies when no state change is present (hasStateChange=true has its own message).
   if (isClearingDelegate && delegateId && !hasStateChange) {
     log.warn(`workflow-gate: raw delegate null (self-clear) block agent=${bodyId} ticket=${issueId}`);
-    return (
-      `[Proxy] Direct delegate clear blocked: the current delegate may re-route ${issueId} ` +
-      `but may not null the delegate field directly. Use undelegate or handoff-work to release ownership.`
-    );
+    return delegateClearRejection();
   }
   const delegateOnlyChange =
     hasDelegateChange && !hasStateChange && !hasAssigneeChange && !hasLabelChange;
@@ -2184,10 +2224,7 @@ export async function checkRawMutationInterception(
     if (callerLinearUserId && delegateId && callerLinearUserId === delegateId) {
       if (isClearingDelegate) {
         log.warn(`workflow-gate: raw delegate null (self-clear) block agent=${bodyId} ticket=${issueId}`);
-        return (
-          `[Proxy] Direct delegate clear blocked: the current delegate may re-route ${issueId} ` +
-          `but may not null the delegate field directly. Use undelegate or handoff-work to release ownership.`
-        );
+        return delegateClearRejection();
       }
       return null; // current delegate may re-route (non-null target only)
     }
