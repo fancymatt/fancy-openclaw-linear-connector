@@ -36,6 +36,7 @@ import type { ObservationStore, ReasonCode } from "./store/observation-store.js"
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { MutationAuditStore, MutationAuditInput, ChangeType } from "./store/mutation-audit-store.js";
+import { isTerminalState } from "./barrier.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
 import type { NoActivityDetector } from "./bag/no-activity-detector.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
@@ -906,6 +907,37 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           const msg = err instanceof Error ? err.message : String(err);
           log.error(`state-transition threw agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg}`);
           transitionResult = { status: "failed", code: "transition-exception", detail: msg };
+        }
+
+        // AI-2035 guard B (defense-in-depth): once a transition has successfully
+        // landed on a TERMINAL state, invalidate the AI-1860 command-auth
+        // snapshot(s) for this issue so a trailing same-turn mutation under the
+        // same sticky intent header can no longer present a stale pre-terminal
+        // snapshotState to B1 (checkWorkflowRules). Without this the snapshot
+        // keeps satisfying B1's terminal rejection for the full 10-min TTL,
+        // letting the lag-prone gate read reopen the ticket. Guard A (the
+        // getAppliedState-backed terminal re-entry guard in applyStateTransition)
+        // is the lag-proof primary stop; this restores B1's live terminal
+        // rejection at the gate. We drop every snapshot for the issue (all
+        // intents), since a reviewer's close may carry >1 intent and any lingering
+        // pre-terminal snapshot could re-authorize a re-entrant write.
+        if (
+          transitionResult?.status === "applied" &&
+          transitionResult.to &&
+          isTerminalState(transitionResult.to) &&
+          deps?.commandAuthSnapshots
+        ) {
+          const issueKeyFragment = issueId ? `:${issueId}:` : null;
+          let dropped = 0;
+          for (const key of [...deps.commandAuthSnapshots.keys()]) {
+            if (key === snapshotKey || (issueKeyFragment && key.includes(issueKeyFragment))) {
+              deps.commandAuthSnapshots.delete(key);
+              dropped++;
+            }
+          }
+          if (dropped > 0) {
+            log.info(`auth-snapshot-invalidated agent=${agentId} intent=${effectiveIntent}${ticketCtx} terminal=${transitionResult.to} dropped=${dropped}`);
+          }
         }
 
         // Layer 1 (AI-1387): proactive legal-verb re-injection at completion.

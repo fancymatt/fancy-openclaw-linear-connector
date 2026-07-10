@@ -52,7 +52,7 @@ import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record
 import { validateDefStateRemovals } from "./def-state-migration.js";
 import { readDefStateSnapshot, writeDefStateSnapshot } from "./store/def-state-snapshot-store.js";
 import { recordImplementer, getImplementer, removeImplementer } from "./implementer-store.js";
-import { recordAppliedState, clearAppliedState } from "./store/applied-state-store.js";
+import { recordAppliedState, clearAppliedState, getAppliedState } from "./store/applied-state-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { reposWithoutCiAutoDeploy, githubRepoFromUrl } from "./deploy-policy.js";
 import { notify } from "./alerts/alert-bus.js";
@@ -2615,6 +2615,42 @@ export async function applyStateTransition(
   const currentStateName = options?.sourceStateOverride ?? actualStateName;
 
   const breakGlassCommand = def.break_glass?.command ?? "escape";
+
+  // AI-2035: terminal re-entry guard (reciprocal of the setStateAtomic terminal
+  // guard at §"AI-1954 AC3"). A reviewer's semantic command can emit >1 mutation
+  // under one sticky intent header; the trailing same-turn mutation re-enters
+  // here ~seconds later, inside Linear's read-after-write lag window, so the live
+  // reads (actualStateName) and the proxy's captured sourceStateOverride BOTH
+  // still show the pre-terminal state — and would match a forward edge that
+  // silently overwrites the just-applied terminal state (the observed Done→Doing
+  // bounce on AI-2027). getAppliedState is the authoritative destination that
+  // write 1 recorded via recordAppliedState; it is lag-proof, so prefer it as the
+  // true source. If that source is terminal, refuse the trailing write LOUDLY.
+  // break-glass (escape) is exempt: it is the recovery path OUT of a terminal or
+  // corrupted state and must stay legal.
+  if (intent !== breakGlassCommand) {
+    const resolvedSource = getAppliedState(issue.identifier) ?? currentStateName;
+    const resolvedSourceNode = resolvedSource
+      ? def.states.find((s) => s.id === resolvedSource)
+      : undefined;
+    if (resolvedSourceNode?.kind === "terminal") {
+      log.warn(
+        `workflow-gate: AI-2035: terminal re-entry guard — refusing '${intent}' on ${issueId}; ` +
+          `applied source state '${resolvedSource}' is terminal` +
+          (resolvedSource !== currentStateName ? ` (live read lagged at '${currentStateName ?? "unknown"}')` : ""),
+      );
+      return {
+        status: "blocked",
+        code: "terminal-reentry-guard",
+        detail:
+          `'${intent}' refused: ${issueId} is already at terminal state '${resolvedSource}'. ` +
+          `This is a trailing same-turn mutation inside the read-after-write lag window; the terminal ` +
+          `disposition stands and must not be reopened by a re-entrant write.`,
+        from: resolvedSource,
+      };
+    }
+  }
+
   let toStateName: string;
   let matchedTransition: WorkflowTransition | undefined;
 
