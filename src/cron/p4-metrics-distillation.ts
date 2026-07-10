@@ -11,6 +11,7 @@
  */
 
 import type { ObservationStore } from "../store/observation-store.js";
+import { DEGRADED_REASON_CODE } from "../store/observation-store.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { registerCron, formatIntervalMs } from "./registry.js";
 
@@ -127,9 +128,20 @@ export async function runDistillation(observationStore: ObservationStore, thresh
     const metrics = observationStore.metrics({ threshold: actualThreshold });
     const crossedPatterns = metrics.items.filter((item) => item.exceedsThreshold);
 
-    log.info(`[P4-3] Found ${crossedPatterns.length} crossed pattern(s)`);
+    // AI-2036: `unspecified` means the reviewer named no category. Such rows
+    // cluster like any other, but there is no lesson to distil from "we don't
+    // know why" — a proposal reading `unspecified rejected 3× — add checklist`
+    // is noise. Count them, surface them, never propose from them. Before
+    // AI-2036 the table was empty, so this path never ran against real data.
+    const proposable = crossedPatterns.filter((item) => item.reasonCode !== DEGRADED_REASON_CODE);
+    const uncategorized = crossedPatterns.length - proposable.length;
 
-    const candidates = crossedPatterns.slice(0, MAX_PROPOSALS_PER_RUN).map((item) => ({
+    log.info(
+      `[P4-3] Found ${crossedPatterns.length} crossed pattern(s)` +
+        (uncategorized > 0 ? ` — ${uncategorized} uncategorized, not proposable` : ""),
+    );
+
+    const candidates = proposable.slice(0, MAX_PROPOSALS_PER_RUN).map((item) => ({
       workflow: item.workflow,
       step: item.step,
       reasonCode: item.reasonCode,

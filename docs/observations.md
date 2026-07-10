@@ -62,13 +62,47 @@ category is missing, and every degraded write is counted so the gap stays visibl
 ## Why this was rewritten (AI-2036)
 
 The table held **zero rows** from the day it shipped (AI-1378) until AI-2036.
-The proxy only built a feedback payload when `X-Openclaw-Feedback-Category` was
-present; no client ever sent that header, so the gate's observation block
-short-circuited — writing no row, and logging nothing. The `X-Openclaw-From-Body`
-check inside that block was a second, latent break that never even executed.
 
-The fix removed the dependency on clients telling the connector what it already
-knows, and made every outcome countable.
+The write was guarded by four preconditions. The spike (AI-2027) suspected the
+`X-Openclaw-From-Body` header. It was not the culprit — it was not even reachable.
+Each precondition was checked independently against the commit production was
+running at diagnosis time (`98cb64e`, confirmed via `GET /health`):
+
+| # | Precondition | Verdict | Evidence |
+|---|--------------|---------|----------|
+| a | `feedback.required` on the transition | **satisfied** | `canonical-dev-impl.yaml` sets `feedback.required: true` with a `category_enum` on `request-changes` / `reject` / `ac-fail` |
+| b | `observationStore` wiring | **satisfied** | `index.ts` constructed the store and passed it into the `/proxy/graphql` deps |
+| c | `feedback` payload present | **ROOT CAUSE** | `proxy.ts` built the payload only `if (feedbackCategoryHeader && ...)`. No client sends `X-Openclaw-Feedback-Category` — zero matches across the CLI's `src/`, `dist/`, and `scripts/`. So `options.feedback` was always `undefined` |
+| d | `X-Openclaw-From-Body` header | latent, **unreachable** | Also never sent by any client — but its check lived *inside* the block that (c) short-circuited, so it never executed |
+
+The decisive detail is the shape of the guard:
+
+```ts
+if (matchedTransition?.feedback?.required && options?.observationStore && options?.feedback)
+```
+
+Preconditions (a)–(c) sat in the `if` condition itself, so failing (c) skipped the
+block with **no row, no counter, and no log line**. Only (d) and an invalid reason
+code had `log.warn` calls — and both were inside the block, downstream of (c).
+
+That yields a falsifiable prediction, and it is the evidence AC1.1 asks for: the
+warn `fromBody not provided (X-Openclaw-From-Body header absent)` was emitted
+**zero times** in production. Had (d) been the culprit, that warn would fire on
+every review transition while the store stayed empty. The simultaneous absence of
+the warn *and* of any rows is consistent only with (c).
+
+Fixing (d) alone — shipping a CLI that sends `X-Openclaw-From-Body` — would have
+left the table at zero rows, because (c) short-circuits first.
+
+The fix removes the dependency on clients telling the connector what it already
+knows, and makes every outcome countable.
+
+### Consequence for P4-3
+
+The table filling up wakes the hourly distillation cron, which had never run
+against real data. Its threshold is 3, so the first cluster to cross would be
+`unspecified` — proposing "unspecified rejected 3× — add checklist". Degraded rows
+are therefore counted and reported as crossed, but never proposed from.
 
 ## Liveness and telemetry
 
