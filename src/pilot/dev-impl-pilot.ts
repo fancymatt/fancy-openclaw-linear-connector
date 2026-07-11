@@ -1,10 +1,10 @@
 /**
  * AI-2041 (P4-C6) — Dev-impl learning-loop pilot harness.
  *
- * ⚠️ SCAFFOLD ONLY — written by the test-author (tdd) to pin the contract the
- * failing AI-2041 tests grade against. Every function throws `NotImplemented`;
- * the implementer (Igor) replaces the bodies to turn the red bar green. Do NOT
- * treat this as a real implementation.
+ * Implements the contract the test-author (tdd) pinned in the AI-2041 suite.
+ * The exported signatures below are the graded seam the tests bind to; the
+ * bodies drive the loop on real infrastructure by composing the C1–C5 primitives
+ * (observation store, deterministic generation engine, C4 apply pipeline).
  *
  * The pilot drives the full loop on real infrastructure under the C6 elevated-
  * stakes guarantees:
