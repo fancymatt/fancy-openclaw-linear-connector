@@ -17,6 +17,7 @@
  */
 
 import { runRescueSweep } from "../rescue-sweep.js";
+import type { OperationalEventStore } from "../store/operational-event-store.js";
 import { loadWorkflowRegistry } from "../workflow-gate.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { registerCron, formatIntervalMs } from "./registry.js";
@@ -51,8 +52,12 @@ const DEFAULT_INTERVAL_MS = parseIntervalMs(process.env.RESCUE_SWEEP_INTERVAL ??
 /**
  * Run one sweep iteration: resolve auth token, load registry, execute, record.
  * Extracted so it can be called both on-interval and on-first-run.
+ *
+ * AI-2093: the operationalEventStore is threaded through to runRescueSweep so
+ * per-ticket rescue:* outcomes reach operational-events.db and are queryable.
+ * Absent store → events are silently skipped (unchanged prior behaviour).
  */
-async function runSweepIteration(): Promise<void> {
+async function runSweepIteration(operationalEventStore?: OperationalEventStore): Promise<void> {
   try {
     // AI-1970: canonical auth pattern — getAccessToken("ai") ?? env, matching every sibling.
     const authToken =
@@ -64,7 +69,7 @@ async function runSweepIteration(): Promise<void> {
       return;
     }
     const workflowRegistry = await loadWorkflowRegistry();
-    const result = await runRescueSweep({ authToken, workflowRegistry });
+    const result = await runRescueSweep({ authToken, workflowRegistry, operationalEventStore });
     recordRescueSweepRun(result);
     if (result.rescued > 0 || result.errors.length > 0) {
       log.info(
@@ -87,19 +92,19 @@ async function runSweepIteration(): Promise<void> {
  * (also unref'd) so the sweep doesn't wait a full interval before initial
  * execution.
  */
-export function registerRescueSweepCron(): void {
+export function registerRescueSweepCron(operationalEventStore?: OperationalEventStore): void {
   const intervalMs = DEFAULT_INTERVAL_MS;
   registerCron("rescue-sweep", `every ${formatIntervalMs(intervalMs)}`);
 
   // AI-1970: first run shortly after startup (unref'd).
   const firstRunTimer = setTimeout(() => {
-    void runSweepIteration();
+    void runSweepIteration(operationalEventStore);
   }, 0);
   firstRunTimer.unref();
 
   // Recurring interval.
   const timer = setInterval(() => {
-    void runSweepIteration();
+    void runSweepIteration(operationalEventStore);
   }, intervalMs);
   timer.unref();
 

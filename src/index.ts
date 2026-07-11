@@ -1126,7 +1126,8 @@ if (isEntryPoint) {
   // context reads real step-guidance surfaces from the instance-config root.
   registerDistillationCron(observationStore, proposalStore, createProdGenerationContext());
   // AI-1566: periodic rescue sweep — detect and repair dormant/malformed wf:* tickets
-  registerRescueSweepCron();
+  // AI-2093: pass the operationalEventStore so rescue:* outcomes are persisted + queryable.
+  registerRescueSweepCron(operationalEventStore);
 
   // AI-1775: periodic reconciliation sweep — heal wf:* tickets that never
   // enrolled (dropped Issue-update webhook). Safety net for the bootstrap path.

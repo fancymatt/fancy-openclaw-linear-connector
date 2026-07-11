@@ -22,6 +22,7 @@ import yaml from "js-yaml";
 import { createLogger, componentLogger } from "./logger.js";
 import { defaultCapabilityPolicyPath } from "./instance-config.js";
 import { getLinearUserIdForAgent } from "./agents.js";
+import type { OperationalEventInput } from "./store/operational-event-store.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "rescue-sweep");
 
@@ -73,8 +74,9 @@ export interface RescueSweepOptions {
   workflowRegistry?: Map<string, WorkflowDef>;
   /** Capability policy path override for tests */
   capabilityPolicyPath?: string;
-  /** Operational event store for emitting rescue events (optional; skipped if absent) */
-  operationalEventStore?: { record(event: { outcome: string; type?: string; detail?: unknown }): unknown };
+  /** Operational event store for emitting rescue events (optional; skipped if absent).
+   * Structural subset of OperationalEventStore so tests can inject a lightweight mock. */
+  operationalEventStore?: { append(event: OperationalEventInput): unknown };
   /** Report issue identifier (e.g. "AI-1234") to post summary comment to */
   reportIssueIdentifier?: string;
   /**
@@ -465,8 +467,8 @@ export async function runRescueSweep(options: RescueSweepOptions): Promise<Rescu
 
     // Emit operational event for all outcomes — failed rescues are pillar-1 violations
     if (rescueAction.outcome === "rescued" || rescueAction.outcome === "ambiguous" || rescueAction.outcome === "failed") {
-      operationalEventStore?.record({
-        outcome: `rescue:${rescueAction.outcome}`,
+      operationalEventStore?.append({
+        outcome: `rescue:${rescueAction.outcome}` as OperationalEventInput["outcome"],
         type: "rescue",
         detail: {
           ticketId: ticket.id,

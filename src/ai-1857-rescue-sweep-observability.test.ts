@@ -232,7 +232,8 @@ describe("AI-1857 AC2b: failed rescue raises an alert via alert bus", () => {
     const { runRescueSweep } = await import("./rescue-sweep.js");
     const events: Array<{ outcome: string; type?: string; detail?: unknown }> = [];
     const eventStore = {
-      record(event: { outcome: string; type?: string; detail?: unknown }) {
+      // AI-2093: the store exposes .append (not .record); the sweep now conforms.
+      append(event: { outcome: string; type?: string; detail?: unknown }) {
         events.push(event);
       },
     };

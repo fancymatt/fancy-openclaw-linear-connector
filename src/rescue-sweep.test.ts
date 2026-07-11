@@ -71,11 +71,11 @@ const DEFAULT_ROLE_RESOLVER = makeRoleResolver({
   "host-deploy": ["grover"],
 });
 
-/** Minimal operational event recorder spy. */
+/** Minimal operational event recorder spy (AI-2093: store exposes .append, not .record). */
 function makeEventSpy() {
   const events: Array<{ outcome: string; type?: string; detail?: unknown }> = [];
   const store = {
-    record(event: { outcome: string; type?: string; detail?: unknown }) {
+    append(event: { outcome: string; type?: string; detail?: unknown }) {
       events.push(event);
     },
   };
