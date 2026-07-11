@@ -356,6 +356,55 @@ export interface CommandAuthSnapshot {
   expiresAt: number;
 }
 
+/**
+ * AI-2091 §8 (AI-2058) — pre-mutation compare-and-swap.
+ *
+ * A governed command authorizes a mutation against the delegate/state it
+ * snapshotted at command start. If another actor changes the delegate or
+ * advances the state mid-run, the trailing mutation must be re-evaluated against
+ * CURRENT state before it commits — not applied blindly against the stale
+ * snapshot (which would overwrite the new owner's decision). AI-2035 added a
+ * terminal re-entry guard for the specific Done→Doing bounce; this generalizes
+ * it to a CAS re-read before ANY mutation commits.
+ *
+ * Returns proceed=false when the delegate changed or the state advanced since
+ * the snapshot was taken; proceed=true only when the snapshot still matches the
+ * authoritative current state.
+ */
+export interface MutationCasInput {
+  agent: string;
+  ticketId: string;
+  snapshotDelegate: string | null;
+  snapshotState: string | null;
+  currentDelegate: string | null;
+  currentState: string | null;
+}
+
+export interface MutationCasDecision {
+  proceed: boolean;
+  reason: string | null;
+}
+
+export function assertMutationAgainstCurrentState(input: MutationCasInput): MutationCasDecision {
+  if (input.snapshotDelegate !== input.currentDelegate) {
+    return {
+      proceed: false,
+      reason:
+        `stale-snapshot: ${input.ticketId} delegate changed since ${input.agent} started ` +
+        `(snapshot=${input.snapshotDelegate ?? "none"} → current=${input.currentDelegate ?? "none"})`,
+    };
+  }
+  if (input.snapshotState !== input.currentState) {
+    return {
+      proceed: false,
+      reason:
+        `stale-snapshot: ${input.ticketId} state advanced since ${input.agent} started ` +
+        `(snapshot=${input.snapshotState ?? "none"} → current=${input.currentState ?? "none"})`,
+    };
+  }
+  return { proceed: true, reason: null };
+}
+
 export interface ProxyDeps {
   /** Optional observation store for recording feedback observations (P4-1). */
   observationStore?: ObservationStore;

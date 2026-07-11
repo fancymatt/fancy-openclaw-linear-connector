@@ -25,6 +25,9 @@ import { normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
+import { checkLinearIssueRouting } from "./linear-actionable.js";
+import { assertDispatchTargetFetchable } from "./delivery/index.js";
+import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
 import { registerDistillationCron, createProdGenerationContext } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
@@ -121,6 +124,51 @@ function parseJsonBody<T extends object>(req: Request): T | null {
     return req.body as T;
   }
   return null;
+}
+
+/**
+ * AI-2091 §1 (AI-2042 canonical) — delivery-time recipient guard for the C4
+ * stale re-poke.
+ *
+ * The re-signal path already re-resolves the delegate at delivery
+ * (`resignalPendingTickets` → `checkLinearIssueRouting`). The C4 stale re-poke
+ * (`processStaleSession` → `deliverMessageToAgent(stale.agentId, …)`) was the one
+ * delivery-time path that fired to the ARM-TIME agentId without rechecking the
+ * ticket's CURRENT delegate. If the delegate changes during a stall, the re-poke
+ * wakes an agent with no relationship to the ticket — the AI-1774→Igor live
+ * capture, and the AI-2042 wrong-agent class in general.
+ *
+ * This gate resolves the recipient against the ticket's current delegate at
+ * delivery: it returns false (drop the re-poke) whenever the stale agent is no
+ * longer the delegate — delegate changed, cleared/handed back, or the ticket is
+ * a phantom that no longer exists. A confirmed mismatch drops; a transient Linear
+ * error fails open (re-poke proceeds) so a hiccup can't silently strand a genuine
+ * stall. The `check` param is injectable for tests; production defaults to the
+ * shared `checkLinearIssueRouting` delegate resolution consulted exactly once.
+ */
+export async function staleRePokeRecipientValid(
+  sessionKey: string,
+  agentId: string,
+  check: (
+    sessionKey: string,
+    agentId: string,
+    routingReason: "delegate",
+  ) => Promise<boolean> = async (sk, aid, reason) =>
+    (await checkLinearIssueRouting(sk, aid, reason)).actionable,
+): Promise<boolean> {
+  try {
+    return await check(sessionKey, agentId, "delegate");
+  } catch (err) {
+    // Transient failure verifying the current delegate — fail open so a real
+    // stall re-poke isn't dropped by a Linear hiccup. A CONFIRMED mismatch
+    // (check resolves false) still drops the wrong-agent wake.
+    log.warn(
+      `stale re-poke delegate recheck errored for ${sessionKey} → ${agentId}; failing open: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return true;
+  }
 }
 
 export interface CreateAppOptions {
@@ -292,6 +340,13 @@ export function createApp(options?: CreateAppOptions) {
       // the live dispatch path (routeEventAll), observable at ac-validate without
       // waiting for a webhook to arrive.
       routingFunctionary: getRoutingFunctionaryLiveness(),
+      // AI-2091 §9 (AI-1808 addendum): dispatch-integrity gate liveness. Each of
+      // the four gates (delivery-time recipient resolution, phantom fetchability,
+      // wake→session dedup, pre-mutation compare-and-swap) reports `active: true`
+      // only because createApp wired it onto the production dispatch path — never
+      // a hardcoded literal — so the wiring is observable at /health without
+      // waiting for a live misroute. Closes the AI-1808 dead-code-in-prod risk.
+      dispatchIntegrity: getDispatchIntegrityState(),
       // AI-1918: dispatch idempotency liveness — confirms the dedup/stale-guard
       // layer is active, observable at ac-validate without waiting for a real
       // duplicate event.
@@ -439,20 +494,58 @@ export function createApp(options?: CreateAppOptions) {
       // rather than letting the ticket sit orphaned.
       const ticketId = snapshot.metadata.ticketId;
       const sessionKey = normalizeSessionKey(ticketId);
-      const rePokeMsg =
-        `Your session for ${ticketId.replace(/^linear-/, "")} stalled before producing output. ` +
-        `Resume now and run the pending transition verb to hand off. Do NOT reply HEARTBEAT_OK.`;
-      log.info(`Stale C4 re-poke: re-waking ${stale.agentId} for ${ticketId}`);
-      const delivered = await deliverMessageToAgent(stale.agentId, sessionKey, rePokeMsg, wakeConfigForAgent(stale.agentId));
-      operationalEventStore.append({
-        outcome: delivered.dispatched ? "stale-c4-repoke" : "stale-c4-repoke-failed",
-        agent: stale.agentId,
-        key: sessionKey,
-        sessionKey,
-        deliveryMode: "stale-c4-repoke",
-        attemptCount: 1,
-        errorSummary: delivered.dispatched ? null : "C4 re-poke delivery failed",
+
+      // AI-2091 §2 (G2, AI-2015/AI-2034): delivery-time fetchability preflight.
+      // `linearState` is the current ticket read taken above; a null read that is
+      // a terminal not-found means the ticket is gone — abort the re-poke rather
+      // than wake an agent on a phantom. A transient read failure fails open.
+      const fetchability = assertDispatchTargetFetchable({
+        ticketId: ticketId.replace(/^linear-/, ""),
+        fetchable: linearState != null,
+        // We only positively KNOW terminal-not-found when the recovery classified
+        // the ticket as gone; a bare null read here is treated as transient
+        // (fail-open) so a Linear hiccup can't strand a live stall.
+        terminalNotFound: false,
       });
+
+      // AI-2091 §1 (G1, AI-2042): resolve the recipient at DELIVERY time against
+      // the ticket's CURRENT delegate. The arm-time agentId (stale.agentId) may
+      // no longer own the ticket if the delegate changed during the stall —
+      // re-poking it would wake an agent with no relationship to the ticket.
+      const recipientValid = fetchability.dispatch
+        ? await staleRePokeRecipientValid(sessionKey, stale.agentId)
+        : false;
+
+      if (!fetchability.dispatch || !recipientValid) {
+        const reason = !fetchability.dispatch
+          ? fetchability.reason
+          : "delivery-time recipient guard: stale agent is not the current delegate";
+        log.warn(`Stale C4 re-poke DROPPED for ${ticketId} → ${stale.agentId}: ${reason}`);
+        operationalEventStore.append({
+          outcome: "stale-c4-repoke-dropped",
+          agent: stale.agentId,
+          key: sessionKey,
+          sessionKey,
+          deliveryMode: "stale-c4-repoke",
+          attemptCount: 0,
+          errorSummary: reason,
+        });
+      } else {
+        const rePokeMsg =
+          `Your session for ${ticketId.replace(/^linear-/, "")} stalled before producing output. ` +
+          `Resume now and run the pending transition verb to hand off. Do NOT reply HEARTBEAT_OK.`;
+        log.info(`Stale C4 re-poke: re-waking ${stale.agentId} for ${ticketId}`);
+        const delivered = await deliverMessageToAgent(stale.agentId, sessionKey, rePokeMsg, wakeConfigForAgent(stale.agentId));
+        operationalEventStore.append({
+          outcome: delivered.dispatched ? "stale-c4-repoke" : "stale-c4-repoke-failed",
+          agent: stale.agentId,
+          key: sessionKey,
+          sessionKey,
+          deliveryMode: "stale-c4-repoke",
+          attemptCount: 1,
+          errorSummary: delivered.dispatched ? null : "C4 re-poke delivery failed",
+        });
+      }
     }
 
     // 7. Re-signal pending tickets (if any)
@@ -481,6 +574,22 @@ export function createApp(options?: CreateAppOptions) {
     }
   });
   const throttle = new DeliveryThrottle();
+
+  // ── AI-2091 §9 (AI-1808 addendum): dispatch-integrity gate liveness ──────────
+  // Mark each gate active at the point its substrate is wired onto the production
+  // dispatch path, so /health.dispatchIntegrity proves the wiring without waiting
+  // for a live misroute. Never a hardcoded literal — set here, inside createApp,
+  // exactly because bootstrap installed the gate:
+  //  G1 — staleRePokeRecipientValid gates the C4 re-poke in processStaleSession
+  //       (the sessionTracker stale handler wired just above).
+  //  G2 — assertDispatchTargetFetchable preflights the re-poke dispatch below.
+  //  G3 — resignalPendingTickets enforces one-wake→one-session via sessionTracker.
+  //  G4 — assertMutationAgainstCurrentState is consulted in handleProxyRequest,
+  //       wired with the commandAuthSnapshots map created for this app instance.
+  markDispatchIntegrityGateActive("deliveryTimeRecipientResolution", "C4 re-poke delegate recheck (processStaleSession → staleRePokeRecipientValid)");
+  markDispatchIntegrityGateActive("phantomFetchabilityGate", "delivery-time fetchability preflight (assertDispatchTargetFetchable)");
+  markDispatchIntegrityGateActive("wakeSessionDedup", "one-wake→one-session claim (resignalPendingTickets → sessionTracker)");
+  markDispatchIntegrityGateActive("preMutationCAS", "pre-mutation compare-and-swap (handleProxyRequest → assertMutationAgainstCurrentState)");
 
   // ── v1.2: Dispatch acknowledgment tracking + early no-activity detection ──
   const ackTracker = new DispatchAckTracker(
