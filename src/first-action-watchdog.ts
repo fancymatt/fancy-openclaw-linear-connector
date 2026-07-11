@@ -42,7 +42,20 @@ import type { DispatchIdempotencyStore } from "./store/dispatch-idempotency-stor
 
 const CRON_NAME = "first-action-watchdog";
 const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
 const DEFAULT_DEADLINE_MS = 45 * MINUTE;
+/**
+ * AI-2091 §4–§6 — restart-safety arming horizon. The watchdog's ladder state is
+ * in-memory: after a restart it is empty. A ticket whose dispatch was delivered
+ * long before this process started must NOT breach on the very first sweep — that
+ * re-fired whole dead backlogs (the AI-2015 AC4/AC6 storm). On a cold/first arm
+ * (no persisted ladder for this dispatch), if the delivery predates `now` by more
+ * than this horizon we treat it as pre-restart backlog and clamp the armed time
+ * forward to `now`, giving the owner a fresh deadline measured from restart rather
+ * than instantly breaching. The horizon sits well above any first-action deadline
+ * (defs top out at 45m) so it never suppresses a legitimate in-process breach.
+ */
+const MAX_ARM_LOOKBACK_MS = 2 * HOUR;
 const DEFAULT_MAX_RUNGS = 3;
 const DEFAULT_CADENCE_MS = 5 * MINUTE;
 
@@ -358,16 +371,34 @@ export async function runFirstActionWatchdogSweep(
       const stateDef = loadWorkflowStateDef(opts.workflowDefPath, t.workflow, t.state);
       const overrideMs = parseDurationToMs(stateDef?.first_action_deadline);
       const deadlineMs = overrideMs ?? defaultDeadlineMs;
-      const armedAtMs = t.dispatchDeliveredAtMs;
-      const deadlineAtMs = armedAtMs + deadlineMs;
+      const rawDeliveredAtMs = t.dispatchDeliveredAtMs;
 
       const existing = getFirstActionLadder(t.ticket);
-      // A ladder only carries over for the SAME dispatch (same delivery time).
+      // A ladder only carries over for the SAME dispatch (same RAW delivery time).
       // A fresh dispatch — re-entry, revision round-trip, or a state change
       // re-stamping entered_state_at — re-arms a clean ladder; rungs and an
       // "unreachable" verdict from a prior dispatch must not swallow it.
+      // Identity is compared on the RAW delivered-at (persisted as deliveredAtMs)
+      // because armedAt may be restart-clamped away from it. Back-compat: ladders
+      // written before deliveredAtMs existed used armedAt === delivered-at.
       const sameDispatch =
-        existing != null && Date.parse(existing.armedAt) === armedAtMs;
+        existing != null &&
+        (existing.deliveredAtMs != null
+          ? existing.deliveredAtMs === rawDeliveredAtMs
+          : Date.parse(existing.armedAt) === rawDeliveredAtMs);
+
+      // AI-2091 §4/§6: on a cold/first or fresh arm, clamp the armed time forward
+      // to `now` when the delivery is older than the restart-safety horizon — a
+      // stale, pre-restart delivered-at must not breach on the first sweep. The
+      // same-dispatch case keeps its already-armed (possibly clamped) time so the
+      // deadline is stable across sweeps.
+      const armedAtMs = sameDispatch
+        ? Date.parse(existing.armedAt)
+        : now - rawDeliveredAtMs > MAX_ARM_LOOKBACK_MS
+          ? now
+          : rawDeliveredAtMs;
+      const deadlineAtMs = armedAtMs + deadlineMs;
+
       const priorRungs = t.rungsFired ?? (sameDispatch ? existing.rungsFired : 0);
       const history: LadderHistoryEntry[] = sameDispatch ? [...existing.history] : [];
 
@@ -467,6 +498,7 @@ export async function runFirstActionWatchdogSweep(
         state: t.state,
         delegate: t.delegate,
         armedAt: new Date(armedAtMs).toISOString(),
+        deliveredAtMs: rawDeliveredAtMs,
         deadlineAt: new Date(deadlineAtMs).toISOString(),
         rungsFired,
         unreachable,

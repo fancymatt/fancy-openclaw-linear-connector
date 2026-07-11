@@ -11,3 +11,8 @@ export {
   type SchedulerDispatchParams,
   type DispatchDeliverySchedulerDeps,
 } from "./dispatch-delivery-scheduler.js";
+export {
+  assertDispatchTargetFetchable,
+  type DispatchTargetFetchability,
+  type DispatchFetchabilityDecision,
+} from "./fetchability-gate.js";
