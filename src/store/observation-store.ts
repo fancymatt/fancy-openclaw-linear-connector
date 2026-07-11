@@ -63,6 +63,13 @@ export interface ObservationInput {
   wakeId?: string | null;
   /** ISO-8601 timestamp; defaults to now. */
   timestamp?: string;
+  /**
+   * AI-2041 (P4-C6) — mark this row as SYNTHETIC seed data (AC6.3). Organic
+   * reject observations leave this false; only the pilot's synthetic seeder sets
+   * it, so synthetic rows stay distinguishable from real accumulation and are
+   * never laundered into looking real.
+   */
+  synthetic?: boolean;
 }
 
 /** A persisted observation row. */
@@ -167,6 +174,13 @@ export class ObservationStore {
     if (!this.hasColumn("observations", "wake_id")) {
       this.db.exec(`ALTER TABLE observations ADD COLUMN wake_id TEXT`);
     }
+
+    // AI-2041 AC6.3: synthetic-seed provenance. Additive, forward-only, guarded
+    // the same way as wake_id. Real rows keep the 0 default; only the pilot's
+    // synthetic seeder writes 1, so `syntheticIds()` can tell them apart.
+    if (!this.hasColumn("observations", "synthetic")) {
+      this.db.exec(`ALTER TABLE observations ADD COLUMN synthetic INTEGER NOT NULL DEFAULT 0`);
+    }
   }
 
   private hasColumn(table: string, column: string): boolean {
@@ -193,8 +207,8 @@ export class ObservationStore {
   append(input: ObservationInput): number {
     const result = this.db
       .prepare(
-        `INSERT INTO observations (ticket, workflow, step, from_body, reviewer_body, reason_code, free_text, wake_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO observations (ticket, workflow, step, from_body, reviewer_body, reason_code, free_text, wake_id, synthetic, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.ticket,
@@ -205,6 +219,7 @@ export class ObservationStore {
         input.reasonCode,
         input.freeText ?? null,
         input.wakeId ?? null,
+        input.synthetic ? 1 : 0,
         input.timestamp ?? new Date().toISOString(),
       );
     const id = Number(result.lastInsertRowid);
@@ -273,6 +288,18 @@ export class ObservationStore {
   total(): number {
     const row = this.db.prepare(`SELECT COUNT(*) AS c FROM observations`).get() as { c: number };
     return Number(row.c);
+  }
+
+  /**
+   * The ids of every row flagged synthetic (AI-2041 AC6.3). Real rows written
+   * through the normal `append` path are never in this set, so a consumer can
+   * prove the pilot did not launder synthetic seed data into looking real.
+   */
+  syntheticIds(): Set<number> {
+    const rows = this.db
+      .prepare(`SELECT id FROM observations WHERE synthetic = 1`)
+      .all() as Array<{ id: number }>;
+    return new Set(rows.map((r) => Number(r.id)));
   }
 
   /**
