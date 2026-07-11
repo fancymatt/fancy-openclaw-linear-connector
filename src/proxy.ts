@@ -347,6 +347,16 @@ export interface CommandAuthSnapshot {
   /** The caller's Linear user ID snapshotted at command start (used as effective delegateId). */
   snapshotDelegateId: string | null;
   /**
+   * AI-2091 §8 (AI-2058) — the TICKET's delegate (Linear user id) snapshotted at
+   * command start, distinct from the caller identity above. The pre-forward CAS
+   * re-read compares this against the ticket's CURRENT delegate: if a foreign
+   * actor moved the delegate away mid-run, a trailing governed mutation that B1
+   * would otherwise wave through on the stale snapshot is rejected before it
+   * commits. null when the delegate could not be read at command start
+   * (fail-open — the CAS does not block on an unknown baseline).
+   */
+  snapshotTicketDelegate: string | null;
+  /**
    * AI-1860: the ticket's workflow source state snapshotted at command start. Reused for
    * meta-intent resolution and transition-legality checks on subsequent mutations so a
    * multi-step governed command is not re-gated against its own post-transition state.
@@ -544,11 +554,22 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       const snapshotKey = issueId && intent ? `${agentId}:${issueId}:${intent}` : null;
       let snapshotDelegateId: string | null | undefined = undefined;
       let snapshotState: string | null | undefined = undefined;
+      // AI-2091 §8 (G4): ticket delegate captured at command start — baseline for
+      // the pre-forward CAS re-read. undefined until captured/loaded.
+      let snapshotTicketDelegate: string | null | undefined = undefined;
+      // AI-2091 §8 (G4): true only on a TRAILING governed mutation — one that
+      // reuses an already-stored command-start snapshot. B1 authorizes it off that
+      // reused snapshot without re-checking the live delegate, so this is exactly
+      // the mutation the pre-forward CAS must re-read. A FIRST mutation (fresh
+      // snapshot) is already gated live by checkWorkflowRules, so it needs no CAS.
+      let snapshotLoadedFromStore = false;
       if (snapshotKey && deps?.commandAuthSnapshots) {
         const existing = deps.commandAuthSnapshots.get(snapshotKey);
         if (existing && Date.now() < existing.expiresAt) {
           snapshotDelegateId = existing.snapshotDelegateId;
           snapshotState = existing.snapshotState;
+          snapshotTicketDelegate = existing.snapshotTicketDelegate;
+          snapshotLoadedFromStore = true;
           log.info(`auth-snapshot-hit agent=${agentId} intent=${intent}${ticketCtx}`);
         }
       }
@@ -708,15 +729,21 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // snapshotState null so follow-up mutations fall back to the live state.
       if (snapshotKey && deps?.commandAuthSnapshots && snapshotDelegateId === undefined) {
         let capturedState: string | null = null;
+        // AI-2091 §8 (G4): capture the ticket delegate alongside the source state
+        // in one read (fetchTicketVerification returns both), so the pre-forward
+        // CAS has a baseline to compare the CURRENT delegate against.
+        let capturedTicketDelegate: string | null = null;
         if (issueId) {
           try {
-            const preLabels = await fetchWorkflowLabels(issueId, authorization);
+            const verification = await fetchTicketVerification(issueId, authorization);
             // AI-2094: resolve def-aware so a stale/duplicate state:* label on a
             // drifted ticket can't snapshot the wrong (earlier) state and bind
             // the follow-up meta-intent to the wrong forward edge (mis-route to assign).
-            const snapWfId = getWorkflowId(preLabels);
+            const snapWfId = getWorkflowId(verification.labels);
             const snapDef = snapWfId ? await loadWorkflowDefById(snapWfId) : null;
-            capturedState = getCurrentState(preLabels, snapDef ?? undefined) ?? null;
+            capturedState = getCurrentState(verification.labels, snapDef ?? undefined) ?? null;
+            // AI-2091 G4: capture the ticket delegate at command start for the pre-mutation CAS re-read.
+            capturedTicketDelegate = verification.delegateId;
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             log.warn(`auth-snapshot source-state capture failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
@@ -725,10 +752,12 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         deps.commandAuthSnapshots.set(snapshotKey, {
           snapshotDelegateId: callerLinearUserId ?? null,
           snapshotState: capturedState,
+          snapshotTicketDelegate: capturedTicketDelegate,
           expiresAt: Date.now() + COMMAND_AUTH_SNAPSHOT_TTL_MS,
         });
         snapshotState = capturedState;
-        log.info(`auth-snapshot-stored agent=${agentId} intent=${intent}${ticketCtx} state=${capturedState ?? "unknown"}`);
+        snapshotTicketDelegate = capturedTicketDelegate;
+        log.info(`auth-snapshot-stored agent=${agentId} intent=${intent}${ticketCtx} state=${capturedState ?? "unknown"} ticketDelegate=${capturedTicketDelegate ?? "none"}`);
       }
 
       // AI-1977: delegateOverride is computed inside the issueId block below
@@ -860,6 +889,73 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           log.warn(`raw-mutation-block-on-intent-path agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${intentPathRawRejection}`);
           res.status(200).json({ errors: [{ message: intentPathRawRejection }] });
           return;
+        }
+      }
+
+      // ── AI-2091 §8 (G4, AI-2058): pre-mutation compare-and-swap ──────────────
+      // Before forwarding a TRAILING governed issue mutation, re-read the ticket's
+      // CURRENT delegate and compare it to the delegate captured at command start.
+      // B1 (checkWorkflowRules) authorizes a trailing mutation off the reused
+      // command-start snapshot without re-checking the live delegate, so a foreign
+      // actor who takes the delegate mid-run — the live AI-2091 instance: a session
+      // dispatched on delegate=Igor, moved to tdd mid-run — would otherwise have its
+      // decision silently overwritten. We reject ONLY a foreign takeover: the
+      // delegate changed away from the snapshot AND is no longer this caller. That
+      // guard is what keeps legitimate self-progression safe — this command's own
+      // transition reassigns the delegate to the next owner post-forward, never to a
+      // foreign actor before this point, and a trailing self-progression step (e.g.
+      // the AI-1848/1872/1924 comment) is a commentCreate, not an issueUpdate, so it
+      // is not gated here at all. A transient re-read failure fails open.
+      if (
+        issueId &&
+        snapshotLoadedFromStore &&
+        typeof snapshotTicketDelegate === "string" &&
+        isIssueUpdateMutation(body)
+      ) {
+        try {
+          const current = await fetchTicketVerification(issueId, authorization);
+          const foreignTakeover =
+            current.delegateId !== snapshotTicketDelegate &&
+            current.delegateId !== (callerLinearUserId ?? null);
+          if (foreignTakeover) {
+            const decision = assertMutationAgainstCurrentState({
+              agent: agentId,
+              ticketId: issueId,
+              snapshotDelegate: snapshotTicketDelegate,
+              // State dimension neutralized: self-progression advances the state
+              // legitimately, so only the foreign-delegate signal drives the reject.
+              snapshotState: null,
+              currentDelegate: current.delegateId,
+              currentState: null,
+            });
+            if (!decision.proceed) {
+              log.warn(`stale-snapshot-mutation-rejected agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${decision.reason}`);
+              deps?.operationalEventStore?.append({
+                outcome: "stale-snapshot-mutation-rejected" as never,
+                type: "pre-mutation-cas",
+                agent: agentId,
+                key: issueId,
+                errorSummary: decision.reason ?? "stale-snapshot mutation rejected",
+              });
+              const casResponse: Record<string, unknown> = {
+                errors: [{
+                  message:
+                    `[Proxy] '${effectiveIntent}' rejected: the ticket delegate changed since your command started ` +
+                    `(${decision.reason}). Another actor now owns this ticket — re-read it before mutating. No state was changed.`,
+                }],
+              };
+              try {
+                casResponse._gateVerification = await fetchTicketVerification(issueId, authorization);
+              } catch {
+                // fail-open: don't suppress the rejection if the verification fetch fails
+              }
+              res.status(200).json(casResponse);
+              return;
+            }
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`pre-mutation CAS re-read failed agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg} — failing open`);
         }
       }
 

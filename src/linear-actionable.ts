@@ -115,6 +115,16 @@ export interface RoutingCheckResult {
   actionable: boolean;
   /** True when actionable is set by fail-open (transient error) not by confirmed routing. */
   failOpen: boolean;
+  /**
+   * AI-2091 §2 (G2, AI-2015 / AI-2034) — true only when Linear returned a
+   * DEFINITIVE not-found for the ticket at check time (`data.issue === null`
+   * with an OK response and no GraphQL errors), i.e. a phantom / dead
+   * identifier. Distinct from a transient fetch failure (`failOpen`): a
+   * terminal not-found aborts the dispatch loudly (phantom-dispatch-abort);
+   * a transient failure fails open and retries. Undefined on the mention /
+   * functionary early-return paths, which do not fetch the issue.
+   */
+  terminalNotFound?: boolean;
 }
 
 /**
@@ -183,7 +193,11 @@ export async function checkLinearIssueRouting(
     }
 
     const issue = body.data?.issue;
-    if (!issue) return { actionable: false, failOpen: false };
+    // AI-2091 §2 (G2): an OK response with no errors and a null issue is a
+    // DEFINITIVE not-found — the ticket does not exist (dead identifier /
+    // deleted). Surface it as terminalNotFound so the dispatch path can abort
+    // as a phantom rather than silently no-route it.
+    if (!issue) return { actionable: false, failOpen: false, terminalNotFound: true };
     if (isTerminalIssueState(issue.state) || isParkedIssueState(issue.state)) {
       return { actionable: false, failOpen: false };
     }

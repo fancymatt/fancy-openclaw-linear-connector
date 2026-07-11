@@ -235,7 +235,7 @@ export function createApp(options?: CreateAppOptions) {
   // validation. ILL fleet runs the main branch and is unaffected.
   // AI-1860: per-app authorization snapshot map — fresh per createApp() call so
   // test isolation is guaranteed and snapshots never outlive the app instance.
-  const commandAuthSnapshots = new Map<string, { snapshotDelegateId: string | null; snapshotState: string | null; expiresAt: number }>();
+  const commandAuthSnapshots = new Map<string, { snapshotDelegateId: string | null; snapshotState: string | null; snapshotTicketDelegate: string | null; expiresAt: number }>();
 
   app.post("/proxy/graphql", (req, res) => handleProxyRequest(req, res, {
     observationStore,
@@ -577,14 +577,19 @@ export function createApp(options?: CreateAppOptions) {
   // exactly because bootstrap installed the gate:
   //  G1 — staleRePokeRecipientValid gates the C4 re-poke in processStaleSession
   //       (the sessionTracker stale handler wired just above).
-  //  G2 — assertDispatchTargetFetchable preflights the re-poke dispatch below.
+  //  G2 — assertDispatchTargetFetchable preflights the C4 re-poke dispatch below;
+  //       the PRIMARY-path wiring is marked inside createWebhookRouter (the real
+  //       phantom source, AI-2014/AI-2034), where dispatchRoute runs the gate.
   //  G3 — resignalPendingTickets enforces one-wake→one-session via sessionTracker.
-  //  G4 — assertMutationAgainstCurrentState is consulted in handleProxyRequest,
-  //       wired with the commandAuthSnapshots map created for this app instance.
+  //  G4 — assertMutationAgainstCurrentState is invoked in handleProxyRequest before
+  //       the upstream mutation forward, re-reading the ticket delegate against the
+  //       commandAuthSnapshots baseline created for this app instance. It rejects a
+  //       trailing governed mutation whose delegate was taken over by a foreign
+  //       actor mid-run (stale-snapshot-mutation-rejected); self-progression passes.
   markDispatchIntegrityGateActive("deliveryTimeRecipientResolution", "C4 re-poke delegate recheck (processStaleSession → staleRePokeRecipientValid)");
-  markDispatchIntegrityGateActive("phantomFetchabilityGate", "delivery-time fetchability preflight (assertDispatchTargetFetchable)");
+  markDispatchIntegrityGateActive("phantomFetchabilityGate", "delivery-time fetchability preflight (processStaleSession → assertDispatchTargetFetchable)");
   markDispatchIntegrityGateActive("wakeSessionDedup", "one-wake→one-session claim (resignalPendingTickets → sessionTracker)");
-  markDispatchIntegrityGateActive("preMutationCAS", "pre-mutation compare-and-swap (handleProxyRequest → assertMutationAgainstCurrentState)");
+  markDispatchIntegrityGateActive("preMutationCAS", "pre-mutation compare-and-swap (handleProxyRequest → assertMutationAgainstCurrentState) before the upstream forward");
 
   // ── v1.2: Dispatch acknowledgment tracking + early no-activity detection ──
   const ackTracker = new DispatchAckTracker(
