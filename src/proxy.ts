@@ -662,7 +662,12 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         if (issueId) {
           try {
             const preLabels = await fetchWorkflowLabels(issueId, authorization);
-            capturedState = getCurrentState(preLabels) ?? null;
+            // AI-2094: resolve def-aware so a stale/duplicate state:* label on a
+            // drifted ticket can't snapshot the wrong (earlier) state and bind
+            // the follow-up meta-intent to the wrong forward edge (mis-route to assign).
+            const snapWfId = getWorkflowId(preLabels);
+            const snapDef = snapWfId ? await loadWorkflowDefById(snapWfId) : null;
+            capturedState = getCurrentState(preLabels, snapDef ?? undefined) ?? null;
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             log.warn(`auth-snapshot source-state capture failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
@@ -688,7 +693,11 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       if (issueId) {
         try {
           const preLabels = await fetchWorkflowLabels(issueId, authorization);
-          sourceStateOverride = getCurrentState(preLabels) ?? undefined;
+          // AI-2094: def-aware most-advanced resolution — see the auth-snapshot
+          // capture above. A stale state:* label must not become the source override.
+          const srcWfId = getWorkflowId(preLabels);
+          const srcDef = srcWfId ? await loadWorkflowDefById(srcWfId) : null;
+          sourceStateOverride = getCurrentState(preLabels, srcDef ?? undefined) ?? undefined;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           log.warn(`source-state snapshot failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
@@ -754,7 +763,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             if (wfId) {
               const def = await loadWorkflowDefById(wfId);
               if (def) {
-                const currentStateName = sourceStateOverride ?? getCurrentState(preLabels);
+                const currentStateName = sourceStateOverride ?? getCurrentState(preLabels, def); // AI-2094: def-aware
                 if (currentStateName) {
                   const stateNode = def.states.find((s) => s.id === currentStateName);
                   const matchedTransition = stateNode?.transitions?.find(

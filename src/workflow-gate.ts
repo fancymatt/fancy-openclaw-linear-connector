@@ -983,9 +983,45 @@ export function getWorkflowId(labels: string[]): string | null {
   return label ? label.slice(label.indexOf(":") + 1).toLowerCase() : null;
 }
 
-export function getCurrentState(labels: string[]): string | null {
-  const label = labels.find((l) => /^state:/i.test(l));
-  return label ? label.slice(label.indexOf(":") + 1).toLowerCase() : null;
+/**
+ * Resolve the ticket's current workflow state id from its labels.
+ *
+ * AI-2094: a correctly-maintained ticket carries exactly one `state:*` label
+ * (the atomic swap in applyStateTransition enforces this on every transition).
+ * But a ticket that drifted BEFORE that invariant was enforced — the live
+ * GEN-103 shape — can carry two, e.g. a stale `state:routing` alongside the
+ * real `state:review`. The old `.find()` returned the FIRST match by label
+ * order, which is nondeterministic and, for the GEN-103 ordering, bound
+ * `continue-workflow` to routing's `assign` edge instead of review's `approve`
+ * — the "mis-routes to assign" symptom.
+ *
+ * When a `def` is supplied and more than one `state:*` label is present, resolve
+ * deterministically to the MOST-ADVANCED state (furthest along the def's state
+ * ordering). Forward progress is exactly what leaves an earlier label stale, so
+ * the furthest-along label reflects the true position. Without a def, or with a
+ * single label, behavior is unchanged.
+ */
+export function getCurrentState(labels: string[], def?: WorkflowDef): string | null {
+  const ids = labels
+    .filter((l) => /^state:/i.test(l))
+    .map((l) => l.slice(l.indexOf(":") + 1).toLowerCase());
+  if (ids.length === 0) return null;
+  if (ids.length === 1 || !def) return ids[0];
+
+  // >1 state:* label + a def to order them: prefer the most-advanced state.
+  // Rank by index in def.states (canonical authoring order = forward order).
+  // Labels whose state is unknown to the def rank below any known state, so a
+  // stray non-workflow `state:*` label can never win over a real one.
+  let best = ids[0];
+  let bestRank = -1;
+  for (const id of ids) {
+    const rank = def.states.findIndex((s) => s.id === id);
+    if (rank > bestRank) {
+      bestRank = rank;
+      best = id;
+    }
+  }
+  return best;
 }
 
 /**
@@ -1373,7 +1409,7 @@ export async function resolveMetaIntent(
   const currentState =
     typeof snapshotState === "string" && snapshotState.length > 0
       ? snapshotState
-      : getCurrentState(labels);
+      : getCurrentState(labels, def); // AI-2094: def-aware — a stale state:* label can never win over the real one
   if (!currentState) {
     return { error: `[Proxy] '${intent}' blocked: ticket has no current workflow state label.` };
   }
@@ -1743,7 +1779,7 @@ export async function checkWorkflowRules(
   const currentState =
     typeof snapshotState === "string" && snapshotState.length > 0
       ? snapshotState
-      : getCurrentState(labels);
+      : getCurrentState(labels, def); // AI-2094: def-aware — a stale state:* label can never win over the real one
   if (!currentState) {
     // AI-1402: For needs-human, fail-closed even without a state label.
     // We cannot determine if there is a forward path, so treat the ticket as actionable.
@@ -2379,6 +2415,11 @@ export async function buildStateTransitionReminder(
 
   // Determine the destination state from the intent.
   let destStateName: string;
+  // AI-2094: also capture the SOURCE state + matched transition so we can detect
+  // a same-native-column advance (todo→todo) that needs explicit "advanced"
+  // framing (below), lest it read as a silent decline.
+  let fromState: WorkflowState | undefined;
+  let matched: WorkflowTransition | undefined;
   if (intent === breakGlassCommand) {
     destStateName = def.break_glass?.to ?? "escape";
   } else {
@@ -2392,6 +2433,8 @@ export async function buildStateTransitionReminder(
       const t = (s.transitions ?? []).find((tr) => tr.command === intent);
       if (t) {
         destStateName = t.to;
+        fromState = s;
+        matched = t;
         found = true;
         break;
       }
@@ -2419,7 +2462,36 @@ export async function buildStateTransitionReminder(
   );
   helpLines.push(`  - \`linear ${breakGlassCommand} ${issueId}\` (break glass, legal from any state)`);
 
+  // AI-2094 (AC3): same-native-column advance legibility. review, sign-off and
+  // doing all project to native_state: todo, so a forward `continue` move like
+  // `approve` (review → sign-off) advances the state:* label without changing the
+  // Linear column — it LOOKS like nothing happened, and operators reached for
+  // `escape`, marking genuinely-complete work Invalid (the GEN-103 failure). When
+  // the move is a same-column forward continue, prepend an explicit advance banner
+  // that names the destination, its owner, and the SECOND continue gate that
+  // actually closes the ticket, so a todo→todo move never reads as a silent decline.
+  let advanceBanner = "";
+  if (
+    matched?.generic === "continue" &&
+    fromState?.native_state &&
+    destState.native_state &&
+    fromState.native_state === destState.native_state
+  ) {
+    const nextContinue = (destState.transitions ?? []).find((t) => t.generic === "continue");
+    const owner = destState.owner_role ?? "the next owner";
+    if (nextContinue) {
+      const nextDest = def.states.find((s) => s.id === nextContinue.to);
+      const verb = nextDest?.kind === "terminal" ? "close" : "advance";
+      advanceBanner =
+        `[Workflow] Advanced to ${destState.id} — this shares the same Linear column ` +
+        `(${destState.native_state}) as the previous state, so the board won't visibly change. ` +
+        `This is a real forward move, not a decline. The ${owner} must now run ` +
+        `\`linear ${nextContinue.command} ${issueId}\` (continue-workflow) to ${verb} the ticket.\n\n`;
+    }
+  }
+
   return (
+    advanceBanner +
     `[Workflow] You are now in state: **${destState.id}**. Your legal action(s):\n` +
     helpLines.join("\n")
   );
@@ -2622,7 +2694,7 @@ export async function applyStateTransition(
   // already reflects the destination; using it as the transition source makes
   // the intent lookup miss and skips the native write. The proxy captures the
   // true source before forwarding and passes it as sourceStateOverride.
-  const actualStateName = getCurrentState(labelNames);
+  const actualStateName = getCurrentState(labelNames, def); // AI-2094: def-aware most-advanced resolution
   const currentStateName = options?.sourceStateOverride ?? actualStateName;
 
   const breakGlassCommand = def.break_glass?.command ?? "escape";
