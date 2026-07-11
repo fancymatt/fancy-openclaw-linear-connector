@@ -495,7 +495,23 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       const snapshotKey = issueId && intent ? `${agentId}:${issueId}:${intent}` : null;
       let snapshotDelegateId: string | null | undefined = undefined;
       let snapshotState: string | null | undefined = undefined;
-      if (snapshotKey && deps?.commandAuthSnapshots) {
+      // AI-2115 Bug 1: the auth snapshot is keyed only on the sticky intent header
+      // (`agentId:issueId:intent`), so two *separate* commands that share an intent
+      // (e.g. a second `continue-workflow` invoked from the next workflow state)
+      // are indistinguishable at this seam. Reusing the prior command's snapshot
+      // leaks its command-start state: a `continue-workflow` issued from `routing`
+      // re-uses the `intake` snapshotState, so resolveMetaIntent resolves the
+      // routing-state continue to intake's singleton `request` verb — force-assigning
+      // astrid and rejecting the real (delegate-only) worker target (the GEN-33 wedge).
+      //
+      // A state-changing `issueUpdate` mutation is always the START of a command and
+      // must re-derive its authorization from LIVE state; it never legitimately reuses
+      // a prior snapshot. AI-1860's within-command protection is preserved because the
+      // follow-up mutations it guards are `commentCreate` (non-issueUpdate), which
+      // still reuse the snapshot and thus are never re-gated against post-transition
+      // state.
+      const isTransitionMutation = isIssueUpdateMutation(body);
+      if (snapshotKey && deps?.commandAuthSnapshots && !isTransitionMutation) {
         const existing = deps.commandAuthSnapshots.get(snapshotKey);
         if (existing && Date.now() < existing.expiresAt) {
           snapshotDelegateId = existing.snapshotDelegateId;

@@ -2825,6 +2825,34 @@ export async function applyStateTransition(
     const targetLabelName = `state:${toStateName}`;
     const hasTargetLabel = issue.labels.some((l) => l.name === targetLabelName);
     if (hasTargetLabel) {
+      // AI-2115 Bug 2: the idempotency short-circuit must not fire while a *stale*
+      // `state:*` label lingers alongside the correct target label. getCurrentState
+      // returns the first `state:*` label it finds, so a stale label mis-derives the
+      // workflow state and (via the meta-intent resolver) mis-routes forward commands
+      // — this is how a stale `state:routing` label survived `escape` and kept GEN-33
+      // wedged. Purge any non-target `state:*` label here, and fail loudly if the
+      // mutation does not persist; never silently no-op with a stale label present.
+      const staleStateLabels = issue.labels.filter(
+        (l) => l.name.startsWith("state:") && l.name !== targetLabelName,
+      );
+      if (staleStateLabels.length > 0) {
+        const cleanedLabelIds = issue.labels
+          .filter((l) => !l.name.startsWith("state:"))
+          .map((l) => l.id);
+        const targetLabelId = issue.labels.find((l) => l.name === targetLabelName)?.id;
+        if (targetLabelId) cleanedLabelIds.push(targetLabelId);
+        const purged = await issueUpdateLabels(issue.internalId, cleanedLabelIds, authToken);
+        if (!purged) {
+          log.warn(
+            `workflow-gate: B2 apply: ${issueId} in state '${toStateName}' — failed to purge stale state:* label(s): ${staleStateLabels.map((l) => l.name).join(", ")}`,
+          );
+          return { status: "failed", code: "atomic-mutation-failed", detail: `purge of stale state:* label(s) [${staleStateLabels.map((l) => l.name).join(", ")}] did not apply`, from: currentStateName, to: toStateName };
+        }
+        log.info(
+          `workflow-gate: B2 apply: ${issueId} in state '${toStateName}' — purged ${staleStateLabels.length} stale state:* label(s): ${staleStateLabels.map((l) => l.name).join(", ")}`,
+        );
+        return { status: "applied", code: "stale-label-purged", from: currentStateName, to: toStateName };
+      }
       log.info(
         `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' with label present — no-op`,
       );
