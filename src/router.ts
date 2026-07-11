@@ -381,18 +381,38 @@ export function routeEventAll(event: LinearEvent): RouteResult[] {
   // AI-1479 (Phase 6.5 / H-4): routing functionary — a *fallback* consulted only
   // when nothing was explicitly delegated/assigned/mentioned (mechanical-first
   // ordering). A clean department-prefix match routes to the department default
-  // with no person in the loop. Anything else (no roster loaded, or a prefix that
-  // matches no department → steward escalation) falls through to the existing
-  // no-route paging path — we do not fabricate a route here, so mention fan-out
-  // and no-route paging (AI-1766 / AI-1900) are composed with, not reverted.
+  // with no person in the loop.
+  //
+  // AI-2017: a prefix that matches no department is a *steward escalation* — the
+  // match failed and now a person (the roster steward) takes over. This must
+  // reach the live dispatch path, not be computed and discarded. Compose with —
+  // do not revert — the existing no-route paths:
+  //   • no roster loaded → no steward to escalate to (the `if (roster)` guard).
+  //   • no issue identifier → nothing to escalate on; resolveRoute() still
+  //     returns steward-escalation for a null identifier, so we gate on the
+  //     identifier here rather than the decision reason (AI-1900 / no-route).
+  //   • AgentSessionEvent with no resolvable owner → a UI-widget event, not a
+  //     routable request; audit #16 (wake-nobody) forbids paging the steward for
+  //     it even though it carries an identifier.
   const roster = getCachedRoster();
   if (roster) {
-    const decision = resolveRoute(extractIssueIdentifier(event), event.type, roster, null);
+    const identifier = extractIssueIdentifier(event);
+    const decision = resolveRoute(identifier, event.type, roster, null);
     if (decision.reason === "department-prefix") {
       log.info(
-        `Department route: ${event.type} identifier=${extractIssueIdentifier(event)} → ${decision.target} (prefix=${decision.matchedPrefix})`,
+        `Department route: ${event.type} identifier=${identifier} → ${decision.target} (prefix=${decision.matchedPrefix})`,
       );
       return [buildRouteResult({ name: decision.target, reason: "department-prefix" }, event)];
+    }
+    if (
+      decision.reason === "steward-escalation" &&
+      identifier &&
+      event.type !== "AgentSessionEvent"
+    ) {
+      log.info(
+        `Steward escalation: ${event.type} identifier=${identifier} → ${decision.target} (prefix matched no department)`,
+      );
+      return [buildRouteResult({ name: decision.target, reason: "steward-escalation" }, event)];
     }
   }
   return [];
