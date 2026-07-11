@@ -271,10 +271,21 @@ function stripStateLabelDeltas(body: GraphQLRequestBody | null, stateLabelIds: S
 /**
  * AI-1857: Strip null delegateId/assigneeId from an intent-bearing issueUpdate input.
  * The proxy owns delegate management; CLIs must not directly null these fields.
+ *
+ * Exception: `needs-human` is the documented, sanctioned path for setting a human
+ * assignee AND clearing the agent delegate in a single atomic mutation (AI-2067).
+ * The `complete` verb is also exempt: both delegate and assignee are cleared for
+ * terminal transitions, and the CLI cannot rely on B2 alone (ad-hoc tickets have
+ * no workflow to drive B2).
  */
-function stripNullDelegateAssigneeFields(body: GraphQLRequestBody | null): void {
+function stripNullDelegateAssigneeFields(body: GraphQLRequestBody | null, effectiveIntent: string | null): void {
   const input = issueUpdateInput(body);
   if (!input) return;
+  // AI-2067: needs-human and complete legitimately send delegateId:null as
+  // part of their documented contract — don't block it.
+  if (effectiveIntent === 'needs-human' || effectiveIntent === 'complete') {
+    return;
+  }
   if (input.delegateId === null) delete input.delegateId;
   if (input.assigneeId === null) delete input.assigneeId;
 }
@@ -709,8 +720,10 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // AI-1857: Strip null delegateId/assigneeId from forwarded intent-bearing mutations.
         // The proxy manages delegates; partial semantic-verb application (e.g. complete)
         // bundles these null clears, which must not reach Linear directly.
+        // AI-2067: needs-human is exempt — it is the documented path for clearing delegate
+        // while setting a human assignee.
         if (isIssueUpdateMutation(body)) {
-          stripNullDelegateAssigneeFields(body);
+          stripNullDelegateAssigneeFields(body, effectiveIntent);
         }
 
         // AI-1977: Pre-resolve the delegateId and inject it into the forwarded mutation

@@ -401,6 +401,8 @@ export function createWebhookRouter(
                 hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
                 hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
                 hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+                gatewayUrl: process.env.OPENCLAW_GATEWAY_URL,
+                gatewayToken: process.env.OPENCLAW_GATEWAY_TOKEN,
               };
               try {
                 if (throttle) {
@@ -745,6 +747,8 @@ export function createWebhookRouter(
           hooksToken: process.env.OPENCLAW_HOOKS_TOKEN,
           hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
           hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+          gatewayUrl: process.env.OPENCLAW_GATEWAY_URL,
+          gatewayToken: process.env.OPENCLAW_GATEWAY_TOKEN,
           timeoutMs: process.env.NODE_ENV === "test" ? 50 : undefined,
           maxRetries: process.env.NODE_ENV === "test" ? 0 : undefined,
         };
@@ -851,6 +855,8 @@ export function createWebhookRouter(
         hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
         hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
         hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+        gatewayUrl: process.env.OPENCLAW_GATEWAY_URL,
+        gatewayToken: process.env.OPENCLAW_GATEWAY_TOKEN,
       };
       try {
         if (throttle) {

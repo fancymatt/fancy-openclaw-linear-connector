@@ -13,6 +13,13 @@ export interface DeliveryConfig {
   hooksToken?: string;
   hooksThinking?: string;
   hooksModel?: string;
+  /** Gateway OpenAI-compatible API URL (e.g. http://10.10.0.105:18789/v1/chat/completions).
+   *  When both gatewayUrl+gatewayToken and hooksUrl+hooksToken are present, the
+   *  gateway API path is preferred — it uses x-openclaw-session-key instead of
+   *  the hook payload field, avoiding the need for allowRequestSessionKey=true. */
+  gatewayUrl?: string;
+  /** Gateway operator token for the OpenAI-compatible API (Authorization: Bearer <token>). */
+  gatewayToken?: string;
   timeoutMs?: number;
   retryDelayMs?: number;
   maxRetries?: number;
@@ -80,6 +87,13 @@ export async function deliverMessageToAgent(
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const retryDelayMs = config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
   const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
+
+  // Prefer the Gateway OpenAI-compatible API path when configured — it uses
+  // x-openclaw-session-key header routing instead of the hook payload field,
+  // which lets us flip allowRequestSessionKey=false (AI-2111).
+  if (config.gatewayUrl && config.gatewayToken) {
+    return deliverViaGatewayApi(agentName, sessionId, config, { message, timeoutMs, retryDelayMs, maxRetries });
+  }
 
   if (config.hooksUrl && config.hooksToken) {
     return deliverViaHooks(agentName, sessionId, config, { message, timeoutMs, retryDelayMs, maxRetries });
@@ -161,6 +175,92 @@ async function deliverViaHooks(
   }
   if (!result.dispatched) {
     log.error(`All delivery attempts exhausted for ${agentName} [${sessionId}]`);
+  }
+  return result;
+}
+
+// ── Gateway OpenAI-Compatible API Mode ──────────────────────────────────────
+//
+// Uses POST /v1/chat/completions with x-openclaw-session-key header for
+// per-ticket session routing, avoiding the need for allowRequestSessionKey=true
+// on the hooks endpoint (AI-2111).
+//
+// The model field is set to "openclaw/<agentName>" per the Gateway's
+// agent-first model contract. The x-openclaw-session-key header routes the
+// turn into the correct per-ticket linear-* session.
+
+async function deliverViaGatewayApi(
+  agentName: string,
+  sessionId: string,
+  config: DeliveryConfig,
+  opts: { message: string; timeoutMs: number; retryDelayMs: number; maxRetries: number },
+): Promise<DeliveryResult> {
+
+  let result: DeliveryResult = { dispatched: false };
+  for (let attempt = 0; attempt <= opts.maxRetries && !result.dispatched; attempt++) {
+    if (attempt > 0) {
+      log.info(
+        `Retrying gateway API delivery for ${agentName} [${sessionId}] (attempt ${attempt + 1}/${opts.maxRetries + 1}) after ${opts.retryDelayMs}ms`,
+      );
+      await new Promise((r) => setTimeout(r, opts.retryDelayMs));
+    }
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+
+      // Construct the OpenAI-compatible chat completions request body.
+      // The model field routes to the specific agent; the message content
+      // carries the dispatch message (same as hooks mode).
+      const body = JSON.stringify({
+        model: `openclaw/${agentName}`,
+        messages: [
+          {
+            role: "user",
+            content: opts.message,
+          },
+        ],
+        // Stream=false for a one-shot dispatch; we wait for the response.
+        stream: false,
+        // Tight max_tokens — the agent's reply is uninteresting here;
+        // we just need it to have received and started processing.
+        max_tokens: 1,
+      });
+
+      const response = await fetch(config.gatewayUrl!, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${config.gatewayToken!}`,
+          "Content-Type": "application/json",
+          "x-openclaw-session-key": sessionId,
+          ...(config.hooksThinking ? { "x-openclaw-model": config.hooksThinking } : {}),
+        },
+        body,
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+
+      if (!response.ok) {
+        const errBody = await response.text().catch(() => "no body");
+        throw new Error(`gateway API responded with ${response.status}: ${errBody}`);
+      }
+
+      const json = (await response.json()) as Record<string, unknown>;
+      // The OpenAI-compatible API returns a standard ChatCompletion response.
+      // Extract id for run tracking.
+      const runId = typeof json.id === "string" ? json.id : undefined;
+
+      log.info(
+        `Gateway API delivery dispatched for ${agentName} [${sessionId}]: id=${runId ?? "ok"}`,
+      );
+      result = { dispatched: true, runId, rawResponse: json };
+    } catch (err) {
+      log.error(
+        `Gateway API delivery attempt ${attempt + 1} failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  if (!result.dispatched) {
+    log.error(`All gateway API delivery attempts exhausted for ${agentName} [${sessionId}]`);
   }
   return result;
 }
