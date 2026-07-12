@@ -94,6 +94,13 @@ export interface WorkflowTransition {
   command: string;
   to: string;
   requires_capability?: string;
+  /** Matt directive 2026-07-12: opt-in designated-approver semantics. When true
+   *  (and requires_capability is set), a caller holding that capability may fire
+   *  THIS transition without being the ticket's delegate — how a def nominates a
+   *  sign-off authority (e.g. Ai's sprint:signoff on sprint-spawner). Absent/false
+   *  keeps the delegate-only gate intact even for capability holders (dev-impl's
+   *  deploy stays delegate-bound — G-13 AC1 semantics). */
+  designated_approver?: boolean;
   /** §5.7 item 1: if true, this transition requires a bound artifact ref (e.g. sprint-plan doc). */
   requires_artifact?: boolean;
   feedback?: { required?: boolean; category_enum?: string[] };
@@ -1751,14 +1758,17 @@ export async function checkWorkflowRules(
   }
   if (callerLinearUserId && delegateId && callerLinearUserId !== delegateId) {
     // Designated-approver exception (Matt directive 2026-07-12, via Astrid): when
-    // the workflow def names a `requires_capability` on the EXACT transition being
-    // invoked, a caller holding that capability may fire that transition without
-    // being the current delegate. This is how a def nominates a sign-off authority
-    // for a ticket delegated to the work's author (e.g. Ai holding sprint:signoff
-    // on sprint-spawner's determining-scope → launching), preserving
-    // author-cannot-self-bless without requiring a human. Scoped to the matched
-    // transition only — every other intent still requires the delegate — and the
-    // requires_capability gate below re-verifies the grant on the same def lookup.
+    // the workflow def marks the EXACT transition being invoked with
+    // `designated_approver: true` AND names a `requires_capability`, a caller
+    // holding that capability may fire that transition without being the current
+    // delegate. This is how a def nominates a sign-off authority for a ticket
+    // delegated to the work's author (e.g. Ai holding sprint:signoff on
+    // sprint-spawner's determining-scope → launching), preserving
+    // author-cannot-self-bless without requiring a human. The flag is a deliberate
+    // opt-in: a bare requires_capability (dev-impl's deploy) does NOT lift the
+    // delegate gate for capability holders (G-13 AC1 semantics preserved). Scoped
+    // to the matched transition only, and the requires_capability gate below
+    // re-verifies the grant on the same def lookup.
     const daState =
       typeof snapshotState === "string" && snapshotState.length > 0
         ? snapshotState
@@ -1766,7 +1776,9 @@ export async function checkWorkflowRules(
     const daNode = daState ? def.states.find((s) => s.id === daState) : undefined;
     const daTx = daNode?.transitions?.find((t) => t.command === intent);
     const isDesignatedApprover = !!(
-      daTx?.requires_capability && (await bodyHasCapability(bodyId, daTx.requires_capability))
+      daTx?.designated_approver === true &&
+      daTx.requires_capability &&
+      (await bodyHasCapability(bodyId, daTx.requires_capability))
     );
     if (isDesignatedApprover) {
       log.info(`workflow-gate: designated-approver delegate bypass agent=${bodyId} intent=${intent} ticket=${issueId} (holds '${daTx?.requires_capability}' named on the transition, not current delegate)`);

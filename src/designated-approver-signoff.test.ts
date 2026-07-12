@@ -55,11 +55,16 @@ states:
       - command: propose-brief
         to: launching
         requires_capability: sprint:signoff
+        designated_approver: true
       - command: approve
         to: launching
         requires_capability: sprint:signoff
+        designated_approver: true
       - command: rescope
         to: evaluate
+      - command: bare-capability
+        to: launching
+        requires_capability: sprint:signoff
 
   - id: launching
     owner_role: steward
@@ -179,6 +184,15 @@ describe("checkWorkflowRules — designated-approver sign-off bypass", () => {
 
   it("scopes the bypass to the capability-named transition — ai stays delegate-blocked on 'rescope'", async () => {
     const result = await checkWorkflowRules("rescope", "issue-uuid", "Bearer tok", "ai", null, AI_UUID);
+    expect(result).not.toBeNull();
+    expect(result).toContain("not the current delegate");
+  });
+
+  it("requires the explicit designated_approver flag — a bare requires_capability does NOT lift the delegate gate (G-13 AC1 parity)", async () => {
+    // ai holds sprint:signoff, but 'bare-capability' lacks designated_approver:
+    // the capability holder must still be the delegate to fire it — this is the
+    // dev-impl `deploy` shape (requires_capability without the flag).
+    const result = await checkWorkflowRules("bare-capability", "issue-uuid", "Bearer tok", "ai", null, AI_UUID);
     expect(result).not.toBeNull();
     expect(result).toContain("not the current delegate");
   });
