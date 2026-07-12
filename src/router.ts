@@ -18,11 +18,26 @@ import { createLogger, componentLogger } from "./logger.js";
 const log = componentLogger(createLogger(), "router");
 
 /**
+ * Discriminated union returned by extractAgentTarget.
+ *
+ * - `{ name, reason }` — a routable agent was found
+ * - `{ suppressed: true }` — the AI-1573 guard or self-trigger filter
+ *   intentionally suppressed this event (should NOT fall through to
+ *   department-prefix / steward-escalation)
+ * - `null` — genuinely no route found (may fall through to department-prefix)
+ */
+export type AgentTargetResult =
+  | { name: string; reason: "delegate" | "assignee" | "mention" | "body-mention" }
+  | { suppressed: true }
+  | null;
+
+/**
  * Extract the target agent name from a webhook payload.
  * Checks delegate first (OAuth app actors), then assignee, then mentioned users.
- * Returns null if no agent target found or if it's a self-triggered event.
+ * Returns { suppressed: true } when the AI-1573 guard or self-trigger filter
+ * intentionally skips the event; null when no route was found at all.
  */
-export function extractAgentTarget(event: LinearEvent): { name: string; reason: "delegate" | "assignee" | "mention" | "body-mention" } | null {
+export function extractAgentTarget(event: LinearEvent): AgentTargetResult {
   const agentMap = buildAgentMap();
   if (Object.keys(agentMap).length === 0) {
     log.warn("No agents configured — skipping event");
@@ -62,7 +77,7 @@ export function extractAgentTarget(event: LinearEvent): { name: string; reason: 
       }
     }
     log.info("AgentSessionEvent: no owning agent resolvable from session payload — not waking anyone");
-    return null;
+    return { suppressed: true };
   }
 
   const data = "data" in event ? (event.data as Record<string, unknown> | undefined) : null;
@@ -92,7 +107,7 @@ export function extractAgentTarget(event: LinearEvent): { name: string; reason: 
           log.info(`No-change delegate but stateId changed — dispatching for same-agent workflow transition`);
         } else {
           log.info(`No-change delegate write — skipping dispatch (updatedFrom present, no delegate key, no state change)`);
-          target = null;
+          return { suppressed: true };
         }
       }
     }
@@ -146,7 +161,7 @@ export function extractAgentTarget(event: LinearEvent): { name: string; reason: 
   if (isActorOurAgent && !isStateTransition) {
     if (!target || agentMap[actorId!] === target) {
       log.info(`Skipping self-triggered event from ${actorId}`);
-      return null;
+      return { suppressed: true };
     }
     log.info(`Agent-to-agent delegation: ${agentMap[actorId!]} → ${target}`);
   }
@@ -353,11 +368,11 @@ function buildRouteResult(
 
 /**
  * Route a Linear event to an OpenClaw agent.
- * Returns a RouteResult if routing succeeded, null if no agent found.
+ * Returns a RouteResult if routing succeeded, null if no agent found or suppressed.
  */
 export function routeEvent(event: LinearEvent): RouteResult | null {
   const result = extractAgentTarget(event);
-  if (!result) return null;
+  if (!result || "suppressed" in result) return null;
   return buildRouteResult(result, event);
 }
 
@@ -369,6 +384,13 @@ export function routeEvent(event: LinearEvent): RouteResult | null {
  */
 export function routeEventAll(event: LinearEvent): RouteResult[] {
   const primary = extractAgentTarget(event);
+
+  // AI-2170: if the guard intentionally suppressed this event, return empty
+  // immediately — do NOT fall through to department-prefix/steward-escalation.
+  if (primary && "suppressed" in primary) {
+    return [];
+  }
+
   if (primary) {
     const routes = [buildRouteResult(primary, event)];
     for (const name of extractAdditionalMentionTargets(event, primary.name)) {

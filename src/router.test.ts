@@ -9,6 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { extractAgentTarget, routeEvent, routeEventAll } from "./router.js";
+import type { AgentTargetResult } from "./router.js";
 import { reloadAgents } from "./agents.js";
 import type { LinearEvent } from "./webhook/schema.js";
 
@@ -175,7 +176,7 @@ describe("extractAgentTarget", () => {
   it("suppresses self-triggered events (actor is the target agent)", () => {
     const event = makeIssueEvent({ actorId: CHARLES_ID, delegateId: CHARLES_ID });
     const result = extractAgentTarget(event);
-    expect(result).toBeNull();
+    expect(result).toEqual({ suppressed: true });
   });
 
   it("allows agent-to-agent delegation (actor is agent A, target is agent B)", () => {
@@ -209,7 +210,7 @@ describe("extractAgentTarget", () => {
   it("AC1 (empty updatedFrom): no fields changed at all does not dispatch", () => {
     const event = makeIssueEvent({ delegateId: CHARLES_ID, updatedFrom: {} });
     const result = extractAgentTarget(event);
-    expect(result).toBeNull();
+    expect(result).toEqual({ suppressed: true });
   });
 
   it("AC2: unrelated-field edit (labelIds) with unchanged delegate does not dispatch", () => {
@@ -218,7 +219,7 @@ describe("extractAgentTarget", () => {
       updatedFrom: { labelIds: ["old-label-uuid"] },
     });
     const result = extractAgentTarget(event);
-    expect(result).toBeNull();
+    expect(result).toEqual({ suppressed: true });
   });
 
   it("AC2: unrelated-field edit (description) with unchanged delegate does not dispatch", () => {
@@ -227,7 +228,7 @@ describe("extractAgentTarget", () => {
       updatedFrom: { description: "old description text" },
     });
     const result = extractAgentTarget(event);
-    expect(result).toBeNull();
+    expect(result).toEqual({ suppressed: true });
   });
 
   it("AC3: genuine delegate change (updatedFrom.delegateId present) dispatches correctly", () => {
@@ -477,5 +478,52 @@ describe("routeEventAll", () => {
   it("returns empty when no target resolves", () => {
     const event = makeIssueEvent({ commentBody: "no agents mentioned here" });
     expect(routeEventAll(event)).toEqual([]);
+  });
+
+  // ── AI-2170: suppressed events must not leak into department-prefix ──
+
+  it("AI-2170: labelIds-only update with delegate does NOT fall through to department-prefix", () => {
+    // Simulate the enrollIfMissing scenario: delegate=charles, updatedFrom has
+    // labelIds (not delegateId/delegate). The AI-1573 guard suppresses this,
+    // and routeEventAll must return [] — NOT fall through to department-prefix.
+    const event = makeIssueEvent({
+      delegateId: CHARLES_ID,
+      identifier: "AI-2170",
+      updatedFrom: { labelIds: ["prev-label-uuid"] },
+    });
+    const routes = routeEventAll(event);
+    expect(routes).toEqual([]);
+  });
+
+  it("AI-2170: genuine delegate change still dispatches correctly via routeEventAll", () => {
+    const event = makeIssueEvent({
+      delegateId: CHARLES_ID,
+      identifier: "AI-2170",
+      updatedFrom: { delegateId: "prev-user-uuid" },
+    });
+    const routes = routeEventAll(event);
+    expect(routes).toHaveLength(1);
+    expect(routes[0].agentId).toBe("charles");
+    expect(routes[0].routingReason).toBe("delegate");
+  });
+
+  it("AI-2170: genuinely unrouted event (no delegate, no assignee, no mention) still returns empty from routeEventAll without department-prefix in tests", () => {
+    // Without a loaded roster, department-prefix fallback is unavailable.
+    // The important thing is the code reaches the fallback path rather than
+    // returning early on { suppressed: true }.
+    const event = makeIssueEvent({ commentBody: "just a comment, no one mentioned" });
+    const routes = routeEventAll(event);
+    // No roster loaded in tests → no department-prefix → empty
+    expect(routes).toEqual([]);
+  });
+
+  it("AI-2170: self-trigger suppression returns empty from routeEventAll", () => {
+    const event = makeIssueEvent({
+      actorId: CHARLES_ID,
+      delegateId: CHARLES_ID,
+      identifier: "AI-2170",
+    });
+    const routes = routeEventAll(event);
+    expect(routes).toEqual([]);
   });
 });
