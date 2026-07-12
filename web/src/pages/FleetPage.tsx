@@ -5,7 +5,9 @@ import { useLiveRefresh } from "../hooks/useLiveRefresh";
 import { Card, Chip, Diagnostics, Empty, ErrorBanner } from "../components";
 import { CapacityStrip } from "../components/CapacityStrip";
 import { OpsActions } from "../components/OpsActions";
+import { FleetDispatchHistory } from "../components/FleetDispatchHistory";
 import type { FleetResponse } from "../types";
+import type { DispatchesResponse } from "./DispatchCyclesView";
 
 /** Console-session invoker identity for admin-mutation attribution (see TicketDetailView). */
 const CONSOLE_INVOKER = "console";
@@ -21,9 +23,11 @@ const ACK_TONE: Record<string, string> = {
 interface FleetPageProps {
   /** For test renders — accepts fleet data directly instead of fetching. */
   data?: FleetResponse;
+  /** For test renders — dispatch history injected into the AC4 section. */
+  dispatchHistory?: DispatchesResponse;
 }
 
-export function FleetPage({ data: propData }: FleetPageProps = {}) {
+export function FleetPage({ data: propData, dispatchHistory }: FleetPageProps = {}) {
   const fleet = usePoll(() => apiGet<FleetResponse>("/admin/api/fleet"), 8000);
   useLiveRefresh({ onFleet: fleet.refresh });
   const f = propData ?? fleet.data;
@@ -141,6 +145,9 @@ export function FleetPage({ data: propData }: FleetPageProps = {}) {
             <Empty>Nothing acknowledged in the current window.</Empty>
           )}
         </Card>
+
+        {/* AI-1955 AC4: per-agent dispatch history with outcome filter. */}
+        <FleetDispatchHistory data={propData ? dispatchHistory : undefined} />
       </div>
     </>
   );
