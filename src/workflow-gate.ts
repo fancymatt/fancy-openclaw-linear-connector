@@ -678,6 +678,12 @@ export async function resolveNativeStateId(
 interface LabelNode {
   id: string;
   name: string;
+  /** AI-2176: true when this label is a Linear label GROUP (container), not a
+   *  regular label. Only populated by queries that select it (findOrCreateLabel);
+   *  undefined elsewhere. */
+  isGroup?: boolean;
+  /** AI-2176: the parent group of this label, when it is a group child. */
+  parent?: { id: string; name: string } | null;
 }
 
 interface TicketContext {
@@ -836,33 +842,74 @@ async function findOrCreateLabel(
   labelName: string,
   authToken: string,
 ): Promise<string | null> {
+  // AI-2176: LIF-team governed transitions silently declined here — create-on-miss
+  // for `state:product-definition` fail-closed and the mechanism was invisible.
+  // Two hardenings, both fully backwards-compatible with flat colon-named labels
+  // (GEN, and the state:* labels LIF already carries):
+  //   1. Group-aware resolution. A team may model `state:*` as a Linear label GROUP
+  //      ("state") with child labels ("product-definition"), where the child's own
+  //      name is the bare suffix and the group owns the "state" namespace. A blind
+  //      flat lookup then misses the existing child, and a flat create collides with
+  //      the group-owned namespace and fail-closes. Match/create against the group.
+  //   2. Raw GraphQL error surfacing (AI-2177). The old fail-closed path swallowed
+  //      the GraphQL `errors` body, so the decline reason never reached the logs.
+  //
+  // Split "group:child" on the FIRST colon only. Labels with no colon have no group.
+  const colonIdx = labelName.indexOf(":");
+  const groupName = colonIdx > 0 ? labelName.slice(0, colonIdx) : null;
+  const childName = colonIdx > 0 ? labelName.slice(colonIdx + 1) : labelName;
+
   const lookupQuery = `
     query TeamLabels($teamId: String!) {
       team(id: $teamId) {
-        labels { nodes { id name } }
+        labels(first: 250) { nodes { id name isGroup parent { id name } } }
       }
     }
   `;
+  let nodes: LabelNode[] = [];
   try {
     const lookupRes = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query: lookupQuery, variables: { teamId } }),
     });
-    type LookupResp = { data?: { team?: { labels: { nodes: LabelNode[] } } } };
+    type LookupResp = { data?: { team?: { labels: { nodes: LabelNode[] } } }; errors?: unknown };
     const lookupData = (await lookupRes.json()) as LookupResp;
-    const existing = (lookupData.data?.team?.labels?.nodes ?? []).find(
-      (n) => n.name === labelName,
-    );
-    if (existing) return existing.id;
+    if (lookupData.errors) {
+      log.warn(`workflow-gate: team label lookup GraphQL errors for team=${teamId} label='${labelName}': ${JSON.stringify(lookupData.errors)}`);
+    }
+    nodes = lookupData.data?.team?.labels?.nodes ?? [];
+    // (a) Flat exact match — GEN and the flat state:* labels LIF already carries.
+    const flat = nodes.find((n) => n.name === labelName && !n.isGroup);
+    if (flat) return flat.id;
+    // (b) Group-child match — the label is modeled as a child of a `groupName` group.
+    if (groupName) {
+      const child = nodes.find(
+        (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName,
+      );
+      if (child) return child.id;
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: team label lookup failed for team=${teamId}: ${msg}`);
     return null;
   }
 
-  // Label does not yet exist — create it with a neutral grey color.
-  const createMutation = `
+  // Not found — create it with a neutral grey color. If a group owns the namespace,
+  // create the label as that group's child (name = bare suffix, parentId = group);
+  // otherwise create a flat colon-named label exactly as before.
+  const group = groupName ? nodes.find((n) => n.isGroup && n.name === groupName) : undefined;
+  const createName = group ? childName : labelName;
+  const createMutation = group
+    ? `
+    mutation CreateLabel($teamId: String!, $name: String!, $color: String!, $parentId: String!) {
+      issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, parentId: $parentId }) {
+        success
+        issueLabel { id }
+      }
+    }
+  `
+    : `
     mutation CreateLabel($teamId: String!, $name: String!, $color: String!) {
       issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color }) {
         success
@@ -870,25 +917,32 @@ async function findOrCreateLabel(
       }
     }
   `;
+  const createVars = group
+    ? { teamId, name: createName, color: "#94a3b8", parentId: group.id }
+    : { teamId, name: createName, color: "#94a3b8" };
   try {
     const createRes = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({
-        query: createMutation,
-        variables: { teamId, name: labelName, color: "#94a3b8" },
-      }),
+      body: JSON.stringify({ query: createMutation, variables: createVars }),
     });
     type CreateResp = {
       data?: { issueLabelCreate?: { success: boolean; issueLabel?: { id: string } } };
+      errors?: unknown;
     };
     const createData = (await createRes.json()) as CreateResp;
     const result = createData.data?.issueLabelCreate;
     if (result?.success && result.issueLabel) {
-      log.info(`workflow-gate: created label '${labelName}' in team ${teamId}`);
+      log.info(
+        `workflow-gate: created label '${labelName}' in team ${teamId}${group ? ` (child of group '${groupName}')` : ""}`,
+      );
       return result.issueLabel.id;
     }
-    log.warn(`workflow-gate: label creation returned non-success for '${labelName}'`);
+    // AI-2177: surface the raw failure instead of swallowing it — this is the log
+    // line that makes a B2 label-resolve fail-closed diagnosable.
+    log.error(
+      `workflow-gate: B2 label create FAIL-CLOSED for '${labelName}' in team ${teamId} (${group ? `child of group '${groupName}'` : "flat"}): success=${result?.success ?? "null"} errors=${createData.errors ? JSON.stringify(createData.errors) : "none"}`,
+    );
     return null;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
