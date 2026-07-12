@@ -22,6 +22,7 @@ import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
 import { getDefStateMigrationLiveness, registerDefStateMigrationRunner } from "./def-state-migration.js";
 import { normalizeSessionKey } from "./session-key.js";
+import { isLinearIssueStillRoutedToAgent } from "./linear-actionable.js";
 import { applyEngagementStatus } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
@@ -150,6 +151,40 @@ export interface CreateAppOptions {
    * live hooks URL. Also used as isTicketActionable bypass when provided.
    */
   sendWakeUp?: (agentId: string, ticketIds: string[]) => Promise<void>;
+}
+
+/**
+ * AI-2091 (wrong-agent dispatch, vector 1): delivery-time recipient guard for
+ * the stale C4 re-poke.
+ *
+ * A stalled session carries the agentId that was bound when the wake was ARMED.
+ * By the time the C4 recovery path re-pokes that session, the ticket's delegate
+ * may have changed (hand-off, needs-human, reassignment). Re-poking the arm-time
+ * agent then delivers a wake to an agent with NO current relationship to the
+ * ticket — the AI-2042 wrong-agent class (canonical fixture: an AI-1774 wake
+ * delivered to Igor while the live delegate was Astrid).
+ *
+ * The re-signal path (resignalPendingTickets → checkLinearIssueRouting) already
+ * re-resolves the delegate at delivery; the C4 re-poke was the one delivery-time
+ * path that skipped it and fired straight to stale.agentId. Resolve recipient
+ * identity at DELIVERY, not arm time: re-poke only when the stale agent is still
+ * confirmed-routed as the ticket's delegate. A CONFIRMED mismatch (delegate is
+ * someone else / cleared / ticket terminal or gone) drops the re-poke. Transient
+ * Linear errors fail OPEN (re-poke) so a legitimate resume is never silently lost
+ * on an API blip — symmetric with re-signal's failOpen behaviour. The C4 re-poke
+ * is by construction a delegate-retained recovery (AI-1578), so the "delegate"
+ * routing reason is the correct check here.
+ */
+export async function staleRePokeRecipientValid(
+  sessionKey: string,
+  agentId: string,
+  check: (
+    sessionKey: string,
+    agentId: string,
+    routingReason: "delegate",
+  ) => Promise<boolean> = isLinearIssueStillRoutedToAgent,
+): Promise<boolean> {
+  return check(sessionKey, agentId, "delegate");
 }
 
 export function createApp(options?: CreateAppOptions) {
@@ -439,20 +474,42 @@ export function createApp(options?: CreateAppOptions) {
       // rather than letting the ticket sit orphaned.
       const ticketId = snapshot.metadata.ticketId;
       const sessionKey = normalizeSessionKey(ticketId);
-      const rePokeMsg =
-        `Your session for ${ticketId.replace(/^linear-/, "")} stalled before producing output. ` +
-        `Resume now and run the pending transition verb to hand off. Do NOT reply HEARTBEAT_OK.`;
-      log.info(`Stale C4 re-poke: re-waking ${stale.agentId} for ${ticketId}`);
-      const delivered = await deliverMessageToAgent(stale.agentId, sessionKey, rePokeMsg, wakeConfigForAgent(stale.agentId));
-      operationalEventStore.append({
-        outcome: delivered.dispatched ? "stale-c4-repoke" : "stale-c4-repoke-failed",
-        agent: stale.agentId,
-        key: sessionKey,
-        sessionKey,
-        deliveryMode: "stale-c4-repoke",
-        attemptCount: 1,
-        errorSummary: delivered.dispatched ? null : "C4 re-poke delivery failed",
-      });
+
+      // AI-2091: resolve the recipient at DELIVERY, not arm time. If the delegate
+      // changed while the session was stalled, re-poking stale.agentId would wake
+      // an agent with no current relationship to the ticket (AI-2042 wrong-agent
+      // class). Only drop on a CONFIRMED mismatch; fail-open still re-pokes.
+      const recipientValid = await staleRePokeRecipientValid(sessionKey, stale.agentId);
+      if (!recipientValid) {
+        log.warn(
+          `Stale C4 re-poke ABORTED: ${stale.agentId} is no longer routed to ${ticketId} ` +
+          `(delegate changed during stall) — not re-poking an agent with no relationship to the ticket`,
+        );
+        operationalEventStore.append({
+          outcome: "stale-c4-repoke-failed",
+          agent: stale.agentId,
+          key: sessionKey,
+          sessionKey,
+          deliveryMode: "stale-c4-repoke",
+          attemptCount: 1,
+          errorSummary: "aborted: stale agent no longer routed to ticket (AI-2091 delivery-time delegate recheck)",
+        });
+      } else {
+        const rePokeMsg =
+          `Your session for ${ticketId.replace(/^linear-/, "")} stalled before producing output. ` +
+          `Resume now and run the pending transition verb to hand off. Do NOT reply HEARTBEAT_OK.`;
+        log.info(`Stale C4 re-poke: re-waking ${stale.agentId} for ${ticketId}`);
+        const delivered = await deliverMessageToAgent(stale.agentId, sessionKey, rePokeMsg, wakeConfigForAgent(stale.agentId));
+        operationalEventStore.append({
+          outcome: delivered.dispatched ? "stale-c4-repoke" : "stale-c4-repoke-failed",
+          agent: stale.agentId,
+          key: sessionKey,
+          sessionKey,
+          deliveryMode: "stale-c4-repoke",
+          attemptCount: 1,
+          errorSummary: delivered.dispatched ? null : "C4 re-poke delivery failed",
+        });
+      }
     }
 
     // 7. Re-signal pending tickets (if any)
