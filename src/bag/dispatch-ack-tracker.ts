@@ -228,6 +228,58 @@ export class DispatchAckTracker {
   }
 
   /**
+   * Filtered dispatch history for the admin console (AI-2140).
+   * Supports optional agentId and/or ackStatus filters.
+   */
+  listFiltered(opts: { agentId?: string; ackStatus?: AckStatus; limit?: number } = {}): DispatchAckEntry[] {
+    const conditions: string[] = [];
+    const params: Array<string | number> = [];
+
+    if (opts.agentId) {
+      conditions.push('agent_id = ?');
+      params.push(opts.agentId);
+    }
+    if (opts.ackStatus) {
+      conditions.push('ack_status = ?');
+      params.push(opts.ackStatus);
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const capped = Math.min(Math.max(opts.limit ?? 200, 1), 1000);
+    params.push(capped);
+
+    const rows = this.db
+      .prepare(
+        `SELECT id, agent_id, ticket_id, dispatched_at, last_signal_at,
+                ack_status, attempt_count, redispatch_failure_count
+         FROM dispatch_acks
+         ${where}
+         ORDER BY last_signal_at DESC
+         LIMIT ?`,
+      )
+      .all(...params) as Array<{
+        id: number;
+        agent_id: string;
+        ticket_id: string;
+        dispatched_at: string;
+        last_signal_at: string;
+        ack_status: string;
+        attempt_count: number;
+        redispatch_failure_count: number;
+      }>;
+    return rows.map((r) => ({
+      id: r.id,
+      agentId: r.agent_id,
+      ticketId: r.ticket_id,
+      dispatchedAt: r.dispatched_at,
+      lastSignalAt: r.last_signal_at,
+      ackStatus: r.ack_status as AckStatus,
+      attemptCount: r.attempt_count,
+      failureCount: r.redispatch_failure_count,
+    }));
+  }
+
+  /**
    * Most recent dispatch entries across all agents and statuses — the
    * management console's fleet/dispatch view (Phase 3). Read-only.
    */

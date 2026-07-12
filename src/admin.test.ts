@@ -259,3 +259,331 @@ describe("GET /admin/api/structure", () => {
     expect(res.body.registryPolicy).toBeDefined();
   });
 });
+
+describe("GET /admin/api/dispatch-acks (AI-2140)", () => {
+  let dir: string;
+  let adminRouter: ReturnType<typeof import("express").Router>;
+  let app: ReturnType<typeof import("express").default>;
+  let ackTracker: import("./bag/dispatch-ack-tracker.js").DispatchAckTracker;
+
+  beforeEach(async () => {
+    const request = (await import("supertest")).default;
+    const express = (await import("express")).default;
+    const path = (await import("path")).default;
+    const fs = (await import("fs")).default;
+    const os = (await import("os")).default;
+    const { createAdminRouter } = await import("./admin.js");
+    const { DispatchAckTracker } = await import("./bag/dispatch-ack-tracker.js");
+
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "dispatch-acks-test-"));
+    ackTracker = new DispatchAckTracker(path.join(dir, "acks.db"));
+
+    app = express();
+    process.env.ADMIN_SECRET = "test-secret";
+    app.use("/admin", createAdminRouter({ ackTracker, deploymentName: "test" } as any));
+  });
+
+  afterEach(async () => {
+    const fs = (await import("fs")).default;
+    ackTracker.close();
+    delete process.env.ADMIN_SECRET;
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("returns empty dispatches when no entries exist", async () => {
+    const supertest = (await import("supertest")).default;
+    const res = await supertest(app)
+      .get("/admin/api/dispatch-acks")
+      .set("x-admin-secret", "test-secret");
+    expect(res.status).toBe(200);
+    expect(res.body.dispatches).toEqual([]);
+  });
+
+  it("returns all dispatches without filters", async () => {
+    ackTracker.recordDispatch("sage", "AI-100");
+    ackTracker.recordDispatch("felix", "AI-101");
+
+    const supertest = (await import("supertest")).default;
+    const res = await supertest(app)
+      .get("/admin/api/dispatch-acks")
+      .set("x-admin-secret", "test-secret");
+    expect(res.status).toBe(200);
+    expect(res.body.dispatches).toHaveLength(2);
+  });
+
+  it("filters by agent", async () => {
+    ackTracker.recordDispatch("sage", "AI-100");
+    ackTracker.recordDispatch("felix", "AI-101");
+
+    const supertest = (await import("supertest")).default;
+    const res = await supertest(app)
+      .get("/admin/api/dispatch-acks?agent=sage")
+      .set("x-admin-secret", "test-secret");
+    expect(res.status).toBe(200);
+    expect(res.body.dispatches).toHaveLength(1);
+    expect(res.body.dispatches[0].agentId).toBe("sage");
+  });
+
+  it("filters by outcome (ackStatus)", async () => {
+    ackTracker.recordDispatch("sage", "AI-100");
+    ackTracker.recordDispatch("felix", "AI-101");
+
+    const supertest = (await import("supertest")).default;
+    const res = await supertest(app)
+      .get("/admin/api/dispatch-acks?outcome=pending")
+      .set("x-admin-secret", "test-secret");
+    expect(res.status).toBe(200);
+    expect(res.body.dispatches).toHaveLength(2);
+    expect(res.body.dispatches.every((d: { ackStatus: string }) => d.ackStatus === "pending")).toBe(true);
+  });
+
+  it("returns 401 without auth", async () => {
+    const supertest = (await import("supertest")).default;
+    const res = await supertest(app).get("/admin/api/dispatch-acks");
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("PUT /admin/api/agents/:name (AI-2140)", () => {
+  let dir: string;
+  let app: ReturnType<typeof import("express").default>;
+
+  beforeEach(async () => {
+    const express = (await import("express")).default;
+    const path = (await import("path")).default;
+    const fs = (await import("fs")).default;
+    const os = (await import("os")).default;
+    const { createAdminRouter } = await import("./admin.js");
+    const { reloadAgents } = await import("./agents.js");
+
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-put-test-"));
+    const agentsPath = path.join(dir, "agents.json");
+    fs.writeFileSync(agentsPath, JSON.stringify({
+      agents: [{
+        name: "sage",
+        linearUserId: "user-sage-12345678",
+        openclawAgent: "sage",
+        clientId: "client-id",
+        clientSecret: "client-secret",
+        accessToken: "access-token",
+        refreshToken: "refresh-token",
+        host: "local",
+        displayName: "Sage",
+      }],
+    }), "utf8");
+    process.env.AGENTS_FILE = agentsPath;
+    process.env.ADMIN_SECRET = "test-secret";
+    reloadAgents();
+
+    app = express();
+    app.use("/admin", createAdminRouter({ deploymentName: "test" } as any));
+  });
+
+  afterEach(async () => {
+    const fs = (await import("fs")).default;
+    delete process.env.AGENTS_FILE;
+    delete process.env.ADMIN_SECRET;
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("updates editable metadata fields", async () => {
+    const supertest = (await import("supertest")).default;
+    const res = await supertest(app)
+      .put("/admin/api/agents/sage")
+      .set("x-admin-secret", "test-secret")
+      .send({ displayName: "Sage (Updated)", openclawAgent: "sage-fe", host: "ishikawa" });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.agent.displayName).toBe("Sage (Updated)");
+    expect(res.body.agent.openclawAgent).toBe("sage-fe");
+    expect(res.body.agent.host).toBe("ishikawa");
+    expect(res.body.registryPolicy).toBeDefined();
+  });
+
+  it("rejects forbidden secret fields", async () => {
+    const supertest = (await import("supertest")).default;
+    const res = await supertest(app)
+      .put("/admin/api/agents/sage")
+      .set("x-admin-secret", "test-secret")
+      .send({ accessToken: "new-token" });
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("accessToken");
+  });
+
+  it("returns 404 for unknown agent", async () => {
+    const supertest = (await import("supertest")).default;
+    const res = await supertest(app)
+      .put("/admin/api/agents/nonexistent")
+      .set("x-admin-secret", "test-secret")
+      .send({ displayName: "Ghost" });
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 401 without auth", async () => {
+    const supertest = (await import("supertest")).default;
+    const res = await supertest(app)
+      .put("/admin/api/agents/sage")
+      .send({ displayName: "Hacker" });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("POST /admin/api/onboard/start (AI-2140)", () => {
+  let dir: string;
+  let app: ReturnType<typeof import("express").default>;
+
+  beforeEach(async () => {
+    const express = (await import("express")).default;
+    const path = (await import("path")).default;
+    const fs = (await import("fs")).default;
+    const os = (await import("os")).default;
+    const { createAdminRouter } = await import("./admin.js");
+    const { reloadAgents } = await import("./agents.js");
+
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "onboard-start-test-"));
+    const agentsPath = path.join(dir, "agents.json");
+    fs.writeFileSync(agentsPath, JSON.stringify({ agents: [] }), "utf8");
+    process.env.AGENTS_FILE = agentsPath;
+    process.env.ADMIN_SECRET = "test-secret";
+    reloadAgents();
+
+    app = express();
+    app.use(express.json());
+    app.use("/admin", createAdminRouter({ deploymentName: "test" } as any));
+  });
+
+  afterEach(async () => {
+    const fs = (await import("fs")).default;
+    delete process.env.AGENTS_FILE;
+    delete process.env.ADMIN_SECRET;
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("creates a partial entry and returns an authorize URL", async () => {
+    const supertest = (await import("supertest")).default;
+    const res = await supertest(app)
+      .post("/admin/api/onboard/start")
+      .set("x-admin-secret", "test-secret")
+      .send({
+        agentName: "new-agent",
+        clientId: "test-client-id",
+        clientSecret: "test-client-secret",
+        displayName: "New Agent",
+      });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.agentName).toBe("new-agent");
+    expect(res.body.authorizeUrl).toContain("https://linear.app/oauth/authorize");
+    expect(res.body.authorizeUrl).toContain("test-client-id");
+  });
+
+  it("returns 400 when required fields are missing", async () => {
+    const supertest = (await import("supertest")).default;
+    const res = await supertest(app)
+      .post("/admin/api/onboard/start")
+      .set("x-admin-secret", "test-secret")
+      .send({ agentName: "missing-creds" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("clientId");
+  });
+
+  it("returns 409 when agent is already fully onboarded", async () => {
+    // First create a partial agent
+    await (await import("./agents.js")).upsertAgent({
+      name: "done-agent",
+      displayName: "Done",
+      linearUserId: "user-1",
+      clientId: "c1",
+      clientSecret: "c2",
+      accessToken: "at-1",
+      refreshToken: "rt-1",
+    });
+
+    const supertest = (await import("supertest")).default;
+    const res = await supertest(app)
+      .post("/admin/api/onboard/start")
+      .set("x-admin-secret", "test-secret")
+      .send({
+        agentName: "done-agent",
+        clientId: "c1",
+        clientSecret: "c2",
+      });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("already fully onboarded");
+  });
+});
+
+describe("GET /admin/api/onboard/:name/status (AI-2140)", () => {
+  let dir: string;
+  let app: ReturnType<typeof import("express").default>;
+
+  beforeEach(async () => {
+    const express = (await import("express")).default;
+    const path = (await import("path")).default;
+    const fs = (await import("fs")).default;
+    const os = (await import("os")).default;
+    const { createAdminRouter } = await import("./admin.js");
+    const { reloadAgents } = await import("./agents.js");
+
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "onboard-status-test-"));
+    const agentsPath = path.join(dir, "agents.json");
+    fs.writeFileSync(agentsPath, JSON.stringify({
+      agents: [{
+        name: "incomplete",
+        linearUserId: "",
+        clientId: "c1",
+        clientSecret: "c2",
+        accessToken: "",
+        refreshToken: "",
+      }, {
+        name: "complete",
+        linearUserId: "user-abc-12345678",
+        clientId: "c1",
+        clientSecret: "c2",
+        accessToken: "at-1",
+        refreshToken: "rt-1",
+      }],
+    }), "utf8");
+    process.env.AGENTS_FILE = agentsPath;
+    process.env.ADMIN_SECRET = "test-secret";
+    reloadAgents();
+
+    app = express();
+    app.use("/admin", createAdminRouter({ deploymentName: "test" } as any));
+  });
+
+  afterEach(async () => {
+    const fs = (await import("fs")).default;
+    delete process.env.AGENTS_FILE;
+    delete process.env.ADMIN_SECRET;
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reports incomplete agent status", async () => {
+    const supertest = (await import("supertest")).default;
+    const res = await supertest(app)
+      .get("/admin/api/onboard/incomplete/status")
+      .set("x-admin-secret", "test-secret");
+    expect(res.status).toBe(200);
+    expect(res.body.completed).toBe(false);
+    expect(res.body.hasToken).toBe(false);
+  });
+
+  it("reports complete agent status", async () => {
+    const supertest = (await import("supertest")).default;
+    const res = await supertest(app)
+      .get("/admin/api/onboard/complete/status")
+      .set("x-admin-secret", "test-secret");
+    expect(res.status).toBe(200);
+    expect(res.body.completed).toBe(true);
+    expect(res.body.hasToken).toBe(true);
+  });
+
+  it("returns 404 for unknown agent", async () => {
+    const supertest = (await import("supertest")).default;
+    const res = await supertest(app)
+      .get("/admin/api/onboard/ghost/status")
+      .set("x-admin-secret", "test-secret");
+    expect(res.status).toBe(404);
+  });
+});

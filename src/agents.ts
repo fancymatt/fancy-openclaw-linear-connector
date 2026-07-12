@@ -19,6 +19,8 @@ const log = componentLogger(createLogger(), "agents");
 
 export interface AgentConfig {
   name: string;
+  /** Human-readable display label for the admin console (AI-2140). */
+  displayName?: string;
   linearUserId: string;
   clientId: string;
   clientSecret: string;
@@ -457,6 +459,40 @@ function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
 }
 
 /** Add or update an agent from OAuth callback */
+/**
+ * Update only the editable metadata fields of an agent configuration.
+ * Intentionally does NOT touch: accessToken, refreshToken, clientId,
+ * clientSecret, proxyToken, proxyUrl, secretsPath, expiresAt,
+ * lastRefreshOkAt, lastFailure.
+ *
+ * Returns null when no agent with that name exists.
+ */
+export function updateAgentMetadata(
+  agentName: string,
+  meta: {
+    openclawAgent?: string;
+    host?: "ishikawa" | "local";
+    linearUserId?: string;
+    displayName?: string;
+  },
+): AgentConfig | null {
+  const idx = _agents.findIndex((a) => a.name === agentName);
+  if (idx === -1) return null;
+
+  const current = _agents[idx];
+  const updated: AgentConfig = {
+    ...current,
+    ...(meta.openclawAgent !== undefined ? { openclawAgent: meta.openclawAgent } : {}),
+    ...(meta.host !== undefined ? { host: meta.host } : {}),
+    ...(meta.linearUserId !== undefined ? { linearUserId: meta.linearUserId } : {}),
+    ...(meta.displayName !== undefined ? { displayName: meta.displayName } : {}),
+  };
+
+  _agents[idx] = updated;
+  save(_agents);
+  return updated;
+}
+
 export function upsertAgent(config: AgentConfig): { isNew: boolean } {
   // Match by name first (for partial entries that don't have linearUserId yet)
   // then fall back to linearUserId for token refresh updates

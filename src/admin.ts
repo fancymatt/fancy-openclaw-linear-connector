@@ -1393,6 +1393,206 @@ export function createAdminRouter(deps: AdminDeps): Router {
     }
   });
 
+  // ── AI-2140 / AI-1955 #1: agent metadata write ──────────────────────────
+  // Editable registry metadata (display name, openclawAgent, host, identity
+  // mapping). Does NOT accept secrets/tokens. Rounds through the AES-v2
+  // save() path via updateAgentMetadata(). Returns the updated agent config
+  // and the current RegistryPolicyStatus for post-reload drift surfacing.
+  router.put("/api/agents/:name", async (req: Request, res: Response) => {
+    const body = parseJsonBody(req);
+    if (body === null) {
+      res.status(400).json({ ok: false, error: "Malformed JSON body" });
+      return;
+    }
+
+    const name = req.params.name;
+    if (!name) {
+      res.status(400).json({ ok: false, error: "Agent name is required" });
+      return;
+    }
+
+    const { updateAgentMetadata, getAgent } = await import("./agents.js");
+    const existing = getAgent(name);
+    if (!existing) {
+      res.status(404).json({ ok: false, error: `No agent found with name "${name}"` });
+      return;
+    }
+
+    const meta: {
+      openclawAgent?: string;
+      host?: "ishikawa" | "local";
+      linearUserId?: string;
+      displayName?: string;
+    } = {};
+
+    if (typeof body.openclawAgent === "string") meta.openclawAgent = body.openclawAgent;
+    if (body.host === "ishikawa" || body.host === "local") meta.host = body.host;
+    if (typeof body.linearUserId === "string") meta.linearUserId = body.linearUserId;
+    if (typeof body.displayName === "string") meta.displayName = body.displayName;
+
+    // Reject attempts to write token/secrets fields as a guard.
+    const FORBIDDEN = ["accessToken", "refreshToken", "clientId", "clientSecret", "proxyToken", "proxyUrl", "secretsPath"];
+    for (const key of FORBIDDEN) {
+      if (key in body) {
+        res.status(422).json({ ok: false, error: `Cannot write "${key}" via this endpoint; use the OAuth flow for credentials.` });
+        return;
+      }
+    }
+
+    const updated = updateAgentMetadata(name, meta);
+    if (!updated) {
+      res.status(404).json({ ok: false, error: `Agent "${name}" disappeared during update` });
+      return;
+    }
+
+    // Fetch the registry-policy status after the hot-reload fires.
+    const status = getRegistryPolicyStatus();
+
+    res.json({
+      ok: true,
+      agent: {
+        name: updated.name,
+        displayName: updated.displayName,
+        openclawAgent: updated.openclawAgent,
+        host: updated.host,
+        linearUserId: updated.linearUserId ? `…${updated.linearUserId.slice(-8)}` : null,
+      },
+      registryPolicy: status,
+    });
+  });
+
+  // ── AI-2140 / AI-1955 #4: filterable dispatch ack history ───────────────
+  // Pulls from the dispatch-acks.db (DispatchAckTracker) with optional
+  // agent and/or ackStatus query-param filters, so the console can show
+  // e.g. only pending dispatches for a specific agent.
+  router.get("/api/dispatch-acks", (_req: Request, res: Response) => {
+    const ackStore = deps.ackTracker;
+    if (!ackStore) {
+      res.json({ dispatches: [] });
+      return;
+    }
+
+    const agentId = typeof _req.query.agent === "string" ? _req.query.agent.trim() : undefined;
+    const ackStatusParam = typeof _req.query.outcome === "string" ? _req.query.outcome.trim() : undefined;
+    const validStatuses = ["pending", "acknowledged", "unconfirmed", "escalated", "deferred"];
+    const ackStatus = ackStatusParam && validStatuses.includes(ackStatusParam)
+      ? (ackStatusParam as "pending" | "acknowledged" | "unconfirmed" | "escalated" | "deferred")
+      : undefined;
+    const limitRaw = typeof _req.query.limit === "string" ? Number.parseInt(_req.query.limit, 10) : undefined;
+    const limit = Number.isFinite(limitRaw ?? NaN) ? Math.min(limitRaw!, 1000) : undefined;
+
+    res.json({
+      dispatches: ackStore.listFiltered({ agentId, ackStatus, limit }),
+    });
+  });
+
+  // ── AI-2140 / AI-1955 #5: console-driven onboarding HTTP endpoints ─────
+  // Extends the CLI-only onboard-wizard with HTTP equivalents so the console
+  // can drive the agent setup flow end-to-end. POST /api/onboard/start
+  // creates a partial registry entry and returns the Linear authorize URL;
+  // GET /api/onboard/:name/status polls for token+linearUserId completion.
+  const ONBOARD_INPROGRESS = new Map<string, {
+    createdAt: number;
+    clientId: string;
+    clientSecret: string;
+    authorizeUrl: string;
+  }>();
+
+  router.post("/api/onboard/start", async (req: Request, res: Response) => {
+    const body = parseJsonBody(req);
+    if (body === null) {
+      res.status(400).json({ ok: false, error: "Malformed JSON body" });
+      return;
+    }
+
+    const agentName = typeof body.agentName === "string" ? body.agentName.trim() : "";
+    const clientId = typeof body.clientId === "string" ? body.clientId.trim() : "";
+    const clientSecret = typeof body.clientSecret === "string" ? body.clientSecret.trim() : "";
+    const openclawAgent = typeof body.openclawAgent === "string" ? body.openclawAgent.trim() : undefined;
+    const hostRaw = body.host === "ishikawa" ? "ishikawa" as const : body.host === "local" ? "local" as const : undefined;
+
+    if (!agentName) {
+      res.status(400).json({ ok: false, error: "agentName is required" });
+      return;
+    }
+    if (!clientId || !clientSecret) {
+      res.status(400).json({ ok: false, error: "clientId and clientSecret are required" });
+      return;
+    }
+
+    // Create a partial registry entry so the agent shows up in the dashboard
+    // (even before OAuth completes).
+    const { upsertAgent, getAgent } = await import("./agents.js");
+    const existing = getAgent(agentName);
+    if (existing && existing.accessToken && existing.linearUserId) {
+      res.status(409).json({ ok: false, error: `Agent "${agentName}" is already fully onboarded (has accessToken + linearUserId).` });
+      return;
+    }
+
+    upsertAgent({
+      name: agentName,
+      displayName: typeof body.displayName === "string" ? body.displayName : undefined,
+      linearUserId: "",
+      clientId,
+      clientSecret,
+      accessToken: "",
+      refreshToken: "",
+      ...(openclawAgent ? { openclawAgent } : {}),
+      ...(hostRaw ? { host: hostRaw } : {}),
+    });
+
+    // Build the Linear OAuth authorize URL (mirrors onboard-wizard.ts).
+    const redirectUri = process.env.LINEAR_REDIRECT_URI ?? "http://localhost:3000/oauth/callback";
+    const stateNonce = crypto.randomBytes(16).toString("hex");
+    const authorizeUrl = `https://linear.app/oauth/authorize?${new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: "code",
+      state: stateNonce,
+      scope: ["read", "write", "issues:create", "admin"].join(","),
+    }).toString()}`;
+
+    ONBOARD_INPROGRESS.set(agentName, {
+      createdAt: Date.now(),
+      clientId,
+      clientSecret,
+      authorizeUrl,
+    });
+
+    // Cleanup stale sessions after 30 minutes
+    setTimeout(() => {
+      const session = ONBOARD_INPROGRESS.get(agentName);
+      if (session && Date.now() - session.createdAt > 30 * 60 * 1000) {
+        ONBOARD_INPROGRESS.delete(agentName);
+      }
+    }, 30 * 60 * 1000);
+
+    res.json({ ok: true, agentName, authorizeUrl });
+  });
+
+  router.get("/api/onboard/:name/status", async (_req: Request, res: Response) => {
+    const name = _req.params.name;
+    const { getAgent } = await import("./agents.js");
+    const agent = getAgent(name);
+    if (!agent) {
+      res.status(404).json({ ok: false, error: `No agent found with name "${name}"` });
+      return;
+    }
+
+    const hasToken = Boolean(agent.accessToken && agent.accessToken !== "");
+    const hasUserId = Boolean(agent.linearUserId && agent.linearUserId !== "");
+    const completed = hasToken && hasUserId;
+
+    res.json({
+      ok: true,
+      agentName: name,
+      completed,
+      hasToken,
+      hasUserId: agent.linearUserId ? `…${agent.linearUserId.slice(-8)}` : null,
+      inProgress: ONBOARD_INPROGRESS.has(name),
+    });
+  });
+
   // ── AI-1986: self-service webhook management ─────────────────────────────
   // CRUD over the Linear webhook signing secrets. Behind adminAuth like the
   // rest of /api. Secrets persist to LINEAR_WEBHOOK_SECRETS in the env file and
