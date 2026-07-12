@@ -164,12 +164,21 @@ describe("AI-2070 — prod trigger → deterministic engine → unified C4 store
       .get("/admin/api/proposals")
       .set("x-admin-secret", ADMIN_SECRET);
     expect(listRes.status).toBe(200);
-    const proposals = listRes.body.proposals as Array<{ id: string; proposal: { targets: Array<{ path: string; kind: string }> } | null }>;
+    // AI-2201: the console queue is flattened at the API boundary — the guidance
+    // surface arrives as a top-level `diffs[]` entry, not nested under `proposal`.
+    const proposals = listRes.body.proposals as Array<{
+      id: string;
+      diffs: Array<{ path: string; kind: string }>;
+      workflowId: string;
+      stateId: string;
+    }>;
     const row = proposals.find((p) => p.id === key);
     expect(row).toBeDefined();
-    // It is the bridged deterministic proposal (targets carry the guidance surface).
-    expect(row?.proposal?.targets?.[0]?.path).toBe(guidanceRel);
-    expect(row?.proposal?.targets?.[0]?.kind).toBe("guidance");
+    // It is the bridged deterministic proposal (diffs carry the guidance surface).
+    expect(row?.diffs?.[0]?.path).toBe(guidanceRel);
+    expect(row?.diffs?.[0]?.kind).toBe("guidance");
+    expect(row?.workflowId).toBe(WORKFLOW);
+    expect(row?.stateId).toBe(STEP);
 
     // And it is readable by idempotency key (the apply-pipeline lookup, AC2).
     const byKey = appState.proposalStore.getByIdempotencyKey(key);

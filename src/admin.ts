@@ -20,6 +20,7 @@ import { setStateAtomic, loadWorkflowRegistry, resetWorkflowCache } from "./work
 import { instanceConfigRoot } from "./instance-config.js";
 import { retryApply } from "./proposal/apply-pipeline.js";
 import type { ProposalStore } from "./store/proposal-store.js";
+import { toConsoleView } from "./proposal/proposal-console-view.js";
 import { parseSlaToMs } from "./barrier.js";
 import { computeDispatchHealth } from "./dispatch-health.js";
 import { getFirstActionLadder } from "./first-action-watchdog-state.js";
@@ -521,9 +522,13 @@ export function createAdminRouter(deps: AdminDeps): Router {
   // the operator's retry affordance on an apply-failed proposal (AC4.8). Both
   // return JSON; a missing store yields an empty queue rather than a 5xx so the
   // console degrades gracefully before C3 begins writing proposals.
+  // Flatten each stored ProposalRow into the console SPA's flat wire shape
+  // (AI-2201): the SPA normalizer reads top-level title/workflowId/diffs/etc.
+  // that live nested under `proposal.*` in the store. The API owns the shape
+  // contract so the SPA stays ignorant of the store's internal nesting.
   router.get("/api/proposals", (_req: Request, res: Response) => {
     const store = deps.proposalStore;
-    res.json({ proposals: store ? store.list() : [] });
+    res.json({ proposals: store ? store.list().map(toConsoleView) : [] });
   });
 
   router.post("/api/proposals/:id/retry-apply", async (req: Request, res: Response) => {

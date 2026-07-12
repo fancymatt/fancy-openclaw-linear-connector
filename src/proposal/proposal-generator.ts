@@ -128,7 +128,7 @@ function groupKey(workflow: string, step: string): string {
  * failure count. More corroborating failures ⇒ higher confidence, saturating
  * toward 1. No clock, no RNG — a pure function of the evidence.
  */
-function scoreConfidence(failureCount: number): number {
+export function scoreConfidence(failureCount: number): number {
   const BASELINE = 5;
   const raw = failureCount / (failureCount + BASELINE);
   // Quantize so the score is a clean, reproducible decimal.
