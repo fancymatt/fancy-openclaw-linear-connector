@@ -121,6 +121,14 @@ pre {
   max-height: 320px;
 }
 
+/* AI-2143: single-line onboarding command — select-all affordance, no scroll clamp. */
+.onboard-command {
+  max-height: none;
+  margin: 10px 0;
+  user-select: all;
+  white-space: nowrap;
+}
+
 button, input[type="password"], input[type="text"], select {
   font: inherit;
   color: var(--text);

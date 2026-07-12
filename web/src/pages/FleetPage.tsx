@@ -5,6 +5,7 @@ import { useLiveRefresh } from "../hooks/useLiveRefresh";
 import { Card, Chip, Diagnostics, Empty, ErrorBanner } from "../components";
 import { CapacityStrip } from "../components/CapacityStrip";
 import { OpsActions } from "../components/OpsActions";
+import { OnboardAgentCard } from "../components/OnboardAgentCard";
 import type { FleetResponse } from "../types";
 
 /** Console-session invoker identity for admin-mutation attribution (see TicketDetailView). */
@@ -119,6 +120,9 @@ export function FleetPage({ data: propData }: FleetPageProps = {}) {
             <Empty>Loading…</Empty>
           )}
         </Card>
+
+        {/* AI-2143 (AC2 of AI-1955): console launch point for CLI onboarding — launch + link only, no HTTP OAuth plumbing. */}
+        <OnboardAgentCard />
 
         <Card span={12} title="Recently acknowledged">
           {f && f.dispatches.some((d) => d.ackStatus === "acknowledged") ? (
