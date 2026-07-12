@@ -23,7 +23,7 @@ import type { ProposalStore } from "./store/proposal-store.js";
 import { parseSlaToMs } from "./barrier.js";
 import { computeDispatchHealth } from "./dispatch-health.js";
 import { getFirstActionLadder } from "./first-action-watchdog-state.js";
-import type { DispatchAckEntry } from "./bag/dispatch-ack-tracker.js";
+import type { DispatchAckEntry, AckStatus } from "./bag/dispatch-ack-tracker.js";
 import { recaptureAc } from "./ac-record-store.js";
 import type { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { getStatus as getConfigHealthStatus } from "./config-health.js";
@@ -818,58 +818,24 @@ export function createAdminRouter(deps: AdminDeps): Router {
     res.json({ workflows, tickets });
   });
 
-  // AI-1800 AC4: Dispatches sub-view — grouped by wake_id.
-  router.get("/api/dispatches", (_req: Request, res: Response) => {
-    if (!deps.operationalEventStore) {
-      res.json({ label: "Dispatch cycles", cycles: [] });
+  // AI-2142: Filterable dispatch history — flat list from the ack tracker
+  // with optional agent/outcome/limit query params. Replaces the old
+  // wake_id-grouped cycles view (AI-1800 AC4).
+  router.get("/api/dispatches", (req: Request, res: Response) => {
+    if (!deps.ackTracker) {
+      res.json({ dispatches: [] });
       return;
     }
-    const allEvents = deps.operationalEventStore.query({ limit: 500 });
-    const byWakeId = new Map<string, { agent_id: string; dispatches: Array<{ ticket_id: string; dispatched_at: string; ack_status: string; attempt_count: number; canon_version?: string }> }>();
-
-    for (const ev of allEvents) {
-      if (!ev.wakeId) continue;
-      const ticketId = ev.key?.startsWith("linear-") ? ev.key.slice(7) : ev.key ?? '';
-      if (!byWakeId.has(ev.wakeId)) {
-        byWakeId.set(ev.wakeId, { agent_id: ev.agent ?? '', dispatches: [] });
-      }
-      const group = byWakeId.get(ev.wakeId)!;
-      if (!group.dispatches.some((d) => d.ticket_id === ticketId)) {
-        // AI-1848: extract canon version stamped into the dispatch record detail.
-        const detail = ev.detail as Record<string, unknown> | null;
-        const canonVersion = typeof detail?.canonVersion === "string" ? detail.canonVersion : undefined;
-        group.dispatches.push({
-          ticket_id: ticketId,
-          dispatched_at: ev.occurredAt,
-          ack_status: 'pending',
-          attempt_count: 1,
-          ...(canonVersion ? { canon_version: canonVersion } : {}),
-        });
-      }
-    }
-
-    // Cross-reference with ackTracker for accurate ack_status/attempt_count.
-    if (deps.ackTracker) {
-      const acks = deps.ackTracker.listRecent(500);
-      for (const group of byWakeId.values()) {
-        for (const d of group.dispatches) {
-          const match = acks.find((a) => a.ticketId === d.ticket_id && a.agentId === group.agent_id);
-          if (match) {
-            d.ack_status = match.ackStatus;
-            d.attempt_count = match.attemptCount;
-            d.dispatched_at = match.dispatchedAt;
-          }
-        }
-      }
-    }
-
-    const cycles = Array.from(byWakeId.entries()).map(([wake_id, group]) => ({
-      wake_id,
-      agent_id: group.agent_id,
-      dispatches: group.dispatches,
-    }));
-
-    res.json({ label: "Dispatch cycles", cycles });
+    const agentId = typeof req.query.agent === "string" ? req.query.agent : undefined;
+    const outcomeRaw = typeof req.query.outcome === "string" ? req.query.outcome : undefined;
+    const validStatuses = ["pending", "acknowledged", "unconfirmed", "escalated", "deferred"];
+    const ackStatus = outcomeRaw && validStatuses.includes(outcomeRaw)
+      ? (outcomeRaw as AckStatus)
+      : undefined;
+    const limitRaw = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : undefined;
+    const limit = Number.isFinite(limitRaw ?? NaN) && (limitRaw ?? 0) > 0 ? limitRaw : undefined;
+    const dispatches = deps.ackTracker.listFiltered({ agentId, ackStatus, limit });
+    res.json({ dispatches });
   });
 
   // AI-1800 AC5: Per-ticket detail — state transitions with wake cycles.

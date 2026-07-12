@@ -1,10 +1,8 @@
 /**
- * AI-1800 AC4 — Dispatches sub-view groups by wake_id and is labeled as
- * dispatch cycles, not tasks; old "Waiting for agent pickup" hardcoded copy
- * is gone.
+ * AI-1800 AC4 → AI-2142: Dispatches endpoint now returns a flat filterable
+ * list from the ack tracker, replacing the old wake_id-grouped cycles view.
  *
- * Tests that the dispatch API returns dispatches grouped by wake_id, and that
- * the response labeling uses "dispatch cycles" terminology.
+ * Tests the response structure matches the new flat dispatch format.
  */
 import request from "supertest";
 import fs from "node:fs";
@@ -22,7 +20,7 @@ function tmpDbPath(prefix: string): string {
 
 const ADMIN_SECRET = "ai1800-dispatch-test";
 
-describe("AI-1800 AC4: Dispatches sub-view — grouped by wake_id, labeled as cycles", () => {
+describe("AI-2142: GET /api/dispatches — flat dispatch list (replaces cycles view)", () => {
   let app: ReturnType<typeof createApp>;
   let bagDbPath: string;
   let mirrorDbPath: string;
@@ -45,7 +43,7 @@ describe("AI-1800 AC4: Dispatches sub-view — grouped by wake_id, labeled as cy
     fs.rmSync(path.dirname(eventsDbPath), { recursive: true, force: true });
   });
 
-  it("GET /api/dispatches returns dispatches grouped by wake_id", async () => {
+  it("GET /api/dispatches returns a flat dispatches array", async () => {
     const noopSendWakeUp = async (_a: string, _t: string[]) => {};
     app = createApp({
       bagDbPath,
@@ -59,12 +57,11 @@ describe("AI-1800 AC4: Dispatches sub-view — grouped by wake_id, labeled as cy
       .set("x-admin-secret", ADMIN_SECRET);
 
     expect(res.status).toBe(200);
-    // Response must have a cycles array (not flat tasks)
-    expect(res.body.cycles).toBeDefined();
-    expect(Array.isArray(res.body.cycles)).toBe(true);
+    expect(res.body.dispatches).toBeDefined();
+    expect(Array.isArray(res.body.dispatches)).toBe(true);
   });
 
-  it("each dispatch cycle group has wake_id, agent_id, and dispatches array", async () => {
+  it("response does not use old cycles-grouped format", async () => {
     const noopSendWakeUp = async (_a: string, _t: string[]) => {};
     app = createApp({
       bagDbPath,
@@ -78,37 +75,13 @@ describe("AI-1800 AC4: Dispatches sub-view — grouped by wake_id, labeled as cy
       .set("x-admin-secret", ADMIN_SECRET);
 
     expect(res.status).toBe(200);
-    // Each cycle entry must have: wake_id, agent_id, dispatches
-    if (res.body.cycles.length > 0) {
-      const cycle = res.body.cycles[0];
-      expect(cycle.wake_id).toBeDefined();
-      expect(cycle.agent_id).toBeDefined();
-      expect(Array.isArray(cycle.dispatches)).toBe(true);
-    }
-  });
-
-  it("response uses 'dispatch_cycles' or 'cycles' labeling — not 'tasks'", async () => {
-    const noopSendWakeUp = async (_a: string, _t: string[]) => {};
-    app = createApp({
-      bagDbPath,
-      enrolledTicketsDbPath: mirrorDbPath,
-      operationalEventsDbPath: eventsDbPath,
-      sendWakeUp: noopSendWakeUp,
-    });
-
-    const res = await request(app.app)
-      .get("/admin/api/dispatches")
-      .set("x-admin-secret", ADMIN_SECRET);
-
-    expect(res.status).toBe(200);
+    // Must NOT contain old cycles-grouped structure
+    expect(res.body.cycles).toBeUndefined();
     // The response must NOT contain a flat 'tasks' array at the top level
-    // (that was the old "Waiting for agent pickup" view)
     expect(res.body.tasks).toBeUndefined();
-    // Must use cycles-based structure
-    expect(res.body.cycles).toBeDefined();
   });
 
-  it("old TasksPage 'Waiting for agent pickup' copy is absent from dispatches", async () => {
+  it("each dispatch entry has expected fields", async () => {
     const noopSendWakeUp = async (_a: string, _t: string[]) => {};
     app = createApp({
       bagDbPath,
@@ -116,17 +89,21 @@ describe("AI-1800 AC4: Dispatches sub-view — grouped by wake_id, labeled as cy
       operationalEventsDbPath: eventsDbPath,
       sendWakeUp: noopSendWakeUp,
     });
+    app.ackTracker!.recordDispatch("test-agent", "linear-AI-9999");
 
     const res = await request(app.app)
       .get("/admin/api/dispatches")
       .set("x-admin-secret", ADMIN_SECRET);
 
     expect(res.status).toBe(200);
-    // Response body stringified should not contain the old hardcoded copy
-    const bodyStr = JSON.stringify(res.body);
-    expect(bodyStr).not.toContain("Waiting for agent pickup");
-    // Should reference dispatch cycles terminology
-    expect(res.body.label).toBeDefined();
-    expect(res.body.label).toMatch(/dispatch cycle/i);
+    if (res.body.dispatches.length > 0) {
+      const d = res.body.dispatches[0];
+      expect(d.agentId).toBeDefined();
+      expect(d.ticketId).toBeDefined();
+      expect(d.dispatchedAt).toBeDefined();
+      expect(d.lastSignalAt).toBeDefined();
+      expect(d.ackStatus).toBeDefined();
+      expect(d.attemptCount).toBeDefined();
+    }
   });
 });
