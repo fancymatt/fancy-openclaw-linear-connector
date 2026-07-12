@@ -104,6 +104,21 @@ export interface StuckCandidate {
   delegateComments: Array<{ id: string; createdAt: string; body: string }>;
   /** ISO timestamps of transition verbs detected (state transitions in Linear history). */
   transitionsAfterEntry: Array<{ from: string; to: string; at: string }>;
+  /**
+   * AI-2129: workflow id (from `wf:*` label), e.g. "dev-sprint". Optional for
+   * backward compatibility with directly-constructed candidates.
+   */
+  workflowId?: string;
+  /** AI-2129: total number of linked child issues (0 for leaf tickets). */
+  totalChildren?: number;
+  /**
+   * AI-2129: number of child issues that are NOT in a terminal state. When a
+   * workflow parent sits on an open barrier (e.g. a `wf:dev-sprint` parent at
+   * `state:validation`) with ≥1 non-terminal child, the barrier is legitimately
+   * open — the delegate has no legal transition to run, so a stuck re-prompt is
+   * pure noise and must be suppressed.
+   */
+  nonTerminalChildCount?: number;
 }
 
 export interface StuckDelegateCycleResult {
@@ -114,6 +129,12 @@ export interface StuckDelegateCycleResult {
   skippedAlreadyPrompted: number;
   /** Candidates skipped because a pending dispatch ack suggests the session is still active. */
   skippedSessionActive: number;
+  /**
+   * AI-2129: candidates skipped because they are workflow parents sitting on an
+   * open barrier (≥1 non-terminal child) — the barrier is legitimately open, so
+   * the "stuck" pattern is a false positive.
+   */
+  skippedBarrierHeld: number;
   errors: number;
 }
 
@@ -155,6 +176,26 @@ function parseEnvInt(name: string, defaultVal: number): number {
   const raw = process.env[name];
   const parsed = raw !== undefined ? parseInt(raw, 10) : NaN;
   return isNaN(parsed) || parsed <= 0 ? defaultVal : parsed;
+}
+
+// ── Helper: child terminality (AI-2129) ──────────────────────────────────────
+
+/** Terminal workflow `state:*` labels that satisfy a parent's N→1 barrier. */
+const TERMINAL_CHILD_STATES = new Set(["done", "escape"]);
+/** Native Linear state types that count as terminal (issue closed). */
+const TERMINAL_NATIVE_STATE_TYPES = new Set(["completed", "canceled"]);
+
+/**
+ * Is a child issue in a terminal state? A child satisfies the parent barrier if
+ * its native Linear state is completed/canceled, or it carries a terminal
+ * workflow `state:*` label (done/escape). Mirrors the barrier subsystem's
+ * child-terminality contract (see barrier.ts) so suppression and auto-advance
+ * agree on when a barrier is closed.
+ */
+function isChildTerminal(nativeStateType: string | null, labels: string[]): boolean {
+  if (nativeStateType && TERMINAL_NATIVE_STATE_TYPES.has(nativeStateType)) return true;
+  const workflowState = getCurrentState(labels);
+  return workflowState !== null && TERMINAL_CHILD_STATES.has(workflowState);
 }
 
 // ── Build re-prompt message ──────────────────────────────────────────────────
@@ -285,6 +326,7 @@ export class StuckDelegateDetector {
       rePromptsSent: 0,
       skippedAlreadyPrompted: 0,
       skippedSessionActive: 0,
+      skippedBarrierHeld: 0,
       errors: 0,
     };
 
@@ -369,6 +411,28 @@ export class StuckDelegateDetector {
         if (candidate.transitionsAfterEntry.length > 0) {
           // A transition DID fire — clear prompt counter and skip
           this.promptCounter.clear(ticketId);
+          continue;
+        }
+
+        // AI-2129: Barrier-held suppression. A workflow parent (e.g. a
+        // `wf:dev-sprint` parent at `state:validation`) cannot advance while its
+        // implementation children are still in flight — the N→1 barrier is
+        // legitimately open, so the delegate has NO legal transition to run. The
+        // "completion comment without transition" pattern is therefore a false
+        // positive: the parent posts an identical "barrier still open" comment on
+        // every wake and can never clear the detector, producing pure dispatch and
+        // comment-noise waste (AI-2021 was re-dispatched ~5×). Suppress while ≥1
+        // child is non-terminal. Once every child terminalizes the count drops to
+        // 0 and normal dispatch resumes, so a genuinely-stuck validation sign-off
+        // is not silently dropped (AC2). Leaf tickets (no children) are unaffected,
+        // preserving ordinary stuck-delegate detection (AC3).
+        if ((candidate.nonTerminalChildCount ?? 0) > 0) {
+          result.skippedBarrierHeld++;
+          log.info(
+            `Stuck-delegate: skipping ${ticketId} — barrier-held parent, ` +
+            `${candidate.nonTerminalChildCount}/${candidate.totalChildren ?? candidate.nonTerminalChildCount} ` +
+            `children non-terminal (wf:${candidate.workflowId ?? "?"}, state:${candidate.currentState})`,
+          );
           continue;
         }
 
@@ -505,6 +569,13 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
           delegate { id }
           updatedAt
           state { name type }
+          children(first: 50) {
+            nodes {
+              identifier
+              state { type }
+              labels { nodes { name } }
+            }
+          }
           comments(first: 20, orderBy: createdAt) {
             nodes {
               id
@@ -552,6 +623,13 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
             delegate: { id: string } | null;
             updatedAt: string;
             state: { name: string; type: string } | null;
+            children?: {
+              nodes?: Array<{
+                identifier: string;
+                state?: { type: string } | null;
+                labels?: { nodes?: Array<{ name: string }> };
+              }>;
+            };
             comments: {
               nodes: Array<{
                 id: string;
@@ -633,6 +711,15 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
           at: h.createdAt ?? "",
         }));
 
+      // AI-2129: resolve child terminality for barrier-held suppression. A child
+      // is terminal if its native Linear state is completed/canceled OR it carries
+      // a terminal workflow `state:*` label (done/escape). Native state is checked
+      // first so a child closed without a workflow label still counts as terminal.
+      const childNodes = issue.children?.nodes ?? [];
+      const nonTerminalChildCount = childNodes.filter(
+        (child) => !isChildTerminal(child.state?.type ?? null, (child.labels?.nodes ?? []).map((l) => l.name)),
+      ).length;
+
       candidates.push({
         identifier: issue.identifier,
         currentState,
@@ -641,6 +728,9 @@ async function defaultFetchStuckCandidates(agent: AgentConfig): Promise<StuckCan
         stateEnteredAt,
         delegateComments,
         transitionsAfterEntry,
+        workflowId,
+        totalChildren: childNodes.length,
+        nonTerminalChildCount,
       });
     }
 
