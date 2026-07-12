@@ -376,6 +376,7 @@ describe("PUT /admin/api/agents/:name (AI-2140)", () => {
     reloadAgents();
 
     app = express();
+    app.use(express.json());
     app.use("/admin", createAdminRouter({ deploymentName: "test" } as any));
   });
 
