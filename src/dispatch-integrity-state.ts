@@ -13,14 +13,12 @@
  *   G1 deliveryTimeRecipientResolution — wrong-agent      (AI-2042)
  *   G2 phantomFetchabilityGate         — unfetchable       (AI-2015 / AI-2034)
  *   G3 wakeSessionDedup                — duplicate session (AI-1774)
- *   G4 preMutationCAS                  — stale-snapshot    (AI-2058)
  */
 
 export type DispatchIntegrityGateKey =
   | "deliveryTimeRecipientResolution"
   | "phantomFetchabilityGate"
-  | "wakeSessionDedup"
-  | "preMutationCAS";
+  | "wakeSessionDedup";
 
 export interface DispatchIntegrityGateState {
   active: boolean;
@@ -32,7 +30,6 @@ const GATE_KEYS: DispatchIntegrityGateKey[] = [
   "deliveryTimeRecipientResolution",
   "phantomFetchabilityGate",
   "wakeSessionDedup",
-  "preMutationCAS",
 ];
 
 function blankGates(): Record<DispatchIntegrityGateKey, DispatchIntegrityGateState> {

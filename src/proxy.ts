@@ -347,13 +347,10 @@ export interface CommandAuthSnapshot {
   /** The caller's Linear user ID snapshotted at command start (used as effective delegateId). */
   snapshotDelegateId: string | null;
   /**
-   * AI-2091 §8 (AI-2058) — the TICKET's delegate (Linear user id) snapshotted at
-   * command start, distinct from the caller identity above. The pre-forward CAS
-   * re-read compares this against the ticket's CURRENT delegate: if a foreign
-   * actor moved the delegate away mid-run, a trailing governed mutation that B1
-   * would otherwise wave through on the stale snapshot is rejected before it
-   * commits. null when the delegate could not be read at command start
-   * (fail-open — the CAS does not block on an unknown baseline).
+   * The ticket's delegate (Linear user id) snapshotted at command start,
+   * distinct from the caller identity above. Used by the AI-1860 snapshot
+   * mechanism to avoid self-blocking after a post-transition delegate change.
+   * null when the delegate could not be read at command start (fail-open).
    */
   snapshotTicketDelegate: string | null;
   /**
@@ -365,56 +362,6 @@ export interface CommandAuthSnapshot {
   snapshotState: string | null;
   expiresAt: number;
 }
-
-/**
- * AI-2091 §8 (AI-2058) — pre-mutation compare-and-swap.
- *
- * A governed command authorizes a mutation against the delegate/state it
- * snapshotted at command start. If another actor changes the delegate or
- * advances the state mid-run, the trailing mutation must be re-evaluated against
- * CURRENT state before it commits — not applied blindly against the stale
- * snapshot (which would overwrite the new owner's decision). AI-2035 added a
- * terminal re-entry guard for the specific Done→Doing bounce; this generalizes
- * it to a CAS re-read before ANY mutation commits.
- *
- * Returns proceed=false when the delegate changed or the state advanced since
- * the snapshot was taken; proceed=true only when the snapshot still matches the
- * authoritative current state.
- */
-export interface MutationCasInput {
-  agent: string;
-  ticketId: string;
-  snapshotDelegate: string | null;
-  snapshotState: string | null;
-  currentDelegate: string | null;
-  currentState: string | null;
-}
-
-export interface MutationCasDecision {
-  proceed: boolean;
-  reason: string | null;
-}
-
-export function assertMutationAgainstCurrentState(input: MutationCasInput): MutationCasDecision {
-  if (input.snapshotDelegate !== input.currentDelegate) {
-    return {
-      proceed: false,
-      reason:
-        `stale-snapshot: ${input.ticketId} delegate changed since ${input.agent} started ` +
-        `(snapshot=${input.snapshotDelegate ?? "none"} → current=${input.currentDelegate ?? "none"})`,
-    };
-  }
-  if (input.snapshotState !== input.currentState) {
-    return {
-      proceed: false,
-      reason:
-        `stale-snapshot: ${input.ticketId} state advanced since ${input.agent} started ` +
-        `(snapshot=${input.snapshotState ?? "none"} → current=${input.currentState ?? "none"})`,
-    };
-  }
-  return { proceed: true, reason: null };
-}
-
 export interface ProxyDeps {
   /** Optional observation store for recording feedback observations (P4-1). */
   observationStore?: ObservationStore;
@@ -577,7 +524,6 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           snapshotDelegateId = existing.snapshotDelegateId;
           snapshotState = existing.snapshotState;
           snapshotTicketDelegate = existing.snapshotTicketDelegate;
-          snapshotLoadedFromStore = true;
           log.info(`auth-snapshot-hit agent=${agentId} intent=${intent}${ticketCtx}`);
         }
       }
@@ -715,6 +661,19 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment, snapshotDelegateId, snapshotState);
       if (p3rejection) {
         log.warn(`workflow-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p3rejection}`);
+
+        // AI-2091 G4 (re-scoped to B1): when the B1 delegate-only block fires
+        // ("is not the current delegate for"), emit the operational event so the
+        // stale-snapshot-mutation-rejected property is observable on the live path.
+        if (issueId && p3rejection.includes("is not the current delegate for")) {
+          deps?.operationalEventStore?.append({
+            outcome: "stale-snapshot-mutation-rejected" as never,
+            type: "delegate-enforcement",
+            agent: agentId,
+            key: issueId,
+            errorSummary: p3rejection,
+          });
+        }
         // AI-1857 AC4: include gate-verification snapshot so CLI can verify "no partial state was written"
         const gateDeclineResponse: Record<string, unknown> = { errors: [{ message: p3rejection }] };
         if (issueId) {
@@ -737,9 +696,6 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // snapshotState null so follow-up mutations fall back to the live state.
       if (snapshotKey && deps?.commandAuthSnapshots && snapshotDelegateId === undefined) {
         let capturedState: string | null = null;
-        // AI-2091 §8 (G4): capture the ticket delegate alongside the source state
-        // in one read (fetchTicketVerification returns both), so the pre-forward
-        // CAS has a baseline to compare the CURRENT delegate against.
         let capturedTicketDelegate: string | null = null;
         if (issueId) {
           try {
@@ -750,7 +706,6 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             const snapWfId = getWorkflowId(verification.labels);
             const snapDef = snapWfId ? await loadWorkflowDefById(snapWfId) : null;
             capturedState = getCurrentState(verification.labels, snapDef ?? undefined) ?? null;
-            // AI-2091 G4: capture the ticket delegate at command start for the pre-mutation CAS re-read.
             capturedTicketDelegate = verification.delegateId;
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -899,74 +854,6 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           return;
         }
       }
-
-      // ── AI-2091 §8 (G4, AI-2058): pre-mutation compare-and-swap ──────────────
-      // Before forwarding a TRAILING governed issue mutation, re-read the ticket's
-      // CURRENT delegate and compare it to the delegate captured at command start.
-      // B1 (checkWorkflowRules) authorizes a trailing mutation off the reused
-      // command-start snapshot without re-checking the live delegate, so a foreign
-      // actor who takes the delegate mid-run — the live AI-2091 instance: a session
-      // dispatched on delegate=Igor, moved to tdd mid-run — would otherwise have its
-      // decision silently overwritten. We reject ONLY a foreign takeover: the
-      // delegate changed away from the snapshot AND is no longer this caller. That
-      // guard is what keeps legitimate self-progression safe — this command's own
-      // transition reassigns the delegate to the next owner post-forward, never to a
-      // foreign actor before this point, and a trailing self-progression step (e.g.
-      // the AI-1848/1872/1924 comment) is a commentCreate, not an issueUpdate, so it
-      // is not gated here at all. A transient re-read failure fails open.
-      if (
-        issueId &&
-        snapshotLoadedFromStore &&
-        typeof snapshotTicketDelegate === "string" &&
-        isIssueUpdateMutation(body)
-      ) {
-        try {
-          const current = await fetchTicketVerification(issueId, authorization);
-          const foreignTakeover =
-            current.delegateId !== snapshotTicketDelegate &&
-            current.delegateId !== (callerLinearUserId ?? null);
-          if (foreignTakeover) {
-            const decision = assertMutationAgainstCurrentState({
-              agent: agentId,
-              ticketId: issueId,
-              snapshotDelegate: snapshotTicketDelegate,
-              // State dimension neutralized: self-progression advances the state
-              // legitimately, so only the foreign-delegate signal drives the reject.
-              snapshotState: null,
-              currentDelegate: current.delegateId,
-              currentState: null,
-            });
-            if (!decision.proceed) {
-              log.warn(`stale-snapshot-mutation-rejected agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${decision.reason}`);
-              deps?.operationalEventStore?.append({
-                outcome: "stale-snapshot-mutation-rejected" as never,
-                type: "pre-mutation-cas",
-                agent: agentId,
-                key: issueId,
-                errorSummary: decision.reason ?? "stale-snapshot mutation rejected",
-              });
-              const casResponse: Record<string, unknown> = {
-                errors: [{
-                  message:
-                    `[Proxy] '${effectiveIntent}' rejected: the ticket delegate changed since your command started ` +
-                    `(${decision.reason}). Another actor now owns this ticket — re-read it before mutating. No state was changed.`,
-                }],
-              };
-              try {
-                casResponse._gateVerification = await fetchTicketVerification(issueId, authorization);
-              } catch {
-                // fail-open: don't suppress the rejection if the verification fetch fails
-              }
-              res.status(200).json(casResponse);
-              return;
-            }
-          }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          log.warn(`pre-mutation CAS re-read failed agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg} — failing open`);
-        }
-      }
-
       let upstreamRes: globalThis.Response;
       try {
         upstreamRes = await fetch(LINEAR_API_URL, {

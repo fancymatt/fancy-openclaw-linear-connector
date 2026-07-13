@@ -582,19 +582,9 @@ export function createApp(options?: CreateAppOptions) {
   // exactly because bootstrap installed the gate:
   //  G1 — staleRePokeRecipientValid gates the C4 re-poke in processStaleSession
   //       (the sessionTracker stale handler wired just above).
-  //  G2 — assertDispatchTargetFetchable preflights the C4 re-poke dispatch below;
-  //       the PRIMARY-path wiring is marked inside createWebhookRouter (the real
-  //       phantom source, AI-2014/AI-2034), where dispatchRoute runs the gate.
-  //  G3 — resignalPendingTickets enforces one-wake→one-session via sessionTracker.
-  //  G4 — assertMutationAgainstCurrentState is invoked in handleProxyRequest before
-  //       the upstream mutation forward, re-reading the ticket delegate against the
-  //       commandAuthSnapshots baseline created for this app instance. It rejects a
-  //       trailing governed mutation whose delegate was taken over by a foreign
-  //       actor mid-run (stale-snapshot-mutation-rejected); self-progression passes.
   markDispatchIntegrityGateActive("deliveryTimeRecipientResolution", "C4 re-poke delegate recheck (processStaleSession → staleRePokeRecipientValid)");
   markDispatchIntegrityGateActive("phantomFetchabilityGate", "delivery-time fetchability preflight (processStaleSession → assertDispatchTargetFetchable)");
   markDispatchIntegrityGateActive("wakeSessionDedup", "one-wake→one-session claim (resignalPendingTickets → sessionTracker)");
-  markDispatchIntegrityGateActive("preMutationCAS", "pre-mutation compare-and-swap (handleProxyRequest → assertMutationAgainstCurrentState) before the upstream forward");
 
   // ── v1.2: Dispatch acknowledgment tracking + early no-activity detection ──
   const ackTracker = new DispatchAckTracker(
