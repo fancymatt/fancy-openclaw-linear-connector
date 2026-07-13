@@ -137,6 +137,9 @@ export async function reconcileOobMutations(
       actorId: webhookRec.actorId,
     });
 
+    // Mark as resolved so the next pass doesn't re-flag this record (AI-2191).
+    store.markFlaggedResolved(webhookRec.id, new Date(now).toISOString());
+
     // Surface via operational event + alert.
     opts?.operationalEventStore?.append({
       outcome: "no-activity-warn",
