@@ -12,7 +12,8 @@ import type { DispatchIdempotencyStore } from "../store/dispatch-idempotency-sto
 import { extractWebhookMutations } from "./mutation-extraction.js";
 import { routeEvent, routeEventAll, unresolvedRoutingCandidates } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
-import { deliverToAgent, DeliveryThrottle, type DeliveryConfig } from "../delivery/index.js";
+import { deliverToAgent, DeliveryThrottle, type DeliveryConfig, assertDispatchTargetFetchable } from "../delivery/index.js";
+import { markDispatchIntegrityGateActive } from "../dispatch-integrity-state.js";
 import type { RouteResult } from "../types.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgents } from "../agents.js";
@@ -24,7 +25,7 @@ import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
 import { createLogger, componentLogger } from "../logger.js";
-import { isLinearIssueStillRoutedToAgent, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
+import { checkLinearIssueRouting, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
 import { onChildTerminal } from "../barrier.js";
 import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
 import { notify } from "../alerts/alert-bus.js";
@@ -161,6 +162,17 @@ export function createWebhookRouter(
   idempotencyStore?: DispatchIdempotencyStore,
 ): Router {
   const router = Router();
+
+  // AI-2091 §2/§9 (G2): the delivery-time fetchability gate is wired into the
+  // PRIMARY dispatch path (dispatchRoute → checkLinearIssueRouting →
+  // assertDispatchTargetFetchable) right here, not just the C4 re-poke path.
+  // Mark it live at the wiring site so /health.dispatchIntegrity reflects the
+  // real installation rather than a hardcoded bootstrap literal (the AI-1808
+  // dead-code guard).
+  markDispatchIntegrityGateActive(
+    "phantomFetchabilityGate",
+    "primary webhook dispatch path (dispatchRoute → assertDispatchTargetFetchable)",
+  );
 
   if (NUDGE_DEDUP_WINDOW_MS > 0) {
     log.info(`Nudge dedup enabled: ${NUDGE_DEDUP_WINDOW_MS}ms window`);
@@ -586,7 +598,40 @@ export function createWebhookRouter(
       // accidental delegation that was already corrected does not let the old
       // agent take ownership or mutate the ticket later.
       const ticketId = route.sessionKey;
-      if (!(await isLinearIssueStillRoutedToAgent(ticketId, route.agentId, route.routingReason))) {
+      const routingCheck = await checkLinearIssueRouting(ticketId, route.agentId, route.routingReason);
+
+      // ── AI-2091 §2 (G2): delivery-time fetchability gate on the PRIMARY path.
+      // A definitive not-found at delivery is a phantom — a dead identifier or a
+      // deleted ticket (AI-2014 at 16:45Z, the AI-2034 dead-identifier cluster).
+      // Abort loudly and ship ZERO delivery; never send a "workflow context
+      // unavailable" wake for a ticket that does not exist. A transient fetch
+      // failure is NOT a phantom (routingCheck.failOpen) and falls through to the
+      // normal fail-open path — a Linear hiccup must not be swallowed as a phantom.
+      if (routingCheck.terminalNotFound) {
+        const fetchability = assertDispatchTargetFetchable({
+          ticketId: ticketId.replace(/^linear-/, ""),
+          fetchable: false,
+          terminalNotFound: true,
+        });
+        if (!fetchability.dispatch) {
+          log.warn(
+            `phantom-dispatch-abort: ${ticketId} unfetchable at delivery — ${fetchability.reason}; aborting dispatch for ${route.agentId}`,
+          );
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "phantom-dispatch-abort" as never,
+            type: event.type,
+            agent: route.agentId,
+            key: ticketId,
+            sessionKey: ticketId,
+            deliveryMode: "fetchability-gate",
+            errorSummary: fetchability.reason,
+            plane: "connector",
+          });
+          return;
+        }
+      }
+
+      if (!routingCheck.actionable) {
         appendOperationalEvent(operationalEventStore, { outcome: "dedup-suppressed", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "stale-route" });
         return;
       }

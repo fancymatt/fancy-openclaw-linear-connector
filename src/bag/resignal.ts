@@ -65,6 +65,24 @@ export async function resignalPendingTickets(
         continue;
       }
 
+      // AI-2091 §7 (AI-1774/AI-1772): one wake → one session. Claim the session
+      // slot ATOMICALLY and SYNCHRONOUSLY here — before the first `await` — so two
+      // concurrent dispatches of the same pending wake (the intake race) can't both
+      // pass the isActiveForTicket check above and each deliver. startSession is a
+      // compare-and-set: it returns false if another in-flight dispatch already
+      // claimed this exact (agent, ticket), and we skip the duplicate. The claim is
+      // released again on the prune paths below so a non-actionable ticket doesn't
+      // leave a phantom active session behind. (Only when markActive — callers that
+      // don't mark sessions active keep the prior behavior.)
+      let claimedSession = false;
+      if (options.markActive) {
+        claimedSession = sessionTracker.startSession(agentId, ticketId);
+        if (!claimedSession) {
+          log.info(`Wake already in-flight for ${agentId} [${ticketId}] — skipping duplicate dispatch`);
+          continue;
+        }
+      }
+
       // Resolve per-ticket actionability. For mention/body-mention–routed tickets the
       // issue need not have this agent as delegate — mentions are always actionable.
       // For everything else (or unknown/legacy rows) fall back to the delegate check,
@@ -73,6 +91,7 @@ export async function resignalPendingTickets(
       if (options.isTicketActionable) {
         // Custom override provided: use it as-is (failOpenBehavior does not apply)
         if (!(await options.isTicketActionable(ticketId, agentId))) {
+          if (claimedSession) sessionTracker.endSession(agentId, ticketId);
           bag.removeTicket(agentId, ticketId);
           sessionTracker.removePendingTicket(ticketId, agentId);
           log.info(`Pruned non-actionable pending ticket for ${agentId} [${ticketId}] before wake-up dispatch`);
@@ -86,6 +105,7 @@ export async function resignalPendingTickets(
         const routingResult = await checkLinearIssueRouting(ticketId, agentId, effectiveReason);
 
         if (!routingResult.actionable) {
+          if (claimedSession) sessionTracker.endSession(agentId, ticketId);
           bag.removeTicket(agentId, ticketId);
           sessionTracker.removePendingTicket(ticketId, agentId);
           log.info(`Pruned non-actionable pending ticket for ${agentId} [${ticketId}] before wake-up dispatch`);
@@ -96,6 +116,7 @@ export async function resignalPendingTickets(
         if (routingResult.failOpen && options.failOpenBehavior === "defer") {
           // Transient error during routing check: defer dispatch rather than risk waking an agent
           // for a ticket that may be Done. Ticket stays in bag for re-check on next connector start.
+          if (claimedSession) sessionTracker.endSession(agentId, ticketId);
           log.info(`Deferring fail-open pending ticket for ${agentId} [${ticketId}] — routing check uncertain, will retry on next startup`);
           results.push({ ticketId, dispatched: false, deferred: true });
           continue;
@@ -111,10 +132,9 @@ export async function resignalPendingTickets(
 
       // Record intent before delivery — prevents double-dispatch even on failure;
       // stale session detection handles cleanup if delivery never completes.
+      // The active-session claim was already made atomically above (AI-2091 §7)
+      // when markActive is set, so no second startSession is needed here.
       bag.recordSignal();
-      if (options.markActive) {
-        sessionTracker.startSession(agentId, ticketId);
-      }
 
       const wakeResult = await sendWakeUp(agentId, [ticketId], ticketWakeConfig);
       options.onDispatched?.(agentId, ticketId);

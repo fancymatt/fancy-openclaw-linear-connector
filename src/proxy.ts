@@ -347,6 +347,13 @@ export interface CommandAuthSnapshot {
   /** The caller's Linear user ID snapshotted at command start (used as effective delegateId). */
   snapshotDelegateId: string | null;
   /**
+   * The ticket's delegate (Linear user id) snapshotted at command start,
+   * distinct from the caller identity above. Used by the AI-1860 snapshot
+   * mechanism to avoid self-blocking after a post-transition delegate change.
+   * null when the delegate could not be read at command start (fail-open).
+   */
+  snapshotTicketDelegate: string | null;
+  /**
    * AI-1860: the ticket's workflow source state snapshotted at command start. Reused for
    * meta-intent resolution and transition-legality checks on subsequent mutations so a
    * multi-step governed command is not re-gated against its own post-transition state.
@@ -355,7 +362,6 @@ export interface CommandAuthSnapshot {
   snapshotState: string | null;
   expiresAt: number;
 }
-
 export interface ProxyDeps {
   /** Optional observation store for recording feedback observations (P4-1). */
   observationStore?: ObservationStore;
@@ -511,11 +517,13 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // still reuse the snapshot and thus are never re-gated against post-transition
       // state.
       const isTransitionMutation = isIssueUpdateMutation(body);
+      let snapshotTicketDelegate: string | null | undefined = undefined;
       if (snapshotKey && deps?.commandAuthSnapshots && !isTransitionMutation) {
         const existing = deps.commandAuthSnapshots.get(snapshotKey);
         if (existing && Date.now() < existing.expiresAt) {
           snapshotDelegateId = existing.snapshotDelegateId;
           snapshotState = existing.snapshotState;
+          snapshotTicketDelegate = existing.snapshotTicketDelegate;
           log.info(`auth-snapshot-hit agent=${agentId} intent=${intent}${ticketCtx}`);
         }
       }
@@ -653,6 +661,19 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment, snapshotDelegateId, snapshotState);
       if (p3rejection) {
         log.warn(`workflow-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p3rejection}`);
+
+        // AI-2091 G4 (re-scoped to B1): when the B1 delegate-only block fires
+        // ("is not the current delegate for"), emit the operational event so the
+        // stale-snapshot-mutation-rejected property is observable on the live path.
+        if (issueId && p3rejection.includes("is not the current delegate for")) {
+          deps?.operationalEventStore?.append({
+            outcome: "stale-snapshot-mutation-rejected" as never,
+            type: "delegate-enforcement",
+            agent: agentId,
+            key: issueId,
+            errorSummary: p3rejection,
+          });
+        }
         // AI-1857 AC4: include gate-verification snapshot so CLI can verify "no partial state was written"
         const gateDeclineResponse: Record<string, unknown> = { errors: [{ message: p3rejection }] };
         if (issueId) {
@@ -675,15 +696,17 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // snapshotState null so follow-up mutations fall back to the live state.
       if (snapshotKey && deps?.commandAuthSnapshots && snapshotDelegateId === undefined) {
         let capturedState: string | null = null;
+        let capturedTicketDelegate: string | null = null;
         if (issueId) {
           try {
-            const preLabels = await fetchWorkflowLabels(issueId, authorization);
+            const verification = await fetchTicketVerification(issueId, authorization);
             // AI-2094: resolve def-aware so a stale/duplicate state:* label on a
             // drifted ticket can't snapshot the wrong (earlier) state and bind
             // the follow-up meta-intent to the wrong forward edge (mis-route to assign).
-            const snapWfId = getWorkflowId(preLabels);
+            const snapWfId = getWorkflowId(verification.labels);
             const snapDef = snapWfId ? await loadWorkflowDefById(snapWfId) : null;
-            capturedState = getCurrentState(preLabels, snapDef ?? undefined) ?? null;
+            capturedState = getCurrentState(verification.labels, snapDef ?? undefined) ?? null;
+            capturedTicketDelegate = verification.delegateId;
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             log.warn(`auth-snapshot source-state capture failed agent=${agentId} intent=${intent}${ticketCtx}: ${msg}`);
@@ -692,10 +715,12 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         deps.commandAuthSnapshots.set(snapshotKey, {
           snapshotDelegateId: callerLinearUserId ?? null,
           snapshotState: capturedState,
+          snapshotTicketDelegate: capturedTicketDelegate,
           expiresAt: Date.now() + COMMAND_AUTH_SNAPSHOT_TTL_MS,
         });
         snapshotState = capturedState;
-        log.info(`auth-snapshot-stored agent=${agentId} intent=${intent}${ticketCtx} state=${capturedState ?? "unknown"}`);
+        snapshotTicketDelegate = capturedTicketDelegate;
+        log.info(`auth-snapshot-stored agent=${agentId} intent=${intent}${ticketCtx} state=${capturedState ?? "unknown"} ticketDelegate=${capturedTicketDelegate ?? "none"}`);
       }
 
       // AI-1977: delegateOverride is computed inside the issueId block below
@@ -829,7 +854,6 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           return;
         }
       }
-
       let upstreamRes: globalThis.Response;
       try {
         upstreamRes = await fetch(LINEAR_API_URL, {

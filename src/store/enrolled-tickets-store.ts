@@ -190,6 +190,20 @@ export class EnrolledTicketsStore {
       .run(now, ticketId);
   }
 
+  /**
+   * AI-2091 §3 (AI-2015 AC2): PURGE a ticket from the mirror entirely.
+   *
+   * Deletion (ticket removed from Linear, or moved out of an enrolled team) must
+   * REMOVE the row, not merely flag it terminal. `markTerminal`/`demoteEnrolled`
+   * leave a `terminal=1` row behind that still feeds the watchdog data plane
+   * (`getAll()`/`listTickets()`), which then arms phantom ladders and drives
+   * phantom wakes on a ticket that no longer exists. Purge is the only disposition
+   * that takes the row off the data plane for good.
+   */
+  purge(ticketId: string): void {
+    this.db.prepare(`DELETE FROM enrolled_tickets WHERE ticket_id = ?`).run(ticketId);
+  }
+
   /** Look up a single ticket by its identifier. */
   getByTicketId(ticketId: string): EnrolledTicketRow | null {
     const row = this.db

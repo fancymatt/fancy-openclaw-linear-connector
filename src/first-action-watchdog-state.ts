@@ -23,8 +23,15 @@ export interface FirstActionLadder {
   ticket: string;
   state: string;
   delegate: string;
-  /** ISO — dispatch delivery time the deadline is armed from. */
+  /** ISO — the (possibly restart-clamped) time the deadline is armed from. */
   armedAt: string;
+  /**
+   * AI-2091 §4 — the RAW dispatch delivered-at (epoch ms) this ladder was armed
+   * for. `armedAt` may be clamped forward to sweep time on a cold/first arm over a
+   * stale (pre-restart) backlog, so dispatch identity ("is this the same
+   * dispatch?") is compared on this raw value, not on the clamped armedAt.
+   */
+  deliveredAtMs?: number;
   /** ISO — armedAt + the per-state (or default) first-action deadline. */
   deadlineAt: string;
   /** How many escalation rungs have fired for this ticket. */

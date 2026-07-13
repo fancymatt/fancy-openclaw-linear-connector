@@ -209,11 +209,17 @@ describe("AC5 admin: per-ticket first-action ladder state is exposed on the boar
 
     // Simulate the watchdog having armed + fired a rung for this ticket by running
     // a sweep whose data plane returns exactly this ticket, past its deadline.
+    // AI-2091 §4: the arming rule now clamps a cold ladder forward to `now` when
+    // the delivery predates the sweep by more than the restart-safety horizon
+    // (MAX_ARM_LOOKBACK_MS = 2h), so a delivered-at 25h stale no longer breaches
+    // on the first sweep. Keep the delivery inside that horizon but past the 30m
+    // deadline so this ticket still legitimately breaches and exposes a rung.
     const wd = await import("./first-action-watchdog.js");
+    const sweepNow = Date.now() + 1_000 * 60 * 60 * 24;
     await wd.runFirstActionWatchdogSweep({
       authToken: "Bearer test",
       workflowDefPath: path.resolve(__dirname, "__fixtures__"),
-      now: () => Date.now() + 1_000 * 60 * 60 * 24, // far past any deadline
+      now: () => sweepNow,
       defaultDeadlineMs: 30 * 60_000,
       maxRungs: 3,
       capabilityPolicy: { bodies: [], containers: [], roles: [] },
@@ -227,7 +233,8 @@ describe("AC5 admin: per-ticket first-action ladder state is exposed on the boar
           delegate: "tdd",
           humanAssigned: false,
           labels: ["wf:dev-impl", "state:write-tests"],
-          dispatchDeliveredAtMs: Date.now() - 1_000 * 60 * 60,
+          // 1h before the sweep: inside the 2h arm horizon, past the 30m deadline.
+          dispatchDeliveredAtMs: sweepNow - 1_000 * 60 * 60,
           dispatchUpdatedAt: new Date().toISOString(),
           firstOwnerActionAtMs: null,
         },
