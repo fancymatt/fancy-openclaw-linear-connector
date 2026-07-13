@@ -28,6 +28,7 @@ import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState
 import { checkLinearIssueRouting } from "./linear-actionable.js";
 import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
+import { getCircuitBreakerHealth } from "./dispatch-circuit-breaker.js";
 import { registerDistillationCron, createProdGenerationContext } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
@@ -381,6 +382,7 @@ export function createApp(options?: CreateAppOptions) {
       // and a computed state (healthy/stale/expired/failing). Powers the
       // console token panel (AI-1955 AC3) and operator triage without log access.
       tokens: getAllTokenStatuses(),
+      dispatchCircuitBreaker: getCircuitBreakerHealth(),
     });
   });
 

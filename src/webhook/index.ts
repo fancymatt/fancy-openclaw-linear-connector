@@ -15,6 +15,11 @@ import { routeEvent, routeEventAll, unresolvedRoutingCandidates } from "../route
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
 import { deliverToAgent, DeliveryThrottle, type DeliveryConfig, assertDispatchTargetFetchable } from "../delivery/index.js";
 import { markDispatchIntegrityGateActive } from "../dispatch-integrity-state.js";
+import {
+  checkBreaker,
+  recordDispatch,
+  checkCommentFedSuppressionForTicket,
+} from "../dispatch-circuit-breaker.js";
 import type { RouteResult } from "../types.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgents } from "../agents.js";
@@ -176,6 +181,10 @@ export function createWebhookRouter(
     "primary webhook dispatch path (dispatchRoute → assertDispatchTargetFetchable)",
   );
   markAutoEnrollRegistered();
+  markDispatchIntegrityGateActive(
+    "deliveryTimeRecipientResolution",
+    "primary webhook dispatch path (dispatchRoute → roster-based recipient validation, AI-2192)",
+  );
 
   if (NUDGE_DEDUP_WINDOW_MS > 0) {
     log.info(`Nudge dedup enabled: ${NUDGE_DEDUP_WINDOW_MS}ms window`);
@@ -674,12 +683,151 @@ export function createWebhookRouter(
         }
       }
 
+      // ── AI-2192: Delivery-time recipient resolution ─────────────────────
+      // Check whether the resolved agent is registered in the live roster.
+      // A non-roster agent means the resolution path (delegate/assignee/mention/
+      // department-prefix/steward-escalation) produced a name absent from
+      // agents.json — a half-applied rename, stale cache, or config drift.
+      // Instead of silently attempting delivery (which will fail with retries
+      // into the void), dead-letter immediately with a critical alert naming
+      // the ticket, intended agent, and resolution path.
+      const ticketId = route.sessionKey;
+      const resolvedAgentName = route.agentId;
+      const rosterNames = getAgents().map((a) => a.name);
+      const rosterNameSet = new Set(rosterNames);
+      if (!rosterNameSet.has(resolvedAgentName)) {
+        const detail = {
+          ticket: ticketId.replace(/^linear-/, ""),
+          resolvedAgent: resolvedAgentName,
+          routingReason: route.routingReason,
+          eventType: event.type,
+          rosterAgents: rosterNames,
+        };
+        log.error(
+          `non-roster-agent: ${resolvedAgentName} is not in the agent roster — aborting dispatch for ${ticketId}. ` +
+          `routingReason=${route.routingReason} roster=[${rosterNames.join(", ")}]`,
+        );
+        // Raise a critical alert naming the ticket, agent, and resolution path.
+        notify({
+          severity: "critical",
+          source: "dispatch",
+          title: `Non-roster dispatch target: ${resolvedAgentName} for ${ticketId.replace(/^linear-/, "")}`,
+          detail: JSON.stringify(detail),
+          agent: resolvedAgentName,
+          ticket: ticketId.replace(/^linear-/, ""),
+        });
+        // Write an operational event recording the dead-letter.
+        appendOperationalEvent(operationalEventStore, {
+          outcome: "dispatch-undeliverable",
+          type: event.type,
+          agent: resolvedAgentName,
+          key: ticketId,
+          sessionKey: ticketId,
+          deliveryMode: "non-roster-recipient",
+          attemptCount: 0,
+          errorSummary: `Non-roster dispatch target: ${resolvedAgentName} — routingReason=${route.routingReason}`,
+          detail,
+          wakeId,
+          plane: "connector",
+        });
+        // Zero delivery attempts — return immediately. No retry, no wake.
+        return;
+      }
+
+      // ── AI-2178: Dispatch circuit breaker + comment-fed suppression ─────
+      // Checks run sequentially:
+      //   1. Comment-fed re-wake suppression (pre-wake heuristic) — skip
+      //      without incrementing breaker when the delegate comments on their
+      //      own ticket without advancing state.
+      //   2. Circuit breaker — skip when the breaker is tripped (N
+      //      consecutive no-change wakes).
+      //   3. State comparison — if state hasn't moved since last dispatch,
+      //      increment the breaker counter. If it has, reset.
+      {
+        const cbTicketId = route.sessionKey;
+        const cbData = event.data as Record<string, unknown> | null;
+
+        // Resolve the current state:* label from the event payload.
+        const cbLabels = ((): string[] => {
+          if (Array.isArray(cbData?.labels)) return cbData.labels as string[];
+          const issue = cbData?.issue as Record<string, unknown> | undefined;
+          if (issue && Array.isArray(issue.labels)) return issue.labels as string[];
+          return [];
+        })();
+        const cbStateLabel = cbLabels
+          .filter((l: string) => /^state:/i.test(l))
+          .map((l: string) => l.slice(l.indexOf(":") + 1).toLowerCase())
+          .sort() // deterministic for multi-label edge case
+          .join(",") || null;
+
+        // Feature 2: comment-fed re-wake suppression (pre-wake heuristic).
+        // Runs BEFORE the breaker counter increment so the dominant self-feed
+        // loop never burns a breaker slot.
+        const commentSuppress = checkCommentFedSuppressionForTicket(
+          cbTicketId,
+          event,
+          cbStateLabel,
+          route.agentId,
+        );
+
+        if (commentSuppress.suppressed) {
+          log.info(
+            `Comment-fed suppression: skipping wake for ${route.agentId} [${cbTicketId}] — ${commentSuppress.reason ?? "delegate comment, no state change"}`,
+          );
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "suppressed-comment-fed" as never,
+            type: event.type,
+            agent: route.agentId,
+            key: cbTicketId,
+            sessionKey: cbTicketId,
+            deliveryMode: "circuit-breaker",
+            plane: "connector",
+            detail: { reason: commentSuppress.reason ?? "delegate comment, no state change" },
+          });
+          return;
+        }
+
+        // Feature 1: circuit breaker. First, check if tripped.
+        const breakerCheck = checkBreaker(cbTicketId);
+        if (breakerCheck.blocked) {
+          log.info(
+            `Circuit breaker: blocking dispatch for ${route.agentId} [${cbTicketId}] — tripped at ${breakerCheck.state!.trippedAt} (${breakerCheck.state!.wakeCount} wakes, state=${breakerCheck.state!.lastStateLabel ?? "unknown"})`,
+          );
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "breaked-blocked" as never,
+            type: event.type,
+            agent: route.agentId,
+            key: cbTicketId,
+            sessionKey: cbTicketId,
+            deliveryMode: "circuit-breaker",
+            plane: "connector",
+            detail: { wakeCount: breakerCheck.state!.wakeCount, trippedAt: breakerCheck.state!.trippedAt, stateLabel: breakerCheck.state!.lastStateLabel },
+          });
+          return;
+        }
+
+        // Not blocked and not comment-suppressed. Determine whether this
+        // wake is a repeat on the same state or a state advance (reset).
+        // recordDispatch handles the comparison internally:
+        //   - First dispatch: seed state, counter=0.
+        //   - State changed from last: reset counter to 0.
+        //   - State unchanged: keep existing counter.
+        //
+        // The counter is then incremented by a SUBSEQUENT webhook that
+        // sees the state hasn't changed from THIS dispatch. That increment
+        // happens in the next arrival's dispatchRoute call — when the
+        // state label matches this recording, recordFailedWake fires.
+        //
+        // We record BEFORE the stale-route guard so the state snapshot
+        // reflects THIS event, not a stale previous entry.
+        recordDispatch(cbTicketId, cbStateLabel);
+      }
+
       // ── 9a. Stale-route guard ───────────────────────────────────────────
       // Linear webhook payloads are snapshots. Before waking an agent from a
       // delegate/assignee event, re-check Linear's current issue state so an
       // accidental delegation that was already corrected does not let the old
       // agent take ownership or mutate the ticket later.
-      const ticketId = route.sessionKey;
       const routingCheck = await checkLinearIssueRouting(ticketId, route.agentId, route.routingReason);
 
       // ── AI-2091 §2 (G2): delivery-time fetchability gate on the PRIMARY path.
