@@ -690,6 +690,14 @@ interface TicketContext {
   labels: string[];
   /** Linear user ID of the current delegate, or null if unset. */
   delegateId: string | null;
+  /**
+   * AI-2357: the human issue identifier (e.g. "AI-2357"), as returned by Linear.
+   * The caller's `issueId` is whatever the mutation carried — a UUID on the
+   * `issueUpdate` path (see extractIssueId) — but the applied-state store is keyed
+   * by the human identifier. Resolving it here gives the store's true key
+   * regardless of which form the request supplied. Null if the fetch failed.
+   */
+  identifier: string | null;
   /** True when the context fetch itself failed (network error, API error, etc.). */
   fetchFailed: boolean;
 }
@@ -705,7 +713,7 @@ interface TicketContext {
  * configured posture.
  */
 async function fetchTicketContext(issueId: string, authToken: string): Promise<TicketContext> {
-  const query = `query IssueContext($id: String!) { issue(id: $id) { labels { nodes { name } } delegate { id } } }`;
+  const query = `query IssueContext($id: String!) { issue(id: $id) { identifier labels { nodes { name } } delegate { id } } }`;
   try {
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",
@@ -718,6 +726,7 @@ async function fetchTicketContext(issueId: string, authToken: string): Promise<T
     type ContextResp = {
       data?: {
         issue?: {
+          identifier?: string;
           labels?: { nodes: Array<{ name: string }> };
           delegate?: { id: string } | null;
         };
@@ -727,17 +736,18 @@ async function fetchTicketContext(issueId: string, authToken: string): Promise<T
     const issue = data.data?.issue;
     if (!issue) {
       log.warn(`workflow-gate: issue ${issueId} not found in context fetch — returning fetchFailed`);
-      return { labels: [], delegateId: null, fetchFailed: true };
+      return { labels: [], delegateId: null, identifier: null, fetchFailed: true };
     }
     return {
       labels: (issue?.labels?.nodes ?? []).map((n) => n.name),
       delegateId: issue?.delegate?.id ?? null,
+      identifier: issue?.identifier ?? null,
       fetchFailed: false,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: context fetch failed for ${issueId}: ${msg}`);
-    return { labels: [], delegateId: null, fetchFailed: true };
+    return { labels: [], delegateId: null, identifier: null, fetchFailed: true };
   }
 }
 
@@ -1678,7 +1688,7 @@ export async function checkWorkflowRules(
     }
   }
 
-  const { labels, delegateId: fetchedDelegateId, fetchFailed } = await fetchTicketContext(issueId, authToken);
+  const { labels, delegateId: fetchedDelegateId, identifier: fetchedIdentifier, fetchFailed } = await fetchTicketContext(issueId, authToken);
 
   // AI-1860: use snapshotted delegateId for authorization checks when provided.
   // snapshotDelegateId is the delegateId captured at command start (first mutation);
@@ -1919,10 +1929,27 @@ export async function checkWorkflowRules(
   // already advanced to the post-transition state; re-checking legality against it
   // self-blocks the command (exit 1) after its own transition applied. The live state
   // is still used above for informational legal-moves hints in block messages.
+  //
+  // AI-2357: prefer the applied-state store (getAppliedState) over the stale label
+  // projection. When the engine's authoritative state (recorded at the last successful
+  // applyStateTransition) disagrees with the stale state:* label on the ticket, the
+  // engine state wins — the label projection is advisory, not authoritative. This
+  // prevents governed transitions from declining on desynced labels.
+  //
+  // The store is keyed by the HUMAN identifier ("AI-2357") — that is what
+  // applyStateTransition writes (recordAppliedState(issue.identifier, ...)). `issueId`
+  // here is whatever the mutation carried, which on the issueUpdate path is a UUID
+  // (extractIssueId prefers the raw `id` variable), so it must NOT be used as the key:
+  // a UUID read can never hit an identifier write, and the lookup would silently miss,
+  // fall through to the stale label, and decline the verb — the very bug this closes.
+  // fetchTicketContext resolves the true identifier for us regardless of the form
+  // supplied. Fall back to issueId only when the fetch gave us nothing (it may itself
+  // already be an identifier on the CLI path).
+  const appliedStateKey = fetchedIdentifier ?? issueId;
   const currentState =
     typeof snapshotState === "string" && snapshotState.length > 0
       ? snapshotState
-      : getCurrentState(labels, def); // AI-2094: def-aware — a stale state:* label can never win over the real one
+      : getAppliedState(appliedStateKey) ?? getCurrentState(labels, def); // AI-2357: applied-state store wins over stale label; AI-2094: def-aware fallback
   if (!currentState) {
     // AI-1402: For needs-human, fail-closed even without a state label.
     // We cannot determine if there is a forward path, so treat the ticket as actionable.
