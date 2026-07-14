@@ -21,7 +21,7 @@
  */
 
 import { createLogger, componentLogger } from "../logger.js";
-import { getAccessToken, getAgents, isAgentLocal, type AgentConfig } from "../agents.js";
+import { getAccessToken, getAgents, isAgentLocal, isPolledForLinear, type AgentConfig } from "../agents.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
 import type { ManagingStateStore } from "../store/managing-state-store.js";
 import type { DeliveryConfig } from "../delivery/index.js";
@@ -188,7 +188,7 @@ export class ManagingPoller {
       store: deps.store,
       operationalEventStore: deps.operationalEventStore,
       resolveDeliveryConfig: deps.resolveDeliveryConfig,
-      listAgents: deps.listAgents ?? (() => getAgents().filter(isAgentLocal)),
+      listAgents: deps.listAgents ?? (() => getAgents().filter(isAgentLocal).filter(isPolledForLinear)),
       fetchManagingTickets: deps.fetchManagingTickets ?? fetchManagingTicketsForAgent,
       sendWake: deps.sendWake ?? sendManagingWakeSignal,
       now: deps.now ?? (() => Date.now()),

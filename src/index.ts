@@ -38,6 +38,7 @@ import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
+import { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import { ProposalStore } from "./store/proposal-store.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
 import { getRegisteredCrons } from "./cron/registry.js";
@@ -50,7 +51,7 @@ import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { startRegistryPolicyCheck } from "./registry-policy.js";
 import { resolveStartupCommit } from "./startup-commit.js";
-import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses } from "./agents.js";
+import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses, isPolledForLinear } from "./agents.js";
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
 import { loadRoster, getRoutingFunctionaryLiveness } from "./department-roster.js";
 import { createGuidanceRouter, getDocsLiveness } from "./docs/guidance-router.js";
@@ -188,6 +189,8 @@ export interface CreateAppOptions {
   mutationAuditDbPath?: string;
   /** Override DispatchIdempotencyStore database path (for testing). AI-1918. */
   idempotencyDbPath?: string;
+  /** Override DispatchLeaseStore database path (for testing). AI-2350. */
+  dispatchLeaseDbPath?: string;
   /** Override ProposalStore database path (for testing). AI-2039. */
   proposalsDbPath?: string;
   /** Override forensics diagnostics base directory (for testing, AI-1953). */
@@ -312,6 +315,7 @@ export function createApp(options?: CreateAppOptions) {
       commit: getStartupCommit(),
       agents: agents.length,
       agentNames: agents.map((a) => a.name),
+      offLinearAgentNames: agents.filter((a) => !isPolledForLinear(a)).map((a) => a.name),
       // AI-1810: live scheduling state. Every periodic/background driver
       // registers at the moment its timer is created; an expected driver
       // missing from this list means it shipped without bootstrap wiring
@@ -390,6 +394,7 @@ export function createApp(options?: CreateAppOptions) {
   const enrolledTicketsStore = new EnrolledTicketsStore(options?.enrolledTicketsDbPath);
   const mutationAuditStore = new MutationAuditStore(options?.mutationAuditDbPath);
   const idempotencyStore = new DispatchIdempotencyStore(options?.idempotencyDbPath);
+  const dispatchLeaseStore = new DispatchLeaseStore(options?.dispatchLeaseDbPath);
   // AI-2039 (P4-C4): learning-loop proposal queue + apply-outcome store. Backs
   // the /admin/api/proposals review console (C5) and the apply pipeline's
   // idempotency/retry surface (AC4.8).
@@ -912,6 +917,7 @@ export function createApp(options?: CreateAppOptions) {
     enrolledTicketsStore,
     mutationAuditStore,
     idempotencyStore,
+    dispatchLeaseStore,
   ));
 
   // ── v1.1: Session-end callback endpoint ──────────────────────────────
@@ -1080,6 +1086,14 @@ export function createApp(options?: CreateAppOptions) {
       }
     }
 
+    // AI-2350: Release dispatch leases for all session-end tickets.
+    if (dispatchLeaseStore) {
+      const released = dispatchLeaseStore.releaseAll(agentId);
+      if (released > 0) {
+        log.info(`Session-end: released ${released} dispatch lease(s) for ${agentId}`);
+      }
+    }
+
     res.json({ ok: true, pendingTickets: allPending.length });
   });
 
@@ -1137,7 +1151,7 @@ export function createApp(options?: CreateAppOptions) {
     wakeFn: migrationWakeFn,
   });
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore };
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore };
 }
 
 /**
@@ -1228,7 +1242,7 @@ if (isEntryPoint) {
     startTokenRefresh();
   }
 
-  const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, proposalStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, mutationAuditStore, enrolledTicketsStore, idempotencyStore } = createApp();
+  const { app, agentQueue, bag, sessionTracker, operationalEventStore, observationStore, proposalStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, watchdog, noActivityDetector, mutationAuditStore, enrolledTicketsStore, idempotencyStore, dispatchLeaseStore } = createApp();
 
   // P4-C3: periodic distillation of reject metrics into the deterministic
   // generation engine, persisted into the unified C4 store (AI-2070). The prod
@@ -1275,6 +1289,7 @@ if (isEntryPoint) {
     authToken: reconciliationAuthToken,
     operationalEventStore,
     wakeFn: reconciliationWakeFn,
+    dispatchLeaseStore,
   });
 
   // AI-2009: first-action watchdog — arm a per-state deadline at dispatch
@@ -1442,6 +1457,7 @@ if (isEntryPoint) {
         ticketIdentifiers,
         since: body?.since,
         until: body?.until,
+        dispatchLeaseStore,
       });
       res.json({ success: true, ...result });
     } catch (err) {

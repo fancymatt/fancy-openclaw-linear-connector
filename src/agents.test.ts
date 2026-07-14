@@ -7,6 +7,7 @@ import {
   getAgents,
   getTokenStatus,
   isAgentLocal,
+  isPolledForLinear,
   recordTokenFailure,
   reloadAgents,
   safeReloadAgents,
@@ -30,6 +31,24 @@ function makeAgent(secretsPath: string): AgentConfig {
     secretsPath,
   };
 }
+
+describe("isPolledForLinear", () => {
+  test("returns true when status is undefined (default active)", () => {
+    expect(isPolledForLinear({ name: "test", linearUserId: "u1", clientId: "", clientSecret: "", accessToken: "", refreshToken: "" })).toBe(true);
+  });
+
+  test("returns true when status is active", () => {
+    expect(isPolledForLinear({ name: "test", linearUserId: "u1", clientId: "", clientSecret: "", accessToken: "", refreshToken: "", status: "active" })).toBe(true);
+  });
+
+  test("returns false when status is off-linear", () => {
+    expect(isPolledForLinear({ name: "test", linearUserId: "u1", clientId: "", clientSecret: "", accessToken: "", refreshToken: "", status: "off-linear" })).toBe(false);
+  });
+
+  test("returns false when status is never-onboarded", () => {
+    expect(isPolledForLinear({ name: "test", linearUserId: "u1", clientId: "", clientSecret: "", accessToken: "", refreshToken: "", status: "never-onboarded" })).toBe(false);
+  });
+});
 
 describe("isAgentLocal", () => {
   const baseAgent: AgentConfig = {

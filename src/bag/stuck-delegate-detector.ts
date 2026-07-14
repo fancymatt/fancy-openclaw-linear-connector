@@ -35,7 +35,7 @@
  */
 
 import { createLogger, componentLogger } from "../logger.js";
-import { getAccessToken, getAgents, isAgentLocal, type AgentConfig } from "../agents.js";
+import { getAccessToken, getAgents, isAgentLocal, isPolledForLinear, type AgentConfig } from "../agents.js";
 import { loadWorkflowDef, getCurrentState, getWorkflowId, type WorkflowDef } from "../workflow-gate.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
 import type { SessionTracker } from "./session-tracker.js";
@@ -230,7 +230,7 @@ export class StuckDelegateDetector {
       operationalEventStore: deps.operationalEventStore,
       deliveryConfig: deps.deliveryConfig,
       sendWake: deps.sendWake ?? defaultSendWakeFactory(deps.deliveryConfig),
-      listAgents: deps.listAgents ?? (() => getAgents().filter(isAgentLocal)),
+      listAgents: deps.listAgents ?? (() => getAgents().filter(isAgentLocal).filter(isPolledForLinear)),
       now: deps.now ?? (() => Date.now()),
       fetchStuckCandidates: deps.fetchStuckCandidates ?? defaultFetchStuckCandidates,
       loadDef: deps.loadDef ?? loadWorkflowDef,

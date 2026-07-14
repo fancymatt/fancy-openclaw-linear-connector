@@ -334,6 +334,7 @@ function buildDashboard(deps: AdminDeps) {
         linearUserId: agent.linearUserId ? `…${agent.linearUserId.slice(-8)}` : "Not mapped",
         openclawAgent: agent.openclawAgent ?? agent.name,
         host: agent.host ?? "local",
+        status: agent.status ?? "active",
       })),
       agentMappings: agentRows.map((agent) => ({
         name: agent.name,
@@ -1394,12 +1395,16 @@ export function createAdminRouter(deps: AdminDeps): Router {
       host?: "ishikawa" | "local";
       linearUserId?: string;
       displayName?: string;
+      status?: "active" | "off-linear" | "never-onboarded";
     } = {};
 
     if (typeof body.openclawAgent === "string") meta.openclawAgent = body.openclawAgent;
     if (body.host === "ishikawa" || body.host === "local") meta.host = body.host;
     if (typeof body.linearUserId === "string") meta.linearUserId = body.linearUserId;
     if (typeof body.displayName === "string") meta.displayName = body.displayName;
+    if (body.status === "active" || body.status === "off-linear" || body.status === "never-onboarded") {
+      meta.status = body.status;
+    }
 
     // Reject attempts to write token/secrets fields as a guard.
     const FORBIDDEN = ["accessToken", "refreshToken", "clientId", "clientSecret", "proxyToken", "proxyUrl", "secretsPath"];
@@ -1427,6 +1432,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
         openclawAgent: updated.openclawAgent,
         host: updated.host,
         linearUserId: updated.linearUserId ? `…${updated.linearUserId.slice(-8)}` : null,
+        status: updated.status ?? "active",
       },
       registryPolicy: status,
     });
