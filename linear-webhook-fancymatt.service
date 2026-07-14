@@ -1,0 +1,16 @@
+[Unit]
+Description=Linear Webhook Service (fancymatt)
+After=network.target
+
+[Service]
+Type=simple
+User=fancymatt
+WorkingDirectory=/home/fancymatt/Code/repos/fancy-openclaw-linear-connector-deploy
+EnvironmentFile=/home/fancymatt/Code/repos/fancy-openclaw-linear-connector-deploy/.env
+Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/linuxbrew/.linuxbrew/bin/node dist/index.js
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
