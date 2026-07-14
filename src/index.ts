@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import './bootstrap-env.js'; // AI-2263: load .env + seed state-dir defaults before any store module reads them
 import express, { Request, Response, NextFunction } from "express";
 import { createWebhookRouter } from "./webhook/index.js";
 import { handleProxyRequest } from "./proxy.js";
@@ -57,6 +57,7 @@ import { createGuidanceRouter, getDocsLiveness } from "./docs/guidance-router.js
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
 import path from "path";
+import { resolveStatePath } from "./state-dir.js";
 
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
@@ -1190,7 +1191,7 @@ if (isEntryPoint) {
   // the orchestrizer (systemd / Docker restart policy) doesn't keep reviving
   // a zombie instance.
   if (agents.length === 0) {
-    const agentsPath = process.env.AGENTS_FILE ?? path.resolve(process.cwd(), "agents.json");
+    const agentsPath = process.env.AGENTS_FILE ?? resolveStatePath("agents.json");
     const msg = `Fatal: agent roster is empty (AGENTS_FILE=${agentsPath}). Refusing to start — check that the agents file exists and is mounted correctly.`;
     log.error(msg);
     notify({
@@ -1454,9 +1455,9 @@ if (isEntryPoint) {
   // their current state exceeds the per-state `sla:` value. Emits a
   // warning-level alert + steward wake per new breach (deduped via SQLite).
   // Managed children are excluded (barrier.ts predicate owns them).
-  const defaultWorkflowDefPath = "config/workflows.yaml";
+  const defaultWorkflowDefPath = resolveStatePath("config", "workflows.yaml");
   const slaWorkflowDefPath = process.env.WORKFLOW_DEFS_DIR ?? process.env.WORKFLOW_DEF_PATH ?? defaultWorkflowDefPath;
-  const slaDataDir = process.env.DATA_DIR ?? "data";
+  const slaDataDir = process.env.DATA_DIR ?? resolveStatePath("data");
   const slaBreachStorePath = process.env.SLA_BREACH_STORE_PATH ?? path.join(slaDataDir, "sla-breaches.db");
   const slaAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
   const slaCadenceMs = process.env.SLA_SWEEP_CADENCE_MS ? parseInt(process.env.SLA_SWEEP_CADENCE_MS, 10) : undefined;

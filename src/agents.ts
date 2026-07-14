@@ -7,6 +7,7 @@
 import fs from "node:fs";
 import crypto from "node:crypto";
 import path from "node:path";
+import { resolveStatePath } from "./state-dir.js";
 import {
   getAgentWorkspaceDir,
   getLinearSecretPath,
@@ -79,7 +80,10 @@ interface EncryptedAgentsFile {
   ct: string;
 }
 
-const DEFAULT_AGENTS_PATH = path.resolve(process.cwd(), "agents.json");
+// AI-2263: fall back to the state dir (OPENCLAW_LINEAR_CONNECTOR_STATE) when
+// set, else cwd. AGENTS_FILE (seeded from the same state dir at bootstrap) still
+// wins in getAgentsPath(); this keeps the standalone default consistent.
+const DEFAULT_AGENTS_PATH = resolveStatePath("agents.json");
 const ENCRYPTED_AGENTS_VERSION = 2;
 const ENCRYPTED_AGENTS_ALG = "AES-256-GCM";
 
