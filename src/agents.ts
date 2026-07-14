@@ -454,12 +454,40 @@ function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
     contents = `LINEAR_OAUTH_TOKEN=${accessToken}\n`;
   }
 
+  // Publish atomically. This runs on every token refresh while readers (the */30
+  // liveness cron among them) are reading the same file, so a truncate-then-write
+  // in place would hand them an empty or half-written env — no `lpx_` line, a
+  // silent credential downgrade, and a 401 that looks like a revoked token.
+  // Write a temp file in the SAME directory (rename(2) is only atomic within one
+  // filesystem), fix its mode to 0600 on the fd before the name is resolvable, then
+  // rename it over the target. A reader then sees either the whole old file or the
+  // whole new one — and never a world-readable one. (AI-2288)
+  const dir = path.dirname(secretsPath);
+  const tmpPath = path.join(dir, `.${path.basename(secretsPath)}.${process.pid}.${crypto.randomUUID()}.tmp`);
   try {
-    fs.mkdirSync(path.dirname(secretsPath), { recursive: true });
-    fs.writeFileSync(secretsPath, contents, "utf8");
-    fs.chmodSync(secretsPath, 0o600);
+    fs.mkdirSync(dir, { recursive: true });
+    let fd: number | undefined;
+    try {
+      // "wx" fails rather than clobbers if the temp name somehow exists.
+      fd = fs.openSync(tmpPath, "wx", 0o600);
+      fs.writeFileSync(fd, contents, "utf8");
+      // Explicit fchmod: the open(2) mode argument is masked by umask, so it alone
+      // cannot guarantee 0600.
+      fs.fchmodSync(fd, 0o600);
+      fs.fsyncSync(fd);
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+    fs.renameSync(tmpPath, secretsPath);
     log.info(`Synced ${agent.proxyToken ? "proxy token" : "token"} to ${secretsPath}`);
   } catch (err) {
+    // Fail closed: leave whatever credentials were already in place untouched and
+    // valid, rather than a partial file that no reader can use.
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // Nothing to clean up.
+    }
     log.error(`Failed to sync token to ${secretsPath}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
