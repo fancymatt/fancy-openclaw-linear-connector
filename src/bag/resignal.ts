@@ -3,7 +3,7 @@ import { createLogger, componentLogger } from "../logger.js";
 import { sendWakeUpSignal, MENTION_TICKET_TEMPLATE, type WakeUpConfig } from "./wake-up.js";
 import { PendingWorkBag } from "./pending-work-bag.js";
 import { SessionTracker } from "./session-tracker.js";
-import { isLinearIssueActionable, isLinearIssueStillRoutedToAgent, checkLinearIssueRouting } from "../linear-actionable.js";
+import { isLinearIssueActionable, isLinearIssueStillRoutedToAgent, checkLinearIssueRouting, type RoutingReason } from "../linear-actionable.js";
 
 const log = componentLogger(createLogger(), "resignal");
 
@@ -101,7 +101,11 @@ export async function resignalPendingTickets(
       } else {
         // Default: use checkLinearIssueRouting for rich result so failOpenBehavior can apply
         const storedReason = bag.getTicketRoutingReason(agentId, ticketId);
-        const effectiveReason = (storedReason ?? "delegate") as "delegate" | "assignee" | "mention" | "body-mention";
+        // AI-2295: the stored reason may be any RoutingReason — department-prefix
+        // and steward-escalation included. The old cast narrowed the type to the
+        // delegate/assignee/mention set, which hid the fact that roster-fanout
+        // reasons flow through this check too and were bypassing every prune.
+        const effectiveReason = (storedReason ?? "delegate") as RoutingReason;
         const routingResult = await checkLinearIssueRouting(ticketId, agentId, effectiveReason);
 
         if (!routingResult.actionable) {

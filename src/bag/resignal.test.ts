@@ -162,4 +162,62 @@ describe("resignalPendingTickets", () => {
     expect(sentTickets).toEqual(["linear-AI-502"]);
     expect(results[0].dispatched).toBe(true);
   });
+
+  // ── AI-2295: the live repro, end-to-end through the real routing check ────
+  describe("AI-2295: department-prefix bag entries no longer bypass the prunes", () => {
+    const originalFetch = global.fetch;
+    const originalKey = process.env.LINEAR_API_KEY;
+
+    // AI-2230's shape at dispatch time: To Do, delegate cleared ~1h earlier,
+    // assignee = Matt (a human). It woke igor via a department-prefix bag entry.
+    const AI_2230 = {
+      id: "issue-2230",
+      identifier: "AI-2230",
+      delegate: null,
+      assignee: { id: "matt-linear-id", name: "Matt Henry", app: false },
+      state: { name: "To Do", type: "unstarted" },
+      relations: { nodes: [] },
+    };
+
+    beforeEach(() => {
+      process.env.LINEAR_API_KEY = "lin_test_token";
+      global.fetch = (async () => ({
+        ok: true,
+        json: async () => ({ data: { issue: AI_2230 } }),
+      })) as unknown as typeof fetch;
+    });
+
+    afterEach(() => {
+      global.fetch = originalFetch;
+      if (originalKey === undefined) delete process.env.LINEAR_API_KEY;
+      else process.env.LINEAR_API_KEY = originalKey;
+    });
+
+    test("prunes a department-prefix ticket parked on a human before wake-up", async () => {
+      bag.add("igor", "AI-2230", "Issue", "department-prefix");
+
+      const sentTickets: string[] = [];
+      const results = await resignalPendingTickets("igor", ["AI-2230"], bag, sessionTracker, wakeConfig, {
+        sendWakeUp: async (_agentId, ticketIds) => { sentTickets.push(...ticketIds); },
+      });
+
+      expect(sentTickets).toHaveLength(0);
+      expect(results[0].pruned).toBe(true);
+      // Pruned entries leave the bag, so the false wake does not re-fire forever
+      // while the ticket stays parked on a travelling human.
+      expect(bag.getPendingTickets("igor")).toHaveLength(0);
+    });
+
+    test("still dispatches a mention on the same human-assigned ticket", async () => {
+      bag.add("igor", "AI-2230", "Issue", "mention");
+
+      const sentTickets: string[] = [];
+      const results = await resignalPendingTickets("igor", ["AI-2230"], bag, sessionTracker, wakeConfig, {
+        sendWakeUp: async (_agentId, ticketIds) => { sentTickets.push(...ticketIds); },
+      });
+
+      expect(sentTickets).toEqual(["linear-AI-2230"]);
+      expect(results[0].dispatched).toBe(true);
+    });
+  });
 });

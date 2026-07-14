@@ -1,4 +1,4 @@
-import { getAccessToken, getAgent } from "./agents.js";
+import { buildAgentMap, getAccessToken, getAgent } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
 import { normalizeSessionKey } from "./session-key.js";
 import type { LinearEvent } from "./webhook/schema.js";
@@ -43,10 +43,70 @@ export interface LinearIssueRelation {
   relatedIssue?: LinearIssueReference | null;
 }
 
+export interface LinearUserReference {
+  id?: string;
+  name?: string;
+  /**
+   * Linear's `User.app` flag: true for application/bot users (our agents),
+   * false for real people. Present on the assignee selection so the
+   * human-blocked prune (AI-2295) can tell a human parking a ticket apart
+   * from an agent holding it.
+   */
+  app?: boolean | null;
+}
+
 export interface LinearIssueWithRelations extends LinearIssueReference {
-  delegate?: { id?: string; name?: string } | null;
-  assignee?: { id?: string; name?: string } | null;
+  delegate?: LinearUserReference | null;
+  assignee?: LinearUserReference | null;
   relations?: { nodes?: LinearIssueRelation[] | null } | null;
+}
+
+/** How the dispatch route to this agent was decided. */
+export type RoutingReason =
+  | "delegate"
+  | "assignee"
+  | "mention"
+  | "body-mention"
+  | "department-prefix"
+  | "steward-escalation";
+
+/**
+ * Routing reasons that carry a delegate/assignee ownership claim on the ticket,
+ * and can therefore have that claim re-verified against Linear at delivery.
+ */
+const OWNERSHIP_REASONS = new Set<RoutingReason>(["delegate", "assignee"]);
+
+/**
+ * Routing reasons that fan a ticket to an agent by roster/department policy
+ * rather than by an explicit human act. A ticket with no delegate that is
+ * assigned to a HUMAN is human-blocked work, not unrouted work: nobody asked
+ * for an agent, so these routes must not wake one. Deliberately EXCLUDES
+ * mention / body-mention — a genuine @mention on a human-assigned ticket is a
+ * legitimate wake (someone explicitly pinged the agent) and must still land.
+ */
+const ROSTER_FANOUT_REASONS = new Set<RoutingReason>(["department-prefix", "steward-escalation"]);
+
+/**
+ * Is this Linear user a human rather than one of our agents?
+ *
+ * Ordered so that a positive agent signal always wins, and an inconclusive
+ * result is treated as NOT human. That keeps the human-blocked prune fail-safe:
+ * when we cannot prove the assignee is a person, we keep dispatching (the
+ * pre-AI-2295 behavior) rather than silently swallowing a legitimate wake.
+ */
+export function isHumanLinearUser(
+  user: LinearUserReference | null | undefined,
+  agentLinearUserIds: ReadonlySet<string>,
+): boolean {
+  if (!user) return false;
+  if (user.app === true) return false;                          // Linear app user ⇒ one of our agents
+  if (user.id && agentLinearUserIds.has(user.id)) return false; // on the agent roster ⇒ agent
+  if (user.app === false) return true;                          // Linear says: real person
+  return false;                                                 // inconclusive ⇒ don't prune
+}
+
+function agentLinearUserIdSet(): ReadonlySet<string> {
+  return new Set(Object.keys(buildAgentMap()).filter((id) => Boolean(id)));
 }
 
 function isSameIssue(a: LinearIssueReference | null | undefined, b: LinearIssueReference): boolean {
@@ -121,8 +181,8 @@ export interface RoutingCheckResult {
    * with an OK response and no GraphQL errors), i.e. a phantom / dead
    * identifier. Distinct from a transient fetch failure (`failOpen`): a
    * terminal not-found aborts the dispatch loudly (phantom-dispatch-abort);
-   * a transient failure fails open and retries. Undefined on the mention /
-   * functionary early-return paths, which do not fetch the issue.
+   * a transient failure fails open and retries. Undefined only when the issue
+   * was never fetched (no token → fail-open).
    */
   terminalNotFound?: boolean;
 }
@@ -130,25 +190,32 @@ export interface RoutingCheckResult {
 /**
  * Core routing check. Returns a rich result distinguishing confirmed routing from fail-open.
  * Most callers should use isLinearIssueStillRoutedToAgent for the simple boolean interface.
+ *
+ * AI-2295 — two independent gates, in order:
+ *
+ *  1. LIVENESS gate — applies to EVERY routing reason. A ticket that is
+ *     not-found, terminal, parked, or blocked by an open prerequisite is dead
+ *     work: nobody should be woken for it, however the route was decided. This
+ *     gate used to be unreachable for mention / body-mention / department-prefix
+ *     / steward-escalation, which short-circuited to `actionable: true` BEFORE
+ *     the issue was ever fetched.
+ *
+ *  2. OWNERSHIP gate — applies only to delegate / assignee routes, the reasons
+ *     that carry a claim we can re-verify. Mentions have no delegate to check.
+ *
+ *  Plus a HUMAN-BLOCKED prune for roster-fanout routes (department-prefix /
+ *  steward-escalation) only: `delegate == null && assignee is a human` means the
+ *  ticket is parked on a person, not waiting on the department.
+ *
+ * Fail-open semantics are preserved throughout: a transient fetch/auth/API
+ * failure still returns `{ actionable: true, failOpen: true }` for every reason,
+ * so a Linear outage cannot turn the new liveness gate into dropped wakes.
  */
 export async function checkLinearIssueRouting(
   ticketId: string,
   agentId: string,
-  routingReason: "delegate" | "assignee" | "mention" | "body-mention" | "department-prefix" | "steward-escalation" | undefined,
+  routingReason: RoutingReason | undefined,
 ): Promise<RoutingCheckResult> {
-  // Mentions and functionary routes (AI-1479 department-prefix / steward
-  // escalation) have no delegate/assignee ownership on the ticket to re-verify —
-  // the route was decided by mention or roster prefix, not by a delegation the
-  // stale-route guard could confirm. Treat them as actionable.
-  if (
-    routingReason === "mention" ||
-    routingReason === "body-mention" ||
-    routingReason === "department-prefix" ||
-    routingReason === "steward-escalation"
-  ) {
-    return { actionable: true, failOpen: false };
-  }
-
   const token = tokenForAgent(agentId);
   if (!token) return { actionable: true, failOpen: true };
 
@@ -165,8 +232,8 @@ export async function checkLinearIssueRouting(
         query: `query IssueRouting($id: String!) {
           issue(id: $id) {
             id identifier
-            delegate { id name }
-            assignee { id name }
+            delegate { id name app }
+            assignee { id name app }
             state { name type }
             relations(first: 50) {
               nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
@@ -193,17 +260,44 @@ export async function checkLinearIssueRouting(
     }
 
     const issue = body.data?.issue;
+
+    // ── Gate 1: LIVENESS (all routing reasons, AI-2295) ──────────────────
     // AI-2091 §2 (G2): an OK response with no errors and a null issue is a
     // DEFINITIVE not-found — the ticket does not exist (dead identifier /
     // deleted). Surface it as terminalNotFound so the dispatch path can abort
     // as a phantom rather than silently no-route it.
     if (!issue) return { actionable: false, failOpen: false, terminalNotFound: true };
     if (isTerminalIssueState(issue.state) || isParkedIssueState(issue.state)) {
+      log.info(`Dropping ${routingReason ?? "unrouted"} event for ${identifier}: state is ${issue.state?.name ?? issue.state?.type ?? "non-actionable"}`);
       return { actionable: false, failOpen: false };
     }
     if (isBlockedByOpenIssue(issue)) {
       log.info(`Dropping pending Linear ticket ${identifier}: blocked by unfinished prerequisite`);
       return { actionable: false, failOpen: false };
+    }
+
+    // ── Gate 2a: HUMAN-BLOCKED prune (roster-fanout reasons only, AI-2295) ─
+    // A department-prefix / steward-escalation route onto a ticket with NO
+    // delegate that is assigned to a HUMAN is not actionable by any agent: the
+    // ticket is blocked on a person (AI-2230 — parked on Matt for a browser
+    // OAuth click), not unrouted departmental work. Without this, every
+    // human-blocked ticket in To Do is a standing false-wake source for every
+    // agent in the department. Mentions deliberately do NOT take this path.
+    if (routingReason && ROSTER_FANOUT_REASONS.has(routingReason)) {
+      if (!issue.delegate && isHumanLinearUser(issue.assignee, agentLinearUserIdSet())) {
+        log.info(
+          `Dropping ${routingReason} event for ${identifier}: no delegate and assigned to human ${issue.assignee?.name ?? "unknown"} — human-blocked, not unrouted work`,
+        );
+        return { actionable: false, failOpen: false };
+      }
+      return { actionable: true, failOpen: false };
+    }
+
+    // ── Gate 2b: OWNERSHIP (delegate / assignee reasons only) ─────────────
+    // Mentions and body-mentions reach here and fall through to actionable:
+    // they passed liveness, and there is no ownership claim to re-verify.
+    if (routingReason && !OWNERSHIP_REASONS.has(routingReason)) {
+      return { actionable: true, failOpen: false };
     }
 
     if (routingReason === "delegate") {
@@ -250,7 +344,7 @@ export async function checkLinearIssueRouting(
 export async function isLinearIssueStillRoutedToAgent(
   ticketId: string,
   agentId: string,
-  routingReason: "delegate" | "assignee" | "mention" | "body-mention" | "department-prefix" | "steward-escalation" | undefined,
+  routingReason: RoutingReason | undefined,
 ): Promise<boolean> {
   return (await checkLinearIssueRouting(ticketId, agentId, routingReason)).actionable;
 }
