@@ -19,6 +19,8 @@ const mockNotify = jest.fn<(alert: unknown) => void>();
 jest.unstable_mockModule("./agents.js", () => ({
   // isAgentLocal is called before any network work; make every test agent local.
   isAgentLocal: jest.fn().mockReturnValue(true),
+  // isPolledForLinear: all test agents are polled by default.
+  isPolledForLinear: jest.fn().mockReturnValue(true),
   updateTokens: mockUpdateTokens,
   recordTokenFailure: mockRecordTokenFailure,
   getAgents: mockGetAgents,

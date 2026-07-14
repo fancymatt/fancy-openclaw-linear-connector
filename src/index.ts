@@ -51,7 +51,7 @@ import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
 import { startRegistryPolicyCheck } from "./registry-policy.js";
 import { resolveStartupCommit } from "./startup-commit.js";
-import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses } from "./agents.js";
+import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses, isPolledForLinear } from "./agents.js";
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
 import { loadRoster, getRoutingFunctionaryLiveness } from "./department-roster.js";
 import { createGuidanceRouter, getDocsLiveness } from "./docs/guidance-router.js";
@@ -315,6 +315,7 @@ export function createApp(options?: CreateAppOptions) {
       commit: getStartupCommit(),
       agents: agents.length,
       agentNames: agents.map((a) => a.name),
+      offLinearAgentNames: agents.filter((a) => !isPolledForLinear(a)).map((a) => a.name),
       // AI-1810: live scheduling state. Every periodic/background driver
       // registers at the moment its timer is created; an expected driver
       // missing from this list means it shipped without bootstrap wiring

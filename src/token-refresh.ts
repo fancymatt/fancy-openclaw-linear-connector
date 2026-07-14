@@ -11,7 +11,7 @@
  * visible alert once every attempt has failed.
  */
 
-import { getAgents, updateTokens, recordTokenFailure, isAgentLocal } from "./agents.js";
+import { getAgents, updateTokens, recordTokenFailure, isAgentLocal, isPolledForLinear } from "./agents.js";
 import type { AgentConfig } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
 import { notify } from "./alerts/alert-bus.js";
@@ -167,8 +167,8 @@ async function refreshAgent(agent: AgentConfig, opts: RefreshOptions = {}): Prom
 }
 
 async function refreshAll(opts: RefreshOptions = {}): Promise<void> {
-  const agents = getAgents();
-  log.info(`Refreshing ${agents.length} agent(s)...`);
+  const agents = getAgents().filter(isPolledForLinear);
+  log.info(`Refreshing ${agents.length} agent(s) (${getAgents().length - agents.length} skipped via status)...`);
   await Promise.all(agents.map((a) => refreshAgent(a, opts)));
 }
 

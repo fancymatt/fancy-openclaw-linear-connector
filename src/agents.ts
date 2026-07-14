@@ -58,6 +58,20 @@ export interface AgentConfig {
   lastRefreshOkAt?: string;
   /** Details of the last failed token refresh attempt, if any. */
   lastFailure?: TokenFailure;
+  /**
+   * Linear connector registration status. Controls whether this agent's
+   * pollers and token refresher contact Linear on its behalf.
+   *
+   * - `"active"` (default when absent): polled normally.
+   * - `"off-linear"`: deliberately decommissioned from Linear; all pollers,
+   *   token refresh, and credential checks skip this agent.
+   * - `"never-onboarded"`: never set up (e.g. blocked on host-side OAuth);
+   *   same skip behaviour, but semantically distinct.
+   *
+   * The registry is the single source of truth for decommission state.
+   * See AI-2346.
+   */
+  status?: "active" | "off-linear" | "never-onboarded";
 }
 
 export interface TokenFailure {
@@ -310,6 +324,22 @@ export function getAgentByProxyToken(token: string): AgentConfig | undefined {
 }
 
 /** Get the OpenClaw agent name for routing */
+/**
+ * Whether this agent should be polled for Linear activity (managing poller,
+ * stuck-delegate detector, token refresh, etc.).
+ *
+ * Agents whose `status` is undefined or `"active"` are polled. Agents marked
+ * `"off-linear"` or `"never-onboarded"` are skipped — no Linear API calls are
+ * made on their behalf, and no 401 noise is produced.
+ *
+ * This is the single gate — every poller and refresher should use this helper
+ * rather than scattering `status === "active"` string checks across modules.
+ * See AI-2346.
+ */
+export function isPolledForLinear(agent: AgentConfig): boolean {
+  return (agent.status ?? "active") === "active";
+}
+
 export function getOpenclawAgentName(agentName: string): string {
   const agent = _agents.find((a) => a.name === agentName);
   return agent?.openclawAgent ?? agentName;
@@ -481,6 +511,7 @@ export function updateAgentMetadata(
     host?: "ishikawa" | "local";
     linearUserId?: string;
     displayName?: string;
+    status?: "active" | "off-linear" | "never-onboarded";
   },
 ): AgentConfig | null {
   const idx = _agents.findIndex((a) => a.name === agentName);
@@ -493,6 +524,7 @@ export function updateAgentMetadata(
     ...(meta.host !== undefined ? { host: meta.host } : {}),
     ...(meta.linearUserId !== undefined ? { linearUserId: meta.linearUserId } : {}),
     ...(meta.displayName !== undefined ? { displayName: meta.displayName } : {}),
+    ...(meta.status !== undefined ? { status: meta.status } : {}),
   };
 
   _agents[idx] = updated;
