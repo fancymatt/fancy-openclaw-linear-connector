@@ -421,6 +421,66 @@ export function getAllTokenStatuses(): TokenStatus[] {
   return _agents.map((a) => getTokenStatus(a.name)!).filter(Boolean);
 }
 
+/**
+ * True when `secretsPath` is safe to publish a credential to: a regular file, or
+ * nothing at all (first provisioning). Anything else — a symlink above all, but
+ * also a directory or a device — is refused loudly and never written.
+ *
+ * A symlinked credential path is never intentional, so we do not follow it and we
+ * do not quietly replace it: we stop and shout. This is not hypothetical. An
+ * off-by-one relative symlink pointed grover's `.secrets/linear.env` at *main's*
+ * credential file; `fs.writeFileSync` follows symlinks, so the connector wrote
+ * grover's `lpx_` proxy token straight through the link into main's file — a
+ * cross-agent credential clobber that took ~1h to diagnose. Repairing the link is
+ * deliberately NOT done here: reconciling a live credential is a supervised job
+ * (AI-2296), not something a refresh loop should do behind an operator's back.
+ * (AI-2293)
+ */
+function isPublishableCredentialPath(secretsPath: string, agentName: string): boolean {
+  const st = fs.lstatSync(secretsPath, { throwIfNoEntry: false });
+
+  // Not there yet: normal first provisioning, nothing to guard against.
+  if (!st) return true;
+
+  if (st.isSymbolicLink()) {
+    let target = "<unreadable>";
+    try {
+      target = fs.readlinkSync(secretsPath);
+    } catch {
+      // Naming the target is a nicety; refusing the write is the point.
+    }
+    const resolved = path.resolve(path.dirname(secretsPath), target);
+    log.error(
+      `SECURITY: refusing to sync token for ${agentName}: credential path ${secretsPath} is a ` +
+        `symlink -> ${target} (resolves to ${resolved}). A credential path must never be a symlink — ` +
+        `following it would write ${agentName}'s token into another agent's file. Nothing was written. ` +
+        `Inspect the link target for a clobbered credential, and find what created the link.`,
+    );
+    notify({
+      severity: "critical",
+      source: "agents",
+      title: "Symlinked agent credential path — token sync refused",
+      detail:
+        `${secretsPath} -> ${resolved} (agent: ${agentName}). The connector refused to write through ` +
+        `the link, so ${agentName} will NOT receive refreshed credentials until the link is replaced ` +
+        `with a real file. Inspect the link target for a clobbered credential.`,
+      agent: agentName,
+      dedupKey: `agents|symlink-credential|${agentName}`,
+    });
+    return false;
+  }
+
+  if (!st.isFile()) {
+    log.error(
+      `Refusing to sync token for ${agentName}: credential path ${secretsPath} exists but is ` +
+        `not a regular file. Nothing was written.`,
+    );
+    return false;
+  }
+
+  return true;
+}
+
 /** Sync access token to the agent's workspace secrets file */
 function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
   const agent = _agents.find((a) => a.name === agentName);
@@ -454,12 +514,49 @@ function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
     contents = `LINEAR_OAUTH_TOKEN=${accessToken}\n`;
   }
 
+  const dir = path.dirname(secretsPath);
+  // Publish atomically: temp file in the SAME directory (rename(2) is only atomic
+  // within one filesystem), 0600 fixed on the fd before the name is resolvable,
+  // fsync, then rename over the target. A reader — the */30 liveness cron among
+  // them, racing every token refresh — then sees either the whole old file or the
+  // whole new one, and never a world-readable one.
+  //
+  // The old write-then-chmod could not promise either. An interrupted write left
+  // grover's linear.env truncated at 25 bytes (`LINEAR_OAUTH_TOKEN=lin_oa`) AND at
+  // mode 777, because the chmod never ran — a half-written, world-readable secret
+  // that cut him off from Linear for ~1h. With a temp+rename, a crash can only ever
+  // strand the temp; the live secret is untouched and still valid. (AI-2293)
+  const tmpPath = path.join(dir, `.${path.basename(secretsPath)}.${process.pid}.${crypto.randomUUID()}.tmp`);
   try {
-    fs.mkdirSync(path.dirname(secretsPath), { recursive: true });
-    fs.writeFileSync(secretsPath, contents, "utf8");
-    fs.chmodSync(secretsPath, 0o600);
+    fs.mkdirSync(dir, { recursive: true });
+
+    // Guard AFTER mkdir (the dir may not exist yet on first provisioning) and
+    // BEFORE any bytes are written.
+    if (!isPublishableCredentialPath(secretsPath, agentName)) return;
+
+    let fd: number | undefined;
+    try {
+      // "wx" fails rather than clobbers if the temp name somehow already exists.
+      fd = fs.openSync(tmpPath, "wx", 0o600);
+      fs.writeFileSync(fd, contents, "utf8");
+      // Explicit fchmod: open(2)'s mode argument is masked by umask, so it alone
+      // cannot guarantee 0600.
+      fs.fchmodSync(fd, 0o600);
+      fs.fsyncSync(fd);
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+
+    fs.renameSync(tmpPath, secretsPath);
     log.info(`Synced ${agent.proxyToken ? "proxy token" : "token"} to ${secretsPath}`);
   } catch (err) {
+    // Fail closed: leave whatever credential was already in place untouched and
+    // valid, rather than a partial file no reader can use.
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // Nothing to clean up.
+    }
     log.error(`Failed to sync token to ${secretsPath}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
