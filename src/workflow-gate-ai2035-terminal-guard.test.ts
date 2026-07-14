@@ -29,6 +29,7 @@
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
+import { reloadAgents } from "./agents.js";
 import { applyStateTransition, resetWorkflowCache } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { resetConfigHealth } from "./config-health.js";
@@ -197,6 +198,16 @@ describe("AI-2035: applyStateTransition terminal re-entry guard (AC2 guard A / A
     const policyFile = path.join(dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
     process.env.CAPABILITY_POLICY_PATH = policyFile;
+    // AI-2359: agents.json must include astrid with linearUserId so singleton
+    // delegate resolution for steward role does not fail-closed.
+    const agentsFile = path.join(dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-c", clientSecret: "a-s", accessToken: "a-t", refreshToken: "a-r" },
+      ],
+    }), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
     resetWorkflowCache();
     resetPolicyCache();
     resetConfigHealth();

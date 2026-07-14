@@ -63,6 +63,7 @@ import {
   validateFanoutSpec,
   type Finding,
 } from "./fanout.js";
+import { reloadAgents } from "./agents.js";
 import { attemptBarrierTransition } from "./barrier.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 
@@ -673,6 +674,21 @@ describe("AC2: applyStateTransition refuses spawn with unregistered per-entry wo
     fs.writeFileSync(policyFile, CAPABILITY_POLICY_YAML, "utf8");
     process.env.WORKFLOW_DEFS_DIR = dir;
     process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    // AI-2359: agents.json must include policy bodies so singleton delegate
+    // resolution does not fail-closed.
+    const agentsFile = path.join(dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "engine-1", linearUserId: "engine-1-linear-uuid", clientId: "e-c", clientSecret: "e-s", accessToken: "e-t", refreshToken: "e-r" },
+        { name: "signe", linearUserId: "signe-linear-uuid", clientId: "s-c", clientSecret: "s-s", accessToken: "s-t", refreshToken: "s-r" },
+        { name: "laren", linearUserId: "laren-linear-uuid", clientId: "l-c", clientSecret: "l-s", accessToken: "l-t", refreshToken: "l-r" },
+        { name: "igor", linearUserId: "igor-linear-uuid", clientId: "i-c", clientSecret: "i-s", accessToken: "i-t", refreshToken: "i-r" },
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-c", clientSecret: "a-s", accessToken: "a-t", refreshToken: "a-r" },
+      ],
+    }), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
   });
 
   afterAll(() => {
@@ -912,6 +928,21 @@ describe("AC4: barrier auto-advance with heterogeneous per-workflow children", (
     fs.writeFileSync(policyFile, CAPABILITY_POLICY_YAML, "utf8");
     process.env.WORKFLOW_DEFS_DIR = dir;
     process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    // AI-2359: agents.json must include policy bodies so singleton delegate
+    // resolution does not fail-closed.
+    const agentsFile = path.join(dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "engine-1", linearUserId: "engine-1-linear-uuid", clientId: "e-c", clientSecret: "e-s", accessToken: "e-t", refreshToken: "e-r" },
+        { name: "signe", linearUserId: "signe-linear-uuid", clientId: "s-c", clientSecret: "s-s", accessToken: "s-t", refreshToken: "s-r" },
+        { name: "laren", linearUserId: "laren-linear-uuid", clientId: "l-c", clientSecret: "l-s", accessToken: "l-t", refreshToken: "l-r" },
+        { name: "igor", linearUserId: "igor-linear-uuid", clientId: "i-c", clientSecret: "i-s", accessToken: "i-t", refreshToken: "i-r" },
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-c", clientSecret: "a-s", accessToken: "a-t", refreshToken: "a-r" },
+      ],
+    }), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
   });
 
   afterAll(() => {
@@ -1157,6 +1188,21 @@ describe("Integration: end-to-end spawn with per-entry child workflows", () => {
     fs.writeFileSync(policyFile, CAPABILITY_POLICY_YAML, "utf8");
     process.env.WORKFLOW_DEFS_DIR = dir;
     process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    // AI-2359: agents.json must include policy bodies so singleton delegate
+    // resolution does not fail-closed.
+    const agentsFile = path.join(dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "engine-1", linearUserId: "engine-1-linear-uuid", clientId: "e-c", clientSecret: "e-s", accessToken: "e-t", refreshToken: "e-r" },
+        { name: "signe", linearUserId: "signe-linear-uuid", clientId: "s-c", clientSecret: "s-s", accessToken: "s-t", refreshToken: "s-r" },
+        { name: "laren", linearUserId: "laren-linear-uuid", clientId: "l-c", clientSecret: "l-s", accessToken: "l-t", refreshToken: "l-r" },
+        { name: "igor", linearUserId: "igor-linear-uuid", clientId: "i-c", clientSecret: "i-s", accessToken: "i-t", refreshToken: "i-r" },
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-c", clientSecret: "a-s", accessToken: "a-t", refreshToken: "a-r" },
+      ],
+    }), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
   });
 
   afterAll(() => {

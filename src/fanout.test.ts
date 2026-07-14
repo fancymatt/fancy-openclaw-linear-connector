@@ -13,6 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import { extractFindings, executeFanout, shouldTriggerFanout, type Finding } from "./fanout.js";
 import { applyStateTransition, resetWorkflowCache, type WorkflowDef, type FanoutConfig } from "./workflow-gate.js";
+import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 
 const CANONICAL_UX_AUDIT_FIXTURE = path.resolve(process.cwd(), "src/__fixtures__/canonical-ux-audit.yaml");
@@ -711,6 +712,21 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     const policyFile = path.join(uxDir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, UX_AUDIT_POLICY_YAML, "utf8");
     process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    // AI-2359: agents.json must include the policy bodies so singleton delegate
+    // resolution (engine-1 for engine, maya for ux-researcher) does not fail-closed.
+    const agentsFile = path.join(uxDir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "engine-1", linearUserId: "engine-1-linear-uuid", clientId: "e-c", clientSecret: "e-s", accessToken: "e-t", refreshToken: "e-r" },
+        { name: "maya", linearUserId: "maya-linear-uuid", clientId: "m-c", clientSecret: "m-s", accessToken: "m-t", refreshToken: "m-r" },
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-c", clientSecret: "a-s", accessToken: "a-t", refreshToken: "a-r" },
+        { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-c", clientSecret: "c-s", accessToken: "c-t", refreshToken: "c-r" },
+        { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-c", clientSecret: "h-s", accessToken: "h-t", refreshToken: "h-r" },
+      ],
+    }), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
 
     process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
   });

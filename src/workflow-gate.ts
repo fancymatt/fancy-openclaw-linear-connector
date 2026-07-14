@@ -1129,7 +1129,7 @@ export function resolveSingletonDelegate(
   if (roleBodies.length !== 1) {
     return {
       failed: true,
-      code: not-a-singleton,
+      code: 'not-a-singleton',
       detail: `role '${destOwnerRole}' has ${roleBodies.length} bodies (expected 1 for singleton resolution)`,
     };
   }
@@ -1140,7 +1140,7 @@ export function resolveSingletonDelegate(
   }
   return {
     failed: true,
-    code: delegate-unresolved,
+    code: 'delegate-unresolved',
     detail: `singleton body '${roleBodies[0]}' has no linearUserId`,
   };
 }

@@ -65,6 +65,7 @@ import {
 import { shouldTriggerFanout, executeFanout, type Finding } from "./fanout.js";
 import { attemptBarrierTransition } from "./barrier.js";
 import { resetPolicyCache } from "./escalation-gate.js";
+import { reloadAgents } from "./agents.js";
 
 // ── Synthetic workflow defs (self-contained fixtures) ──────────────────────
 
@@ -681,6 +682,17 @@ describe("AI-1992 malformed/empty spawn spec refuses the transition", () => {
     fs.writeFileSync(path.join(dir, "synthetic-fanout.yaml"), SYNTHETIC_FANOUT_YAML, "utf8");
     policyFile = path.join(dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, CAPABILITY_POLICY_YAML, "utf8");
+    // Agents with linearUserId for singleton delegate resolution (AI-2359 fail-closed)
+    const agentsFile = path.join(dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+        { name: "engine-1", linearUserId: "engine1-linear-uuid", clientId: "e1-client", clientSecret: "e1-secret", accessToken: "e1-token", refreshToken: "e1-refresh" },
+        { name: "igor", linearUserId: "igor-linear-uuid", clientId: "i-client", clientSecret: "i-secret", accessToken: "i-token", refreshToken: "i-refresh" },
+      ],
+    }, null, 2), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
     process.env.WORKFLOW_DEFS_DIR = dir;
     process.env.CAPABILITY_POLICY_PATH = policyFile;
   });
@@ -747,6 +759,17 @@ describe("AI-1992 two-phase synthetic def — end to end", () => {
     fs.writeFileSync(path.join(dir, "synthetic-two-phase.yaml"), SYNTHETIC_TWO_PHASE_YAML, "utf8");
     policyFile = path.join(dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, CAPABILITY_POLICY_YAML, "utf8");
+    // Agents with linearUserId for singleton delegate resolution (AI-2359 fail-closed)
+    const agentsFile = path.join(dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+        { name: "engine-1", linearUserId: "engine1-linear-uuid", clientId: "e1-client", clientSecret: "e1-secret", accessToken: "e1-token", refreshToken: "e1-refresh" },
+        { name: "igor", linearUserId: "igor-linear-uuid", clientId: "i-client", clientSecret: "i-secret", accessToken: "i-token", refreshToken: "i-refresh" },
+      ],
+    }, null, 2), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
     process.env.WORKFLOW_DEFS_DIR = dir;
     process.env.CAPABILITY_POLICY_PATH = policyFile;
   });

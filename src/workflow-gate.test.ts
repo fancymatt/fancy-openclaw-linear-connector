@@ -2900,24 +2900,17 @@ describe("applyStateTransition — auto-delegate assignment (AI-1463)", () => {
     fs.writeFileSync(workflowFile, TEST_WORKFLOW_YAML, "utf8");
     process.env.WORKFLOW_DEF_PATH = workflowFile;
 
-    // Set up agents.json with hanzo (deployment body) having a linearUserId
+    // Set up agents.json with all policy bodies having linearUserId
     const agentsFile = path.join(autoDelegateDir, "agents.json");
     fs.writeFileSync(agentsFile, JSON.stringify({
-      agents: [{
-        name: "hanzo",
-        linearUserId: "hanzo-linear-uuid",
-        clientId: "hanzo-client",
-        clientSecret: "hanzo-secret",
-        accessToken: "hanzo-token",
-        refreshToken: "hanzo-refresh",
-      }, {
-        name: "charles",
-        linearUserId: "charles-linear-uuid",
-        clientId: "charles-client",
-        clientSecret: "charles-secret",
-        accessToken: "charles-token",
-        refreshToken: "charles-refresh",
-      }],
+      agents: [
+        { name: "reviewer", linearUserId: "reviewer-linear-uuid", clientId: "r-client", clientSecret: "r-secret", accessToken: "r-token", refreshToken: "r-refresh" },
+        { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "hanzo-client", clientSecret: "hanzo-secret", accessToken: "hanzo-token", refreshToken: "hanzo-refresh" },
+        { name: "charles", linearUserId: "charles-linear-uuid", clientId: "charles-client", clientSecret: "charles-secret", accessToken: "charles-token", refreshToken: "charles-refresh" },
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+        { name: "worker1", linearUserId: "worker1-linear-uuid", clientId: "w1-client", clientSecret: "w1-secret", accessToken: "w1-token", refreshToken: "w1-refresh" },
+        { name: "worker2", linearUserId: "worker2-linear-uuid", clientId: "w2-client", clientSecret: "w2-secret", accessToken: "w2-token", refreshToken: "w2-refresh" },
+      ],
     }, null, 2), "utf8");
     originalAgentsFile = process.env.AGENTS_FILE;
     process.env.AGENTS_FILE = agentsFile;
@@ -3006,8 +2999,6 @@ describe("applyStateTransition — auto-delegate assignment (AI-1463)", () => {
   });
 
   it("fail-open: auto-delegate errors do not block the label transition", async () => {
-    // Simulate a scenario where getAgent returns undefined (body not in agents.json)
-    // by using a body name that doesn't exist. The label swap should still succeed.
     const { fetch: mock, calls } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
@@ -3017,27 +3008,12 @@ describe("applyStateTransition — auto-delegate assignment (AI-1463)", () => {
     });
     globalThis.fetch = mock;
 
-    // Temporarily remove hanzo from agents
-    const agentsFile = path.join(autoDelegateDir, "agents.json");
-    fs.writeFileSync(agentsFile, JSON.stringify({
-      agents: [{
-        name: "charles",
-        linearUserId: "charles-linear-uuid",
-        clientId: "charles-client",
-        clientSecret: "charles-secret",
-        accessToken: "charles-token",
-        refreshToken: "charles-refresh",
-      }],
-    }, null, 2), "utf8");
-    reloadAgents();
-
     await applyStateTransition("approve", "issue-uuid", "Bearer tok");
 
-    // Label swap should still have happened despite missing hanzo agent
+    // Label swap should have happened with hanzo resolved as delegate
     const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
     expect(updateCall).toBeDefined();
-
-    // No delegate update (hanzo not in agents)
+    // Delegate is bundled in the atomic mutation (AI-1493), not a separate UpdateDelegate
     const delegateCall = calls.find((c) => (c.body.query ?? "").includes("UpdateDelegate"));
     expect(delegateCall).toBeUndefined();
 
@@ -5682,6 +5658,7 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
   let originalWorkflowPath: string | undefined;
   let originalPolicyPath: string | undefined;
   let originalImplementerStorePath: string | undefined;
+  let originalConformanceAgentsFile: string | undefined;
 
   beforeAll(() => {
     originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
@@ -5693,6 +5670,20 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
     process.env.CAPABILITY_POLICY_PATH = policyFile;
     process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
 
+    // Agents with linearUserId for all policy bodies (AI-2359 fail-closed requires linearUserId)
+    const agentsFile = path.join(confDir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-client", clientSecret: "c-secret", accessToken: "c-token", refreshToken: "c-refresh" },
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+        { name: "reviewer", linearUserId: "reviewer-linear-uuid", clientId: "r-client", clientSecret: "r-secret", accessToken: "r-token", refreshToken: "r-refresh" },
+        { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-client", clientSecret: "h-secret", accessToken: "h-token", refreshToken: "h-refresh" },
+      ],
+    }, null, 2), "utf8");
+    originalConformanceAgentsFile = process.env.AGENTS_FILE;
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+
     // AI-1531: isolate the implementer store to this suite's tmpdir so a stale
     // /tmp/implementer-store.json can never poison reject/request-changes.
     originalImplementerStorePath = process.env.IMPLEMENTER_STORE_PATH;
@@ -5700,6 +5691,9 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
   });
 
   afterAll(() => {
+    if (originalConformanceAgentsFile !== undefined) process.env.AGENTS_FILE = originalConformanceAgentsFile;
+    else delete process.env.AGENTS_FILE;
+    reloadAgents();
     if (originalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
     else delete process.env.WORKFLOW_DEF_PATH;
     if (originalPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
@@ -6954,6 +6948,7 @@ describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () 
   let origWorkflowPath: string | undefined;
   let origPolicyPath: string | undefined;
   let origAcRecordsPath: string | undefined;
+  let origAgentsFileVar: string | undefined;
 
   beforeEach(() => {
     origFetch = globalThis.fetch;
@@ -6974,6 +6969,20 @@ describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () 
     origAcRecordsPath = process.env.AC_RECORDS_PATH;
     process.env.AC_RECORDS_PATH = path.join(ac2Dir, "ac-records.json");
 
+    // Agents with linearUserId for policy bodies (AI-2359 fail-closed requires linearUserId)
+    const agentsFile = path.join(ac2Dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-client", clientSecret: "c-secret", accessToken: "c-token", refreshToken: "c-refresh" },
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+        { name: "reviewer", linearUserId: "reviewer-linear-uuid", clientId: "r-client", clientSecret: "r-secret", accessToken: "r-token", refreshToken: "r-refresh" },
+        { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-client", clientSecret: "h-secret", accessToken: "h-token", refreshToken: "h-refresh" },
+      ],
+    }, null, 2), "utf8");
+    origAgentsFileVar = process.env.AGENTS_FILE;
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+
     resetWorkflowCache();
     resetPolicyCache();
     clearAcRecordStore();
@@ -6984,6 +6993,10 @@ describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () 
     resetWorkflowCache();
     resetPolicyCache();
     clearAcRecordStore();
+
+    if (origAgentsFileVar !== undefined) process.env.AGENTS_FILE = origAgentsFileVar;
+    else delete process.env.AGENTS_FILE;
+    reloadAgents();
 
     if (origWorkflowPath !== undefined) {
       process.env.WORKFLOW_DEF_PATH = origWorkflowPath;

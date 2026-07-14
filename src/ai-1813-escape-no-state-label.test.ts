@@ -211,6 +211,16 @@ describe("AI-1813 AC1: applyStateTransition — escape from no-state-label ticke
     const policyFile = path.join(dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
     process.env.CAPABILITY_POLICY_PATH = policyFile;
+    // Agents with linearUserId for singleton delegate resolution (AI-2359 fail-closed)
+    const agentsFile = path.join(dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+        { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-client", clientSecret: "c-secret", accessToken: "c-token", refreshToken: "c-refresh" },
+      ],
+    }, null, 2), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
     resetWorkflowCache();
     resetPolicyCache();
     resetConfigHealth();
@@ -407,6 +417,7 @@ describe("AI-1813 AC2: proxy integration — escape from no-state-label ticket e
       file,
       JSON.stringify({
         agents: [
+          { name: "astrid", linearUserId: "astrid-uuid", openclawAgent: "astrid", accessToken: "tok", host: "local" },
           { name: "charles", linearUserId: "u1", openclawAgent: "charles", accessToken: "tok", host: "local" },
         ],
       }),
@@ -634,6 +645,16 @@ describe("AI-1813 AC3: existing escape-from-known-state regression guard", () =>
     const policyFile = path.join(dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
     process.env.CAPABILITY_POLICY_PATH = policyFile;
+    // Agents with linearUserId for singleton delegate resolution (AI-2359 fail-closed)
+    const agentsFile = path.join(dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+        { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-client", clientSecret: "c-secret", accessToken: "c-token", refreshToken: "c-refresh" },
+      ],
+    }, null, 2), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
     resetWorkflowCache();
     resetPolicyCache();
     originalFetch = globalThis.fetch;
