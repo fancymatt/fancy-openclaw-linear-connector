@@ -1,0 +1,21 @@
+services:
+  mam-downloader:
+    image: mam-downloader:latest
+    container_name: mam-downloader
+    ports:
+      - "8687:8687"
+    environment:
+      - MAM_BASE_URL=https://www.myanonamouse.net
+      - MAM_USERNAME=${MAM_USERNAME:?MAM_USERNAME not set}
+      - MAM_PASSWORD=${MAM_PASSWORD:?MAM_PASSWORD not set}
+      - QBITTORRENT_URL=http://qbittorrent:8080
+      - QBITTORRENT_USERNAME=${QBITTORRENT_USERNAME:?QBITTORRENT_USERNAME not set}
+      - QBITTORRENT_PASSWORD=${QBITTORRENT_PASSWORD:?QBITTORRENT_PASSWORD not set}
+      - ABS_URL=http://audiobookshelf:13378
+      - ABS_API_KEY=${ABS_API_KEY:?ABS_API_KEY not set}
+      - DOWNLOAD_PATH=/data/media/audiobooks
+      - CONFIG_PATH=/config
+    volumes:
+      - /volume1/media/audiobooks:/data/media/audiobooks
+      - /volume1/docker/mam-downloader/config:/config
+    restart: unless-stopped
