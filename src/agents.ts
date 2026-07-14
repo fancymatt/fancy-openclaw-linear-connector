@@ -182,6 +182,7 @@ function save(agents: AgentConfig[]): void {
     ? JSON.stringify(encryptAgentsFile(data, key), null, 2) + "\n"
     : JSON.stringify(data, null, 2) + "\n";
   fs.writeFileSync(getAgentsPath(), serialized, "utf8");
+  fs.chmodSync(getAgentsPath(), 0o600);
 }
 
 // In-memory cache, kept in sync with disk via file watcher

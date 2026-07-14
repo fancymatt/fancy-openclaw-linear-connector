@@ -10,6 +10,7 @@ import {
   recordTokenFailure,
   reloadAgents,
   safeReloadAgents,
+  updateAgentMetadata,
   updateTokens,
   upsertAgent,
   type AgentConfig,
@@ -306,5 +307,124 @@ describe("getTokenStatus — credential state ladder (AI-2231)", () => {
     // lastFailure && !lastRefreshOkAt is caught by the earlier "failing" branch;
     // the unconfigured branch must not shadow it.
     expect(getTokenStatus("charles")!.state).toBe("failing");
+  });
+});
+
+/**
+ * AI-2305 — save() must chmod agents.json to 0600 on every write.
+ *
+ * agents.json holds AES-256-GCM-encrypted agent secrets at rest, but save()
+ * wrote it with a bare writeFileSync and no chmodSync, so the file regressed to
+ * the umask default (0664 observed, group/other-readable) on every token refresh
+ * and registry edit.
+ *
+ * These tests force a permissive umask (0o022) so a passing result proves the
+ * mode is applied by the code, not inherited from ambient process state.
+ */
+describe("agents.json file mode hardening (AI-2305)", () => {
+  const MODE_MASK = 0o777;
+  const PERMISSIVE_UMASK = 0o022;
+
+  let dir: string;
+  let agentsFile: string;
+  let previousUmask: number;
+
+  function modeOf(filePath: string): number {
+    return fs.statSync(filePath).mode & MODE_MASK;
+  }
+
+  beforeEach(() => {
+    // A permissive umask is the whole point: under 0o022 a bare writeFileSync
+    // creates 0644, so 0600 can only come from an explicit chmod in save().
+    previousUmask = process.umask(PERMISSIVE_UMASK);
+
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "agents-mode-test-"));
+    agentsFile = path.join(dir, "agents.json");
+    process.env.AGENTS_FILE = agentsFile;
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+    reloadAgents();
+  });
+
+  afterEach(() => {
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+    delete process.env.AGENTS_FILE;
+    reloadAgents();
+    fs.rmSync(dir, { recursive: true, force: true });
+    process.umask(previousUmask);
+  });
+
+  // AC1 (fresh create) + AC2: on-disk mode is 0600 after save() under umask 0o022.
+  test("fresh create under a permissive umask lands at 0600, not the umask default", () => {
+    expect(fs.existsSync(agentsFile)).toBe(false);
+
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+
+    expect(fs.existsSync(agentsFile)).toBe(true);
+    expect(modeOf(agentsFile)).toBe(0o600);
+  });
+
+  // AC1 (rewrite): the regression itself — writeFileSync does not reset the mode
+  // of an existing file, so a file left at 0664 stays group/other-readable
+  // through every subsequent save() unless save() chmods it back.
+  test("rewrite re-asserts 0600 on a file that is already group/other-readable", () => {
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+    fs.chmodSync(agentsFile, 0o664);
+    expect(modeOf(agentsFile)).toBe(0o664);
+
+    // Token refresh is the hot path that rewrites the file in production.
+    updateTokens("charles", "access-token-2", "refresh-token-2");
+
+    expect(modeOf(agentsFile)).toBe(0o600);
+  });
+
+  // AC1: the mode guarantee holds on the encrypted branch of save() too — that
+  // is the branch that actually puts ciphered secrets on disk.
+  test("encrypted writes are 0600 as well", () => {
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = key;
+
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+
+    const raw = fs.readFileSync(agentsFile, "utf8");
+    expect(JSON.parse(raw)).toMatchObject({ version: 2, alg: "AES-256-GCM" });
+    expect(modeOf(agentsFile)).toBe(0o600);
+  });
+
+  // AC1: every exported mutator routes through save(), so none of them may leave
+  // the file readable. updateAgentMetadata is the third writer, distinct from
+  // upsertAgent (create) and updateTokens (refresh).
+  test("metadata edits also leave the file at 0600", () => {
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+    fs.chmodSync(agentsFile, 0o644);
+
+    updateAgentMetadata("charles", { openclawAgent: "charles-renamed" });
+
+    expect(modeOf(agentsFile)).toBe(0o600);
+  });
+
+  // AC4: no behavioral change beyond file mode — the round-trip still works.
+  test("round-trip read/write is unaffected by the mode change (plaintext)", () => {
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+    updateTokens("charles", "access-token-2", "refresh-token-2");
+
+    reloadAgents();
+
+    expect(getAgents()).toHaveLength(1);
+    expect(getAccessToken("charles")).toBe("access-token-2");
+    expect(modeOf(agentsFile)).toBe(0o600);
+  });
+
+  // AC4: same round-trip guarantee on the encrypted branch.
+  test("round-trip read/write is unaffected by the mode change (encrypted)", () => {
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = key;
+
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+    updateTokens("charles", "access-token-3", "refresh-token-3");
+    reloadAgents();
+
+    expect(getAccessToken("charles")).toBe("access-token-3");
+    expect(fs.readFileSync(agentsFile, "utf8")).not.toContain("access-token-3");
+    expect(modeOf(agentsFile)).toBe(0o600);
   });
 });
