@@ -616,10 +616,19 @@ export function createWebhookRouter(
       // Before dispatching, acquire a lease for (agent, ticket). If an unexpired
       // lease exists, refuse the dispatch — regardless of whether this is the
       // sweep path or the webhook path (AI-2343 / AI-2344).
+      //
+      // Pass updatedAt so that a legitimate re-dispatch for a newer state
+      // supersedes the old lease (AI-1969 / AI-1918 AC2) rather than being
+      // blocked. The AI-1918 idempotency check above already determined this
+      // is a legitimate re-dispatch (not stale, not a duplicate of the same
+      // state); the lease must honor the same signal.
       if (dispatchLeaseStore) {
+        const data = event.data as Record<string, unknown> | null;
+        const updatedAt = (data?.updatedAt as string) ?? undefined;
         const lease = dispatchLeaseStore.acquire(
           route.agentId,
           route.sessionKey,
+          { updatedAt },
         );
         if (lease.refused) {
           log.info(

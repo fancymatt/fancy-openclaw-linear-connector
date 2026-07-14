@@ -5,11 +5,13 @@
  *   - Acquire fresh lease succeeds
  *   - Acquire same (agent, ticket) with unexpired lease is refused (AI-2343, AI-2344)
  *   - Acquire after lease expiry succeeds (legitimate re-dispatch)
+ *   - Acquire with newer updatedAt supersedes the old lease (AI-1918 AC2 / AI-1969)
  *   - Renew extends lease
  *   - Release removes lease
  *   - ReleaseAll clears all leases for an agent
  *   - Survival across store recreation (restart-safety)
  *   - Purge expired leases
+ *   - TTL configuration
  */
 
 import fs from "node:fs";
@@ -58,16 +60,23 @@ describe("DispatchLeaseStore — acquire / refuse", () => {
     const { dbPath, cleanup } = makeTempDb();
     const store = new DispatchLeaseStore(dbPath);
 
-    // Acquire first lease
-    const first = store.acquire(AGENT, TICKET, { nowMs: T0 });
-    expect(first.acquired).toBe(true);
+    // Acquire first lease (with an older updatedAt)
+    store.acquire(AGENT, TICKET, {
+      nowMs: T0,
+      updatedAt: "2026-07-07T06:00:00.000Z",
+    });
 
-    // Simulate re-dispatch 30 minutes later — still within 90min TTL
-    const second = store.acquire(AGENT, TICKET, { nowMs: T0 + 30 * MINUTE });
+    // Simulate re-dispatch 30 minutes later — still within 90min TTL,
+    // same updatedAt (no state change) → refuse
+    const second = store.acquire(AGENT, TICKET, {
+      nowMs: T0 + 30 * MINUTE,
+      updatedAt: "2026-07-07T06:00:00.000Z",
+    });
     expect(second.acquired).toBe(false);
     expect(second.refused).toBe(true);
     expect(second.existingLease).not.toBeNull();
     expect(store.counters.refused).toBe(1);
+    expect(store.counters.superseded).toBe(0);
 
     store.close();
     cleanup();
@@ -78,11 +87,70 @@ describe("DispatchLeaseStore — acquire / refuse", () => {
     const store = new DispatchLeaseStore(dbPath);
 
     // Acquire via sweep dispatch
-    store.acquire(AGENT, TICKET, { nowMs: T0 });
+    store.acquire(AGENT, TICKET, {
+      nowMs: T0,
+      updatedAt: "2026-07-07T06:00:00.000Z",
+    });
 
-    // Webhook re-dispatch — must also be refused
-    const webhookResult = store.acquire(AGENT, TICKET, { nowMs: T0 + 5_000 });
+    // Webhook re-dispatch — same updatedAt, must also be refused
+    const webhookResult = store.acquire(AGENT, TICKET, {
+      nowMs: T0 + 5_000,
+      updatedAt: "2026-07-07T06:00:00.000Z",
+    });
     expect(webhookResult.refused).toBe(true);
+
+    store.close();
+    cleanup();
+  });
+
+  it("supersedes lease when incoming updatedAt is newer (AI-1969 / AI-1918 AC2)", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new DispatchLeaseStore(dbPath);
+
+    // Leg 1: dispatch with older state
+    store.acquire(AGENT, TICKET, {
+      nowMs: T0,
+      updatedAt: "2026-07-07T06:00:00.000Z",
+    });
+
+    // Leg 2: re-dispatch hours later with newer updatedAt — legitimate re-entry
+    const result = store.acquire(AGENT, TICKET, {
+      nowMs: T0 + 5_000,
+      updatedAt: "2026-07-08T04:46:06.000Z",
+    });
+    expect(result.acquired).toBe(true);
+    expect(result.refused).toBe(false);
+
+    // Counter: 1 acquired (fresh) + 1 acquired (superseded re-acquire) = 2
+    // Wait — the first acquire was counted as "acquired", the second supersede
+    // also counts as "acquired" since it succeeded.
+    expect(store.counters.acquired).toBe(2);
+    expect(store.counters.superseded).toBe(1);
+    expect(store.counters.refused).toBe(0);
+
+    // New lease has the newer updatedAt
+    const active = store.get(AGENT, TICKET);
+    expect(active!.ticket_updated_at).toBe("2026-07-08T04:46:06.000Z");
+
+    store.close();
+    cleanup();
+  });
+
+  it("refuses when incoming updatedAt is older than stored ticket_updated_at", () => {
+    const { dbPath, cleanup } = makeTempDb();
+    const store = new DispatchLeaseStore(dbPath);
+
+    store.acquire(AGENT, TICKET, {
+      nowMs: T0,
+      updatedAt: "2026-07-08T04:46:06.000Z",
+    });
+
+    // Incoming with older updatedAt — refuse
+    const result = store.acquire(AGENT, TICKET, {
+      nowMs: T0 + 5_000,
+      updatedAt: "2026-07-07T06:00:00.000Z",
+    });
+    expect(result.refused).toBe(true);
 
     store.close();
     cleanup();
@@ -138,17 +206,6 @@ describe("DispatchLeaseStore — renew / release", () => {
     store.acquire(AGENT, TICKET, { nowMs: T0 });
     const result = store.renew(AGENT, TICKET, { nowMs: T0 + 10 * MINUTE }); // past 5min TTL
     expect(result).toBe(false);
-
-    store.close();
-    cleanup();
-  });
-
-  it("returns false when renewing a nonexistent lease", () => {
-    const { dbPath, cleanup } = makeTempDb();
-    const store = new DispatchLeaseStore(dbPath);
-
-    // Already tested above, but keeping explicit for clarity
-    expect(store.renew("nonexistent", TICKET, { nowMs: T0 })).toBe(false);
 
     store.close();
     cleanup();
@@ -215,7 +272,7 @@ describe("DispatchLeaseStore — restart safety", () => {
 
     // First store lifetime
     const store1 = new DispatchLeaseStore(dbPath);
-    store1.acquire(AGENT, TICKET, { nowMs: T0 });
+    store1.acquire(AGENT, TICKET, { nowMs: T0, updatedAt: "2026-07-07T06:00:00.000Z" });
     store1.close();
 
     // Second store lifetime — same dbPath, simulates restart
@@ -223,10 +280,21 @@ describe("DispatchLeaseStore — restart safety", () => {
     const active = store2.isActive(AGENT, TICKET, { nowMs: T0 + 5_000 });
     expect(active).not.toBeNull();
     expect(active!.ticket_key).toBe(TICKET);
+    expect(active!.ticket_updated_at).toBe("2026-07-07T06:00:00.000Z");
 
-    // Lease still blocks re-dispatch
-    const result = store2.acquire(AGENT, TICKET, { nowMs: T0 + 10_000 });
+    // Lease still blocks re-dispatch for same state
+    const result = store2.acquire(AGENT, TICKET, {
+      nowMs: T0 + 10_000,
+      updatedAt: "2026-07-07T06:00:00.000Z",
+    });
     expect(result.refused).toBe(true);
+
+    // But allows re-dispatch for newer state
+    const result2 = store2.acquire(AGENT, TICKET, {
+      nowMs: T0 + 10_000,
+      updatedAt: "2026-07-08T04:46:06.000Z",
+    });
+    expect(result2.acquired).toBe(true);
 
     store2.close();
     cleanup();

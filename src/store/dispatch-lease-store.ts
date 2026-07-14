@@ -9,10 +9,19 @@
  *   2. Webhook path (AI-2344) — the webhook honors the lease as a refusal.
  *
  * Key: (agentId, ticketKey).
- * Columns: dispatchedAt (ISO-8601), expiresAt (ISO-8601), renewedAt (ISO-8601).
+ * Columns:
+ *   - dispatched_at: real-time when the lease was created (ISO-8601)
+ *   - expires_at: when this lease expires (ISO-8601)
+ *   - renewed_at: last activity timestamp (ISO-8601)
+ *   - ticket_updated_at: the Linear issue's updatedAt at time of dispatch (ISO-8601).
+ *     Used to distinguish "same state, re-requested" (refuse) from "newer state,
+ *     legitimate re-dispatch" (supersede and admit).
  *
  * Semantics:
- *   - acquire(): INSERT OR IGNORE. If an unexpired lease exists, returns false.
+ *   - acquire(): If no unexpired lease exists, creates one.
+ *     If an unexpired lease exists with an older ticket_updatedAt than the
+ *     incoming updatedAt, the old lease is superseded (deleted and re-acquired).
+ *     Otherwise, the dispatch is refused.
  *   - isActive(): checks (expiresAt > now) without mutating.
  *   - renew(): updates renewedAt and extends expiresAt by TTL.
  *   - release(): deletes the lease row.
@@ -37,19 +46,23 @@ export interface LeaseRecord {
   agent_id: string;
   /** SQLite column: ticket_key */
   ticket_key: string;
-  /** SQLite column: dispatched_at */
+  /** SQLite column: dispatched_at (real-time clock) */
   dispatched_at: string;
   /** SQLite column: expires_at */
   expires_at: string;
   /** SQLite column: renewed_at */
   renewed_at: string;
+  /** SQLite column: ticket_updated_at (Linear issue state version) */
+  ticket_updated_at: string;
 }
 
 export interface AcquireResult {
-  /** True if the lease was acquired (fresh insert). */
+  /** True if the lease was acquired (fresh insert or superseded). */
   acquired: boolean;
-  /** True if an unexpired lease already existed — the dispatch should be refused. */
+  /** True if an unexpired lease already existed and was not superseded. */
   refused: boolean;
+  /** The superseding reason, if applicable. */
+  superseded?: boolean;
   /** The existing lease record if refused, or null. */
   existingLease: LeaseRecord | null;
 }
@@ -57,6 +70,7 @@ export interface AcquireResult {
 export interface LeaseStoreCounters {
   acquired: number;
   refused: number;
+  superseded: number;
   renewed: number;
   released: number;
   /** Stale lease rows purged by cleanup. */
@@ -68,6 +82,7 @@ export class DispatchLeaseStore {
   private readonly leaseTtlMs: number;
   private _acquired = 0;
   private _refused = 0;
+  private _superseded = 0;
   private _renewed = 0;
   private _released = 0;
   private _stalePurged = 0;
@@ -107,6 +122,7 @@ export class DispatchLeaseStore {
         dispatched_at TEXT NOT NULL,
         expires_at TEXT NOT NULL,
         renewed_at TEXT NOT NULL DEFAULT (datetime('now')),
+        ticket_updated_at TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (agent_id, ticket_key)
       );
       CREATE INDEX IF NOT EXISTS idx_lease_expires
@@ -132,20 +148,28 @@ export class DispatchLeaseStore {
    * Acquire a dispatch lease for (agentId, ticketKey).
    *
    * If no active lease exists, creates one and returns { acquired: true }.
-   * If an unexpired lease already exists, returns { acquired: false, refused: true }
-   * with the existing record — the caller MUST refuse the dispatch.
    *
-   * This is a single atomic INSERT OR IGNORE + SELECT operation — no check-then-act
-   * race. Uses INSERT OR IGNORE (not INSERT OR REPLACE) so an existing row survives.
+   * If an unexpired lease exists:
+   *   - If `updatedAt` is provided and is strictly newer than the existing
+   *     lease's `ticket_updated_at`, the old lease is superseded (deleted and
+   *     re-acquired). This allows legitimate re-dispatches when a ticket's
+   *     state has advanced (e.g. a new delegate assignment hours later).
+   *   - Otherwise, returns { acquired: false, refused: true } with the
+   *     existing record — the caller MUST refuse the dispatch.
+   *
+   * Note: `updatedAt` is the Linear issue's updatedAt (state version), NOT a
+   * real-time clock. It is compared against the stored `ticket_updated_at`,
+   * not against `dispatched_at` (which is a real-time timestamp).
+   *
+   * This is a single atomic transaction — no check-then-act race.
    *
    * A lease is considered "expired" when expires_at < now. Expired leases are
-   * silently replaced — the INSERT OR IGNORE will conflict, so we DELETE first
-   * (in the same transaction) to allow re-acquisition.
+   * silently replaced — we DELETE first (in the same transaction) to allow re-acquisition.
    */
   acquire(
     agentId: string,
     ticketKey: string,
-    options?: { nowMs?: number; ttlOverrideMs?: number },
+    options?: { nowMs?: number; ttlOverrideMs?: number; updatedAt?: string },
   ): AcquireResult {
     const now = this.now(options);
     const expiresAt = new Date(now.getTime() + (options?.ttlOverrideMs ?? this.leaseTtlMs));
@@ -153,7 +177,7 @@ export class DispatchLeaseStore {
     const acquire = this.db.transaction((): AcquireResult => {
       // Check if an unexpired lease exists
       const row = this.db.prepare(
-        `SELECT agent_id, ticket_key, dispatched_at, expires_at, renewed_at
+        `SELECT agent_id, ticket_key, dispatched_at, expires_at, renewed_at, ticket_updated_at
          FROM dispatch_lease
          WHERE agent_id = ? AND ticket_key = ?`,
       ).get(agentId, ticketKey) as LeaseRecord | undefined;
@@ -161,25 +185,40 @@ export class DispatchLeaseStore {
       if (row) {
         const expiresMs = new Date(row.expires_at).getTime();
         if (expiresMs > now.getTime()) {
-          // Unexpired lease exists — refuse
-          this._refused++;
-          return {
-            acquired: false,
-            refused: true,
-            existingLease: row,
-          };
+          // Unexpired lease exists — check if this is a legitimate re-dispatch
+          // for a newer state of the ticket.
+          if (
+            options?.updatedAt &&
+            options.updatedAt > row.ticket_updated_at
+          ) {
+            // Legitimate re-dispatch for a newer state — supersede old lease
+            this.db.prepare(
+              `DELETE FROM dispatch_lease WHERE agent_id = ? AND ticket_key = ?`,
+            ).run(agentId, ticketKey);
+            this._superseded++;
+          } else {
+            // Same (or older) state — refuse the duplicate
+            this._refused++;
+            return {
+              acquired: false,
+              refused: true,
+              existingLease: row,
+            };
+          }
+        } else {
+          // Expired lease: DELETE first, then INSERT below
+          this.db.prepare(
+            `DELETE FROM dispatch_lease WHERE agent_id = ? AND ticket_key = ?`,
+          ).run(agentId, ticketKey);
         }
-        // Expired lease: DELETE first, then INSERT below
-        this.db.prepare(
-          `DELETE FROM dispatch_lease WHERE agent_id = ? AND ticket_key = ?`,
-        ).run(agentId, ticketKey);
       }
 
-      // Acquire the lease
+      // Acquire the lease (fresh insert or after supersede/expiry)
+      const ticketUpdatedAt = options?.updatedAt ?? this.iso(now);
       this.db.prepare(
-        `INSERT INTO dispatch_lease (agent_id, ticket_key, dispatched_at, expires_at, renewed_at)
-         VALUES (?, ?, ?, ?, ?)`,
-      ).run(agentId, ticketKey, this.iso(now), this.iso(expiresAt), this.iso(now));
+        `INSERT INTO dispatch_lease (agent_id, ticket_key, dispatched_at, expires_at, renewed_at, ticket_updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(agentId, ticketKey, this.iso(now), this.iso(expiresAt), this.iso(now), ticketUpdatedAt);
 
       this._acquired++;
       return {
@@ -203,7 +242,7 @@ export class DispatchLeaseStore {
   ): LeaseRecord | null {
     const now = this.now(options);
     const row = this.db.prepare(
-      `SELECT agent_id, ticket_key, dispatched_at, expires_at, renewed_at
+      `SELECT agent_id, ticket_key, dispatched_at, expires_at, renewed_at, ticket_updated_at
        FROM dispatch_lease
        WHERE agent_id = ? AND ticket_key = ? AND expires_at > ?`,
     ).get(agentId, ticketKey, this.iso(now)) as LeaseRecord | undefined;
@@ -290,7 +329,7 @@ export class DispatchLeaseStore {
    */
   get(agentId: string, ticketKey: string): LeaseRecord | null {
     const row = this.db.prepare(
-      `SELECT agent_id, ticket_key, dispatched_at, expires_at, renewed_at
+      `SELECT agent_id, ticket_key, dispatched_at, expires_at, renewed_at, ticket_updated_at
        FROM dispatch_lease
        WHERE agent_id = ? AND ticket_key = ?`,
     ).get(agentId, ticketKey) as LeaseRecord | undefined;
@@ -301,17 +340,19 @@ export class DispatchLeaseStore {
   getAllActive(options?: { nowMs?: number }): LeaseRecord[] {
     const now = this.now(options);
     return this.db.prepare(
-      `SELECT agent_id, ticket_key, dispatched_at, expires_at, renewed_at
+      `SELECT agent_id, ticket_key, dispatched_at, expires_at, renewed_at, ticket_updated_at
        FROM dispatch_lease
        WHERE expires_at > ?
        ORDER BY agent_id, ticket_key`,
     ).all(this.iso(now)) as LeaseRecord[];
   }
 
+  /** Get registered counter values. */
   get counters(): LeaseStoreCounters {
     return {
       acquired: this._acquired,
       refused: this._refused,
+      superseded: this._superseded,
       renewed: this._renewed,
       released: this._released,
       stalePurged: this._stalePurged,

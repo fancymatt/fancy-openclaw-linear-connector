@@ -515,11 +515,14 @@ export async function runDelegationReconciliationSweep(
       // AI-2350: acquire dispatch lease before dispatching the wake.
       // If a lease already exists (another path dispatched this ticket
       // between our check and this point), skip the wake.
+      // Pass ticket.updatedAt so a legitimate re-dispatch for a newer
+      // state supersedes the old lease rather than being blocked.
       const leaseKey = `linear-${ticket.identifier}`;
       if (opts.dispatchLeaseStore) {
         const lease = opts.dispatchLeaseStore.acquire(
           ticket.delegateName,
           leaseKey,
+          { updatedAt: ticket.updatedAt },
         );
         if (lease.refused) {
           log.info(
