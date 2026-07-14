@@ -5,7 +5,9 @@ import {
   getAccessToken,
   getAgentByProxyToken,
   getAgents,
+  getTokenStatus,
   isAgentLocal,
+  recordTokenFailure,
   reloadAgents,
   safeReloadAgents,
   updateTokens,
@@ -254,5 +256,55 @@ describe("safeReloadAgents — malformed hot edit must not crash (audit #15)", (
     expect(() => safeReloadAgents()).not.toThrow();
     expect(safeReloadAgents()).toBe(false);
     expect(getAgents().map((a) => a.name)).toEqual(["felix"]);
+  });
+});
+
+describe("getTokenStatus — credential state ladder (AI-2231)", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "agents-token-status-"));
+    process.env.AGENTS_FILE = path.join(dir, "agents.json");
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+    reloadAgents();
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTS_FILE;
+    reloadAgents();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // The bug: a never-onboarded credential has no lastRefreshOkAt, no expiresAt,
+  // and no lastFailure, so it fell through the ladder to "healthy" — masking a
+  // dead/never-configured cred that 401s in practice (jiwon case on AI-2230).
+  test("reports a never-onboarded credential as unconfigured, not healthy", () => {
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+
+    const status = getTokenStatus("charles");
+    expect(status).toBeDefined();
+    expect(status!.lastRefreshOkAt).toBeNull();
+    expect(status!.expiresAt).toBeNull();
+    expect(status!.lastFailure).toBeNull();
+    // The core assertion: must not read as healthy.
+    expect(status!.state).not.toBe("healthy");
+    expect(status!.state).toBe("unconfigured");
+  });
+
+  test("a successfully refreshed credential still reports healthy", () => {
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+    updateTokens("charles", "access-2", "refresh-2", 24 * 60 * 60);
+
+    expect(getTokenStatus("charles")!.state).toBe("healthy");
+  });
+
+  test("a never-refreshed credential with a recorded failure reports failing, not unconfigured", () => {
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+    recordTokenFailure("charles", 401, false, "unauthorized");
+
+    // lastFailure && !lastRefreshOkAt is caught by the earlier "failing" branch;
+    // the unconfigured branch must not shadow it.
+    expect(getTokenStatus("charles")!.state).toBe("failing");
   });
 });

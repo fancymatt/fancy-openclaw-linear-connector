@@ -333,7 +333,7 @@ export interface TokenStatus {
     retriable: boolean;
     reason: string;
   } | null;
-  state: "healthy" | "stale" | "expired" | "failing";
+  state: "healthy" | "stale" | "expired" | "failing" | "unconfigured";
 }
 
 export function updateTokens(
@@ -398,6 +398,12 @@ export function getTokenStatus(agentName: string): TokenStatus | undefined {
     state = expiresAt != null && now >= expiresAt - 2 * 60 * 60 * 1000
       ? "stale"
       : "healthy";
+  } else if (agent.lastRefreshOkAt == null && expiresAt == null) {
+    // Never onboarded: no successful refresh, no expiry, no failure recorded.
+    // Previously fell through to "healthy", masking dead/never-configured creds
+    // that 401 in practice (AI-2231). A failed never-refreshed cred is caught
+    // by the "failing" branch above; this catches the silent never-configured case.
+    state = "unconfigured";
   } else {
     state = "healthy";
   }
