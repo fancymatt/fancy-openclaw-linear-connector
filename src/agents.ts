@@ -689,6 +689,16 @@ export function updateAgentMetadata(
   return updated;
 }
 
+/**
+ * Mint a new opaque proxy token (`lpx_`-prefixed) for an agent.
+ * The proxy token is what the agent presents as its Authorization header;
+ * the connector resolves it to the agent and swaps in the vaulted real token
+ * for the upstream Linear API call. It is useless against api.linear.app directly.
+ */
+export function mintProxyToken(): string {
+  return "lpx_" + crypto.randomBytes(24).toString("hex");
+}
+
 export function upsertAgent(config: AgentConfig): { isNew: boolean } {
   // Match by name first (for partial entries that don't have linearUserId yet)
   // then fall back to linearUserId for token refresh updates. The fallback must
@@ -716,6 +726,14 @@ export function upsertAgent(config: AgentConfig): { isNew: boolean } {
     syncWorkspaceSecrets(config.name, config.accessToken);
     return { isNew: false };
   }
+  // Mint a proxy token for every new agent before it hits disk so that
+  // syncWorkspaceSecrets always has a `lpx_` credential to write — never
+  // the raw upstream `lin_oauth_` token (AI-2308). Already-provisioned
+  // agents with an existing proxyToken are untouched.
+  if (!config.proxyToken) {
+    config.proxyToken = mintProxyToken();
+  }
+
   _agents.push(reconcileStatusWithCredential(config));
   save(_agents);
   syncWorkspaceSecrets(config.name, config.accessToken);
