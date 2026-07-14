@@ -2054,11 +2054,23 @@ export async function checkWorkflowRules(
   if (match.requires_human_signoff_above_stakes && def.stakes) {
     const ticketStakesLevel = resolveStakesLevel(labels, def.stakes);
     if (ticketStakesLevel >= def.stakes.threshold) {
-      // AI-2358: designated-approver bypass — if the transition names a
-      // requires_capability holder and the caller holds it, they are the
-      // designated approver and bypass the stakes gate. Only the designated
-      // approver passes; all other AI agents are still blocked.
-      if (match.requires_capability && (await bodyHasCapability(bodyId, match.requires_capability))) {
+      // AI-2358: designated-approver bypass — a transition marked
+      // `designated_approver: true` AND naming a `requires_capability` nominates
+      // its holder as the sign-off authority; that holder bypasses the stakes
+      // gate. Only the designated approver passes; all other AI agents are still
+      // blocked.
+      //
+      // AI-2360: the flag is required, not optional. A bare `requires_capability`
+      // must NOT lift this gate — same opt-in the delegate gate above enforces.
+      // Keying off `requires_capability` alone handed the bypass to every
+      // capability-gated transition, including dev-impl's `deploy`
+      // (`requires_capability: deploy:execute`), letting hanzo self-sign-off on
+      // high-stakes deploys and breaking G-13 AC1.
+      if (
+        match.designated_approver === true &&
+        match.requires_capability &&
+        (await bodyHasCapability(bodyId, match.requires_capability))
+      ) {
         log.info(`workflow-gate: stakes-threshold gate: ${intent} on ${issueId} — stakes level ${ticketStakesLevel} >= threshold ${def.stakes.threshold}, but caller '${bodyId}' holds required capability '${match.requires_capability}' — designated-approver bypass`);
       } else {
         // A body known in the capability policy is an AI agent; unknown = human

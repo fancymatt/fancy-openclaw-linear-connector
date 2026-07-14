@@ -4900,6 +4900,14 @@ states:
         to: done
         requires_human_signoff_above_stakes: true
         requires_capability: sprint:signoff
+        designated_approver: true
+      # AI-2360 negative control: capability-gated but NOT a designated approver.
+      # Models dev-impl's \`deploy\` (requires_capability: deploy:execute, no flag).
+      # A holder of the capability must still be blocked by the stakes gate.
+      - command: bare-approve
+        to: done
+        requires_human_signoff_above_stakes: true
+        requires_capability: sprint:signoff
       - command: request-rework
         to: intake
 
@@ -4996,6 +5004,29 @@ describe("AI-2358: stakes-threshold designated-approver bypass", () => {
     globalThis.fetch = makeLabelFetch(["wf:sprint-with-stakes", "state:validating", "stakes:high"]);
     const result = await checkWorkflowRules("approve", "AI2358-AC6", "Bearer tok", "matt");
     // matt is not in the capability policy — unknown = human
+    expect(result).toBeNull();
+  });
+
+  // AI-2360 regression: the bypass is opt-in via `designated_approver: true`.
+  // `bare-approve` is capability-gated but carries no flag, so a holder of the
+  // capability is NOT a designated approver and the stakes gate must still fire.
+  // This is the shape of dev-impl's `deploy` — the transition AI-2358's original
+  // bare-`requires_capability` check wrongly handed a bypass to, letting hanzo
+  // self-sign-off on high-stakes deploys (3 suites / 6 tests red on main).
+  it("AI-2360: capability holder is blocked on a bare requires_capability transition (no designated_approver flag)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:sprint-with-stakes", "state:validating", "stakes:high"]);
+    const result = await checkWorkflowRules("bare-approve", "AI2360-REG", "Bearer tok", "ai");
+    // ai holds sprint:signoff, so the capability gate passes — but without the
+    // designated_approver opt-in the stakes gate must block the self-sign-off.
+    expect(result).not.toBeNull();
+    expect(result).toContain("elevated stakes");
+    expect(result).toContain("human sign-off");
+  });
+
+  it("AI-2360: low-stakes bare requires_capability transition still passes for a holder", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:sprint-with-stakes", "state:validating", "stakes:low"]);
+    const result = await checkWorkflowRules("bare-approve", "AI2360-REG-LOW", "Bearer tok", "ai");
+    // Below threshold the stakes gate never fires — the flag is irrelevant here.
     expect(result).toBeNull();
   });
 
