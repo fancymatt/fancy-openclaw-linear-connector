@@ -4836,6 +4836,208 @@ describe("AI-1482: Verbatim AC + Stakes-threshold sign-off", () => {
     });
   });
 
+// ── AI-2358: Stakes-threshold designated-approver bypass ────────────────────
+
+/** Track whether tests are in a beforeAll-defined YAML so afterEach does not
+ *  accidentally restore the fetch to a stale value. */
+let _ai2358RestoreFetch: typeof globalThis.fetch | undefined;
+const AI2358_CAP_POLICY = `
+capabilities:
+  - id: linear:transition
+  - id: human:escalate
+  - id: sprint:signoff
+
+containers:
+  - id: dev
+    grants: [linear:transition]
+  - id: steward
+    grants: [linear:transition, human:escalate]
+  - id: sprint-owner
+    grants: [linear:transition, sprint:signoff]
+
+roles:
+  - id: dev
+    requires: [linear:transition]
+  - id: steward
+    requires: [human:escalate]
+  - id: sprint-owner
+    requires: [sprint:signoff]
+
+bodies:
+  - id: ai
+    container: sprint-owner
+    fills_roles: [sprint-owner]
+  - id: charles
+    container: dev
+    fills_roles: [dev]
+  - id: astrid
+    container: steward
+    fills_roles: [steward]
+`;
+
+const AI2358_WORKFLOW_YAML = `
+id: sprint-with-stakes
+description: Sprint workflow with stakes threshold and designated approver
+entry_state: validating
+
+stakes:
+  threshold: 2
+  levels:
+    stakes:low: 0
+    stakes:medium: 1
+    stakes:high: 2
+
+break_glass:
+  command: escape
+
+states:
+  - id: validating
+    owner_role: sprint-owner
+    kind: normal
+    native_state: thinking
+    transitions:
+      - command: approve
+        to: done
+        requires_human_signoff_above_stakes: true
+        requires_capability: sprint:signoff
+      - command: request-rework
+        to: intake
+
+  - id: done
+    kind: terminal
+    native_state: done
+    transitions: []
+
+  - id: escape
+    kind: terminal
+    native_state: invalid
+    transitions:
+      - command: unescape
+        to: validating
+        assign: { mode: auto }
+`;
+
+describe("AI-2358: stakes-threshold designated-approver bypass", () => {
+  let ai2358Dir: string;
+  let ai2358OrigFetch: typeof globalThis.fetch;
+  let ai2358OrigWorkflowPath: string | undefined;
+  let ai2358OrigPolicyPath: string | undefined;
+
+  beforeAll(() => {
+    ai2358Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai2358-test-"));
+    const workflowFile = path.join(ai2358Dir, "sprint-stakes.yaml");
+    fs.writeFileSync(workflowFile, AI2358_WORKFLOW_YAML, "utf8");
+    ai2358OrigWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    const policyFile = path.join(ai2358Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, AI2358_CAP_POLICY, "utf8");
+    ai2358OrigPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+  });
+
+  afterAll(() => {
+    process.env.WORKFLOW_DEF_PATH = ai2358OrigWorkflowPath;
+    process.env.CAPABILITY_POLICY_PATH = ai2358OrigPolicyPath;
+    try { fs.rmSync(ai2358Dir, { recursive: true }); } catch { /* best-effort */ }
+  });
+
+  beforeEach(() => {
+    ai2358OrigFetch = globalThis.fetch;
+    resetWorkflowCache();
+    resetPolicyCache();
+  });
+
+  afterEach(() => {
+    if (_ai2358RestoreFetch) {
+      globalThis.fetch = _ai2358RestoreFetch;
+      _ai2358RestoreFetch = undefined;
+    } else {
+      globalThis.fetch = ai2358OrigFetch;
+    }
+  });
+
+  it("AC1: designated approver (ai, holding sprint:signoff) bypasses stakes-threshold gate on high-stakes approve", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:sprint-with-stakes", "state:validating", "stakes:high"]);
+    const result = await checkWorkflowRules("approve", "AI2358-AC1", "Bearer tok", "ai");
+    expect(result).toBeNull();
+  });
+
+  it("AC2: non-holder (charles, no sprint:signoff) is blocked on high-stakes approve (capability gate fires first)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:sprint-with-stakes", "state:validating", "stakes:high"]);
+    const result = await checkWorkflowRules("approve", "AI2358-AC2", "Bearer tok", "charles");
+    // The requires_capability gate fires before the stakes gate; charles
+    // doesn't hold sprint:signoff, so the capability gate blocks him.
+    expect(result).not.toBeNull();
+    expect(result).toContain("requires the 'sprint:signoff' capability");
+  });
+
+  it("AC3: non-holder (astrid, no sprint:signoff) is blocked on high-stakes approve (capability gate fires first)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:sprint-with-stakes", "state:validating", "stakes:high"]);
+    const result = await checkWorkflowRules("approve", "AI2358-AC3", "Bearer tok", "astrid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("requires the 'sprint:signoff' capability");
+  });
+
+  it("AC4: low-stakes approve passes for designated approver (ai)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:sprint-with-stakes", "state:validating", "stakes:low"]);
+    const result = await checkWorkflowRules("approve", "AI2358-AC4", "Bearer tok", "ai");
+    expect(result).toBeNull();
+  });
+
+  it("AC5: transition with no requires_capability still blocks (original behavior preserved)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:sprint-with-stakes", "state:validating", "stakes:high"]);
+    const result = await checkWorkflowRules("request-rework", "AI2358-AC5", "Bearer tok", "charles");
+    // request-rework does NOT have requires_human_signoff_above_stakes — should pass
+    expect(result).toBeNull();
+  });
+
+  it("AC6: human/unknown caller (not in policy) is still allowed through stakes-threshold gate", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:sprint-with-stakes", "state:validating", "stakes:high"]);
+    const result = await checkWorkflowRules("approve", "AI2358-AC6", "Bearer tok", "matt");
+    // matt is not in the capability policy — unknown = human
+    expect(result).toBeNull();
+  });
+
+  it("AC7: transition with requires_capability and no holder blocks non-holder (capability gate)", async () => {
+    // Use a capability policy where no body holds sprint:signoff
+    const noSignoffPolicy = `
+capabilities:
+  - id: linear:transition
+  - id: human:escalate
+
+containers:
+  - id: dev
+    grants: [linear:transition]
+  - id: steward
+    grants: [linear:transition, human:escalate]
+
+roles:
+  - id: dev
+    requires: [linear:transition]
+  - id: steward
+    requires: [human:escalate]
+
+bodies:
+  - id: charles
+    container: dev
+    fills_roles: [dev]
+`;
+    _ai2358RestoreFetch = globalThis.fetch;
+
+    const policyFile = path.join(ai2358Dir, "no-signoff-policy.yaml");
+    fs.writeFileSync(policyFile, noSignoffPolicy, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+    resetPolicyCache();
+
+    globalThis.fetch = makeLabelFetch(["wf:sprint-with-stakes", "state:validating", "stakes:high"]);
+    // charles doesn't hold sprint:signoff and nobody does — capability gate blocks
+    const result = await checkWorkflowRules("approve", "AI2358-AC7", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("requires the 'sprint:signoff' capability");
+  });
+});
+
 // ── AI-1493: Atomic transitions + deterministic owner-routing ──────────────
 
 describe("applyStateTransition — AI-1493 atomic transitions", () => {

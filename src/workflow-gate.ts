@@ -2027,18 +2027,26 @@ export async function checkWorkflowRules(
   if (match.requires_human_signoff_above_stakes && def.stakes) {
     const ticketStakesLevel = resolveStakesLevel(labels, def.stakes);
     if (ticketStakesLevel >= def.stakes.threshold) {
-      // A body known in the capability policy is an AI agent; unknown = human
-      const isAgent = await isBodyKnown(bodyId);
-      if (isAgent) {
-        log.warn(`workflow-gate: stakes-threshold gate: ${intent} on ${issueId} blocked — stakes level ${ticketStakesLevel} >= threshold ${def.stakes.threshold}, caller '${bodyId}' is a known AI agent`);
-        const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
-        return (
-          `[Proxy] '${intent}' blocked: this ticket has elevated stakes (level ${ticketStakesLevel}) ` +
-          `and requires human sign-off. AI agent '${bodyId}' cannot self-sign-off on high-stakes work. ` +
-          `Legal moves: ${legalMoves}.`
-        );
+      // AI-2358: designated-approver bypass — if the transition names a
+      // requires_capability holder and the caller holds it, they are the
+      // designated approver and bypass the stakes gate. Only the designated
+      // approver passes; all other AI agents are still blocked.
+      if (match.requires_capability && (await bodyHasCapability(bodyId, match.requires_capability))) {
+        log.info(`workflow-gate: stakes-threshold gate: ${intent} on ${issueId} — stakes level ${ticketStakesLevel} >= threshold ${def.stakes.threshold}, but caller '${bodyId}' holds required capability '${match.requires_capability}' — designated-approver bypass`);
+      } else {
+        // A body known in the capability policy is an AI agent; unknown = human
+        const isAgent = await isBodyKnown(bodyId);
+        if (isAgent) {
+          log.warn(`workflow-gate: stakes-threshold gate: ${intent} on ${issueId} blocked — stakes level ${ticketStakesLevel} >= threshold ${def.stakes.threshold}, caller '${bodyId}' is a known AI agent`);
+          const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
+          return (
+            `[Proxy] '${intent}' blocked: this ticket has elevated stakes (level ${ticketStakesLevel}) ` +
+            `and requires human sign-off. AI agent '${bodyId}' cannot self-sign-off on high-stakes work. ` +
+            `Legal moves: ${legalMoves}.`
+          );
+        }
+        log.info(`workflow-gate: stakes-threshold gate: ${intent} on ${issueId} — stakes level ${ticketStakesLevel} >= threshold ${def.stakes.threshold}, but caller '${bodyId}' is human/unknown — allowing`);
       }
-      log.info(`workflow-gate: stakes-threshold gate: ${intent} on ${issueId} — stakes level ${ticketStakesLevel} >= threshold ${def.stakes.threshold}, but caller '${bodyId}' is human/unknown — allowing`);
     }
   }
 
