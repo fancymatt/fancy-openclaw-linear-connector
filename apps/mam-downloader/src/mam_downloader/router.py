@@ -6,9 +6,8 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 
 from mam_downloader.config import Settings
-from mam_downloader.models import BookRequisition, Job
+from mam_downloader.models import BookRequisition, Job, JobStatus
 from mam_downloader.services.download_manager import DownloadManager
-from mam_downloader.services.mam import MAMClient
 
 logger = logging.getLogger(__name__)
 
@@ -72,5 +71,5 @@ async def _process_job(job: Job, dm: DownloadManager) -> None:
         await dm.execute(job)
     except Exception as exc:
         logger.exception("Background job %s failed unexpectedly", job.id)
-        job.status = job.status
+        job.status = JobStatus.failed
         job.error = str(exc)

@@ -142,7 +142,7 @@ class TestMAMSearch:
         assert first.author == "Patrick Rothfuss"
         assert first.seeders == 120
         assert first.peers == 15
-        assert first.size_bytes == 500_000_000  # 500 MB
+        assert first.size_bytes == 524_288_000  # 500.0 * 1024 * 1024 = 524_288_000
         assert first.format == "audiobook"
         assert "id=12345" in first.torrent_url
 

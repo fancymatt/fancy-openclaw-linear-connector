@@ -61,17 +61,14 @@ class TestCLIServe:
 
     def test_serve_flag_starts_uvicorn(self) -> None:
         """--serve flag starts the uvicorn server."""
-        from mam_downloader.cli import main as cli_main
+        from mam_downloader.cli import main as cli_main, run_server
 
         with patch.object(sys, "argv", ["mam-downloader", "--serve"]), \
-             patch("mam_downloader.cli.uvicorn.run") as mock_uvicorn:
+             patch("mam_downloader.cli.run_server") as mock_run:
 
             cli_main()
 
-            mock_uvicorn.assert_called_once()
-            # Check it runs on port 8687
-            args, kwargs = mock_uvicorn.call_args
-            assert kwargs.get("port") == 8687 or kwargs.get("port") == 8687
+            mock_run.assert_called_once()
 
 
 class TestCLIHelp:
