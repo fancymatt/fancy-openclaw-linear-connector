@@ -1919,10 +1919,16 @@ export async function checkWorkflowRules(
   // already advanced to the post-transition state; re-checking legality against it
   // self-blocks the command (exit 1) after its own transition applied. The live state
   // is still used above for informational legal-moves hints in block messages.
+  //
+  // AI-2357: prefer the applied-state store (getAppliedState) over the stale label
+  // projection. When the engine's authoritative state (recorded at the last successful
+  // applyStateTransition) disagrees with the stale state:* label on the ticket, the
+  // engine state wins — the label projection is advisory, not authoritative. This
+  // prevents governed transitions from declining on desynced labels.
   const currentState =
     typeof snapshotState === "string" && snapshotState.length > 0
       ? snapshotState
-      : getCurrentState(labels, def); // AI-2094: def-aware — a stale state:* label can never win over the real one
+      : getAppliedState(issueId) ?? getCurrentState(labels, def); // AI-2357: applied-state store wins over stale label; AI-2094: def-aware fallback
   if (!currentState) {
     // AI-1402: For needs-human, fail-closed even without a state label.
     // We cannot determine if there is a forward path, so treat the ticket as actionable.
