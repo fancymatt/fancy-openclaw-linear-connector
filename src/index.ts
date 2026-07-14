@@ -1116,6 +1116,13 @@ export function createApp(options?: CreateAppOptions) {
     getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
   const migrationWakeFn = async (agentName: string, ticketIdentifier: string) => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
+    // AI-2313: guard against re-dispatch when a session is already live for this (agent, ticket).
+    // The session tracker's stale timeout (25 min) can clean up in-memory state while the
+    // OpenClaw session is still working — a subsequent sweep tick then creates a second session.
+    if (sessionTracker.isActiveForTicket(agentName, sessionKey)) {
+      log.info(`AI-2313 re-dispatch skipped for ${agentName} [${sessionKey}]: session already active (migrationWakeFn)`);
+      return;
+    }
     const agentCfg = getAgent(agentName);
     const deliveryConfig: DeliveryConfig = {
       nodeBin: process.execPath,
@@ -1248,6 +1255,11 @@ if (isEntryPoint) {
     getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
   const reconciliationWakeFn = async (agentName: string, ticketIdentifier: string) => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
+    // AI-2313: guard against re-dispatch when a session is already live for this (agent, ticket).
+    if (sessionTracker.isActiveForTicket(agentName, sessionKey)) {
+      log.info(`AI-2313 re-dispatch skipped for ${agentName} [${sessionKey}]: session already active (reconciliationWakeFn)`);
+      return;
+    }
     const agentCfg = getAgent(agentName);
     const deliveryConfig: DeliveryConfig = {
       nodeBin: process.execPath,
@@ -1275,6 +1287,7 @@ if (isEntryPoint) {
     authToken: reconciliationAuthToken,
     operationalEventStore,
     wakeFn: reconciliationWakeFn,
+    sessionTracker,
   });
 
   // AI-2009: first-action watchdog — arm a per-state deadline at dispatch

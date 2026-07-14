@@ -28,6 +28,7 @@ import {
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, formatIntervalMs } from "./cron/registry.js";
 import { OperationalEventStore, type OperationalEventStore as OperationalEventStoreType } from "./store/operational-event-store.js";
+import type { SessionTracker } from "./bag/session-tracker.js";
 
 const log = componentLogger(
   createLogger(process.env.LOG_LEVEL ?? "info"),
@@ -49,6 +50,7 @@ export interface DelegationReconciliationOptions {
   operationalEventStore: OperationalEventStoreType;
   alertBus: AlertBus;
   wakeFn: (agentName: string, ticketIdentifier: string) => Promise<void>;
+  sessionTracker?: SessionTracker;
   fetchFn?: typeof fetch;
   /** AC5: single-ticket mode — reconcile only these identifiers. */
   ticketIdentifiers?: string[];
@@ -178,7 +180,18 @@ function hasDispatchSinceDelegation(
   agentName: string,
   ticketIdentifier: string,
   delegationTimestamp: string,
+  sessionTracker?: SessionTracker,
 ): boolean {
+  // AI-2313: if a live session exists for this (agent, ticket), treat it as "already dispatched"
+  // even if the event store doesn't have a dispatch-accepted event. This covers the gap where
+  // the session tracker's stale timeout cleaned up in-memory state but the session is still alive.
+  if (sessionTracker) {
+    const sessionKey = `linear-${ticketIdentifier}`;
+    if (sessionTracker.isActiveForTicket(agentName, sessionKey)) {
+      return true;
+    }
+  }
+
   const events = operationalEventStore.query({
     key: `linear-${ticketIdentifier}`,
     limit: 100,
@@ -210,6 +223,7 @@ export async function runDelegationReconciliationSweep(
   const alertBus = opts.alertBus;
   const operationalEventStore = opts.operationalEventStore;
   const wakeFn = opts.wakeFn;
+  const sessionTracker = opts.sessionTracker;
   const nowDate = opts.now ?? (() => new Date());
 
   const result: DelegationReconciliationResult = {
@@ -399,6 +413,7 @@ export async function runDelegationReconciliationSweep(
           ticket.delegateName,
           ticket.identifier,
           ticket.updatedAt,
+          sessionTracker,
         )
       ) {
         result.skippedIdempotent++;
@@ -507,6 +522,7 @@ export function registerDelegationReconciliationCron(opts: {
   operationalEventStore?: OperationalEventStoreType;
   alertBus?: AlertBus;
   wakeFn?: (agentName: string, ticketIdentifier: string) => Promise<void>;
+  sessionTracker?: SessionTracker;
   fetchFn?: typeof fetch;
 }): NodeJS.Timeout {
   const intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
@@ -526,6 +542,7 @@ export function registerDelegationReconciliationCron(opts: {
       operationalEventStore: store,
       alertBus: opts.alertBus ?? getAlertBus(),
       wakeFn: opts.wakeFn ?? (() => Promise.resolve()),
+      sessionTracker: opts.sessionTracker,
       fetchFn: opts.fetchFn,
     }).catch((err) => {
       log.error(
