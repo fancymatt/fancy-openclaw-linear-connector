@@ -264,7 +264,9 @@ describe("NoActivityDetector", () => {
 
     const result = await detector.runCycle();
 
-    expect(result.failed).toBe(1);
+    // AI-2404: terminal-state prune handles non-actionable tickets at the top
+    // of runCycle, before the fail loop. Expected: 0 failed (silent prune).
+    expect(result.failed).toBe(0);
     // Should NOT have re-dispatched — ticket was pruned
     expect(dispatchedTickets).toHaveLength(0);
 
@@ -305,7 +307,9 @@ describe("NoActivityDetector", () => {
 
     const result = await detector.runCycle();
 
-    expect(result.failed).toBe(1);
+    // AI-2404: terminal-state prune handles Done/Canceled tickets at the top
+    // of runCycle, before the warn/fail loop. Expected: 0 failed (silent prune).
+    expect(result.failed).toBe(0);
     expect(dispatchedTickets).toHaveLength(0);
 
     // ackTracker must be acknowledged — not left as pending — so the detector

@@ -280,7 +280,48 @@ export class NoActivityDetector {
     const result: NoActivityCycleResult = { warned: 0, failed: 0, alreadyEnded: 0, deferredAtCapacity: 0 };
 
     // Get all currently tracked dispatches that are still pending/unconfirmed
-    const pending = ackTracker.getPendingTimedOut(0); // 0ms → all pending
+    let pending = ackTracker.getPendingTimedOut(0); // 0ms → all pending
+
+    // === Terminal-state prune ===
+    // Before any warn/fail escalation, prune ack entries whose tickets are
+    // Done/Canceled — they should never emit no-activity events. Batched:
+    // deduplicate by (agentId, ticketId) so one unique ticket gets at most
+    // one Linear read per cycle, regardless of how many ack rows exist.
+    // Reuses the same isLinearIssueActionable function as the resignal path
+    // (AI-2389 pattern: isTerminalIssueState).
+    // Fail-open: isLinearIssueActionable returns true on auth/network errors,
+    // so the prune is safely skipped during a Linear outage.
+    if (pending.length > 0) {
+      const seen = new Set<string>();
+      const unique: Array<{ agentId: string; ticketId: string }> = [];
+      for (const e of pending) {
+        const key = `${e.agentId}:${e.ticketId}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          unique.push({ agentId: e.agentId, ticketId: e.ticketId });
+        }
+      }
+
+      const isTicketActionable = this.deps.resignalOptions?.isTicketActionable ?? isLinearIssueActionable;
+      for (const { agentId, ticketId } of unique) {
+        if (!(await isTicketActionable(ticketId, agentId))) {
+          // Terminal ticket: end the dead session and acknowledge the ack
+          const sessionKey = ticketId;
+          sessionTracker.endSession(agentId, sessionKey);
+          ackTracker.acknowledge(agentId, ticketId);
+          this.clearWarned(agentId, sessionKey);
+          log.info(
+            `No-activity: pruned terminal-state ticket ${ticketId} for ${agentId}` +
+            ` (Done/Canceled) — acknowledged and removed from no-activity ladder`,
+          );
+        }
+      }
+
+      // Re-fetch pending after pruning so the warn/fail loop doesn't iterate
+      // over entries that were just acknowledged.
+      pending = ackTracker.getPendingTimedOut(0);
+    }
+
     const now = Date.now();
 
     for (const entry of pending) {
