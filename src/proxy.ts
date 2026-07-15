@@ -776,6 +776,42 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           stripNullDelegateAssigneeFields(body, effectiveIntent);
         }
 
+        // AI-2417: Restore assignee-clear alongside a delegate SET so app-user
+        // delegates persist. The Linear API silently drops a delegateId write to
+        // an app/bot user unless assigneeId is carried in the SAME mutation
+        // (AI-1395: "silently rejects delegateId writes for app users unless
+        // assigneeId is [sent]"; the valid persistent shape is
+        // { delegateId: app_user, assigneeId: null }). Two paths converge on the
+        // bug for generic delegate-routing verbs (refuse-work, generic
+        // handoff-work, undelegate):
+        //   • refuse-work OMITS assigneeId entirely (the AI-1395 CLI guard leaves
+        //     it unset for app-user targets), so Linear drops the delegate back to
+        //     the caller — the "reverts to Ai" symptom on GEN-178.
+        //   • generic handoff-work DOES send assigneeId:null, but
+        //     stripNullDelegateAssigneeFields (AI-1857) just removed it above,
+        //     re-creating the same omit shape.
+        // When the CLI itself set a non-null delegateId and did not pin a specific
+        // assignee, inject assigneeId:null so the app-user delegate write persists.
+        // This runs BEFORE the AI-1977 delegate-pre-resolve block, so it only fires
+        // for verbs where the CLI wrote the delegate directly (the generic path);
+        // governed dev-impl verbs omit the CLI delegateId — the proxy's
+        // applyStateTransition owns their delegate/assignee — and are untouched.
+        // A delegate CLEAR (delegateId:null) is excluded, so the AI-1857 guard
+        // against ungoverned delegate self-clears is unaffected.
+        if (isIssueUpdateMutation(body)) {
+          const inputForDelegate = issueUpdateInput(body);
+          if (
+            inputForDelegate &&
+            inputForDelegate.delegateId != null &&
+            !("assigneeId" in inputForDelegate)
+          ) {
+            inputForDelegate.assigneeId = null;
+            log.info(
+              `app-user-delegate-assignee-clear agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected assigneeId:null alongside delegateId so the delegate persists (AI-2417)`,
+            );
+          }
+        }
+
         // AI-1977: Pre-resolve the delegateId and inject it into the forwarded mutation
         // BEFORE the forward, so webhook #1 carries the correct delegate from the start.
         // Previously applyStateTransition set the delegate as a separate API call after
