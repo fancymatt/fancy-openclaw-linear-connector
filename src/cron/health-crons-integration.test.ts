@@ -36,6 +36,7 @@ const EXPECTED_CRONS = [
   "g20-canary",
   "oob-reconcile-sweep",
   "p4-metrics-distillation",
+  "registry-integrity-check", // AI-2359: periodic registry⇄policy integrity check (registered in createApp)
   "rescue-sweep",
   "sla-sweep",
 ].sort();

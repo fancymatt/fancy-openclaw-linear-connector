@@ -3365,11 +3365,13 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
   let originalFetch: typeof globalThis.fetch;
   let originalWorkflowPath: string | undefined;
   let originalPolicyPath: string | undefined;
+  let originalAgentsFile: string | undefined;
   let sprintDir: string;
 
   beforeAll(() => {
     originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
     originalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    originalAgentsFile = process.env.AGENTS_FILE;
 
     sprintDir = fs.mkdtempSync(path.join(os.tmpdir(), "sprint-test-"));
     const policyFile = path.join(sprintDir, "capability-policy.yaml");
@@ -3377,6 +3379,27 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
     process.env.CAPABILITY_POLICY_PATH = policyFile;
 
     process.env.WORKFLOW_DEF_PATH = CANONICAL_SPRINT_FIXTURE;
+
+    // AI-2359: singleton auto-delegate now fails closed when the target body
+    // has no linearUserId. The canonical-sprint apply path (accept → ux-shaping)
+    // auto-delegates to the 'ux-researcher' singleton 'maya', so every
+    // SPRINT_POLICY_YAML body must have a linearUserId or the transition aborts
+    // before binding its artifact (C-2). Give this block its own registry.
+    const agentsFile = path.join(sprintDir, "agents.json");
+    fs.writeFileSync(
+      agentsFile,
+      JSON.stringify({ agents: [
+        { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-client", clientSecret: "h-secret", accessToken: "h-token", refreshToken: "h-refresh" },
+        { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-client", clientSecret: "c-secret", accessToken: "c-token", refreshToken: "c-refresh" },
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+        { name: "maya", linearUserId: "maya-linear-uuid", clientId: "m-client", clientSecret: "m-secret", accessToken: "m-token", refreshToken: "m-refresh" },
+        { name: "engine-1", linearUserId: "engine-1-linear-uuid", clientId: "e-client", clientSecret: "e-secret", accessToken: "e-token", refreshToken: "e-refresh" },
+        { name: "soren", linearUserId: "soren-linear-uuid", clientId: "s-client", clientSecret: "s-secret", accessToken: "s-token", refreshToken: "s-refresh" },
+      ] }),
+      "utf8",
+    );
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
   });
 
   afterAll(() => {
@@ -3390,6 +3413,14 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
     } else {
       delete process.env.CAPABILITY_POLICY_PATH;
     }
+    if (originalAgentsFile !== undefined) {
+      process.env.AGENTS_FILE = originalAgentsFile;
+    } else {
+      delete process.env.AGENTS_FILE;
+    }
+    // Restore the in-memory registry so the sprint bodies don't leak into
+    // later describe blocks that rely on the outer fixture.
+    reloadAgents();
   });
 
   beforeEach(() => {
@@ -3676,6 +3707,22 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
+      // Atomic transition-write mutation (state + labels + delegate in one).
+      // Must be matched BEFORE the broad "delegate" context-fetch branch:
+      // AI-2359 gave the ux-researcher singleton (maya) a linearUserId, so the
+      // atomic write now carries a delegateId variable and its body contains
+      // "delegate" — without this ordering it would be misrouted to the context
+      // fetch, return a non-success shape, and fail the transition (C-2 regressed
+      // silently on main only because maya was skipped for lack of a linearUserId).
+      if (bodyText.includes("issueUpdate")) {
+        try {
+          lastAtomicWrite = (JSON.parse(bodyText) as { variables?: typeof lastAtomicWrite }).variables;
+        } catch { /* keep prior */ }
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
       // Issue context fetch (for delegate check in checkWorkflowRules)
       if (bodyText.includes("delegate")) {
         return new Response(
@@ -3702,16 +3749,6 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
       if (bodyText.includes("TeamLabels")) {
         return new Response(
           JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-ux-shaping", name: "state:ux-shaping" }] } } } }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
-      // Label swap mutation
-      if (bodyText.includes("issueUpdate")) {
-        try {
-          lastAtomicWrite = (JSON.parse(bodyText) as { variables?: typeof lastAtomicWrite }).variables;
-        } catch { /* keep prior */ }
-        return new Response(
-          JSON.stringify({ data: { issueUpdate: { success: true } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
