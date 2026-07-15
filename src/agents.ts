@@ -45,6 +45,22 @@ export interface AgentConfig {
   hooksUrl?: string;
   /** Per-agent OpenClaw hooks token override */
   hooksToken?: string;
+  /**
+   * AI-2420: Per-agent OpenClaw Gateway OpenAI-compatible API URL (e.g.
+   * `http://10.10.0.105:18820/v1/chat/completions`). When set together with
+   * `gatewayToken`, delivery routes through the gateway `/v1` API using the
+   * trusted `x-openclaw-session-key` header for per-ticket session routing,
+   * instead of the hook payload `sessionKey` field — which lets the fleet flip
+   * `hooks.allowRequestSessionKey` to `false` (AI-2111/AI-2112).
+   *
+   * The fleet is **multi-gateway**: each agent runs its own gateway, so this
+   * MUST be the agent's own URL. Never populate it from a global env URL — that
+   * points at a single gateway and strands every other agent as "Unknown agent"
+   * (see the trap note in `src/webhook/index.ts`).
+   */
+  gatewayUrl?: string;
+  /** AI-2420: Per-agent operator token for the gateway `/v1` API (sent as `Authorization: Bearer <token>`). */
+  gatewayToken?: string;
   /** Maximum concurrent sessions this agent can handle. Overrides the global default. */
   maxConcurrent?: number;
   /**

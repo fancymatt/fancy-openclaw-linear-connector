@@ -424,6 +424,10 @@ export function createApp(options?: CreateAppOptions) {
       ...wakeConfig,
       hooksUrl: cfg?.hooksUrl ?? wakeConfig.hooksUrl,
       hooksToken: cfg?.hooksToken ?? wakeConfig.hooksToken,
+      // AI-2420: per-agent gateway-API target (never a global URL — multi-gateway
+      // fleet). When set, delivery prefers the x-openclaw-session-key path.
+      gatewayUrl: cfg?.gatewayUrl,
+      gatewayToken: cfg?.gatewayToken,
       linearAuthToken,
       // AI-2008: route every real workflow wake through the acknowledged
       // retry/loud-failure layer. Evaluated at dispatch time, so referencing the
@@ -1155,6 +1159,9 @@ export function createApp(options?: CreateAppOptions) {
       hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
       hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
       hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+      // AI-2420: per-agent gateway-API target (never a global URL).
+      gatewayUrl: agentCfg?.gatewayUrl,
+      gatewayToken: agentCfg?.gatewayToken,
     };
     const actionText = `${ticketIdentifier} was migrated to a new workflow state (its previous state was removed by a def change)`;
     const message =
@@ -1300,6 +1307,9 @@ if (isEntryPoint) {
       hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
       hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
       hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+      // AI-2420: per-agent gateway-API target (never a global URL).
+      gatewayUrl: agentCfg?.gatewayUrl,
+      gatewayToken: agentCfg?.gatewayToken,
     };
     const actionText = `You were delegated ${ticketIdentifier}`;
     const message =
@@ -1518,6 +1528,9 @@ if (isEntryPoint) {
         hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
         hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
         hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+        // AI-2420: per-agent gateway-API target (never a global URL).
+        gatewayUrl: agentCfg?.gatewayUrl,
+        gatewayToken: agentCfg?.gatewayToken,
       };
       const actionText = `SLA breach detected for ${identifier}`;
       const message =

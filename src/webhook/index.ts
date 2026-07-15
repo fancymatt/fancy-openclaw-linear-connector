@@ -433,15 +433,16 @@ export function createWebhookRouter(
                 hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
                 hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
                 hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
-                // NB: no global gatewayUrl/gatewayToken here. The gateway API
-                // delivery path (deliver.ts) is preferred whenever both are set,
-                // but OPENCLAW_GATEWAY_URL only ever points at ONE gateway (the
-                // host), which knows only host-local agents (grover/main). There
-                // is no per-agent gatewayUrl override in AgentConfig, so injecting
-                // the global here made every container agent (astrid@18822,
-                // igor@18820, …) unreachable — "Unknown agent" — while silently
-                // bypassing the correct per-agent hooksUrl. Delivery routes via
-                // per-agent hooksUrl/hooksToken from agents.json instead.
+                // AI-2420: gateway-API target comes from the agent's OWN config
+                // (agents.json), never the global OPENCLAW_GATEWAY_URL. The global
+                // points at ONE gateway (the host, which knows only grover/main),
+                // so injecting it would strand every container agent (astrid@18822,
+                // igor@18820, …) as "Unknown agent" while bypassing the correct
+                // per-agent hooksUrl. With per-agent gatewayUrl+gatewayToken set,
+                // delivery prefers the x-openclaw-session-key path; otherwise it
+                // falls back to per-agent hooksUrl/hooksToken from agents.json.
+                gatewayUrl: agentCfg?.gatewayUrl,
+                gatewayToken: agentCfg?.gatewayToken,
               };
               try {
                 if (throttle) {
@@ -872,10 +873,10 @@ export function createWebhookRouter(
           hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
           hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
           // No global gatewayUrl/gatewayToken — see note at the wakeDeliveryConfig
-          // above. wakeConfigForAgent (below) overrides hooksUrl/hooksToken per
-          // agent but NOT gatewayUrl, so a global gateway here would win the
-          // delivery-path preference and strand every container agent. Route via
-          // per-agent hooks instead.
+          // above. A global gateway URL points at ONE gateway and would win the
+          // delivery-path preference, stranding every container agent. AI-2420:
+          // wakeConfigForAgent (below) now sets gatewayUrl/gatewayToken per agent
+          // from agents.json; this base config stays gateway-less on purpose.
           timeoutMs: process.env.NODE_ENV === "test" ? 50 : undefined,
           maxRetries: process.env.NODE_ENV === "test" ? 0 : undefined,
         };
@@ -893,6 +894,9 @@ export function createWebhookRouter(
             ...wakeConfig,
             hooksUrl: cfg?.hooksUrl ?? wakeConfig.hooksUrl,
             hooksToken: cfg?.hooksToken ?? wakeConfig.hooksToken,
+            // AI-2420: per-agent gateway-API target (never a global URL).
+            gatewayUrl: cfg?.gatewayUrl,
+            gatewayToken: cfg?.gatewayToken,
             linearAuthToken,
           };
         };
@@ -982,9 +986,13 @@ export function createWebhookRouter(
         hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
         hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
         hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
-        // No global gatewayUrl/gatewayToken — see note at the wakeDeliveryConfig
-        // earlier in this file. Routes via per-agent hooksUrl/hooksToken so
-        // container agents are reachable.
+        // AI-2420: gateway-API target from the agent's OWN config (never the
+        // global OPENCLAW_GATEWAY_URL — see note at wakeDeliveryConfig earlier).
+        // With both set, delivery prefers the x-openclaw-session-key path; else
+        // it falls back to per-agent hooksUrl/hooksToken so container agents stay
+        // reachable.
+        gatewayUrl: agentCfg?.gatewayUrl,
+        gatewayToken: agentCfg?.gatewayToken,
       };
       try {
         if (throttle) {

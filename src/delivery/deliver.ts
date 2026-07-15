@@ -20,6 +20,16 @@ export interface DeliveryConfig {
   gatewayUrl?: string;
   /** Gateway operator token for the OpenAI-compatible API (Authorization: Bearer <token>). */
   gatewayToken?: string;
+  /**
+   * AI-2420: When true, gateway-API delivery is *required* — an agent without
+   * both `gatewayUrl` and `gatewayToken` fails loud instead of silently falling
+   * back to the hook payload-`sessionKey` path (which needs
+   * `allowRequestSessionKey=true` and would silently break once the fleet flips
+   * that flag off). When undefined, the delivery layer reads the fleet switch
+   * from `REQUIRE_GATEWAY_DELIVERY` (default off — preserves the hooks fallback
+   * during the rollout window, AI-2112 scope-4).
+   */
+  requireGatewayApi?: boolean;
   timeoutMs?: number;
   retryDelayMs?: number;
   maxRetries?: number;
@@ -91,7 +101,23 @@ export async function deliverMessageToAgent(
   // Prefer the Gateway OpenAI-compatible API path when configured — it uses
   // x-openclaw-session-key header routing instead of the hook payload field,
   // which lets us flip allowRequestSessionKey=false (AI-2111).
-  if (config.gatewayUrl && config.gatewayToken) {
+  const haveGatewayApi = Boolean(config.gatewayUrl && config.gatewayToken);
+
+  // AI-2420: fail-loud when gateway delivery is mandated fleet-wide but this
+  // agent has no gateway mapping/token. Falling through to the hooks path here
+  // would deliver via the payload `sessionKey` field, which silently stops
+  // working once `allowRequestSessionKey` flips to false — surfacing as
+  // mis-routed/dropped dispatches rather than an error. Refuse instead.
+  const requireGatewayApi = config.requireGatewayApi ?? process.env.REQUIRE_GATEWAY_DELIVERY === "true";
+  if (requireGatewayApi && !haveGatewayApi) {
+    const summary =
+      `gateway-API delivery required (REQUIRE_GATEWAY_DELIVERY) but agent ${agentName} ` +
+      `has no gatewayUrl/gatewayToken mapping — refusing silent fallback to payload sessionKey`;
+    log.error(`${summary} [${sessionId}]`);
+    return { dispatched: false, hookError: true, hookErrorSummary: summary };
+  }
+
+  if (haveGatewayApi) {
     return deliverViaGatewayApi(agentName, sessionId, config, { message, timeoutMs, retryDelayMs, maxRetries });
   }
 
