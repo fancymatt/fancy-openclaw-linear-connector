@@ -266,6 +266,41 @@ describe("reconcileOobMutations", () => {
     expect(second.flagged).toBe(0);
   });
 
+  test("AI-2191: flagged mutations are resolved — second pass does not re-examine or re-alert them", async () => {
+    // A single out-of-band mutation (webhook only, no proxy op).
+    store.append({
+      source: "webhook",
+      ticket: "AI-2191-OOB",
+      changeType: "state",
+      field: "state:done",
+      actorId: "user-raw-token-holder",
+      recordedAt: "2026-07-05T20:30:00.000Z",
+    });
+
+    const bus1 = fakeAlertBus();
+    const first = await reconcileOobMutations(store, {
+      nowMs: NOW,
+      graceMs: 60_000,
+      alertBus: bus1 as any,
+    });
+    expect(first.examined).toBe(1);
+    expect(first.flagged).toBe(1);
+    expect(bus1._calls).toHaveLength(1);
+
+    // Second pass in a later hour: the record must already be resolved, so it
+    // is not re-examined and the alert does not re-fire. Before the fix, the
+    // still-uncorrelated record was re-counted every pass and the count climbed.
+    const bus2 = fakeAlertBus();
+    const second = await reconcileOobMutations(store, {
+      nowMs: NOW + 60 * 60 * 1000, // +1h — fresh dedup key, would re-alert if unresolved
+      graceMs: 60_000,
+      alertBus: bus2 as any,
+    });
+    expect(second.examined).toBe(0);
+    expect(second.flagged).toBe(0);
+    expect(bus2._calls).toHaveLength(0);
+  });
+
   test("writes operational events for flagged mutations", async () => {
     const opStore = fakeOpStore();
 

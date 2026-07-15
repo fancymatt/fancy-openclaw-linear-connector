@@ -262,6 +262,32 @@ export class MutationAuditStore {
   }
 
   /**
+   * AI-2191 — Mark a flagged webhook record as resolved after it has been
+   * surfaced as an out-of-band mutation (no matching proxy op).
+   *
+   * Unlike {@link correlate}, this does NOT pair the record to a proxy op — it
+   * records that the OOB alert has already been fired, so subsequent reconcile
+   * sweeps skip it. `uncorrelatedWebhookMutations` filters on `correlated = 0`;
+   * without this call, flagged records stay uncorrelated forever, so every
+   * sweep re-examines the full cumulative set of unresolved OOB records and the
+   * hourly alert count climbs monotonically (10 → 109 → … → 351) instead of
+   * reporting the per-window delta.
+   *
+   * Reuses the existing `correlated` column (no schema change, no migration):
+   * `correlated = 1` means "this webhook mutation needs no further reconcile
+   * attention," whether because it matched a proxy op or because it was flagged
+   * and alerted. The `correlated_at` timestamp persists in SQLite, so a restart
+   * does not re-alert an already-flagged backlog.
+   */
+  markFlaggedResolved(webhookId: number, resolvedAt?: string): void {
+    const ts = resolvedAt ?? new Date().toISOString();
+    this.db.prepare(`
+      UPDATE mutation_audit SET correlated = 1, correlated_at = ?
+      WHERE id = ? AND source = 'webhook'
+    `).run(ts, webhookId);
+  }
+
+  /**
    * Find proxy records for a given ticket/change_type within a time window.
    * Matches on exact ticket OR ticket_uuid to handle the UUID⇄identifier gap
    * (proxy often only has the UUID; webhook has the human-readable identifier).

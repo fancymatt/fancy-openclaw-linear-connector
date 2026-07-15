@@ -16,9 +16,11 @@
  *     proxy op land first).
  *   - For each, looks for any proxy record for the same ticket + change type
  *     within a match window. If found → correlate. If not → flag.
- *   - Flagged mutations are surfaced via the alert bus + operational events.
- *   - Idempotent: correlating on re-runs is safe (already-correlated records
- *     are excluded by the query).
+ *   - Flagged mutations are surfaced via the alert bus + operational events,
+ *     then marked resolved (AI-2191) so later passes report only per-window new
+ *     OOB mutations — not an ever-growing cumulative total.
+ *   - Idempotent: re-runs are safe. Both correlated and already-flagged records
+ *     are excluded by the query (both carry correlated=1).
  */
 
 import { componentLogger, createLogger } from "./logger.js";
@@ -153,6 +155,13 @@ export async function reconcileOobMutations(
         recordedAt: webhookRec.recordedAt,
       },
     });
+
+    // AI-2191: mark the flagged record resolved so subsequent sweeps don't
+    // re-examine and re-alert it. Without this, `uncorrelatedWebhookMutations`
+    // (filters correlated=0) re-counts the full cumulative OOB set every pass,
+    // making the hourly alert count climb monotonically instead of reporting
+    // the per-window delta. The flag persists in SQLite → no re-alert on restart.
+    store.markFlaggedResolved(webhookRec.id, new Date(now).toISOString());
   }
 
   // Emit a consolidated alert if any mutations were flagged.
