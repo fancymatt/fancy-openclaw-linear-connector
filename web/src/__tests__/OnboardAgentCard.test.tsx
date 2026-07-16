@@ -14,7 +14,7 @@ import { FleetPage } from "../pages/FleetPage";
 import type { FleetResponse } from "../types";
 
 const GUIDE_URL =
-  "https://github.com/fancymatt/fancy-openclaw-linear-connector#quick-start-onboard-wizard";
+  "https://github.com/fancyfleet/fancy-openclaw-linear-connector#quick-start-onboard-wizard";
 
 describe("AI-2143 — OnboardAgentCard (launch + link)", () => {
   it("surfaces the CLI onboarding command", () => {

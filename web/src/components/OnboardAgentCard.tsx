@@ -12,7 +12,7 @@ import { Card } from "../components";
 
 /** GitHub README section that documents the onboarding wizard end-to-end. */
 const ONBOARD_GUIDE_URL =
-  "https://github.com/fancymatt/fancy-openclaw-linear-connector#quick-start-onboard-wizard";
+  "https://github.com/fancyfleet/fancy-openclaw-linear-connector#quick-start-onboard-wizard";
 
 /** The CLI entry point wired in package.json ("onboard": "node dist/onboard-wizard.js"). */
 const ONBOARD_COMMAND = "npm run onboard";
