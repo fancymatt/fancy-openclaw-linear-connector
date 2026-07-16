@@ -25,8 +25,6 @@ import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const RUNTIME_TREE_MARKER = "CONNECTOR_DEPLOY";
-
 function main() {
   const projectRoot = resolve(__dirname, "..");
   const outDir = resolve(projectRoot, "dist");
@@ -71,7 +69,12 @@ function main() {
   }
 
   // We're building into the runtime tree's dist/. Is the deploy marker set?
-  if (process.env[RUNTIME_TREE_MARKER] === "1") {
+  // Accept CONNECTOR_DEPLOY (used by this guard's docs) or CONNECTOR_DEPLOY_BUILD
+  // (used by guard-build-location.js). Both are env vars that the deploy path sets.
+  if (
+    process.env.CONNECTOR_DEPLOY === "1" ||
+    process.env.CONNECTOR_DEPLOY_BUILD === "1"
+  ) {
     // Deploy path — allow.
     process.exit(0);
   }
