@@ -31,6 +31,44 @@ cd "$(./scripts/connector-worktree.sh <linear-branch-name>)"
 Worktrees live under `.worktrees/` (gitignored) and share `.git/objects`, so
 setup is instant and costs no extra disk. Never `git add` a worktree directory.
 
+### Arming the isolation hook — and keeping it current (INF-19)
+
+The worktree guard above is enforced by a `reference-transaction` hook that is
+**armed by copying it out of the tree** into `.git/hooks/` via
+`scripts/connector-reftxn-arm.sh`. Because the armed copy lives outside the
+working tree, nothing makes it converge when the tracked hook changes upstream —
+**"the fix merged" is not "the fix is live."** A clone can run an arbitrarily old
+hook while `git log` shows the fix landed hours ago; that exact
+tracked-vs-armed drift made INF-17 look like a different bug than it was.
+
+Two guards close this:
+
+```bash
+# Arm (or re-arm) a clone. Self-gates on 15m HEAD quiescence; --force bypasses.
+# Arming ALSO installs post-merge + post-rewrite hooks that auto-re-arm on every
+# pull/rebase, so an already-armed clone self-converges from then on.
+scripts/connector-reftxn-arm.sh
+
+# Is my armed copy current? 0 in-sync, 1 drift, 2 not-armed, 3 no tracked source.
+scripts/connector-reftxn-arm.sh --check
+
+# What's armed, what version, is auto-re-arm on?
+scripts/connector-reftxn-arm.sh --status
+```
+
+Rules of thumb:
+
+- **A fresh clone, or one parked on a branch that predates the hook, is NOT
+  protected.** Auto-re-arm only maintains an *already-armed* clone — it will not
+  silently arm one left disarmed on purpose. Run the arm script **once by hand**
+  to bootstrap; after that, pulls keep it current automatically.
+- **After merging any change to the hook**, every already-armed live clone
+  refreshes on its next pull. To confirm (or to converge a clone that hasn't
+  pulled), run `--check` and re-arm if it reports `DRIFT` / `NOT-ARMED`.
+- The hook carries a `REFTXN_HOOK_VERSION` stamp. A refusal prints it, and
+  `.git/hooks/reference-transaction --version` prints it — so a bug report can
+  state exactly **which hook actually ran**.
+
 ## Branch Naming
 
 Use Linear's auto-generated branch names (e.g., `ai-205-bootstrap-repo`). This keeps branches linked to their tickets automatically.
