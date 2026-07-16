@@ -11,6 +11,9 @@ COPY vendor/ vendor/
 RUN npm ci
 
 COPY tsconfig.json ./
+# `npm run build` fires the prebuild guards (scripts/guard-*.js|mjs); without
+# scripts/ the build dies on MODULE_NOT_FOUND before tsc runs.
+COPY scripts/ scripts/
 COPY src/ src/
 RUN npm run build
 
