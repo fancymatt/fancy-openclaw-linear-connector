@@ -2957,6 +2957,43 @@ async function postComment(internalIssueId: string, body: string, authToken: str
   }
 }
 
+/**
+ * INF-12: the single exit for every `delegate-unresolved` fail-close.
+ *
+ * Four of the five original return sites logged their reason server-side and
+ * returned mute: the agent's comment posted, the state label never flipped, and
+ * nothing said why. A mute fail-close is indistinguishable from a hang, so
+ * agents retry instead of correcting — it costs sessions, not seconds (LIF-7
+ * declined 5× across three sessions before being demoted to Backlog to stop the
+ * loop). The reason was already computed at every site; only the delivery was
+ * missing.
+ *
+ * Routing all five sites through here is the actual guard: a sixth fail-close
+ * path cannot be added mute without deliberately going around this function.
+ *
+ * `remedy` is the operator-facing half — what to DO — and is what separates a
+ * useful comment from a restatement of the failure. `detail` stays the terse
+ * machine-facing string already on the wire.
+ *
+ * Fail-close semantics are unchanged and deliberately so (AI-1709): this always
+ * returns failed/delegate-unresolved and never applies a write. `postComment` is
+ * itself fail-open, so a failed comment cannot convert a clean abort into a
+ * throw — which matters because two of these sites sit inside the try block
+ * whose catch is itself a fail-close site.
+ */
+async function failDelegateUnresolved(args: {
+  issueId: string;
+  authToken: string;
+  detail: string;
+  remedy: string;
+  from?: string | null;
+  to?: string;
+}): Promise<TransitionApplyResult> {
+  const { issueId, authToken, detail, remedy, from, to } = args;
+  await postComment(issueId, `[Connector] Transition blocked: ${remedy}`, authToken);
+  return { status: "failed", code: "delegate-unresolved", detail, from, to };
+}
+
 export async function applyStateTransition(
   intent: string,
   issueId: string | null,
@@ -3454,7 +3491,17 @@ export async function applyStateTransition(
             log.error(
               `workflow-gate: B2 apply: FAIL-CLOSED — prior implementer '${priorImplementer}' has no linearUserId. Cannot route ${intent} on ${issueId}.`,
             );
-            return { status: "failed", code: "delegate-unresolved", detail: `prior implementer '${priorImplementer}' has no linearUserId`, from: currentStateName, to: toStateName };
+            return await failDelegateUnresolved({
+              issueId,
+              authToken,
+              detail: `prior implementer '${priorImplementer}' has no linearUserId`,
+              remedy:
+                `'${intent}' routes back to the prior implementer '${priorImplementer}', but that agent has no ` +
+                `linearUserId in agents.json. Register the agent's Linear user ID to proceed, or re-run with ` +
+                `\`--target <body>\` to route this transition to someone else.`,
+              from: currentStateName,
+              to: toStateName,
+            });
           }
         } else {
           log.warn(
@@ -3475,26 +3522,51 @@ export async function applyStateTransition(
               log.error(
                 `workflow-gate: B2 apply: FAIL-CLOSED — singleton body '${roleBodies[0]}' for role '${destOwnerRole}' has no linearUserId. Transition aborted.`,
               );
-              if (issueId) {
-                await postComment(
-                  issueId,
-                  `[Connector] Transition blocked: singleton body '${roleBodies[0]}' for role '${destOwnerRole}' has no linearUserId in agents.json. Register the agent's Linear user ID to proceed.`,
-                  authToken,
-                );
-              }
-              return { status: "failed", code: "delegate-unresolved", detail: singletonResult.detail ?? "singleton body has no linearUserId", from: currentStateName, to: toStateName };
+              // INF-12: text pinned verbatim — this path was already correct and
+              // its wording is asserted exactly by the regression suite.
+              return await failDelegateUnresolved({
+                issueId,
+                authToken,
+                detail: singletonResult.detail ?? "singleton body has no linearUserId",
+                remedy:
+                  `singleton body '${roleBodies[0]}' for role '${destOwnerRole}' has no linearUserId in agents.json. ` +
+                  `Register the agent's Linear user ID to proceed.`,
+                from: currentStateName,
+                to: toStateName,
+              });
             }
           } else if (roleBodies.length > 1) {
             log.error(
               `workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) on '${intent}' for ${issueId} requires a CLI --target${wantsPriorImplementer ? " (no prior implementer recorded)" : ""} but none was supplied. Transition aborted.`,
             );
-            return { status: "failed", code: "delegate-unresolved", detail: `multi-body role '${destOwnerRole}' requires a --target`, from: currentStateName, to: toStateName };
+            return await failDelegateUnresolved({
+              issueId,
+              authToken,
+              detail: `multi-body role '${destOwnerRole}' requires a --target`,
+              remedy:
+                `'${intent}' routes to role '${destOwnerRole}', which is filled by ${roleBodies.length} bodies ` +
+                `(${roleBodies.join(", ")}), so the connector will not guess which one` +
+                `${wantsPriorImplementer ? " and no prior implementer is recorded on this ticket" : ""}. ` +
+                `Re-run with \`--target <body>\`, naming one of: ${roleBodies.join(", ")}.`,
+              from: currentStateName,
+              to: toStateName,
+            });
           } else {
             if (intent === 'approve' || intent === 'reject') {
               log.error(
                 `workflow-gate: B2 apply: FAIL-CLOSED — no bodies found for role '${destOwnerRole}' on '${intent}'. Transition aborted per AI-1493.`,
               );
-              return { status: "failed", code: "delegate-unresolved", detail: `no bodies found for role '${destOwnerRole}'`, from: currentStateName, to: toStateName };
+              return await failDelegateUnresolved({
+                issueId,
+                authToken,
+                detail: `no bodies found for role '${destOwnerRole}'`,
+                remedy:
+                  `'${intent}' routes to role '${destOwnerRole}', but no body is registered as filling that role, ` +
+                  `so there is nobody to delegate to. Add a body with '${destOwnerRole}' in its \`fills_roles\` in ` +
+                  `capability-policy.yaml, or re-run with \`--target <body>\` to route this transition explicitly.`,
+                from: currentStateName,
+                to: toStateName,
+              });
             }
             log.warn(
               `workflow-gate: B2 apply: no bodies found for role '${destOwnerRole}' on '${intent}' — skipping auto-delegate`,
@@ -3505,7 +3577,18 @@ export async function applyStateTransition(
           log.error(
             `workflow-gate: B2 apply: FAIL-CLOSED — role resolution failed for '${destOwnerRole}': ${msg}. Transition aborted.`,
           );
-          return { status: "failed", code: "delegate-unresolved", detail: `role resolution failed for '${destOwnerRole}': ${msg}`, from: currentStateName, to: toStateName };
+          return await failDelegateUnresolved({
+            issueId,
+            authToken,
+            detail: `role resolution failed for '${destOwnerRole}': ${msg}`,
+            remedy:
+              `'${intent}' routes to role '${destOwnerRole}', but resolving the bodies for that role failed: ${msg}. ` +
+              `This is usually an unreadable or malformed capability-policy.yaml rather than anything about this ` +
+              `ticket — check the connector's config-health. Re-run with \`--target <body>\` to route explicitly in ` +
+              `the meantime.`,
+            from: currentStateName,
+            to: toStateName,
+          });
         }
       }
     }
