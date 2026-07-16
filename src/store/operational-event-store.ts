@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 
-export const OPERATIONAL_EVENT_OUTCOMES = ["received", "signature-rejected", "duplicate", "normalized", "terminal-pruned", "no-route", "no-route-human", "routed", "dedup-suppressed", "bag-added", "delivered", "dispatch-accepted", "dispatched", "queued", "delivery-failed", "delivery-unconfirmed", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "no-activity-warn", "no-activity-failed", "deferred-at-capacity", "deferred-capacity-rearm", "stuck-delegate-reprompt", "stale-c4-repoke", "stale-c4-repoke-failed", "stale-c4-repoke-dropped", "phantom-dispatch-abort", "stale-snapshot-mutation-rejected", "engagement-thinking", "engagement-doing", "engagement-todo", "bootstrap-bootstrapped", "bootstrap-demoted", "bootstrap-wake-dispatched", "bootstrap-wake-delivered", "bootstrap-wake-failed", "enrollment-healed", "break-glass-used", "hold-retry-dispatch", "no-activity-redispatch", "no-activity-redispatch-failed", "delegation-reconciled", "delegation-reconciliation-failed", "watchdog-resignal", "comment-post-failed", "def-state-migrated", "def-state-migration-failed", "suppressed-duplicate", "dropped-stale", "transition-write-failed", "dispatch-undeliverable", "observation-recorded", "observation-skipped", "rescue:rescued", "rescue:ambiguous", "rescue:failed"] as const;
+export const OPERATIONAL_EVENT_OUTCOMES = ["received", "signature-rejected", "duplicate", "normalized", "terminal-pruned", "no-route", "no-route-human", "routed", "dedup-suppressed", "bag-added", "delivered", "delivery-pending-ack", "dispatch-accepted", "dispatched", "queued", "delivery-failed", "delivery-unconfirmed", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "no-activity-warn", "no-activity-failed", "deferred-at-capacity", "deferred-capacity-rearm", "stuck-delegate-reprompt", "stale-c4-repoke", "stale-c4-repoke-failed", "stale-c4-repoke-dropped", "phantom-dispatch-abort", "stale-snapshot-mutation-rejected", "engagement-thinking", "engagement-doing", "engagement-todo", "bootstrap-bootstrapped", "bootstrap-demoted", "bootstrap-wake-dispatched", "bootstrap-wake-delivered", "bootstrap-wake-failed", "enrollment-healed", "break-glass-used", "hold-retry-dispatch", "no-activity-redispatch", "no-activity-redispatch-failed", "delegation-reconciled", "delegation-reconciliation-failed", "watchdog-resignal", "comment-post-failed", "def-state-migrated", "def-state-migration-failed", "suppressed-duplicate", "dropped-stale", "transition-write-failed", "dispatch-undeliverable", "observation-recorded", "observation-skipped", "rescue:rescued", "rescue:ambiguous", "rescue:failed"] as const;
 export type OperationalEventOutcome = typeof OPERATIONAL_EVENT_OUTCOMES[number];
 
 export interface OperationalEventInput {
@@ -35,13 +35,14 @@ export interface OperationalSnapshot { key?: string; agent?: string; lastSuccess
  * workflow failures; clustering them drowns the real signal. `dropped-stale`
  * and `suppressed-duplicate` are stale-digest noise emitted by connector bugs
  * since fixed (webhook/index.ts) — the AC calls for it to be filtered, not
- * clustered.
+ * clustered. `delivery-pending-ack` is a normal queued outcome, not a failure.
  */
 export const NON_CLUSTERING_OUTCOMES: readonly OperationalEventOutcome[] = [
   "signature-rejected",
   "duplicate",
   "dropped-stale",
   "suppressed-duplicate",
+  "delivery-pending-ack",
 ] as const;
 
 /** AI-2037: an operational failure cluster, keyed on forward-only enrichment columns. */
@@ -80,7 +81,7 @@ const SECRET_VALUE_PATTERNS: Array<[RegExp, string]> = [
   [/\blin_wh_[A-Za-z0-9_-]+\b/ig, "[REDACTED]"],
   [/\b[^\s,;]*?(?:token|secret|password|authorization|api[-_]?key)[^\s,;]*\b/ig, "[REDACTED]"],
 ];
-const SUCCESS_OUTCOMES = new Set<OperationalEventOutcome>(["received", "normalized", "routed", "bag-added", "delivered", "dispatch-accepted", "queued", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "deferred-capacity-rearm", "enrollment-healed"]);
+const SUCCESS_OUTCOMES = new Set<OperationalEventOutcome>(["received", "normalized", "routed", "bag-added", "delivered", "delivery-pending-ack", "dispatch-accepted", "queued", "session-ended", "stale-resignaled", "startup-replayed", "startup-pruned", "deferred-capacity-rearm", "enrollment-healed"]);
 const ERROR_OUTCOMES = new Set<OperationalEventOutcome>(["signature-rejected", "delivery-failed", "no-route", "no-activity-warn", "no-activity-failed", "deferred-at-capacity", "dispatch-undeliverable"]);
 
 function redactText(value: string): string {

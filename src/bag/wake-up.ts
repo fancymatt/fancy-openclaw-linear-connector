@@ -36,7 +36,7 @@ export interface WakeDeliveryScheduler {
     deliver: (ctx: { attempt: number; dispatchId: string }) => Promise<DeliveryResult>;
     maxRetries?: number;
     backoffMs?: (attempt: number) => number;
-  }): Promise<{ status: "delivered" | "undeliverable"; attempts: number; dispatchId: string }>;
+  }): Promise<{ status: "delivered" | "delivered-pending-ack" | "undeliverable"; attempts: number; dispatchId: string }>;
 }
 
 export interface WakeUpConfig extends DeliveryConfig {
@@ -202,7 +202,7 @@ export async function sendWakeUpSignal(
         // scheduler applies its bounded backoff default.
         maxRetries: config.maxRetries,
       });
-      if (outcome.status !== "delivered") {
+      if (outcome.status === "undeliverable") {
         throw new Error(
           `wake-up delivery undeliverable after ${outcome.attempts} attempt(s)`,
         );

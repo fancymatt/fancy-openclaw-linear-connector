@@ -1,16 +1,19 @@
 /**
  * AI-2008 — Dispatch delivery acknowledgment + retry — no fire-and-forget wakes.
  *
- * `deliverWithAck` is the seam that removes the fire-and-forget dispatch path.
- * It wraps a single delivery attempt with:
+ * `deliverWithAck` is the seam that removes the fire-and-forget dispatch path
+ * and owns dispatch retry. The injected delivery primitive performs one
+ * attempt per call; this module is the only retry loop. It wraps delivery with:
  *   - a recorded delivery outcome for EVERY attempt (AC1: no fire-and-forget),
  *   - bounded retry-with-backoff on failed/unconfirmed delivery (AC2),
  *   - a loud `dispatch-undeliverable` warning after the final attempt fails,
  *     naming ticket / state / delegate / gateway (AC3),
  *   - an ack expectation registered on success so an unacked wake still
  *     self-heals via the dispatch watchdog,
- *   - a stable dispatch id reused across every retry so the receiver can dedup
- *     — a retried wake never executes twice (AC5).
+ *   - a stable dispatch id reused across every retry for delivery paths that
+ *     carry it. The gateway path does not send dispatchId today, so queued
+ *     connect-established aborts are treated as pending ack and not retried,
+ *     making receiver-side dedup unnecessary for that case.
  *
  * `deliver` is injected so the orchestration is exercisable without a live
  * gateway; `sleep` is injected so backoff is asserted without real timers.
@@ -56,7 +59,7 @@ export interface DeliverWithAckParams {
 }
 
 export interface DeliverWithAckOutcome {
-  status: "delivered" | "undeliverable";
+  status: "delivered" | "delivered-pending-ack" | "undeliverable";
   attempts: number;
   dispatchId: string;
 }
@@ -98,6 +101,7 @@ export async function deliverWithAck(params: DeliverWithAckParams): Promise<Deli
     delegate: agentId,
     gateway: gateway ?? null,
     dispatchId,
+    attemptBound: totalAttempts,
   };
 
   let attempt = 0;
@@ -121,6 +125,21 @@ export async function deliverWithAck(params: DeliverWithAckParams): Promise<Deli
       // Register the ack expectation so an unacked wake self-heals via the watchdog.
       ackTracker.recordDispatch(agentId, ticketId);
       return { status: "delivered", attempts: attempt, dispatchId };
+    }
+
+    if (result.pendingAck) {
+      eventStore.append({
+        outcome: "delivery-pending-ack",
+        agent: agentId,
+        key,
+        sessionKey: key,
+        workflowState: workflowState ?? null,
+        attemptCount: attempt,
+        wakeId: dispatchId,
+        detail: baseDetail,
+      });
+      ackTracker.recordDispatch(agentId, ticketId);
+      return { status: "delivered-pending-ack", attempts: attempt, dispatchId };
     }
 
     // AC2: log every failed/unconfirmed attempt to the operational event store.

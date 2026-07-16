@@ -31,7 +31,16 @@ export interface DeliveryConfig {
    */
   requireGatewayApi?: boolean;
   timeoutMs?: number;
+  /**
+   * Deprecated/unused at this layer. Retry backoff is owned by deliverWithAck,
+   * not by the gateway/hooks/CLI delivery primitives.
+   */
   retryDelayMs?: number;
+  /**
+   * Outer scheduler/deliverWithAck retry bound. `wake-up.ts` reads this value
+   * and passes it to the acknowledged delivery scheduler; this delivery layer
+   * performs exactly one attempt per call.
+   */
   maxRetries?: number;
 }
 
@@ -48,11 +57,34 @@ export interface DeliveryResult {
   delegateUnavailable?: boolean;
   /** AI-1848: Canon version injected into the dispatch message (null when no canon loaded). */
   canonVersion?: string | null;
+  /** The connection was established and the request was accepted; the turn is queued. Not a failure. */
+  pendingAck?: boolean;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
-const DEFAULT_RETRY_DELAY_MS = 5_000;
-const DEFAULT_MAX_RETRIES = 1;
+
+function summarizeError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function classifyFetchError(err: unknown): DeliveryResult {
+  const summary = summarizeError(err);
+  const name = typeof err === "object" && err !== null && "name" in err
+    ? String((err as { name?: unknown }).name)
+    : undefined;
+  if (name === "AbortError") {
+    return {
+      dispatched: false,
+      pendingAck: true,
+      hookErrorSummary: summary,
+    };
+  }
+  return {
+    dispatched: false,
+    hookError: true,
+    hookErrorSummary: summary,
+  };
+}
 
 /**
  * Deliver a routed event to an OpenClaw agent.
@@ -61,8 +93,8 @@ const DEFAULT_MAX_RETRIES = 1;
  * 1. **HTTP hooks** — POST to an isolated agent endpoint (when hooksUrl + hooksToken configured).
  * 2. **CLI spawn** — run `openclaw agent` as a detached child process (default).
  *
- * Both modes include retry with configurable timeout/delay/attempts.
- * Errors are logged, never thrown.
+ * Each mode performs exactly one delivery attempt. Retry ownership lives in
+ * deliverWithAck / the scheduler layer. Errors are logged, never thrown.
  */
 export async function deliverToAgent(
   route: RouteResult,
@@ -95,8 +127,6 @@ export async function deliverMessageToAgent(
   config: DeliveryConfig,
 ): Promise<DeliveryResult> {
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const retryDelayMs = config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
-  const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
 
   // Prefer the Gateway OpenAI-compatible API path when configured — it uses
   // x-openclaw-session-key header routing instead of the hook payload field,
@@ -118,13 +148,13 @@ export async function deliverMessageToAgent(
   }
 
   if (haveGatewayApi) {
-    return deliverViaGatewayApi(agentName, sessionId, config, { message, timeoutMs, retryDelayMs, maxRetries });
+    return deliverViaGatewayApi(agentName, sessionId, config, { message, timeoutMs });
   }
 
   if (config.hooksUrl && config.hooksToken) {
-    return deliverViaHooks(agentName, sessionId, config, { message, timeoutMs, retryDelayMs, maxRetries });
+    return deliverViaHooks(agentName, sessionId, config, { message, timeoutMs });
   }
-  return deliverViaCli(agentName, sessionId, config, { message, timeoutMs, retryDelayMs, maxRetries });
+  return deliverViaCli(agentName, sessionId, config, { message, timeoutMs });
 }
 
 // ── HTTP Hooks Mode ──────────────────────────────────────────────────────────
@@ -133,76 +163,67 @@ async function deliverViaHooks(
   agentName: string,
   sessionId: string,
   config: DeliveryConfig,
-  opts: { message: string; timeoutMs: number; retryDelayMs: number; maxRetries: number },
+  opts: { message: string; timeoutMs: number },
 ): Promise<DeliveryResult> {
 
-  let result: DeliveryResult = { dispatched: false };
-  for (let attempt = 0; attempt <= opts.maxRetries && !result.dispatched; attempt++) {
-    if (attempt > 0) {
-      log.info(
-        `Retrying isolated delivery for ${agentName} [${sessionId}] (attempt ${attempt + 1}/${opts.maxRetries + 1}) after ${opts.retryDelayMs}ms`,
-      );
-      await new Promise((r) => setTimeout(r, opts.retryDelayMs));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const controller = new AbortController();
+    timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+    const response = await fetch(config.hooksUrl!, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.hooksToken!}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        agentId: agentName,
+        sessionKey: sessionId,
+        message: opts.message,
+        thinking: config.hooksThinking || undefined,
+        model: config.hooksModel || undefined,
+        deliver: false,
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    timer = undefined;
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => "no body");
+      throw new Error(`hooks responded with ${response.status}: ${errBody}`);
     }
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
-      const response = await fetch(config.hooksUrl!, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${config.hooksToken!}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          agentId: agentName,
-          sessionKey: sessionId,
-          message: opts.message,
-          thinking: config.hooksThinking || undefined,
-          model: config.hooksModel || undefined,
-          deliver: false,
-        }),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (!response.ok) {
-        const errBody = await response.text().catch(() => "no body");
-        throw new Error(`hooks responded with ${response.status}: ${errBody}`);
-      }
-      const json = (await response.json()) as Record<string, unknown>;
-      const runId = typeof json.runId === "string" ? json.runId : undefined;
-      const hookOk = json.ok !== false; // Treat missing 'ok' as success (backward compat)
+    const json = (await response.json()) as Record<string, unknown>;
+    const runId = typeof json.runId === "string" ? json.runId : undefined;
+    const hookOk = json.ok !== false; // Treat missing 'ok' as success (backward compat)
 
-      if (!hookOk) {
-        // Gateway explicitly returned { ok: false } — the run was not started.
-        const errorSummary = typeof json.error === "string" ? json.error
-          : typeof json.summary === "string" ? json.summary
-          : JSON.stringify(json).slice(0, 200);
-        log.error(
-          `Gateway returned hook error for ${agentName} [${sessionId}]: ${errorSummary}`,
-        );
-        result = {
-          dispatched: false,
-          runId,
-          rawResponse: json,
-          hookError: true,
-          hookErrorSummary: errorSummary,
-        };
-      } else {
-        log.info(
-          `Isolated delivery dispatched for ${agentName} [${sessionId}]: runId=${runId ?? "ok"}`,
-        );
-        result = { dispatched: true, runId, rawResponse: json };
-      }
-    } catch (err) {
+    if (!hookOk) {
+      // Gateway explicitly returned { ok: false } — the run was not started.
+      const errorSummary = typeof json.error === "string" ? json.error
+        : typeof json.summary === "string" ? json.summary
+        : JSON.stringify(json).slice(0, 200);
       log.error(
-        `Isolated delivery attempt ${attempt + 1} failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`,
+        `Gateway returned hook error for ${agentName} [${sessionId}]: ${errorSummary}`,
       );
+      return {
+        dispatched: false,
+        runId,
+        rawResponse: json,
+        hookError: true,
+        hookErrorSummary: errorSummary,
+      };
     }
+
+    log.info(
+      `Isolated delivery dispatched for ${agentName} [${sessionId}]: runId=${runId ?? "ok"}`,
+    );
+    return { dispatched: true, runId, rawResponse: json };
+  } catch (err) {
+    if (timer) clearTimeout(timer);
+    log.error(
+      `Isolated delivery failed for ${agentName}: ${summarizeError(err)}`,
+    );
+    return classifyFetchError(err);
   }
-  if (!result.dispatched) {
-    log.error(`All delivery attempts exhausted for ${agentName} [${sessionId}]`);
-  }
-  return result;
 }
 
 // ── Gateway OpenAI-Compatible API Mode ──────────────────────────────────────
@@ -219,76 +240,67 @@ async function deliverViaGatewayApi(
   agentName: string,
   sessionId: string,
   config: DeliveryConfig,
-  opts: { message: string; timeoutMs: number; retryDelayMs: number; maxRetries: number },
+  opts: { message: string; timeoutMs: number },
 ): Promise<DeliveryResult> {
 
-  let result: DeliveryResult = { dispatched: false };
-  for (let attempt = 0; attempt <= opts.maxRetries && !result.dispatched; attempt++) {
-    if (attempt > 0) {
-      log.info(
-        `Retrying gateway API delivery for ${agentName} [${sessionId}] (attempt ${attempt + 1}/${opts.maxRetries + 1}) after ${opts.retryDelayMs}ms`,
-      );
-      await new Promise((r) => setTimeout(r, opts.retryDelayMs));
-    }
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const controller = new AbortController();
+    timer = setTimeout(() => controller.abort(), opts.timeoutMs);
 
-      // Construct the OpenAI-compatible chat completions request body.
-      // The model field routes to the specific agent; the message content
-      // carries the dispatch message (same as hooks mode).
-      const body = JSON.stringify({
-        model: `openclaw/${agentName}`,
-        messages: [
-          {
-            role: "user",
-            content: opts.message,
-          },
-        ],
-        // Stream=false for a one-shot dispatch; we wait for the response.
-        stream: false,
-        // Tight max_tokens — the agent's reply is uninteresting here;
-        // we just need it to have received and started processing.
-        max_tokens: 1,
-      });
-
-      const response = await fetch(config.gatewayUrl!, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${config.gatewayToken!}`,
-          "Content-Type": "application/json",
-          "x-openclaw-session-key": sessionId,
-          ...(config.hooksThinking ? { "x-openclaw-model": config.hooksThinking } : {}),
+    // Construct the OpenAI-compatible chat completions request body.
+    // The model field routes to the specific agent; the message content
+    // carries the dispatch message (same as hooks mode).
+    const body = JSON.stringify({
+      model: `openclaw/${agentName}`,
+      messages: [
+        {
+          role: "user",
+          content: opts.message,
         },
-        body,
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
+      ],
+      // Stream=false for a one-shot dispatch; we wait for the response.
+      stream: false,
+      // Tight max_tokens — the agent's reply is uninteresting here;
+      // we just need it to have received and started processing.
+      max_tokens: 1,
+    });
 
-      if (!response.ok) {
-        const errBody = await response.text().catch(() => "no body");
-        throw new Error(`gateway API responded with ${response.status}: ${errBody}`);
-      }
+    const response = await fetch(config.gatewayUrl!, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.gatewayToken!}`,
+        "Content-Type": "application/json",
+        "x-openclaw-session-key": sessionId,
+        ...(config.hooksThinking ? { "x-openclaw-model": config.hooksThinking } : {}),
+      },
+      body,
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    timer = undefined;
 
-      const json = (await response.json()) as Record<string, unknown>;
-      // The OpenAI-compatible API returns a standard ChatCompletion response.
-      // Extract id for run tracking.
-      const runId = typeof json.id === "string" ? json.id : undefined;
-
-      log.info(
-        `Gateway API delivery dispatched for ${agentName} [${sessionId}]: id=${runId ?? "ok"}`,
-      );
-      result = { dispatched: true, runId, rawResponse: json };
-    } catch (err) {
-      log.error(
-        `Gateway API delivery attempt ${attempt + 1} failed for ${agentName}: ${err instanceof Error ? err.message : String(err)}`,
-      );
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => "no body");
+      throw new Error(`gateway API responded with ${response.status}: ${errBody}`);
     }
+
+    const json = (await response.json()) as Record<string, unknown>;
+    // The OpenAI-compatible API returns a standard ChatCompletion response.
+    // Extract id for run tracking.
+    const runId = typeof json.id === "string" ? json.id : undefined;
+
+    log.info(
+      `Gateway API delivery dispatched for ${agentName} [${sessionId}]: id=${runId ?? "ok"}`,
+    );
+    return { dispatched: true, runId, rawResponse: json };
+  } catch (err) {
+    if (timer) clearTimeout(timer);
+    log.error(
+      `Gateway API delivery failed for ${agentName}: ${summarizeError(err)}`,
+    );
+    return classifyFetchError(err);
   }
-  if (!result.dispatched) {
-    log.error(`All gateway API delivery attempts exhausted for ${agentName} [${sessionId}]`);
-  }
-  return result;
 }
 
 // ── CLI Spawn Mode ───────────────────────────────────────────────────────────
@@ -297,59 +309,51 @@ async function deliverViaCli(
   agentName: string,
   sessionId: string,
   config: DeliveryConfig,
-  opts: { message: string; timeoutMs: number; retryDelayMs: number; maxRetries: number },
+  opts: { message: string; timeoutMs: number },
 ): Promise<DeliveryResult> {
 
   let result: DeliveryResult = { dispatched: false };
-  for (let attempt = 0; attempt <= opts.maxRetries && !result.dispatched; attempt++) {
-    if (attempt > 0) {
-      log.info(
-        `Retrying CLI delivery for ${agentName} [${sessionId}] (attempt ${attempt + 1}/${opts.maxRetries + 1}) after ${opts.retryDelayMs}ms`,
+  try {
+    result = { dispatched: await new Promise<boolean>((resolve) => {
+      const child = spawn(
+        config.nodeBin,
+        ["openclaw", "agent", "--agent", agentName, "--message", opts.message, "--channel", "telegram", "--deliver"],
+        { detached: true, stdio: ["ignore", "pipe", "pipe"] },
       );
-      await new Promise((r) => setTimeout(r, opts.retryDelayMs));
-    }
-    try {
-      result = { dispatched: await new Promise<boolean>((resolve) => {
-        const child = spawn(
-          config.nodeBin,
-          ["openclaw", "agent", "--agent", agentName, "--message", opts.message, "--channel", "telegram", "--deliver"],
-          { detached: true, stdio: ["ignore", "pipe", "pipe"] },
+      child.unref();
+
+      const timer = setTimeout(() => {
+        log.warn(
+          `CLI delivery timed out after ${opts.timeoutMs}ms for ${agentName} — killing child`,
         );
-        child.unref();
+        child.kill("SIGKILL");
+        resolve(false);
+      }, opts.timeoutMs);
 
-        const timer = setTimeout(() => {
-          log.warn(
-            `CLI delivery timed out after ${opts.timeoutMs}ms for ${agentName} — killing child`,
-          );
-          child.kill("SIGKILL");
+      child.on("exit", (code: number | null) => {
+        clearTimeout(timer);
+        if (code === 0) {
+          resolve(true);
+        } else {
+          log.error(`CLI delivery exited with code ${code} for ${agentName}`);
           resolve(false);
-        }, opts.timeoutMs);
-
-        child.on("exit", (code: number | null) => {
-          clearTimeout(timer);
-          if (code === 0) {
-            resolve(true);
-          } else {
-            log.error(`CLI delivery exited with code ${code} for ${agentName}`);
-            resolve(false);
-          }
-        });
-        child.on("error", (err: Error) => {
-          clearTimeout(timer);
-          log.error(`CLI delivery spawn error for ${agentName}: ${err.message}`);
-          resolve(false);
-        });
-      }) };
-    } catch (err) {
-      log.error(
-        `CLI delivery attempt ${attempt + 1} threw for ${agentName}: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
+        }
+      });
+      child.on("error", (err: Error) => {
+        clearTimeout(timer);
+        log.error(`CLI delivery spawn error for ${agentName}: ${err.message}`);
+        resolve(false);
+      });
+    }) };
+  } catch (err) {
+    log.error(
+      `CLI delivery threw for ${agentName}: ${summarizeError(err)}`,
+    );
   }
   if (result.dispatched) {
     log.info(`Delivery spawned for ${agentName} [${sessionId}]`);
   } else {
-    log.error(`All CLI delivery attempts exhausted for ${agentName} [${sessionId}]`);
+    log.error(`CLI delivery failed for ${agentName} [${sessionId}]`);
   }
   return result;
 }
