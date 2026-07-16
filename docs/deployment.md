@@ -151,7 +151,53 @@ docker run -d \
   openclaw-linear-connector
 ```
 
-### Reverse Proxy
+## Reloading Workflow Definitions (Without a Code Deploy)
+
+`POST /admin/api/workflows/reload` re-reads all `.yaml` workflow definition files
+from `WORKFLOW_DEFS_DIR` and hot-swaps the registry without restarting the
+service or requiring a deploy.
+
+**Usage:**
+
+```bash
+curl -X POST http://localhost:3000/admin/api/workflows/reload \
+  -H "x-admin-secret: $ADMIN_SECRET"
+```
+
+**Success response (200):**
+
+```json
+{
+  "ok": true,
+  "registry": {
+    "ui-audit": { "version": 3, "states": ["todo", "doing", "done"] },
+    "dev-impl": { "version": 5, "states": ["todo", "implementation", "code-review", "done"] }
+  }
+}
+```
+
+If any def file fails validation (native_state mapping, state-removal check,
+gate-anchor drift, fanout/barrier config), the endpoint returns **422** with
+diagnostics **and the prior registry is left intact**:
+
+```json
+{
+  "ok": false,
+  "diagnostics": [
+    "bad-def.yaml: Workflow definition 'bad-def' has 1 invalid native_state mapping(s): ..."
+  ]
+}
+```
+
+Catastrophic failures (unreadable defs directory, etc.) return **502** with an
+error message.
+
+> **Design decision (INF-25):** This is an explicit, audited operation — not a
+> filesystem watcher. A def going live because someone saved a file is a worse
+> failure mode than the one this fixes. Hot-reload is the only way to activate
+> a config-only change without a full code deploy.
+
+## Reverse Proxy
 
 In production, put the connector behind nginx or Caddy with HTTPS. Linear sends webhooks over HTTPS and validates the URL on creation.
 

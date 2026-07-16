@@ -16,7 +16,7 @@ import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import type { ObservationStore, ReasonCode, MetricSummary } from "./store/observation-store.js";
 import { aggregateDigest, formatDigestSummary } from "./bag/stale-session-forensics.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
-import { setStateAtomic, loadWorkflowRegistry, resetWorkflowCache } from "./workflow-gate.js";
+import { setStateAtomic, loadWorkflowRegistry, resetWorkflowCache, reloadWorkflowDefs } from "./workflow-gate.js";
 import { instanceConfigRoot } from "./instance-config.js";
 import { retryApply } from "./proposal/apply-pipeline.js";
 import type { ProposalStore } from "./store/proposal-store.js";
@@ -518,6 +518,24 @@ export function createAdminRouter(deps: AdminDeps): Router {
       res.json({ workflows: [], error: err instanceof Error ? err.message : String(err) });
     }
   });
+  // ── INF-25: reload workflow defs from disk without a code deploy ──────────
+  // POST /api/workflows/reload calls reloadWorkflowDefs() which re-reads all
+  // .yaml def files from WORKFLOW_DEFS_DIR, validates them, and swaps the
+  // registry atomically. On any invalid def the prior registry is left intact.
+  // The response includes the resulting registry (ids + versions) or diagnostics.
+  router.post("/api/workflows/reload", async (_req: Request, res: Response) => {
+    try {
+      const result = await reloadWorkflowDefs();
+      if (!result.ok) {
+        res.status(422).json({ ok: false, diagnostics: result.diagnostics });
+        return;
+      }
+      res.json({ ok: true, registry: result.registry });
+    } catch (err) {
+      res.status(502).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   // ── AI-2039 (P4-C4/C5): learning-loop proposal review queue ──────────────
   // GET lists the queue for the /admin/proposals console; POST retry-apply is
   // the operator's retry affordance on an apply-failed proposal (AC4.8). Both

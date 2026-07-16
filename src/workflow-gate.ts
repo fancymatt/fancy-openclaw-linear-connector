@@ -454,6 +454,137 @@ export function resetWorkflowCache(): void {
 }
 
 /**
+ * INF-25: Reload workflow defs from disk, fail-closed on any invalid def.
+ *
+ * Unlike loadWorkflowRegistry (which excludes bad defs per-file and keeps the
+ * rest), this function validates ALL defs before committing the reload. If any
+ * def fails validation, the prior registry is left intact and the validation
+ * diagnostics are returned — the endpoint must never take the registry down.
+ *
+ * Returns the loaded registry ids + versions on success.
+ * Throws on catastrophic failure (dir unreadable, etc.) or returns
+ * { diagnostics: string[] } on per-def validation failures.
+ *
+ * Intended for use by the POST /api/workflows/reload admin endpoint.
+ */
+/**
+ * INF-25: Reload workflow defs from disk, fail-closed on any invalid def.
+ *
+ * Unlike loadWorkflowRegistry (which excludes bad defs per-file and keeps the
+ * rest), this function validates ALL defs before committing the reload. If any
+ * def fails validation, the prior registry is left intact and the validation
+ * diagnostics are returned — the endpoint must never take the registry down.
+ *
+ * Returns the loaded registry ids + versions on success.
+ * Catastrophic failures (dir unreadable, etc.) throw.
+ * Per-def validation failures return { ok: false, diagnostics }.
+ *
+ * Intended for use by the POST /api/workflows/reload admin endpoint.
+ */
+/**
+ * INF-25: Reload workflow defs from disk, fail-closed on any invalid def.
+ *
+ * Runs the full loadWorkflowRegistry pipeline (native_state, state-removal,
+ * gate-anchor drift, fanout/barrier checks) but snapshots the prior state so
+ * a partial failure can be rolled back cleanly.
+ *
+ * If any def fails validation, the prior registry is left intact and the
+ * validation diagnostics are returned — the endpoint must never take the
+ * registry down.
+ *
+ * Returns the loaded registry ids + versions on success.
+ * Catastrophic failures (dir unreadable, etc.) throw.
+ * Per-def validation failures return { ok: false, diagnostics }.
+ *
+ * Intended for use by the POST /api/workflows/reload admin endpoint.
+ */
+export async function reloadWorkflowDefs(): Promise<
+  {
+    ok: true;
+    registry: Record<string, { version: number | undefined; states: string[] }>;
+  }
+  | { ok: false; diagnostics: string[] }
+> {
+  // Snapshot prior state for rollback.
+  const priorCache = _registryCache;
+  const priorSnapshot = await readDefStateSnapshot();
+
+  // Force a fresh read from disk.
+  _registryCache = null;
+
+  let newRegistry: Map<string, WorkflowDef>;
+  try {
+    newRegistry = await loadWorkflowRegistry();
+  } catch (err) {
+    // Catastrophic failure (dir unreadable, single-file parse error) —
+    // restore prior state and re-throw.
+    _registryCache = priorCache;
+    await writeDefStateSnapshot(priorSnapshot);
+    throw err;
+  }
+
+  // Detect excluded defs: every .yaml file should have produced a registry
+  // entry. If not, a def was silently excluded — roll back.
+  const dir = process.env.WORKFLOW_DEFS_DIR || process.env.WORKFLOW_DEF_DIR || undefined;
+  const diagnostics: string[] = [];
+
+  if (dir) {
+    try {
+      const entries = await fs.readdir(dir);
+      const yamlFiles = entries.filter((f) => f.endsWith(".yaml")).sort();
+      const loadedIds = new Set(newRegistry.keys());
+
+      for (const f of yamlFiles) {
+        try {
+          const full = path.join(dir, f);
+          const raw = await fs.readFile(full, "utf8");
+          const parsed = yaml.load(raw) as Record<string, unknown> | null;
+          const id = parsed && typeof parsed.id === "string" ? parsed.id : null;
+          if (id && !loadedIds.has(id)) {
+            // Def was excluded; get the reason by attempting a load.
+            try {
+              await loadDefFromFile(full);
+              diagnostics.push(`${f}: definition '${id}' excluded (state-removal or gate-anchor check)`);
+            } catch (err) {
+              diagnostics.push(`${f}: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          } else if (!id) {
+            // File exists and is parseable but has no id — that's a validation failure.
+            try {
+              await loadDefFromFile(full);
+            } catch (err) {
+              diagnostics.push(`${f}: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+        } catch {
+          diagnostics.push(`${f}: could not read or parse`);
+        }
+      }
+    } catch {
+      // Cannot read the defs dir (defensive — loadWorkflowRegistry succeeded).
+    }
+  }
+
+  if (diagnostics.length > 0) {
+    // Roll back: restore prior cache AND snapshot (loadWorkflowRegistry may
+    // have written a new snapshot with the partial set).
+    _registryCache = priorCache;
+    await writeDefStateSnapshot(priorSnapshot);
+    return { ok: false, diagnostics };
+  }
+
+  // All good — newRegistry is already in _registryCache. Build the response.
+  const result: Record<string, { version: number | undefined; states: string[] }> = {};
+  for (const [id, def] of newRegistry) {
+    result[id] = {
+      version: def.version,
+      states: (def.states ?? []).map((s) => s.id),
+    };
+  }
+  return { ok: true, registry: result };
+}
+
+/**
  * AI-2359: Alias for resetWorkflowCache() used by the singleton-fail-closed
  * test to clear the workflow registry between cases.
  */
