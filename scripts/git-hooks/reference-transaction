@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# reference-transaction — enforce per-session worktree isolation in the shared
+# connector clone (AI-2481, follow-up to AI-2475).
+#
+# The AI-2475 bug: many agent sessions share ONE connector clone — one working
+# tree, one HEAD. A concurrent session detaching HEAD onto a commit / remote ref,
+# or a `git reset --hard`, silently reverts another session's checkout mid-edit
+# (reflog caught HEAD detaching onto an unrelated ref, and a tracked file reverting
+# under an active session). Worktrees fix it — each session gets its own HEAD —
+# but nothing *enforced* them.
+#
+# This hook makes the destructive cases structural. In the PRIMARY working tree it
+# VETOES a HEAD move that is NOT a commit/pull on the current branch — i.e. a
+# detached checkout (`git checkout <commit|origin/branch|--detach>`) or a
+# `git reset` onto a different commit. It ALLOWS, deliberately:
+#   - commits and `git pull`/ff-merge on the current branch (HEAD and its branch
+#     ref advance together to the same SHA)
+#   - `git worktree add` and all HEAD moves INSIDE a linked worktree (the point)
+#   - branch create/delete and fetches (refs/heads,* refs/remotes/* — not HEAD)
+#
+# KNOWN LIMITATION (measured, AI-2481): a plain `git checkout <existing-local-
+# branch>` only retargets the HEAD symref and fires NO reference-transaction
+# event, so this hook cannot veto it. That case is far less dangerous — git
+# refuses the switch if it would overwrite dirty tracked files — and the workflow
+# guidance + CONTRIBUTING already steer sessions to worktrees. This hook is
+# defense-in-depth for the destructive detach/reset yanks, not a total interlock.
+#
+# Non-destructive: a refusal in the "prepared" phase aborts the transaction BEFORE
+# git touches the working tree (same guarantee as the ~/.openclaw stash-veto).
+# Escape hatch: OC_GIT_UNSAFE=1 (human, having read the above).
+set -uo pipefail
+
+[ "${1:-}" = "prepared" ] || exit 0
+[ "${OC_GIT_UNSAFE:-}" = "1" ] && exit 0
+
+# Enforce only in the PRIMARY tree. A linked worktree's git dir is under
+# <common>/worktrees/<name>; the primary tree's git dir IS the common dir.
+GITDIR="$(git rev-parse --absolute-git-dir 2>/dev/null || echo "")"
+case "$GITDIR" in
+  */worktrees/*) exit 0 ;;
+esac
+
+ZERO="0000000000000000000000000000000000000000"
+
+# Buffer the whole transaction: HEAD's new SHA is only safe if some branch ref in
+# the SAME transaction advances to that same SHA (commit / reset-on-branch / ff).
+head_old="" head_new="" head_seen=""
+branch_news=""
+while read -r _old _new ref; do
+  case "$ref" in
+    HEAD)
+      head_seen=1; head_old="$_old"; head_new="$_new" ;;
+    refs/heads/*)
+      branch_news="$branch_news $_new" ;;
+  esac
+done
+
+[ -n "$head_seen" ] || exit 0
+# No-op HEAD update — allow.
+[ "$head_old" = "$head_new" ] && exit 0
+# HEAD advanced together with a branch ref to the same SHA → commit / pull / reset
+# on the current branch. The session moved its OWN branch; allow.
+case " $branch_news " in
+  *" $head_new "*)
+    # A branch advanced to HEAD's new SHA. Allow only a FORWARD move (old is an
+    # ancestor of new) — that is a commit, ff-pull, or merge on the current
+    # branch. A sideways/backward move (reset --hard onto another commit, rebase)
+    # is destructive to the shared tree and is refused. Fail open only if
+    # merge-base cannot run (rc>1) so a legitimate commit is never blocked.
+    if [ "$head_old" = "$ZERO" ]; then exit 0; fi
+    git merge-base --is-ancestor "$head_old" "$head_new" 2>/dev/null
+    rc=$?
+    [ "$rc" -eq 0 ] && exit 0     # forward move — allow
+    [ "$rc" -gt 1 ] && exit 0     # merge-base errored — fail open (don't block commits)
+    ;;                             # rc==1: not an ancestor → fall through to veto
+esac
+
+# HEAD moved to a commit with no branch following it → detached checkout or a
+# reset onto another commit. This is the yank. Refuse.
+cat >&2 <<'MSG'
+──────────────────────────────────────────────────────────────────────────
+  Blocked: detaching/moving HEAD in the shared connector clone's PRIMARY tree.
+
+  This clone is shared by every concurrent agent session. Detaching HEAD onto a
+  commit or remote ref (git checkout <commit|origin/branch|--detach>), or a
+  git reset onto a different commit, is exactly the race that silently reverted
+  another session's checkout in AI-2475.
+
+  Work in an isolated worktree instead:
+
+    cd "$(scripts/connector-worktree.sh <branch> [base-ref])"
+
+  You get your own HEAD, index, and files (sharing only .git/objects); this hook
+  does not touch worktree HEAD moves. Clean up when done:
+
+    scripts/connector-worktree-remove.sh <branch>
+
+  Nothing has been changed. The working tree is untouched. (AI-2481)
+  Human override, having read the above: OC_GIT_UNSAFE=1 git ...
+──────────────────────────────────────────────────────────────────────────
+MSG
+exit 1
