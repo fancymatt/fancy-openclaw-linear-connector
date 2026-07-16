@@ -41,6 +41,7 @@ import { getAgent, getAgentByProxyToken } from "./agents.js";
 import type { NoActivityDetector } from "./bag/no-activity-detector.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { IssueCreateDedupCache, extractIssueCreateInput, fingerprintIssueCreate, isSuccessfulIssueCreate, DEFAULT_DEDUP_TTL_MS, type Claim } from "./issue-create-dedup.js";
+import { checkArtifactDisclosure } from "./artifact-disclosure.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
@@ -449,6 +450,8 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   const target = (req.headers["x-openclaw-linear-target"] as string | undefined) ?? null;
   const feedbackCategoryHeader = (req.headers["x-openclaw-feedback-category"] as string | undefined) ?? null;
   const artifactRefHeader = (req.headers["x-openclaw-artifact-ref"] as string | undefined) ?? null;
+  const codeArtifactHeader = (req.headers["x-openclaw-code-artifact"] as string | undefined) ?? null;
+  const substitutionReasonHeader = (req.headers["x-openclaw-substitution-reason"] as string | undefined) ?? null;
   const cliVersion = (req.headers["x-openclaw-linear-cli-version"] as string | undefined) ?? null;
   // AI-1860 AC7: invoking session identity, recorded on governed proxy audit rows so
   // "who ran this mutation" is a one-query lookup (the AI-1909 forensics gap).
@@ -1250,6 +1253,15 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
     if (rawRejection) {
       log.warn(`raw-mutation-block agent=${agentId}${ticketCtx}: ${rawRejection}`);
       res.status(200).json({ errors: [{ message: rawRejection }] });
+      return;
+    }
+    const artifactRejection = await checkArtifactDisclosure(
+      body, issueId, authorization, agentId, callerLinearUserId,
+      codeArtifactHeader, substitutionReasonHeader,
+    );
+    if (artifactRejection) {
+      log.warn(`artifact-disclosure-block agent=${agentId}${ticketCtx}: ${artifactRejection}`);
+      res.status(200).json({ errors: [{ message: artifactRejection }] });
       return;
     }
   }
