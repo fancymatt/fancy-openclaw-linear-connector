@@ -509,7 +509,8 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // meta-intent resolution, the delegate check, nor the transition-legality check is
       // re-evaluated against the command's own post-transition state — the AI-1848 /
       // AI-1872 / AI-1924 "apply-then-self-block, comment dropped, exit 1" repros.
-      const snapshotKey = issueId && intent ? `${agentId}:${issueId}:${intent}` : null;
+      const commandId = (req.headers["x-openclaw-command-id"] as string | undefined) ?? null;
+      const snapshotKey = issueId && intent ? `${agentId}:${issueId}:${intent}:${commandId ?? "legacy"}` : null;
       let snapshotDelegateId: string | null | undefined = undefined;
       let snapshotState: string | null | undefined = undefined;
       // AI-2115 Bug 1: the auth snapshot is keyed only on the sticky intent header
