@@ -60,33 +60,62 @@ const TEST_WORKFLOW_YAML = `
 id: dev-impl
 version: 1
 archetype: single-task
-entry_state: deployment
+entry_state: merge
 
 break_glass:
   command: escape
-  to: deployment
+  to: merge
   owner_role: steward
 
 states:
-  - id: deployment
+  # AI-2473: v10-shaped synthetic def. The AI-1795 guard fires on forward exit
+  # from the deploy state (continue → ac-validate). The merged-PR release gate
+  # fires on forward exit from merge or deploy.
+  - id: merge
     owner_role: deployment
     kind: normal
     native_state: doing
     transitions:
-      - command: deploy
-        to: done
+      - command: continue
+        to: deploy
+        generic: continue
         requires_capability: deploy:execute
-      - command: handoff-host-deploy
-        to: host-deploy
-        assign: { mode: auto }
 
-  - id: host-deploy
+  - id: deploy
     owner_role: host-deploy
     kind: normal
     native_state: doing
     transitions:
-      - command: host-deployed
-        to: done
+      - command: continue
+        to: ac-validate
+        generic: continue
+        assign: { mode: auto }
+      - command: reject
+        to: implementation
+        requires_comment: true
+
+  - id: implementation
+    owner_role: dev
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: continue
+        to: code-review
+        generic: continue
+
+  - id: code-review
+    owner_role: code-review
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: submit
+        to: merge
+
+  - id: ac-validate
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    transitions: []
 
   - id: done
     kind: terminal
@@ -261,48 +290,48 @@ describe("githubRepoFromUrl", () => {
 
 // ── Gate integration tests ─────────────────────────────────────────────────
 
-const DEPLOYMENT_LABELS = ["wf:dev-impl", "state:deployment"];
+const DEPLOY_LABELS = ["wf:dev-impl", "state:deploy"];
 
 describe("checkWorkflowRules — AI-1795 no-CI-auto-deploy guard", () => {
-  it("blocks 'deploy' when a repo:* label names a flagged repo", async () => {
-    globalThis.fetch = makeGateFetch([...DEPLOYMENT_LABELS, "repo:linear-webhook-fancymatt"], []);
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+  it("blocks 'continue' from 'deploy' when a repo:* label names a flagged repo", async () => {
+    globalThis.fetch = makeGateFetch([...DEPLOY_LABELS, "repo:linear-webhook-fancymatt"], []);
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "grover");
     expect(result).not.toBeNull();
     expect(result).toContain("no CI auto-deploy");
-    expect(result).toContain("handoff-host-deploy");
+    expect(result).toContain("reject");
   });
 
-  it("blocks 'deploy' when a GitHub PR attachment names a flagged repo (AI-1775 scenario: no repo label)", async () => {
-    globalThis.fetch = makeGateFetch(DEPLOYMENT_LABELS, [
+  it("blocks 'continue' from 'deploy' when a GitHub PR attachment names a flagged repo (AI-1775 scenario: no repo label)", async () => {
+    globalThis.fetch = makeGateFetch(DEPLOY_LABELS, [
       "https://github.com/fancymatt/linear-webhook-fancymatt/pull/144",
     ]);
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "grover");
     expect(result).not.toBeNull();
-    expect(result).toContain("handoff-host-deploy");
+    expect(result).toContain("no CI auto-deploy");
   });
 
-  it("allows 'deploy' on an unflagged repo", async () => {
-    globalThis.fetch = makeGateFetch(DEPLOYMENT_LABELS, ["https://github.com/fancymatt/auto-deploying-repo/pull/9"]);
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+  it("allows 'continue' from 'deploy' on an unflagged repo", async () => {
+    globalThis.fetch = makeGateFetch(DEPLOY_LABELS, ["https://github.com/fancymatt/auto-deploying-repo/pull/9"]);
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "grover");
     expect(result).toBeNull();
   });
 
-  it("allows 'deploy' when no repo is resolvable (guard is opt-in)", async () => {
-    globalThis.fetch = makeGateFetch(DEPLOYMENT_LABELS, []);
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+  it("allows 'continue' from 'deploy' when no repo is resolvable (guard is opt-in)", async () => {
+    globalThis.fetch = makeGateFetch(DEPLOY_LABELS, []);
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "grover");
     expect(result).toBeNull();
   });
 
-  it("allows 'handoff-host-deploy' on a flagged repo", async () => {
-    globalThis.fetch = makeGateFetch([...DEPLOYMENT_LABELS, "repo:linear-webhook-fancymatt"], []);
-    const result = await checkWorkflowRules("handoff-host-deploy", "issue-uuid", "Bearer tok", "hanzo");
+  it("allows 'reject' from 'deploy' on a flagged repo (backward exit is never blocked)", async () => {
+    globalThis.fetch = makeGateFetch([...DEPLOY_LABELS, "repo:linear-webhook-fancymatt"], []);
+    const result = await checkWorkflowRules("reject", "issue-uuid", "Bearer tok", "grover", null, null, null, false, false, true);
     expect(result).toBeNull();
   });
 
   it("emits ONE deduped warning alert naming ticket and repo when the guard fires twice", async () => {
-    globalThis.fetch = makeGateFetch([...DEPLOYMENT_LABELS, "repo:linear-webhook-fancymatt"], []);
-    await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
-    await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+    globalThis.fetch = makeGateFetch([...DEPLOY_LABELS, "repo:linear-webhook-fancymatt"], []);
+    await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "grover");
+    await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "grover");
     const rows = alertStore.query({ source: "deploy-policy" });
     expect(rows.length).toBe(1);
     expect(rows[0].count).toBe(2);
@@ -311,14 +340,14 @@ describe("checkWorkflowRules — AI-1795 no-CI-auto-deploy guard", () => {
     expect(rows[0].title).toContain("linear-webhook-fancymatt");
   });
 
-  it("attachment fetch failure fails open (deploy allowed)", async () => {
-    const base = makeGateFetch(DEPLOYMENT_LABELS, []);
+  it("attachment fetch failure fails open (continue from deploy allowed)", async () => {
+    const base = makeGateFetch(DEPLOY_LABELS, []);
     globalThis.fetch = (async (url: any, init: any) => {
       const bodyText = typeof init?.body === "string" ? init.body : "";
       if (bodyText.includes("IssueRepoAttachments")) throw new Error("ECONNRESET");
       return base(url, init);
     }) as typeof globalThis.fetch;
-    const result = await checkWorkflowRules("deploy", "issue-uuid", "Bearer tok", "hanzo");
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "grover");
     expect(result).toBeNull();
   });
 });
