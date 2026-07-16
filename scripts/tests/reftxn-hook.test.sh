@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# AI-2481 item 1 — comprehensive regression test for the out-of-tree HEAD-veto
-# hook + self-gating arm script. Uses the REAL scripts from /tmp/conn-fix.
+# AI-2481 / INF-17 — comprehensive regression test for the out-of-tree HEAD-veto
+# hook + self-gating arm script. Runs the REAL scripts from this repo checkout.
 # Each case runs in its own fresh fixture so a vetoed op's working-tree tear
-# cannot corrupt a later assertion.
+# cannot corrupt a later assertion. INF-17 added the ATOMIC-veto assertions below:
+# a veto must leave the index + working tree exactly as before, and its scoped
+# self-restore must not clobber a concurrent session's unstaged edit.
 set -uo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 pass=0; fail=0
@@ -30,13 +32,52 @@ T=$(new_fixture)
 [ -z "$(git -C "$T" config --local --get core.hooksPath || true)" ] && ok "core.hooksPath left unset" || no "core.hooksPath set (should be unset)"
 rm -rf "$T"
 
-echo "== ACCEPTANCE: yank onto a PRE-hook commit while armed (Ai's live repro) =="
+echo "== ACCEPTANCE (INF-17): yank onto a PRE-hook commit is VETOED and ATOMIC =="
 T=$(new_fixture); C_PRE=$(git -C "$T" rev-parse HEAD~1); C_HOOK=$(git -C "$T" rev-parse HEAD)
 ( cd "$T"; git checkout --detach "$C_PRE" >/dev/null 2>&1 )
-[ "$(git -C "$T" rev-parse HEAD)" = "$C_HOOK" ] && ok "YANK VETOED: HEAD unmoved (bug fixed — hook survives checkout onto pre-hook commit)" || no "YANK SUCCEEDED: HEAD moved — NOT fixed"
-# working tree was swapped by git before the veto, but HEAD intact → recoverable
-( cd "$T"; git reset --hard HEAD >/dev/null 2>&1 )
-[ "$(cat "$T/marker.txt")" = "hook" ] && ok "recovery: git reset --hard HEAD restores working tree (HEAD preserved)" || no "recovery failed"
+[ "$(git -C "$T" rev-parse HEAD)" = "$C_HOOK" ] && ok "YANK VETOED: HEAD unmoved (hook survives checkout onto pre-hook commit)" || no "YANK SUCCEEDED: HEAD moved — NOT fixed"
+# INF-17: the veto must be ATOMIC — NO manual recovery. git swapped the index +
+# worktree to the target before the veto; the aborted-phase self-restore must have
+# already put them back at HEAD, with nothing left staged from the target ref.
+[ "$(cat "$T/marker.txt")" = "hook" ] && ok "atomic: working tree already restored to HEAD (no manual recovery)" || no "atomic FAIL: working tree left swapped to foreign content"
+[ -z "$(git -C "$T" status --porcelain)" ] && ok "atomic: index + tree clean — nothing left staged after veto" || no "atomic FAIL: veto left residue: $(git -C "$T" status --porcelain | tr '\n' '|')"
+rm -rf "$T"
+
+echo "== ACCEPTANCE (INF-17): atomic restore is SCOPED — a concurrent UNSTAGED edit survives =="
+# Session A holds an unstaged WIP edit to a file the yank does NOT swap (identical
+# between HEAD and the target). The scoped restore (staged delta only) must leave
+# A's edit intact — a blanket `git restore .` would clobber it.
+T=$(new_fixture)
+( cd "$T"
+  echo shared > bystander.txt; git add bystander.txt; git commit -qm add-bystander
+  echo changed > marker.txt;   git add marker.txt;    git commit -qm change-marker
+  TARGET=$(git rev-parse HEAD~1)                  # old marker + identical bystander
+  echo SESSION-A-WIP > bystander.txt              # concurrent UNSTAGED edit
+  git checkout --detach "$TARGET" >/dev/null 2>&1 # vetoed + auto-restored (scoped)
+)
+[ "$(cat "$T/bystander.txt")" = "SESSION-A-WIP" ] && ok "scoped restore PRESERVED concurrent unstaged edit" || no "scoped restore CLOBBERED concurrent unstaged edit (blanket-restore bug)"
+[ "$(cat "$T/marker.txt")" = "changed" ] && ok "swapped file restored to HEAD" || no "swapped file NOT restored"
+[ "$(git -C "$T" status --porcelain | grep -v ' bystander.txt$' | grep -c .)" = "0" ] && ok "no foreign staged residue (besides the preserved WIP)" || no "unexpected residue: $(git -C "$T" status --porcelain | tr '\n' '|')"
+rm -rf "$T"
+
+echo "== ACCEPTANCE (INF-17): atomic restore is SCOPED — a concurrent STAGED edit survives =="
+# Mirror of the unstaged case. Session A has a STAGED edit to a file the yank does
+# NOT swap. checkout carries that staged edit across, so it lands in the staged
+# delta vs HEAD alongside the swap — but it is NOT in the swap set (head_old..
+# head_new). The scoped restore must leave it staged and intact. Restoring the whole
+# staged delta (the pre-fix behavior) destroys it with no recoverable ref — the exact
+# regression this AC closes.
+T=$(new_fixture)
+( cd "$T"
+  echo shared > bystander.txt; git add bystander.txt; git commit -qm add-bystander
+  echo changed > marker.txt;   git add marker.txt;    git commit -qm change-marker
+  TARGET=$(git rev-parse HEAD~1)                  # old marker + identical bystander
+  echo SESSION-A-STAGED > bystander.txt; git add bystander.txt   # concurrent STAGED edit
+  git checkout --detach "$TARGET" >/dev/null 2>&1 # vetoed + auto-restored (scoped)
+)
+[ "$(git -C "$T" show :bystander.txt 2>/dev/null)" = "SESSION-A-STAGED" ] && ok "scoped restore PRESERVED concurrent STAGED edit (index)" || no "scoped restore DESTROYED concurrent staged edit (INF-17 regression)"
+[ "$(cat "$T/bystander.txt")" = "SESSION-A-STAGED" ] && ok "concurrent staged edit intact in worktree" || no "concurrent staged edit lost from worktree"
+[ "$(cat "$T/marker.txt")" = "changed" ] && ok "swapped file restored to HEAD (staged sibling preserved)" || no "swapped file NOT restored"
 rm -rf "$T"
 
 echo "== amend must be ALLOWED =="

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # reference-transaction — enforce per-session worktree isolation in the shared
-# connector clone (AI-2481, follow-up to AI-2475).
+# connector clone, with an ATOMIC veto (AI-2481 / INF-17, follow-up to AI-2475).
 #
 # The AI-2475 bug: many agent sessions share ONE connector clone — one working
 # tree, one HEAD. A concurrent session detaching HEAD onto a commit / remote ref,
@@ -27,14 +27,41 @@
 # guidance + CONTRIBUTING already steer sessions to worktrees. This hook is
 # defense-in-depth for the destructive detach/reset yanks, not a total interlock.
 #
-# WHAT A REFUSAL PROTECTS (measured, AI-2481): a refusal aborts the ref update, so
-# the shared HEAD pointer does NOT move — that is the AI-2475 invariant (a session's
-# checkout cannot be repointed by another session). It does NOT roll back the
-# working tree: `git checkout` / `git reset --hard` swap the working tree BEFORE the
-# ref transaction fires, and a veto leaves those files swapped (HEAD intact). Because
-# HEAD is preserved, one `git reset --hard HEAD` restores them. git's own guard still
-# refuses to overwrite DIRTY tracked files, so a session mid-edit is protected. The
-# real fix for the file swap is a worktree; this hook guards the shared HEAD pointer.
+# ATOMIC VETO (INF-17). git updates the index + working tree to the target BEFORE
+# the ref transaction fires, so a naive veto aborts the HEAD move but leaves the
+# tree + index swapped to foreign content — a "failed" checkout that silently
+# dirties the shared clone. INF-17: the operator sees `fatal: ref updates aborted
+# by hook`, reads it as a clean no-op, and walks away from a staged pile of another
+# ref's files; a later `git commit` in any session then captures the foreign
+# content with no prompt. This hook closes that hole. The reference-transaction
+# `aborted` phase fires AFTER git has released the index lock, so we restore the
+# exact paths the checkout swapped — the staged delta vs HEAD — back to HEAD there.
+# Net effect: HEAD never moved AND the index + working tree are exactly as before.
+# The veto is atomic.
+#
+# The restore is SCOPED to the paths THIS checkout swapped — the set of files that
+# differ between old HEAD and the target commit (`git diff head_old head_new`),
+# intersected with the current staged delta — NOT a blanket `git restore .` and NOT
+# the whole staged delta. Two concurrent-session hazards this scoping avoids:
+#   - an UNSTAGED edit to an unrelated file (worktree≠index, index==HEAD) is not in
+#     the staged delta at all, so it is never touched;
+#   - a pre-existing STAGED edit to a file the target ref does NOT touch is carried
+#     across by checkout and appears in the staged delta, but is NOT in the swap set,
+#     so it is left alone. Restoring the whole delta destroyed that staged work with
+#     no recoverable ref (INF-17 regression) — the AI-2475 clobber class via the
+#     staged door. `git checkout` refuses to run over a locally-modified file it must
+#     swap, so no pre-existing work ever rides on a swap-set path. If the auto-restore
+#     itself fails, the veto message prints the manual command and we are no worse off
+#     than the old non-atomic behavior.
+#
+# WHY NOT MAKE THE PRIMARY TREE FULLY READ-ONLY (INF-17 AC, considered & rejected):
+# commits and ff-pulls on the current branch are legitimate primary-tree operations
+# (deploys pull here), and the hook already allows exactly those while vetoing the
+# yanks. A blanket read-only lock would break the sanctioned commit/pull path. The
+# atomic veto + "work in a worktree" guidance gives the same protection without that
+# cost; `git worktree add` remains the only sanctioned path for detached/PR checkouts
+# and is unaffected by this hook.
+#
 # Escape hatch: OC_GIT_UNSAFE=1 (human, having read the above).
 set -uo pipefail
 
@@ -55,7 +82,10 @@ REFTXN_HOOK_VERSION="2026.07.16+atomic-veto"
 # --version arg is unambiguous and safe.
 [ "${1:-}" = "--version" ] && { printf '%s\n' "$REFTXN_HOOK_VERSION"; exit 0; }
 
-[ "${1:-}" = "prepared" ] || exit 0
+state="${1:-}"
+# Act in "prepared" (cast the veto) and "aborted" (self-restore after the veto
+# rolled the ref back). Ignore "committed" and any unknown phase.
+case "$state" in prepared|aborted) ;; *) exit 0 ;; esac
 [ "${OC_GIT_UNSAFE:-}" = "1" ] && exit 0
 
 # Enforce only in the PRIMARY tree. A linked worktree's git dir is under
@@ -69,6 +99,8 @@ ZERO="0000000000000000000000000000000000000000"
 
 # Buffer the whole transaction: HEAD's new SHA is only safe if some branch ref in
 # the SAME transaction advances to that same SHA (commit / reset-on-branch / ff).
+# git replays the same ref lines on stdin in BOTH the prepared and aborted phases,
+# so the veto decision below is identical across the two callbacks.
 head_old="" head_new="" head_seen=""
 branch_news=""
 while read -r _old _new ref; do
@@ -80,39 +112,99 @@ while read -r _old _new ref; do
   esac
 done
 
-[ -n "$head_seen" ] || exit 0
-# No-op HEAD update — allow.
-[ "$head_old" = "$head_new" ] && exit 0
-# HEAD advanced together with a branch ref to the same SHA → commit / pull / reset
-# on the current branch. The session moved its OWN branch; allow.
-case " $branch_news " in
-  *" $head_new "*)
-    # A branch advanced to HEAD's new SHA. Allow only a FORWARD move (old is an
-    # ancestor of new) — that is a commit, ff-pull, or merge on the current
-    # branch. A sideways/backward move (reset --hard onto another commit, rebase)
-    # is destructive to the shared tree and is refused. Fail open only if
-    # merge-base cannot run (rc>1) so a legitimate commit is never blocked.
-    if [ "$head_old" = "$ZERO" ]; then exit 0; fi
-    git merge-base --is-ancestor "$head_old" "$head_new" 2>/dev/null
-    rc=$?
-    [ "$rc" -eq 0 ] && exit 0     # forward move — allow
-    [ "$rc" -gt 1 ] && exit 0     # merge-base errored — fail open (don't block commits)
-    # rc==1: not a forward move. Distinguish `git commit --amend` — the new commit
-    # is a SIBLING of old HEAD (shares its parent) and the amend does NOT touch the
-    # working tree, so it is not a yank — from a destructive sideways `reset --hard`.
-    # Allow only when the first parents match. A reset onto an older/unrelated commit
-    # has a different parent and still falls through to the veto below. (Residual:
-    # a reset --hard onto an exact sibling of HEAD is indistinguishable from an amend
-    # from ref data alone and is allowed — an exotic case; this hook is documented
-    # defense-in-depth, not a total interlock.)
-    old_par="$(git rev-parse --verify -q "${head_old}^" 2>/dev/null || echo "")"
-    new_par="$(git rev-parse --verify -q "${head_new}^" 2>/dev/null || echo "")"
-    if [ -n "$old_par" ] && [ "$old_par" = "$new_par" ]; then exit 0; fi
-    ;;                             # else → fall through to veto
-esac
+# is_yank: return 0 when this transaction is a destructive HEAD yank to veto, 1 to
+# allow. Encapsulates the full allow-matrix so the prepared (veto) and aborted
+# (restore) phases agree exactly on which transactions they act upon.
+is_yank() {
+  [ -n "$head_seen" ] || return 1
+  # No-op HEAD update — allow.
+  [ "$head_old" = "$head_new" ] && return 1
+  # HEAD advanced together with a branch ref to the same SHA → commit / pull /
+  # reset on the current branch. The session moved its OWN branch; allow.
+  case " $branch_news " in
+    *" $head_new "*)
+      # A branch advanced to HEAD's new SHA. Allow only a FORWARD move (old is an
+      # ancestor of new) — that is a commit, ff-pull, or merge on the current
+      # branch. A sideways/backward move (reset --hard onto another commit, rebase)
+      # is destructive to the shared tree and is refused. Fail open only if
+      # merge-base cannot run (rc>1) so a legitimate commit is never blocked.
+      [ "$head_old" = "$ZERO" ] && return 1
+      git merge-base --is-ancestor "$head_old" "$head_new" 2>/dev/null
+      rc=$?
+      [ "$rc" -eq 0 ] && return 1     # forward move — allow
+      [ "$rc" -gt 1 ] && return 1     # merge-base errored — fail open (don't block commits)
+      # rc==1: not a forward move. Distinguish `git commit --amend` — the new commit
+      # is a SIBLING of old HEAD (shares its parent) and the amend does NOT touch the
+      # working tree, so it is not a yank — from a destructive sideways `reset --hard`.
+      # Allow only when the first parents match. A reset onto an older/unrelated commit
+      # has a different parent and still falls through to the veto. (Residual: a reset
+      # --hard onto an exact sibling of HEAD is indistinguishable from an amend from
+      # ref data alone and is allowed — an exotic case; documented defense-in-depth.)
+      old_par="$(git rev-parse --verify -q "${head_old}^" 2>/dev/null || echo "")"
+      new_par="$(git rev-parse --verify -q "${head_new}^" 2>/dev/null || echo "")"
+      [ -n "$old_par" ] && [ "$old_par" = "$new_par" ] && return 1
+      ;;
+  esac
+  # HEAD moved to a commit with no branch following it → detached checkout or a
+  # reset onto another commit. This is the yank.
+  return 0
+}
 
-# HEAD moved to a commit with no branch following it → detached checkout or a
-# reset onto another commit. This is the yank. Refuse.
+is_yank || exit 0
+
+if [ "$state" = "aborted" ]; then
+  # The prepared-phase veto already aborted the HEAD move — HEAD is intact. git
+  # swapped the index + working tree to the target BEFORE the ref txn; undo EXACTLY
+  # the paths THIS checkout swapped, back to HEAD, and no others.
+  #
+  # The swap set is NOT the whole staged delta. A concurrent session may have a
+  # pre-existing STAGED edit to a file the target ref does not touch; checkout
+  # carries that staged edit across untouched, so it shows up in `git diff --cached
+  # HEAD` alongside the swap. Restoring the whole delta destroys that staged work
+  # with no recoverable ref (INF-17 regression Ai found: the veto that was supposed
+  # to *protect* the shared clone silently ate another session's staged edit and
+  # printed "nothing was left staged" while doing it — the AI-2475 clobber class via
+  # the staged door).
+  #
+  # The swap set is knowable exactly and independently of the staged delta: it is
+  # the paths that differ between old HEAD and the target commit (head_new — its
+  # object exists even though the ref move was vetoed). We restore only (swap set ∩
+  # staged delta): the checkout's own swap, and never a file the session had staged
+  # before the yank. A swap-set path can only be in the staged delta because checkout
+  # put it there — checkout refuses to run over a locally-modified file it must swap,
+  # so no pre-existing work rides on those. This runs after git released the index
+  # lock, and `git restore` moves no ref, so it does not re-enter here.
+  #
+  # Use LIVE `HEAD` as the base, NOT the stdin head_old: in the aborted phase git
+  # reports head_old as all-zeros for a detaching HEAD move, so `git diff $head_old`
+  # would be empty and restore nothing. The move was aborted, so HEAD still resolves
+  # to the true old commit — that is the correct, reliable base.
+  base="$(git rev-parse --verify -q HEAD 2>/dev/null || echo "")"
+  [ -n "$base" ] || exit 0                            # unborn HEAD — nothing to restore against
+  [ "$head_new" = "$ZERO" ] && exit 0                 # no target object to diff — leave as-is (non-atomic fallback)
+  git rev-parse --verify -q "${head_new}^{commit}" >/dev/null 2>&1 || exit 0   # target object gone — same fallback
+  declare -A in_swap=()
+  while IFS= read -r -d '' p; do in_swap["$p"]=1; done \
+    < <(git diff --name-only -z "$base" "$head_new" 2>/dev/null)
+  restore=()
+  while IFS= read -r -d '' p; do
+    [ -n "${in_swap[$p]:-}" ] && restore+=("$p")
+  done < <(git diff --cached --name-only -z HEAD 2>/dev/null)
+  if [ "${#restore[@]}" -eq 0 ]; then exit 0; fi
+  err="$(git rev-parse --git-dir 2>/dev/null)/reftxn-restore.$$.err"
+  if git restore --staged --worktree --source=HEAD -- "${restore[@]}" 2>"$err"; then
+    echo "  [reference-transaction] auto-restored ${#restore[@]} path(s) that the vetoed checkout swapped, back to HEAD. Anything you had staged before the checkout is untouched." >&2
+    rm -f "$err"
+  else
+    echo "  [reference-transaction] AUTO-RESTORE FAILED — the tree is still swapped to foreign content. Restore it by hand (this reverts ALL staged+worktree changes; check 'git status' first if you had staged work):" >&2
+    echo "      git restore --staged --worktree ." >&2
+    sed 's/^/      /' "$err" >&2 2>/dev/null || true
+    rm -f "$err"
+  fi
+  exit 0
+fi
+
+# state == prepared: cast the veto.
 cat >&2 <<'MSG'
 ──────────────────────────────────────────────────────────────────────────
   Blocked: detaching/moving HEAD in the shared connector clone's PRIMARY tree.
@@ -131,12 +223,15 @@ cat >&2 <<'MSG'
 
     scripts/connector-worktree-remove.sh <branch>
 
-  HEAD was NOT moved — the shared checkout pointer is intact. But git may have
-  already swapped your working-tree files before this veto fired; restore them with:
+  HEAD was NOT moved — the shared checkout pointer is intact. git DID swap your
+  index + working tree to the target ref before this veto fired; the hook restores
+  them to HEAD automatically in the transaction-abort step that follows (look for a
+  "[reference-transaction] auto-restored ..." line just below). If that line reports
+  a FAILURE instead, undo the swap by hand with:
 
-    git reset --hard HEAD
+    git restore --staged --worktree .
 
-  Human override, having read the above: OC_GIT_UNSAFE=1 git ... (AI-2481)
+  Human override, having read the above: OC_GIT_UNSAFE=1 git ... (AI-2481 / INF-17)
 ──────────────────────────────────────────────────────────────────────────
 MSG
 # Provenance stamp so a bug report names the hook that actually vetoed (INF-19).
