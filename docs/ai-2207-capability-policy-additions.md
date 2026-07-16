@@ -29,3 +29,21 @@ After:  `fills_roles: [ux-researcher, visual-reviewer, worker]`
 ### caspar
 Before: `fills_roles: [image-generator, worker]`
 After:  `fills_roles: [image-generator, visual-reviewer, worker]`
+
+## AI-2525 follow-up: new role `browser-automation`
+
+```yaml
+  - id: browser-automation
+    requires: [browser:execute]
+    capabilities: [browser:execute]
+    note: >
+      Automated browser capture role for ui-audit workflow (AI-2525).
+      Runs headless Chromium via Playwright to capture screenshots at
+      multiple breakpoints. Single-body assignment (igor).
+```
+
+## Updated bodies
+
+### igor
+Before: `fills_roles: [backend-dev, worker]`
+After:  `fills_roles: [backend-dev, browser-automation, worker]`

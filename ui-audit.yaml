@@ -1,0 +1,105 @@
+# ui-audit — Archetype B (orchestrator) workflow definition
+# spec of record: AI-2207 + AI-2525
+# owner: steward, visual-reviewer, browser-automation
+# version history: bump `version` on any state/edge change.
+#
+# v1 (AI-2207): visual-reviewer handled capture as manual walkthrough.
+# v2 (AI-2525): capture automated via browser-automation role (Playwright).
+#
+# State machine:
+#   intake → planning → capture → review → done ✓
+#                              ↘ fail → retry → capture (max 2x per screen)
+#                                     → resolve → done ✓
+#                                     → escalate → cap-hit (steward)
+#                                                → waive → done-waived ✓
+#                                                → abandon → escape ✗
+
+workflows:
+  ui-audit:
+    id: ui-audit
+    version: 2
+    archetype: orchestrator
+    entry_state: intake
+
+    break_glass:
+      command: escape
+      to: escape
+      owner_role: steward
+
+    states:
+      intake:
+        owner_role: steward
+        kind: normal
+        native_state: todo
+        transitions:
+          - command: accept
+            to: planning
+            assign: { mode: required }
+          - command: waive
+            to: done-waived
+          - command: demote
+            to: __ad_hoc__
+
+      planning:
+        owner_role: visual-reviewer
+        kind: normal
+        native_state: thinking
+        transitions:
+          - command: begin-capture
+            to: capture
+
+      capture:
+        owner_role: browser-automation
+        kind: normal
+        native_state: doing
+        transitions:
+          - command: complete-capture
+            to: review
+
+      review:
+        owner_role: visual-reviewer
+        kind: normal
+        native_state: thinking
+        transitions:
+          - command: pass
+            to: done
+          - command: pass-with-followups
+            to: done
+          - command: fail
+            to: fail
+
+      fail:
+        owner_role: visual-reviewer
+        kind: normal
+        native_state: todo
+        transitions:
+          - command: retry-capture
+            to: capture
+          - command: resolve
+            to: done
+          - command: escalate
+            to: cap-hit
+
+      cap-hit:
+        owner_role: steward
+        kind: normal
+        native_state: todo
+        transitions:
+          - command: waive
+            to: done-waived
+          - command: abandon
+            to: escape
+
+      done:
+        kind: terminal
+        native_state: done
+        satisfies_parent_barrier: true
+
+      done-waived:
+        kind: terminal
+        native_state: done
+        satisfies_parent_barrier: true
+
+      escape:
+        kind: terminal
+        native_state: invalid

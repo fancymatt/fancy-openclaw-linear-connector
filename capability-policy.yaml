@@ -1,0 +1,12 @@
+# Capability policy — browser-automation role (AI-2525)
+#
+# Live instance at: /home/node/linear-connector/config/capability-policy.yaml
+# This file mirrors the role entry for the browser-automation role.
+# Full capability policy includes additional roles (worker, steward,
+# visual-reviewer, etc.) defined in the live instance config.
+
+roles:
+  browser-automation:
+    capabilities:
+      - browser:execute
+    body: igor
