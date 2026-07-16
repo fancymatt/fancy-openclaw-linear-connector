@@ -40,9 +40,32 @@ import { isTerminalState } from "./barrier.js";
 import { getAgent, getAgentByProxyToken } from "./agents.js";
 import type { NoActivityDetector } from "./bag/no-activity-detector.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
+import { IssueCreateDedupCache, extractIssueCreateInput, fingerprintIssueCreate, isSuccessfulIssueCreate, DEFAULT_DEDUP_TTL_MS, type Claim } from "./issue-create-dedup.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
+
+/**
+ * AGI-3: process-local dedup window for agent-driven `issueCreate`.
+ *
+ * `ISSUE_CREATE_DEDUP_TTL_MS=0` disables the guard, leaving creates to forward
+ * unconditionally.
+ */
+const issueCreateDedupTtlMs = (() => {
+  const raw = process.env.ISSUE_CREATE_DEDUP_TTL_MS;
+  if (raw === undefined) return DEFAULT_DEDUP_TTL_MS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_DEDUP_TTL_MS;
+})();
+let issueCreateDedupCache = new IssueCreateDedupCache(issueCreateDedupTtlMs);
+
+/**
+ * Drop the dedup window. Test seam — the cache is process-local and long-lived,
+ * so without this a create cached by one test leaks into the next.
+ */
+export function resetIssueCreateDedupCache(): void {
+  issueCreateDedupCache = new IssueCreateDedupCache(issueCreateDedupTtlMs);
+}
 
 // G-16/AI-1548: per-ticket command lock (first-wins).
 // Tracks ticket IDs whose commands are currently in-flight. A second concurrent
@@ -1116,6 +1139,40 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
     }
   }
 
+  // AGI-3: idempotent issueCreate dedup. An identical create from the same agent
+  // inside the TTL is answered with the first create's upstream response, so the
+  // caller receives the issue that already exists instead of minting a second one.
+  // `linear create` carries no intent header, so this sits on the non-intent path.
+  let createClaim: Claim | null = null;
+  const createInput = issueCreateDedupTtlMs > 0 ? extractIssueCreateInput(body) : null;
+  if (createInput) {
+    const hash = fingerprintIssueCreate(agentId, createInput);
+    let claim = issueCreateDedupCache.claim(hash);
+
+    if (claim.kind === "await") {
+      // An identical create is already in flight. Wait for it rather than racing it.
+      const replayed = await claim.wait;
+      if (replayed !== null) {
+        log.warn(`issue-create-dedup agent=${agentId} coalesced in-flight duplicate create title='${createInput.title ?? ""}'`);
+        res.status(200).set("Content-Type", "application/json").send(replayed);
+        return;
+      }
+      // The in-flight create failed and cached nothing; this request is a genuine
+      // attempt, not a duplicate. Re-claim — the abandoned entry is gone, so this
+      // yields a fresh forward claim and cannot loop.
+      claim = issueCreateDedupCache.claim(hash);
+    }
+
+    if (claim.kind === "replay") {
+      log.warn(`issue-create-dedup agent=${agentId} replayed duplicate create title='${createInput.title ?? ""}'`);
+      res.status(200).set("Content-Type", "application/json").send(claim.responseText);
+      return;
+    }
+    if (claim.kind === "forward") {
+      createClaim = claim;
+    }
+  }
+
   // Non-intent forward path (reads and raw non-workflow mutations).
   let upstreamRes: globalThis.Response;
   try {
@@ -1128,6 +1185,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       body: JSON.stringify(body),
     });
   } catch (err) {
+    createClaim?.abandon();
     const msg = err instanceof Error ? err.message : String(err);
     log.error(`upstream request failed: ${msg}`);
     res.status(200).json({
@@ -1143,6 +1201,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   log.info(`response agent=${agentId} op=${opName} status=${upstreamRes.status}`);
 
   if (!upstreamRes.ok) {
+    createClaim?.abandon();
     const status = upstreamRes.status;
     log.warn(`upstream-error agent=${agentId} op=${opName}${ticketCtx} status=${status}`);
     if (status === 429) {
@@ -1165,6 +1224,16 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
     return;
   }
 
+  if (createClaim) {
+    // Only a genuine success is remembered: Linear reports rejected mutations as
+    // HTTP 200 with a GraphQL `errors` array, and caching one would replay the
+    // failure onto a legitimate retry.
+    if (isSuccessfulIssueCreate(responseText)) {
+      createClaim.settle(responseText);
+    } else {
+      createClaim.abandon();
+    }
+  }
 
   res
     .status(upstreamRes.status)
