@@ -128,6 +128,23 @@ export interface WorkflowTransition {
  * by this config — replacing the hardcoded `ux-audit`/`sprint` allowlist and
  * the hardcoded `wf:dev-impl` child label in fanout.ts.
  */
+/**
+ * AI-2523: Configuration for the spawn_if predicate — conditional child spawning.
+ *
+ * A state declaring `spawn_if` will only spawn its child_workflow when the
+ * predicate evaluates to true. In v1, the only predicate type is `label_present`
+ * which checks whether any closed child ticket carries the specified label.
+ */
+export interface SpawnIfConfig {
+  /** Label name to check for on closed children. */
+  label_present: string;
+  /**
+   * Evaluation scope. v1 only supports "closed_children" (default when absent).
+   * Only children in a terminal Linear native state (type: "completed") are examined.
+   */
+  scope?: "closed_children";
+}
+
 export interface FanoutConfig {
   /** Structured section of the parent ticket description that supplies the
    *  fan-out cardinality (e.g. "findings" → the `## Findings` section). */
@@ -141,6 +158,10 @@ export interface FanoutConfig {
   /** When true, create sibling blocking relations between the spawned children
    *  at spawn time (each sibling blocks the next). */
   block_siblings?: boolean;
+  /** AI-2523: conditional spawn predicate. When present, children are spawned
+   *  ONLY if the predicate evaluates to true. When absent, unconditional spawn
+   *  behavior is preserved (no regression). */
+  spawn_if?: SpawnIfConfig;
 }
 
 export interface WorkflowState {
@@ -780,6 +801,44 @@ export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
         }
         if (cfg.block_siblings !== undefined && typeof cfg.block_siblings !== "boolean") {
           errors.push(`Workflow state '${state.id}' fanout block_siblings must be a boolean when present.`);
+        }
+
+        // AI-2523: spawn_if validation
+        if (cfg.spawn_if !== undefined) {
+          const si = cfg.spawn_if as unknown;
+          if (si === null || typeof si !== "object") {
+            errors.push(`Workflow state '${state.id}' fanout spawn_if must be an object when present.`);
+          } else {
+            const sif = si as Record<string, unknown>;
+
+            // Required: label_present must be a non-empty string
+            if (
+              sif.label_present === undefined ||
+              typeof sif.label_present !== "string" ||
+              (sif.label_present as string).trim() === ""
+            ) {
+              errors.push(
+                `Workflow state '${state.id}' fanout spawn_if requires a non-empty string 'label_present' field.`,
+              );
+            }
+
+            // scope must be "closed_children" when present
+            if (sif.scope !== undefined && sif.scope !== "closed_children") {
+              errors.push(
+                `Workflow state '${state.id}' fanout spawn_if scope must be "closed_children" when present.`,
+              );
+            }
+
+            // No unknown fields
+            const knownFields = new Set(["label_present", "scope"]);
+            for (const key of Object.keys(sif)) {
+              if (!knownFields.has(key)) {
+                errors.push(
+                  `Workflow state '${state.id}' fanout spawn_if has unknown field '${key}'.`,
+                );
+              }
+            }
+          }
         }
       }
     }

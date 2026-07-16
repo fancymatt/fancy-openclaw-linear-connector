@@ -17,11 +17,17 @@
  *
  * This module is called from workflow-gate's applyStateTransition when the `spawn`
  * command is processed for a ux-audit ticket in the `spawning` state.
+ *
+ * AI-2523: spawn_if predicate — conditional child spawning. A state declaring
+ * `spawn_if: { label_present: "ui-impact" }` spawns its child_workflow ONLY when
+ * a closed child ticket carries that label. When no child carries the label, the
+ * gate auto-waives and the parent proceeds with no steward action. The predicate
+ * evaluation result is recorded on FanoutResult for inspection.
  */
 
 import { componentLogger, createLogger } from "./logger.js";
 import { generateSpawnPreview, checkCaps, formatPreviewComment, formatCapRefusalComment, parseSpawnCaps, type SpawnPreview, type CapCheckResult, type SpawnCaps } from "./spawn-preview.js";
-import type { FanoutConfig, WorkflowDef } from "./workflow-gate.js";
+import type { FanoutConfig, SpawnIfConfig, WorkflowDef } from "./workflow-gate.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "fanout");
 
@@ -82,6 +88,16 @@ export interface ExistingChild {
   state?: string;
 }
 
+/** AI-2523: Result of a spawn_if predicate evaluation. */
+export interface SpawnIfResult {
+  /** Whether the predicate passed — children should be spawned. */
+  shouldSpawn: boolean;
+  /** Human-readable explanation of the evaluation outcome. */
+  reason: string;
+  /** Identifiers of closed children that carried the target label (empty when waived). */
+  matchedChildren: string[];
+}
+
 /** Result of a fan-out operation. */
 export interface FanoutResult {
   /** Number of children successfully created. */
@@ -102,6 +118,8 @@ export interface FanoutResult {
    * human/steward-driven) — the engine posts a note listing them instead.
    */
   unmatchedChildren: string[];
+  /** AI-2523: result of spawn_if predicate evaluation, if configured. */
+  spawnIfResult?: SpawnIfResult;
 }
 
 export interface FanoutError {
@@ -407,6 +425,206 @@ export function validateFanoutSpec(
     }
   }
   return { ok: true, findings };
+}
+
+// ── Spawn-if predicate ─────────────────────────────────────────────────────
+
+/**
+ * AI-2523: GraphQL query to fetch a parent issue's children with their
+ * identifiers, labels, and native workflow state (type). This lets us
+ * determine which children are closed (terminal) and what labels they carry.
+ */
+const PARENT_CHILDREN_QUERY = `
+  query ParentChildrenLabels($id: String!) {
+    issue(id: $id) {
+      children {
+        nodes {
+          identifier
+          state { name type }
+          labels { nodes { id name } }
+        }
+      }
+    }
+  }
+`;
+
+interface ChildNode {
+  identifier: string;
+  state: { name: string; type: string } | null;
+  labels: { nodes: Array<{ id: string; name: string }> };
+}
+
+interface ParentChildrenResponse {
+  data?: {
+    issue?: {
+      children: {
+        nodes: ChildNode[];
+      };
+    } | null;
+  };
+  errors?: Array<{ message: string }>;
+}
+
+/**
+ * AI-2523: Evaluate a spawn_if predicate for a parent issue.
+ *
+ * Queries the parent's children (via ParentChildrenLabels), filters to closed
+ * children (native state type === "completed"), then checks if any closed child
+ * carries the configured label.
+ *
+ * The result is a SpawnIfResult indicating whether the spawn should proceed,
+ * a human-readable reason, and the list of matched child identifiers.
+ *
+ * On query failure, an error is returned (fail-closed: no spawn), and the
+ * caller (executeFanout) is expected to post a failure comment.
+ */
+export async function evaluateSpawnIf(
+  parentInternalId: string,
+  authToken: string,
+  spawnIf: SpawnIfConfig,
+): Promise<SpawnIfResult> {
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: PARENT_CHILDREN_QUERY, variables: { id: parentInternalId } }),
+    });
+
+    const data = (await res.json()) as ParentChildrenResponse;
+
+    if (data.errors?.length) {
+      const errorMsg = data.errors.map((e) => e.message).join("; ");
+      return {
+        shouldSpawn: false,
+        reason: `spawn_if evaluation failed: GraphQL error — ${errorMsg}`,
+        matchedChildren: [],
+      };
+    }
+
+    const children = data.data?.issue?.children?.nodes ?? [];
+    const targetLabel = spawnIf.label_present;
+
+    // Filter to closed children (native state type === "completed")
+    const closedChildren = children.filter((c) => c.state?.type === "completed");
+
+    // Find those carrying the target label
+    const matchedChildren = closedChildren
+      .filter((c) => c.labels.nodes.some((l) => l.name === targetLabel))
+      .map((c) => c.identifier);
+
+    if (matchedChildren.length > 0) {
+      return {
+        shouldSpawn: true,
+        reason: `spawn_if predicate matched: ${matchedChildren.length} closed child(ren) carry the '${targetLabel}' label (${matchedChildren.join(", ")})`,
+        matchedChildren,
+      };
+    }
+
+    // No match found — determine the right diagnostic
+    if (children.length === 0) {
+      return {
+        shouldSpawn: false,
+        reason: `spawn_if predicate waived: parent has no children — no '${targetLabel}' label found anywhere`,
+        matchedChildren: [],
+      };
+    }
+
+    const closedCount = closedChildren.length;
+    if (closedCount === 0) {
+      const openChildren = children.map((c) => c.identifier).join(", ");
+      return {
+        shouldSpawn: false,
+        reason: `spawn_if predicate waived: no closed children yet (${children.length} open child(ren) — ${openChildren}) — none carry '${targetLabel}'`,
+        matchedChildren: [],
+      };
+    }
+
+    return {
+      shouldSpawn: false,
+      reason: `spawn_if predicate waived: ${closedCount} closed child(ren) checked, none carry the '${targetLabel}' label`,
+      matchedChildren: [],
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      shouldSpawn: false,
+      reason: `spawn_if evaluation failed: query error — ${msg}`,
+      matchedChildren: [],
+    };
+  }
+}
+
+/**
+ * Post a spawn_if outcome comment on the parent ticket.
+ * Fail-open: errors are logged but don't block the operation.
+ */
+async function postSpawnIfComment(
+  issueInternalId: string,
+  spawnIfResult: SpawnIfResult,
+  authToken: string,
+): Promise<void> {
+  const emoji = spawnIfResult.shouldSpawn ? "✅" : "⏭️";
+  const body = [
+    `${emoji} **spawn_if Evaluation** (label_present: "${spawnIfResult.matchedChildren.length > 0 ? spawnIfResult.reason.match(/'([^']+)'/)?.[1] ?? "—" : "—"}")`,
+    ``,  // "ui-impact" not stable — just explain clearly
+    `**Outcome:** ${spawnIfResult.shouldSpawn ? "FIRE — spawning children" : "WAIVE — skipping spawn"}`,
+    `**Reason:** ${spawnIfResult.reason}`,
+    spawnIfResult.matchedChildren.length > 0
+      ? `**Matched children:** ${spawnIfResult.matchedChildren.join(", ")}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const mutation = `
+    mutation($issueId: ID!, $body: String!) {
+      commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
+    }
+  `;
+  try {
+    await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId: issueInternalId, body } }),
+    });
+    log.info(`fanout: spawn_if comment posted on ${issueInternalId} (${spawnIfResult.shouldSpawn ? "fire" : "waive"})`);
+  } catch (err) {
+    log.warn(`fanout: failed to post spawn_if comment: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Post a spawn_if error comment on the parent ticket when the children query fails.
+ */
+async function postSpawnIfErrorComment(
+  issueInternalId: string,
+  errorMessage: string,
+  authToken: string,
+): Promise<void> {
+  const body = [
+    `❌ **spawn_if Evaluation Error**`,
+    ``,  // blank line
+    `The spawn_if predicate could not be evaluated because the children query failed.`,
+    `**Error:** ${errorMessage}`,
+    ``,  // blank line
+    `The parent ticket transition was refused — no children were spawned. The steward should investigate and retry.`,
+  ].join("\n");
+
+  const mutation = `
+    mutation($issueId: ID!, $body: String!) {
+      commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
+    }
+  `;
+  try {
+    await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId: issueInternalId, body } }),
+    });
+    log.info(`fanout: spawn_if error comment posted on ${issueInternalId}`);
+  } catch (err) {
+    log.warn(`fanout: failed to post spawn_if error comment: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 // ── Linear API helpers ────────────────────────────────────────────────────
@@ -750,6 +968,41 @@ export async function executeFanout(
       `(${findings.length} spec entr${findings.length === 1 ? "y" : "ies"}, all already spawned)`,
     );
     return result;
+  }
+
+  // ── AI-2523: spawn_if predicate evaluation ─────────────────────────
+  // Evaluate the spawn_if predicate BEFORE spawn-preview/caps checks but AFTER
+  // the dedup (both are independent — dedup partitions the spec, spawn_if
+  // queries children by label). When spawn_if is configured and evaluates to
+  // shouldSpawn: false, we short-circuit — no children are created.
+  if (config.spawn_if) {
+    const siResult = await evaluateSpawnIf(parentCtx.internalId, authToken, config.spawn_if);
+    result.spawnIfResult = siResult;
+
+    if (!siResult.shouldSpawn) {
+      const isError = siResult.reason.startsWith("spawn_if evaluation failed");
+
+      if (isError) {
+        result.errors.push({
+          findingIndex: -1,
+          message: siResult.reason,
+        });
+        await postSpawnIfErrorComment(parentCtx.internalId, siResult.reason, authToken);
+      } else {
+        await postSpawnIfComment(parentCtx.internalId, siResult, authToken);
+      }
+
+      log.info(
+        `fanout: spawn_if ${isError ? "failed" : "waived"} for ${parentIssueId} — ${siResult.reason}`,
+      );
+      return result;
+    }
+
+    await postSpawnIfComment(parentCtx.internalId, siResult, authToken);
+
+    log.info(
+      `fanout: spawn_if fired for ${parentIssueId} — ${siResult.reason}`,
+    );
   }
 
   // ── Phase 6.5 / H-2: Spawn-preview gate + hard recursion caps ──────
