@@ -651,6 +651,47 @@ describe("AC4: idempotent — dispatch record prevents re-wake", () => {
     eventStore.close();
   });
 
+  it("AI-2464: does not re-wake when delivery-pending-ack event exists after delegation timestamp", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    // A connect-established abort (AI-2437): the wake is queued in the agent's
+    // hands and deliver-with-ack registered an ack expectation, so the watchdog
+    // owns the retry. The sweep must not race it with a duplicate dispatch.
+    eventStore.append({
+      outcome: "delivery-pending-ack",
+      agent: DELEGATE_AGENT_NAME,
+      key: `linear-AI-1807`,
+      occurredAt: OLD_TIMESTAMP,
+    });
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [
+        {
+          id: "issue-stranded",
+          identifier: "AI-1807",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+          delegateId: DELEGATE_LINEAR_ID,
+          delegateName: DELEGATE_AGENT_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (_, id) => { wakeDispatches.push(id); },
+    });
+
+    expect(result.healed).toBe(0);
+    expect(wakeDispatches).toHaveLength(0);
+    eventStore.close();
+  });
+
   it("DOES re-wake when the only dispatch record is from a PREVIOUS delegation (before current delegate was set)", async () => {
     const eventStore = makeEventStore();
     const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];

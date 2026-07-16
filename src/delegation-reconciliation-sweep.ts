@@ -250,8 +250,17 @@ async function queryDelegateSetTimestamp(
 
 /**
  * Check if the given delegate has been dispatched for this ticket since the
- * delegation timestamp. Returns true if a dispatch-accepted or delivered
- * event exists for the current agent after the delegate was set.
+ * delegation timestamp. Returns true if a dispatch-accepted, delivered, or
+ * delivery-pending-ack event exists for the current agent after the delegate
+ * was set.
+ *
+ * AI-2464: `delivery-pending-ack` (AI-2437) counts as dispatched. It means the
+ * connection was established and the wake is queued in the agent's hands, and
+ * deliver-with-ack registers the ack expectation on that path with the same
+ * `ackTracker.recordDispatch` call the `delivered` path uses. The dispatch
+ * watchdog therefore already owns retry for it, with backoff and escalation
+ * this sweep does not have. Counting it keeps the sweep from racing the
+ * watchdog to heal the same entry — the duplicate wake AI-2437 set out to stop.
  */
 function hasDispatchSinceDelegation(
   operationalEventStore: OperationalEventStore,
@@ -278,7 +287,12 @@ function hasDispatchSinceDelegation(
   const delegationMs = new Date(delegationTimestamp).getTime();
 
   return events.some((e) => {
-    if (e.outcome !== "dispatch-accepted" && e.outcome !== "delivered") return false;
+    if (
+      e.outcome !== "dispatch-accepted" &&
+      e.outcome !== "delivered" &&
+      e.outcome !== "delivery-pending-ack"
+    )
+      return false;
     if (e.agent !== agentName) return false;
     const eventMs = new Date(e.occurredAt).getTime();
     return eventMs >= delegationMs;
