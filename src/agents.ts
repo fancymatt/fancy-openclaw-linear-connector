@@ -360,6 +360,69 @@ export function isPolledForLinear(agent: AgentConfig): boolean {
   return (agent.status ?? "active") === "active";
 }
 
+/**
+ * Reconcile an agent's registration status against whether it actually holds a
+ * credential, and return the entry the registry may store (AI-2444).
+ *
+ * `active` with no refresh token is not a state the registry is allowed to
+ * hold. It is a fourth, unnamed state that reads as *intent* — "should be
+ * enrolled but isn't" — which nothing forces anyone to resolve. It generated
+ * nine credential tickets: the hourly proxy probe finds an agent that is
+ * supposed to be on Linear, correctly diagnoses that it isn't, files a ticket,
+ * and the ambiguity survives to the next pass. The registry vocabulary already
+ * has a name for every legitimate case, so this collapses onto it:
+ *
+ * - no credential      -> `never-onboarded`: a pending intent, not yet set up
+ * - credential present -> `active`, promoted from `never-onboarded` on onboard
+ * - `off-linear`       -> a decision; never reconciled in either direction
+ *
+ * `status` absent means `active` (see `isPolledForLinear`), so an entry written
+ * with no status and no token is that same ambiguous state and coerces too —
+ * which is exactly how both onboard paths create their pre-OAuth entries.
+ *
+ * Coercion is loud rather than rejecting: the onboard flows legitimately write
+ * a token-less entry before OAuth completes, and landing it as
+ * `never-onboarded` is the intended destination for it, not an error.
+ *
+ * Naming the state is what earns it the watchdog skip. Do not instead widen
+ * `isPolledForLinear` to skip any credential-less agent: that would fold
+ * active-with-no-token into `/health`'s `offLinearAgentNames`, and the probe
+ * would skip it as "revoked on purpose" *before* reaching the missing-token
+ * warning — silently deleting the signal AI-2231 added to surface it.
+ */
+function reconcileStatusWithCredential(agent: AgentConfig): AgentConfig {
+  // A deliberate decommission is a decision, not a pending intent. A credential
+  // arriving or going missing must never silently overturn it.
+  if (agent.status === "off-linear") return agent;
+
+  const hasCredential = Boolean(agent.refreshToken);
+  const effectiveStatus = agent.status ?? "active";
+
+  if (effectiveStatus === "active" && !hasCredential) {
+    log.warn(
+      `Roster agent "${agent.name}" is ${agent.status ? "set" : "defaulting"} to ` +
+        `status "active" with no stored refresh token — coercing to ` +
+        `"never-onboarded". An active agent with no credential pages the ` +
+        `hourly credential-liveness probe forever and resolves to nobody. ` +
+        `Complete OAuth to promote it back to "active", or mark it ` +
+        `"off-linear" if it is decommissioned. (AI-2444)`,
+    );
+    return { ...agent, status: "never-onboarded" };
+  }
+
+  // A credential means onboarding finished, so "never set up yet" is no longer
+  // true of this agent regardless of who wrote it. Promote (AC2).
+  if (effectiveStatus === "never-onboarded" && hasCredential) {
+    log.info(
+      `Roster agent "${agent.name}" onboarded: refresh token stored — ` +
+        `promoting "never-onboarded" -> "active". (AI-2444)`,
+    );
+    return { ...agent, status: "active" };
+  }
+
+  return agent;
+}
+
 export function getOpenclawAgentName(agentName: string): string {
   const agent = _agents.find((a) => a.name === agentName);
   return agent?.openclawAgent ?? agentName;
@@ -538,14 +601,14 @@ export function updateAgentMetadata(
   if (idx === -1) return null;
 
   const current = _agents[idx];
-  const updated: AgentConfig = {
+  const updated: AgentConfig = reconcileStatusWithCredential({
     ...current,
     ...(meta.openclawAgent !== undefined ? { openclawAgent: meta.openclawAgent } : {}),
     ...(meta.host !== undefined ? { host: meta.host } : {}),
     ...(meta.linearUserId !== undefined ? { linearUserId: meta.linearUserId } : {}),
     ...(meta.displayName !== undefined ? { displayName: meta.displayName } : {}),
     ...(meta.status !== undefined ? { status: meta.status } : {}),
-  };
+  });
 
   _agents[idx] = updated;
   save(_agents);
@@ -558,14 +621,19 @@ export function upsertAgent(config: AgentConfig): { isNew: boolean } {
   const existing = _agents.find((a) => a.name === config.name) ??
     _agents.find((a) => a.linearUserId === config.linearUserId);
   if (existing) {
+    // Reconcile the merged entry, not the incoming patch: a partial upsert that
+    // omits refreshToken must not read as "no credential" when the stored entry
+    // has one.
     _agents = _agents.map((a) =>
-      a.name === config.name ? { ...a, ...config } : a
+      a.name === config.name
+        ? reconcileStatusWithCredential({ ...a, ...config })
+        : a
     );
     save(_agents);
     syncWorkspaceSecrets(config.name, config.accessToken);
     return { isNew: false };
   }
-  _agents.push(config);
+  _agents.push(reconcileStatusWithCredential(config));
   save(_agents);
   syncWorkspaceSecrets(config.name, config.accessToken);
   return { isNew: true };
