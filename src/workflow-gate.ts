@@ -4285,6 +4285,146 @@ export async function enrollIfMissing(
   return { enrolled: true, entryState: def.entry_state };
 }
 
+// ── AI-2469: Auto-enroll AI-team tickets into dev-impl at intake ────────────
+
+/**
+ * AI-2469 AC1(a): Auto-enroll tickets from a target team into a default
+ * workflow when the ticket has no `wf:*` label at all.
+ *
+ * This is the PRIMARY enrollment path — a ticket enters dev-impl at its first
+ * webhook event, before any agent touches it. Over-inclusive in the right
+ * direction: non-code tickets can use `escape`; code tickets that never
+ * entered the workflow are precisely the defect class from AI-2450.
+ *
+ * Fail-open: any API or registry failure logs a warning and returns
+ * `{ enrolled: false }` — the inbound path is never blocked by enrollment.
+ *
+ * Compare with `enrollIfMissing`, which only heals the gap where a `wf:*`
+ * label exists but `state:*` is missing. This function handles the case
+ * where neither label exists.
+ *
+ * @param issueId - Linear issue UUID to enroll
+ * @param teamKey - Team key from the webhook event (e.g. "AI")
+ * @param authToken - Linear API token
+ * @param config - Configuration for which teams map to which workflows
+ * @param onEnroll - Optional audit hook called on successful enrollment
+ */
+export interface TeamEnrollConfig {
+  /** Map of team keys to workflow IDs. Default: { "AI": "dev-impl" } */
+  [teamKey: string]: string;
+}
+
+export interface AutoEnrollInfo {
+  /** Display identifier or UUID passed in. */
+  issueId: string;
+  /** Linear internal issue UUID. */
+  internalId: string;
+  /** Resolved workflow id (e.g. "dev-impl"). */
+  workflowId: string;
+  /** Entry state stamped (e.g. "intake"). */
+  entryState: string;
+  /** Team key that triggered enrollment. */
+  teamKey: string;
+}
+
+const DEFAULT_TEAM_ENROLL_CONFIG: TeamEnrollConfig = {
+  "AI": "dev-impl",
+};
+
+/**
+ * Auto-enroll a ticket from a configured team into its default workflow.
+ *
+ * Skips if:
+ * - The ticket already has a `wf:*` label (already enrolled or in another workflow)
+ * - The team key is not in the enrollment config
+ * - The workflow def cannot be loaded
+ * - Any API error occurs (fail-open)
+ *
+ * Called from the webhook inbound path on every Issue event, alongside
+ * `enrollIfMissing`. Idempotent on re-runs.
+ */
+export async function autoEnrollByTeam(
+  issueId: string,
+  teamKey: string,
+  authToken: string,
+  config?: TeamEnrollConfig,
+  onEnroll?: (info: AutoEnrollInfo) => void,
+): Promise<{ enrolled: boolean; entryState?: string }> {
+  const enrollConfig = config ?? DEFAULT_TEAM_ENROLL_CONFIG;
+  const workflowId = enrollConfig[teamKey];
+  if (!workflowId) return { enrolled: false }; // team not configured for auto-enroll
+
+  const issue = await fetchIssueWithLabels(issueId, authToken);
+  if (!issue) {
+    log.warn(`workflow-gate: autoEnrollByTeam: failed to fetch labels for ${issueId} (team=${teamKey}) — skipping`);
+    return { enrolled: false };
+  }
+
+  const labelNames = issue.labels.map((l) => l.name);
+  const existingWorkflowId = getWorkflowId(labelNames);
+  if (existingWorkflowId) {
+    return { enrolled: false }; // already has a wf:* label — skip
+  }
+
+  // Ticket has no wf:* label. Enroll into the configured workflow.
+  let def: WorkflowDef | undefined;
+  try {
+    const registry = await loadWorkflowRegistry();
+    def = registry.get(workflowId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: autoEnrollByTeam: registry load failed for ${issueId}: ${msg} — skipping`);
+    return { enrolled: false };
+  }
+
+  if (!def?.entry_state) {
+    log.warn(`workflow-gate: autoEnrollByTeam: no entry_state in def for ${workflowId} on ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  // Resolve or create both labels: wf:<workflowId> and state:<entry_state>
+  const wfLabelName = `wf:${workflowId}`;
+  const stateLabelName = `state:${def.entry_state}`;
+
+  const wfLabelId = await findOrCreateLabel(issue.teamId, wfLabelName, authToken);
+  if (!wfLabelId) {
+    log.warn(`workflow-gate: autoEnrollByTeam: could not resolve label '${wfLabelName}' for ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  const stateLabelId = await findOrCreateLabel(issue.teamId, stateLabelName, authToken);
+  if (!stateLabelId) {
+    log.warn(`workflow-gate: autoEnrollByTeam: could not resolve label '${stateLabelName}' for ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  // Add both labels alongside existing ones
+  const existingIds = issue.labels.map((l) => l.id);
+  const newLabelIds = [...new Set([...existingIds, wfLabelId, stateLabelId])];
+
+  const success = await issueUpdateLabels(issue.internalId, newLabelIds, authToken);
+  if (!success) {
+    log.warn(`workflow-gate: autoEnrollByTeam: label update failed for ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  log.info(`workflow-gate: autoEnrollByTeam: stamped '${wfLabelName}' + '${stateLabelName}' on ${issueId} (team=${teamKey})`);
+
+  try {
+    onEnroll?.({
+      issueId,
+      internalId: issue.internalId,
+      workflowId,
+      entryState: def.entry_state,
+      teamKey,
+    });
+  } catch (err) {
+    log.warn(`workflow-gate: autoEnrollByTeam: onEnroll audit hook threw for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  return { enrolled: true, entryState: def.entry_state };
+}
+
 // ── AI-1546 / G-6: Steward/human-only atomic set-state ─────────────────────
 
 export interface SetStateAtomicResult {

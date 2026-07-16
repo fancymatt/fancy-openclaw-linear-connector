@@ -21,7 +21,7 @@ import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgent
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam } from "../workflow-gate.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
@@ -363,6 +363,30 @@ export function createWebhookRouter(
           }).catch((err) => {
             log.warn(`enrollIfMissing failed for ${enrollIssueId}: ${err instanceof Error ? err.message : String(err)}`);
           });
+
+          // AI-2469 AC1(a): Auto-enroll AI-team tickets into dev-impl at intake.
+          // Runs on every Issue event alongside enrollIfMissing. Skips tickets
+          // that already have a wf:* label (enrollIfMissing handles the gap where
+          // wf:* exists but state:* is missing; this handles the case where
+          // neither exists).
+          const enrollTeamKey = enrollData?.teamKey as string | undefined;
+          if (enrollTeamKey) {
+            autoEnrollByTeam(enrollIssueId, enrollTeamKey, enrollToken, undefined, (info) => {
+              appendOperationalEvent(operationalEventStore, {
+                outcome: "auto-enrolled",
+                type: event.type,
+                key: enrollIdentifier,
+                sessionKey: normalizeSessionKey(enrollIdentifier),
+                detail: { workflowId: info.workflowId, entryState: info.entryState, teamKey: info.teamKey },
+              });
+            }).then((result) => {
+              if (result.enrolled) {
+                log.info(`Auto-enrolled: stamped wf:dev-impl + state:${result.entryState} on ${enrollIssueId} (team=AI)`);
+              }
+            }).catch((err) => {
+              log.warn(`autoEnrollByTeam failed for ${enrollIssueId}: ${err instanceof Error ? err.message : String(err)}`);
+            });
+          }
         }
       }
 
