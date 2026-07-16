@@ -4,10 +4,21 @@ set -euo pipefail
 # connector-reftxn-arm.sh — arm/disarm the primary-tree HEAD-veto hook in the
 # SHARED connector clone (AI-2481). Self-gating on quiescence.
 #
-# Arming means pointing this clone's core.hooksPath at scripts/git-hooks, which
-# activates scripts/git-hooks/reference-transaction. From that instant, a
+# Arming means installing scripts/git-hooks/reference-transaction OUT OF THE
+# WORKING TREE, into <git-common-dir>/hooks/reference-transaction (git's default
+# hook location), and leaving core.hooksPath UNSET. From that instant, a
 # detached checkout or a sideways/backward `git reset` in the PRIMARY working
 # tree is refused (see the hook header for the exact allow/deny matrix).
+#
+# WHY OUT OF TREE (AI-2481, the flaw that made the first cut fail open): the hook
+# used to be armed via core.hooksPath=scripts/git-hooks — a path INSIDE the
+# working tree. But `git checkout` updates the working tree BEFORE the ref
+# transaction fires, so detaching onto any commit that predates the hook DELETES
+# the hook file before it can veto, and the transaction proceeds unhooked. That
+# fails open on exactly the case the hook exists to stop. The default hook dir
+# (<git-common-dir>/hooks) is untracked and immune to tree swaps, so the hook
+# survives any checkout and always runs. We COPY the committed hook there on each
+# arm (so it can never go stale relative to source), and disarm by deleting it.
 #
 # WHY THIS IS GATED: arming while a session is mid-checkout would abort that
 # session's in-flight git command (non-destructively — the transaction aborts
@@ -22,7 +33,7 @@ set -euo pipefail
 #   connector-reftxn-arm.sh --quiet-min N
 #   connector-reftxn-arm.sh --force      # arm now, bypassing the quiescence gate (human)
 #   connector-reftxn-arm.sh --status     # report armed/disarmed + last activity
-#   connector-reftxn-arm.sh --disarm     # unset core.hooksPath
+#   connector-reftxn-arm.sh --disarm     # remove the installed hook
 
 QUIET_MIN=15
 MODE="arm"
@@ -39,10 +50,40 @@ done
 
 # Operate on the MAIN working tree of the clone this script lives in.
 REPO_ROOT="$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')"
-HOOKS_REL="scripts/git-hooks"
-HOOK="$REPO_ROOT/$HOOKS_REL/reference-transaction"
+HOOK_SRC="$REPO_ROOT/scripts/git-hooks/reference-transaction"
 
-current_hookspath() { git -C "$REPO_ROOT" config --local --get core.hooksPath || true; }
+# Absolute default hook dir. --git-common-dir may be relative to REPO_ROOT; the
+# default (unset core.hooksPath) hook dir is <common>/hooks, shared across every
+# linked worktree — which is why the in-hook worktree early-exit must (and does)
+# key off --absolute-git-dir, not off which hooks dir ran it.
+GIT_COMMON_DIR="$(cd "$REPO_ROOT" && git rev-parse --git-common-dir)"
+case "$GIT_COMMON_DIR" in
+  /*) : ;;
+  *)  GIT_COMMON_DIR="$REPO_ROOT/$GIT_COMMON_DIR" ;;
+esac
+HOOK_DST="$GIT_COMMON_DIR/hooks/reference-transaction"
+
+is_armed() { [ -e "$HOOK_DST" ]; }
+
+# Legacy: the first (broken) cut armed via core.hooksPath=scripts/git-hooks. If a
+# clone still carries that, clear it — the whole point is to NOT depend on an
+# in-tree hooks path. Harmless when already unset.
+clear_legacy_hookspath() {
+  local hp
+  hp="$(git -C "$REPO_ROOT" config --local --get core.hooksPath 2>/dev/null || true)"
+  if [ "$hp" = "scripts/git-hooks" ]; then
+    git -C "$REPO_ROOT" config --local --unset core.hooksPath 2>/dev/null || true
+    echo "  (cleared legacy in-tree core.hooksPath=scripts/git-hooks)"
+  fi
+}
+
+install_hook() {
+  mkdir -p "$GIT_COMMON_DIR/hooks"
+  local tmp="$HOOK_DST.tmp.$$"
+  cp "$HOOK_SRC" "$tmp"
+  chmod +x "$tmp"
+  mv -f "$tmp" "$HOOK_DST"   # atomic rename within the same dir
+}
 
 # Seconds since the most recent HEAD reflog ENTRY (checkout/commit/reset/detach).
 # Uses the reflog selector time (%gd --date=unix → "HEAD@{<unixts>}"), NOT the
@@ -60,24 +101,28 @@ last_activity_secs() {
 
 case "$MODE" in
   status)
-    hp="$(current_hookspath)"
-    if [ "$hp" = "$HOOKS_REL" ]; then echo "ARMED (core.hooksPath=$hp)"; else echo "DISARMED (core.hooksPath='${hp:-unset}')"; fi
+    if is_armed; then echo "ARMED (hook installed at $HOOK_DST)"; else echo "DISARMED (no hook at $HOOK_DST)"; fi
     secs="$(last_activity_secs)"
     if [ "$secs" -lt 0 ]; then echo "last HEAD activity: unknown"; else echo "last HEAD activity: $((secs/60))m ago (${secs}s)"; fi
     exit 0
     ;;
   disarm)
-    git -C "$REPO_ROOT" config --local --unset core.hooksPath 2>/dev/null || true
-    echo "disarmed: core.hooksPath unset in $REPO_ROOT"
+    rm -f "$HOOK_DST"
+    clear_legacy_hookspath
+    echo "disarmed: removed $HOOK_DST"
     exit 0
     ;;
 esac
 
 # ── arm ──────────────────────────────────────────────────────────────────────
-[ -x "$HOOK" ] || { echo "refuse: hook not found/executable at $HOOK" >&2; exit 1; }
+[ -x "$HOOK_SRC" ] || { echo "refuse: hook source not found/executable at $HOOK_SRC" >&2; exit 1; }
 
-if [ "$(current_hookspath)" = "$HOOKS_REL" ]; then
-  echo "already armed (core.hooksPath=$HOOKS_REL) — nothing to do."
+# Already armed → just refresh the copy so it can't drift from source, no gate
+# needed (enforcement is already on; re-copying identical bytes changes nothing).
+if is_armed; then
+  install_hook
+  clear_legacy_hookspath
+  echo "already armed — refreshed hook copy at $HOOK_DST"
   exit 0
 fi
 
@@ -97,6 +142,7 @@ else
   echo "warning: --force — arming without the quiescence gate."
 fi
 
-git -C "$REPO_ROOT" config --local core.hooksPath "$HOOKS_REL"
-echo "ARMED: core.hooksPath=$HOOKS_REL in $REPO_ROOT"
+install_hook
+clear_legacy_hookspath
+echo "ARMED: hook installed at $HOOK_DST (out of tree; core.hooksPath left unset)."
 echo "  primary-tree detach/reset HEAD moves are now vetoed. Disarm: $0 --disarm"

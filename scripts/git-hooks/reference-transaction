@@ -15,6 +15,8 @@
 # `git reset` onto a different commit. It ALLOWS, deliberately:
 #   - commits and `git pull`/ff-merge on the current branch (HEAD and its branch
 #     ref advance together to the same SHA)
+#   - `git commit --amend` (rewrites the current commit in place; the new commit
+#     is a sibling of old HEAD and the amend does not touch the working tree)
 #   - `git worktree add` and all HEAD moves INSIDE a linked worktree (the point)
 #   - branch create/delete and fetches (refs/heads,* refs/remotes/* — not HEAD)
 #
@@ -25,8 +27,14 @@
 # guidance + CONTRIBUTING already steer sessions to worktrees. This hook is
 # defense-in-depth for the destructive detach/reset yanks, not a total interlock.
 #
-# Non-destructive: a refusal in the "prepared" phase aborts the transaction BEFORE
-# git touches the working tree (same guarantee as the ~/.openclaw stash-veto).
+# WHAT A REFUSAL PROTECTS (measured, AI-2481): a refusal aborts the ref update, so
+# the shared HEAD pointer does NOT move — that is the AI-2475 invariant (a session's
+# checkout cannot be repointed by another session). It does NOT roll back the
+# working tree: `git checkout` / `git reset --hard` swap the working tree BEFORE the
+# ref transaction fires, and a veto leaves those files swapped (HEAD intact). Because
+# HEAD is preserved, one `git reset --hard HEAD` restores them. git's own guard still
+# refuses to overwrite DIRTY tracked files, so a session mid-edit is protected. The
+# real fix for the file swap is a worktree; this hook guards the shared HEAD pointer.
 # Escape hatch: OC_GIT_UNSAFE=1 (human, having read the above).
 set -uo pipefail
 
@@ -72,7 +80,18 @@ case " $branch_news " in
     rc=$?
     [ "$rc" -eq 0 ] && exit 0     # forward move — allow
     [ "$rc" -gt 1 ] && exit 0     # merge-base errored — fail open (don't block commits)
-    ;;                             # rc==1: not an ancestor → fall through to veto
+    # rc==1: not a forward move. Distinguish `git commit --amend` — the new commit
+    # is a SIBLING of old HEAD (shares its parent) and the amend does NOT touch the
+    # working tree, so it is not a yank — from a destructive sideways `reset --hard`.
+    # Allow only when the first parents match. A reset onto an older/unrelated commit
+    # has a different parent and still falls through to the veto below. (Residual:
+    # a reset --hard onto an exact sibling of HEAD is indistinguishable from an amend
+    # from ref data alone and is allowed — an exotic case; this hook is documented
+    # defense-in-depth, not a total interlock.)
+    old_par="$(git rev-parse --verify -q "${head_old}^" 2>/dev/null || echo "")"
+    new_par="$(git rev-parse --verify -q "${head_new}^" 2>/dev/null || echo "")"
+    if [ -n "$old_par" ] && [ "$old_par" = "$new_par" ]; then exit 0; fi
+    ;;                             # else → fall through to veto
 esac
 
 # HEAD moved to a commit with no branch following it → detached checkout or a
@@ -95,8 +114,12 @@ cat >&2 <<'MSG'
 
     scripts/connector-worktree-remove.sh <branch>
 
-  Nothing has been changed. The working tree is untouched. (AI-2481)
-  Human override, having read the above: OC_GIT_UNSAFE=1 git ...
+  HEAD was NOT moved — the shared checkout pointer is intact. But git may have
+  already swapped your working-tree files before this veto fired; restore them with:
+
+    git reset --hard HEAD
+
+  Human override, having read the above: OC_GIT_UNSAFE=1 git ... (AI-2481)
 ──────────────────────────────────────────────────────────────────────────
 MSG
 exit 1
