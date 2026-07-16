@@ -95,7 +95,6 @@ states:
     transitions:
       - command: submit
         to: ac-validate
-        requires_comment: true
   - id: ac-validate
     owner_role: steward
     kind: normal

@@ -316,6 +316,17 @@ function extractCommentBody(body: GraphQLRequestBody | null): string | null {
 }
 
 /**
+ * True when the mutation is a `commentCreate` — a mutation that posts a comment
+ * and can never change workflow state or delegate. Used to skip workflow
+ * enforcement (B1) on the intent path so a trailing commentCreate in a
+ * multi-step governed command is not re-gated against the post-transition state
+ * (AI-2472).
+ */
+function isCommentCreateMutation(body: GraphQLRequestBody | null): boolean {
+  return !!body?.query && /\bcommentCreate\s*\(/.test(body.query);
+}
+
+/**
  * AI-1583: True only when the request's GraphQL operation is a mutation.
  *
  * Workflow enforcement (and the B2 state-transition writer) must apply to
@@ -979,16 +990,18 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
 
         // AI-2035 guard B (defense-in-depth): once a transition has successfully
         // landed on a TERMINAL state, invalidate the AI-1860 command-auth
-        // snapshot(s) for this issue so a trailing same-turn mutation under the
-        // same sticky intent header can no longer present a stale pre-terminal
-        // snapshotState to B1 (checkWorkflowRules). Without this the snapshot
-        // keeps satisfying B1's terminal rejection for the full 10-min TTL,
-        // letting the lag-prone gate read reopen the ticket. Guard A (the
-        // getAppliedState-backed terminal re-entry guard in applyStateTransition)
-        // is the lag-proof primary stop; this restores B1's live terminal
-        // rejection at the gate. We drop every snapshot for the issue (all
-        // intents), since a reviewer's close may carry >1 intent and any lingering
-        // pre-terminal snapshot could re-authorize a re-entrant write.
+        // snapshot for this issue except the current in-flight command's own
+        // snapshot. A trailing same-turn commentCreate under the same sticky
+        // intent header needs the pre-terminal snapshotState to resolve its
+        // meta-intent and pass B1; without it the re-resolution against the
+        // live terminal state rejects the comment and drops the body silently
+        // (AI-2472). The current command's snapshot is safe to preserve because
+        // issueUpdate mutations (isTransitionMutation=true) never reuse a
+        // snapshot — they always re-fetch. Only non-transition mutations like
+        // commentCreate reuse it. Guard A (getAppliedState-backed terminal
+        // re-entry guard in applyStateTransition) is the primary stop against
+        // re-open; dropping OTHER snapshots for the issue still catches the
+        // reviewer-close scenario where a different intent might follow.
         if (
           transitionResult?.status === "applied" &&
           transitionResult.to &&
@@ -998,7 +1011,10 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           const issueKeyFragment = issueId ? `:${issueId}:` : null;
           let dropped = 0;
           for (const key of [...deps.commandAuthSnapshots.keys()]) {
-            if (key === snapshotKey || (issueKeyFragment && key.includes(issueKeyFragment))) {
+            // AI-2472: preserve the current in-flight command's snapshot so a
+            // trailing commentCreate can reuse its pre-terminal snapshotState.
+            if (key === snapshotKey) continue;
+            if (issueKeyFragment && key.includes(issueKeyFragment)) {
               deps.commandAuthSnapshots.delete(key);
               dropped++;
             }
