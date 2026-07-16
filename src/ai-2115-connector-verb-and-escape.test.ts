@@ -317,13 +317,14 @@ describe("AI-2115 Bug 1: continue-workflow from routing resolves to the routing 
     const mf = makeTaskFetch({ state: "intake", delegate: "u-astrid" });
     globalThis.fetch = mf.fetch;
 
-    const send = (agent: string, token: string, target?: string) => {
+    const send = (agent: string, token: string, commandId: string, target?: string) => {
       let r = request(appState.app)
         .post("/proxy/graphql")
         .set("Authorization", `Bearer ${token}`)
         .set("X-Openclaw-Agent", agent)
         .set("X-Openclaw-Linear-Cli-Version", "0.3.6")
-        .set("X-Openclaw-Linear-Intent", "continue-workflow");
+        .set("X-Openclaw-Linear-Intent", "continue-workflow")
+        .set("X-Openclaw-Command-Id", commandId);
       if (target) r = r.set("X-Openclaw-Linear-Target", target);
       return r.send(issueUpdateTriggerBody());
     };
@@ -331,7 +332,7 @@ describe("AI-2115 Bug 1: continue-workflow from routing resolves to the routing 
     // Command A: continue-workflow at intake (astrid, steward) → resolves to
     // intake's `request`, advances intake → routing (the mock self-applies the
     // write). Stores the command-auth snapshot at state=intake.
-    const resA = await send("astrid", "tok-astrid");
+    const resA = await send("astrid", "tok-astrid", crypto.randomUUID());
     expect(resA.status).toBe(200);
     expect(resA.body?.errors ?? []).toHaveLength(0);
 
@@ -339,7 +340,7 @@ describe("AI-2115 Bug 1: continue-workflow from routing resolves to the routing 
     // delegate-only worker signe. With the bug, the stale intake snapshot makes
     // this resolve to intake's singleton `request` and reject signe. With the
     // fix, it re-derives routing and resolves to routing's `assign` → doing.
-    const resB = await send("astrid", "tok-astrid", "signe");
+    const resB = await send("astrid", "tok-astrid", crypto.randomUUID(), "signe");
 
     // Bug signature: the singleton-rejection error must NOT appear.
     expect(errText(resB).toLowerCase()).not.toContain("rejected");

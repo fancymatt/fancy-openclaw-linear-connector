@@ -532,7 +532,15 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // meta-intent resolution, the delegate check, nor the transition-legality check is
       // re-evaluated against the command's own post-transition state — the AI-1848 /
       // AI-1872 / AI-1924 "apply-then-self-block, comment dropped, exit 1" repros.
-      const snapshotKey = issueId && intent ? `${agentId}:${issueId}:${intent}` : null;
+      //
+      // AI-2530: the key now includes a per-invocation command nonce
+      // (X-Openclaw-Command-Id) so that a FRESH command always gets a cache-miss
+      // and re-derives from live state, while follow-up mutations (chunked
+      // commentCreate, AI-2472) from the SAME command share the nonce and reuse
+      // the snapshot. The header is REQUIRED for intent-resolving paths; a hard
+      // gate below rejects requests that lack it.
+      const commandId = (req.headers['x-openclaw-command-id'] as string | undefined) ?? null;
+      const snapshotKey = issueId && intent ? `${agentId}:${issueId}:${intent}:${commandId}` : null;
       let snapshotDelegateId: string | null | undefined = undefined;
       let snapshotState: string | null | undefined = undefined;
       // AI-2115 Bug 1: the auth snapshot is keyed only on the sticky intent header
@@ -551,6 +559,27 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // still reuse the snapshot and thus are never re-gated against post-transition
       // state.
       const isTransitionMutation = isIssueUpdateMutation(body);
+
+      // AI-2530 hard-gate: reject intent-resolving requests that lack a command
+      // identity header. Without the nonce, two separate `continue-workflow`
+      // calls from the same agent on the same issue within TTL hash to the
+      // identical snapshot key and the second reuses stale state — a structural
+      // bug with no connector-only fix (proven in the AI-2530 evidence branch).
+      // The header is emitted by skill CLI >= the version shipping this fix;
+      // older CLIs must be updated before the connector accepts their requests.
+      // Only gated on paths that engage meta-intent resolution — plain intents
+      // (begin-work, handoff-work, etc.) don't need a command nonce because they
+      // already resolve to the user-supplied verb directly.
+      if (
+        (intent === 'continue-workflow' || intent === 'request-revision') &&
+        issueId &&
+        !commandId
+      ) {
+        log.warn(`command-nonce-missing agent=${agentId} intent=${intent}${ticketCtx}: connector rejects intent-resolving path without X-Openclaw-Command-Id; upgrade the skill CLI`);
+        res.status(200).json({ errors: [{ message: `Command identity header X-Openclaw-Command-Id is required for '${intent}'. This connector requires skill CLI >= the AI-2530 release that emits per-invocation nonces.` }] });
+        return;
+      }
+
       let snapshotTicketDelegate: string | null | undefined = undefined;
       if (snapshotKey && deps?.commandAuthSnapshots && !isTransitionMutation) {
         const existing = deps.commandAuthSnapshots.get(snapshotKey);

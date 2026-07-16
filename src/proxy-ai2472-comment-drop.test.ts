@@ -311,13 +311,14 @@ describe("proxy — AI-2472: commentCreate must NOT be dropped under sticky inte
   /**
    * Helper: send a request to the proxy with the standard governed-ticket headers.
    */
-  const sendWithIntent = (payload: object, intent = "continue-workflow") =>
+  const sendWithIntent = (payload: object, intent = "continue-workflow", commandId?: string) =>
     request(appState.app)
       .post("/proxy/graphql")
       .set("Authorization", "Bearer tok-astrid")
       .set("X-Openclaw-Agent", "astrid")
       .set("X-Openclaw-Linear-Cli-Version", "0.3.6")
       .set("X-Openclaw-Linear-Intent", intent)
+      .set("X-Openclaw-Command-Id", commandId ?? crypto.randomUUID())
       .send(payload);
 
   it("AC4: issueUpdate state transition is applied correctly (the first mutation succeeds)", async () => {
@@ -325,7 +326,7 @@ describe("proxy — AI-2472: commentCreate must NOT be dropped under sticky inte
     globalThis.fetch = mf.fetch;
     mf.setWithIdsState("ac-validate");
 
-    const res1 = await sendWithIntent(issueUpdateTriggerBody());
+    const res1 = await sendWithIntent(issueUpdateTriggerBody(), "continue-workflow", crypto.randomUUID());
     expect(res1.status).toBe(200);
     expect(res1.body.errors).toBeUndefined();
 
@@ -343,8 +344,10 @@ describe("proxy — AI-2472: commentCreate must NOT be dropped under sticky inte
     globalThis.fetch = mf.fetch;
     mf.setWithIdsState("ac-validate");
 
+    const cmdId = crypto.randomUUID();
+
     // Write 1: issueUpdate (state transition) — succeeds.
-    const res1 = await sendWithIntent(issueUpdateTriggerBody());
+    const res1 = await sendWithIntent(issueUpdateTriggerBody(), "continue-workflow", cmdId);
     expect(res1.status).toBe(200);
     expect(res1.body.errors).toBeUndefined();
 
@@ -356,9 +359,9 @@ describe("proxy — AI-2472: commentCreate must NOT be dropped under sticky inte
     // Count how many commentCreate calls were forwarded by write 1.
     const afterFirst = commentCreateCount(mf.calls);
 
-    // Write 2: commentCreate under the same sticky intent.
+    // Write 2: commentCreate under the same sticky intent + same commandId.
     // The fix must forward this to Linear, NOT reject it at B1.
-    const res2 = await sendWithIntent(commentCreateBody("reviewer sign-off: all ACs verified"));
+    const res2 = await sendWithIntent(commentCreateBody("reviewer sign-off: all ACs verified"), "continue-workflow", cmdId);
 
     // ── THIS IS THE FIX ASSERTION ─────────────────────────────────────────────
     // The commentCreate mutation must be forwarded to Linear, not blocked at B1.
@@ -386,16 +389,18 @@ describe("proxy — AI-2472: commentCreate must NOT be dropped under sticky inte
     globalThis.fetch = mf.fetch;
     mf.setWithIdsState("ac-validate");
 
+    const cmdId = crypto.randomUUID();
+
     // Write 1: issueUpdate
-    await sendWithIntent(issueUpdateTriggerBody());
+    await sendWithIntent(issueUpdateTriggerBody(), "continue-workflow", cmdId);
     const afterFirst = commentCreateCount(mf.calls);
 
     // Advance context to post-transition state
     mf.setContext("done", null);
     mf.setWithIdsState("done");
 
-    // Write 2: commentCreate
-    const res2 = await sendWithIntent(commentCreateBody("sign-off record"));
+    // Write 2: commentCreate — same commandId as write 1 (same command)
+    const res2 = await sendWithIntent(commentCreateBody("sign-off record"), "continue-workflow", cmdId);
     expect(res2.status).toBe(200);
 
     // The commentCreate must reach Linear. Under the bug, this assertion
@@ -409,15 +414,17 @@ describe("proxy — AI-2472: commentCreate must NOT be dropped under sticky inte
     globalThis.fetch = mf.fetch;
     mf.setWithIdsState("ac-validate");
 
+    const cmdId = crypto.randomUUID();
+
     // Write 1: issueUpdate — transitions ac-validate → done
-    await sendWithIntent(issueUpdateTriggerBody());
+    await sendWithIntent(issueUpdateTriggerBody(), "continue-workflow", cmdId);
 
     // Advance context to done (post-transition)
     mf.setContext("done", null);
     mf.setWithIdsState("done");
 
-    // Write 2: commentCreate — must NOT be blocked by B1 after fix
-    const res2 = await sendWithIntent(commentCreateBody("AC sign-off record"));
+    // Write 2: commentCreate — same commandId as write 1, must NOT be blocked
+    const res2 = await sendWithIntent(commentCreateBody("AC sign-off record"), "continue-workflow", cmdId);
 
     // The response must NOT contain a workflow-gate rejection.
     // Under the bug, this contains `[Proxy] 'continue-workflow' has no continue
@@ -432,17 +439,19 @@ describe("proxy — AI-2472: commentCreate must NOT be dropped under sticky inte
     globalThis.fetch = mf.fetch;
     mf.setWithIdsState("implementation");
 
+    const cmdId = crypto.randomUUID();
+
     // submit (implementation → ac-validate) with a comment.
     // Use `submit` intent directly (no meta-resolution needed).
-    const res1 = await sendWithIntent(issueUpdateTriggerBody(), "submit");
+    const res1 = await sendWithIntent(issueUpdateTriggerBody(), "submit", cmdId);
     expect(res1.body.errors).toBeUndefined();
 
     mf.setContext("ac-validate", "u-astrid");
     mf.setWithIdsState("ac-validate");
 
-    // Second mutation: commentCreate under same sticky intent.
+    // Second mutation: commentCreate under same sticky intent + same commandId.
     const commentText = "Ready for review. All ACs covered.";
-    const res2 = await sendWithIntent(commentCreateBody(commentText), "submit");
+    const res2 = await sendWithIntent(commentCreateBody(commentText), "submit", cmdId);
 
     // Must NOT get a B1 workflow rejection.
     expect(res2.body.errors).toBeUndefined();

@@ -379,6 +379,7 @@ describe("proxy — AI-1860: governed transitions are atomic (source-state + del
     token: string;
     intent: string;
     target?: string;
+    commandId?: string;
     srcState: string;
     srcDelegate: string | null;
     dstState: string;
@@ -397,6 +398,7 @@ describe("proxy — AI-1860: governed transitions are atomic (source-state + del
         .set("X-Openclaw-Agent", opts.agent)
         .set("X-Openclaw-Linear-Cli-Version", "0.3.6")
         .set("X-Openclaw-Linear-Intent", opts.intent);
+      if (opts.commandId) r = r.set("X-Openclaw-Command-Id", opts.commandId);
       if (opts.target) r = r.set("X-Openclaw-Linear-Target", opts.target);
       return r.send(payload);
     };
@@ -496,6 +498,7 @@ describe("proxy — AI-1860: governed transitions are atomic (source-state + del
       agent: "astrid",
       token: "tok-astrid",
       intent: "continue-workflow",
+      commandId: crypto.randomUUID(),
       srcState: "ac-validate",
       srcDelegate: "u-astrid",
       dstState: "done",
@@ -520,6 +523,7 @@ describe("proxy — AI-1860: governed transitions are atomic (source-state + del
       token: "tok-astrid",
       intent: "request-revision",
       target: "igor",
+      commandId: crypto.randomUUID(),
       srcState: "ac-validate",
       srcDelegate: "u-astrid",
       dstState: "implementation",
