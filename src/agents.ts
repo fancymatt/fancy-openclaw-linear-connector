@@ -535,6 +535,20 @@ export function getAllTokenStatuses(): TokenStatus[] {
   return _agents.map((a) => getTokenStatus(a.name)!).filter(Boolean);
 }
 
+/**
+ * Symlink target of `p`, or null if `p` is absent or a regular file.
+ * lstat, not stat: stat resolves the link and would report the target's type.
+ */
+function readSymlinkTarget(p: string): string | null {
+  try {
+    if (!fs.lstatSync(p).isSymbolicLink()) return null;
+    return fs.readlinkSync(p);
+  } catch {
+    // ENOENT (nothing there yet) is the normal first-write case.
+    return null;
+  }
+}
+
 /** Sync access token to the agent's workspace secrets file */
 function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
   const agent = _agents.find((a) => a.name === agentName);
@@ -568,12 +582,90 @@ function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
     contents = `LINEAR_OAUTH_TOKEN=${accessToken}\n`;
   }
 
+  // Backstop: an empty token is never a credential, so publishing `LINEAR_OAUTH_TOKEN=`
+  // can only ever destroy access — it cannot grant it. Callers reach here with a blank
+  // token by merging a partial record over a good one (admin.ts did exactly that:
+  // AI-2309), and the write would then land an empty env over a live linear.env and
+  // brick the agent. Whatever is already on disk is strictly better than nothing, so
+  // fail closed and leave it alone. This guards *every* caller, not just the one we
+  // know about — a fixed caller is one fix, a writer that refuses to self-harm is a
+  // property.
+  const tokenToWrite = agent.proxyToken || accessToken;
+  if (!tokenToWrite?.trim()) {
+    log.error(
+      `Refusing to write an empty credential to ${secretsPath} for "${agentName}" — ` +
+        `no proxyToken and no accessToken. This is a provisioning bug in the caller; ` +
+        `leaving any existing credential file untouched.`,
+    );
+    return;
+  }
+
+  // Publish atomically. This runs on every token refresh while readers (the */30
+  // liveness cron among them) are reading the same file, so a truncate-then-write
+  // in place would hand them an empty or half-written env — no `lpx_` line, a
+  // silent credential downgrade, and a 401 that looks like a revoked token.
+  // Write a temp file in the SAME directory (rename(2) is only atomic within one
+  // filesystem), fix its mode to 0600 on the fd before the name is resolvable, then
+  // rename it over the target. A reader then sees either the whole old file or the
+  // whole new one — and never a world-readable one. (AI-2288)
+  const dir = path.dirname(secretsPath);
+  const tmpPath = path.join(dir, `.${path.basename(secretsPath)}.${process.pid}.${crypto.randomUUID()}.tmp`);
   try {
-    fs.mkdirSync(path.dirname(secretsPath), { recursive: true });
-    fs.writeFileSync(secretsPath, contents, "utf8");
-    fs.chmodSync(secretsPath, 0o600);
+    fs.mkdirSync(dir, { recursive: true });
+    let fd: number | undefined;
+    try {
+      // "wx" fails rather than clobbers if the temp name somehow exists.
+      fd = fs.openSync(tmpPath, "wx", 0o600);
+      fs.writeFileSync(fd, contents, "utf8");
+      // Explicit fchmod: the open(2) mode argument is masked by umask, so it alone
+      // cannot guarantee 0600.
+      fs.fchmodSync(fd, 0o600);
+      fs.fsyncSync(fd);
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+
+    // A symlink at a canonical `.secrets/linear.env` is never legitimate, and it is
+    // actively dangerous: writeFileSync follows symlinks, so the old in-place write
+    // published this agent's token *through* the link into whatever it pointed at.
+    // That fired in production on 2026-07-14 — an off-by-one relative link resolved
+    // grover's linear.env onto main's, and grover's proxy token was written into
+    // main's credential file (AI-2289).
+    //
+    // The rename below inherently reclaims the path (rename(2) replaces the link
+    // itself, never its target), so the clobber cannot recur. But a silent reclaim
+    // would erase the only evidence that something is creating these links, so shout
+    // first. Reclaim rather than bail: refusing to write would leave the agent
+    // holding the bad symlink and locked out of Linear — the very outage being fixed.
+    const linkTarget = readSymlinkTarget(secretsPath);
+    if (linkTarget !== null) {
+      const resolved = path.resolve(dir, linkTarget);
+      log.error(
+        `SECURITY: ${secretsPath} was a symlink -> ${linkTarget} (resolves to ${resolved}). ` +
+          `Credential paths must be regular files; reclaiming it as one. ` +
+          `Any token previously synced for "${agentName}" may have been written through this link into ${resolved}.`,
+      );
+      notify({
+        severity: "critical",
+        source: "agents",
+        title: `Symlinked credential path reclaimed for "${agentName}"`,
+        detail:
+          `${secretsPath} was a symlink to ${resolved}. The pre-rename writer followed it, so ${resolved} ` +
+          `may hold "${agentName}"'s token. Rotate if so, and find what created the link (AI-2297).`,
+        dedupKey: `agents|symlinked-secrets|${agentName}`,
+      });
+    }
+
+    fs.renameSync(tmpPath, secretsPath);
     log.info(`Synced ${agent.proxyToken ? "proxy token" : "token"} to ${secretsPath}`);
   } catch (err) {
+    // Fail closed: leave whatever credentials were already in place untouched and
+    // valid, rather than a partial file that no reader can use.
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // Nothing to clean up.
+    }
     log.error(`Failed to sync token to ${secretsPath}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
@@ -615,6 +707,16 @@ export function updateAgentMetadata(
   return updated;
 }
 
+/**
+ * Mint a new opaque proxy token (`lpx_`-prefixed) for an agent.
+ * The proxy token is what the agent presents as its Authorization header;
+ * the connector resolves it to the agent and swaps in the vaulted real token
+ * for the upstream Linear API call. It is useless against api.linear.app directly.
+ */
+export function mintProxyToken(): string {
+  return "lpx_" + crypto.randomBytes(24).toString("hex");
+}
+
 export function upsertAgent(config: AgentConfig): { isNew: boolean } {
   // Match by name first (for partial entries that don't have linearUserId yet)
   // then fall back to linearUserId for token refresh updates. The fallback must
@@ -633,17 +735,45 @@ export function upsertAgent(config: AgentConfig): { isNew: boolean } {
     // Reconcile the merged entry, not the incoming patch: a partial upsert that
     // omits refreshToken must not read as "no credential" when the stored entry
     // has one.
-    _agents = _agents.map((a) =>
-      a === existing
-        ? reconcileStatusWithCredential({ ...a, ...config })
-        : a
-    );
+    _agents = _agents.map((a) => {
+      if (a !== existing) return a;
+      const merged = reconcileStatusWithCredential({ ...a, ...config });
+      // An agent onboarded partially (no upstream token yet) has no proxy token
+      // to mint against; when its real token finally arrives on this update
+      // path, mint then — otherwise syncWorkspaceSecrets falls back to
+      // publishing the raw upstream token, the exact leak AI-2308 closes.
+      if (needsProxyToken(merged)) {
+        merged.proxyToken = mintProxyToken();
+      }
+      return merged;
+    });
     save(_agents);
     syncWorkspaceSecrets(config.name, config.accessToken);
     return { isNew: false };
   }
+  // Mint a proxy token for a new agent before it hits disk so that
+  // syncWorkspaceSecrets always has a `lpx_` credential to write — never
+  // the raw upstream `lin_oauth_` token (AI-2308). Already-provisioned
+  // agents with an existing proxyToken are untouched.
+  if (needsProxyToken(config)) {
+    config.proxyToken = mintProxyToken();
+  }
+
   _agents.push(reconcileStatusWithCredential(config));
   save(_agents);
   syncWorkspaceSecrets(config.name, config.accessToken);
   return { isNew: true };
+}
+
+/**
+ * Mint only when there is a real upstream token to broker.
+ *
+ * A proxy token is a stand-in for a vaulted `accessToken`; minting one for an
+ * agent that has no upstream credential yet would publish a linear.env that
+ * reads as provisioned but brokers nothing — the "configured-but-broken"
+ * credential file AI-2309 exists to prevent. With no token on either side,
+ * syncWorkspaceSecrets' empty-credential guard declines to write at all.
+ */
+function needsProxyToken(config: AgentConfig): boolean {
+  return !config.proxyToken && Boolean(config.accessToken?.trim());
 }

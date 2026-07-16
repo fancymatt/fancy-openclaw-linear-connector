@@ -1506,14 +1506,23 @@ export function createAdminRouter(deps: AdminDeps): Router {
       return;
     }
 
+    // upsertAgent merges `{...existing, ...config}`, so every field named here
+    // overwrites what is already on the record. The 409 above only rejects a
+    // *fully* onboarded agent (accessToken AND linearUserId), so a partially
+    // onboarded one — access token issued, OAuth callback not yet returned a
+    // linearUserId — falls through to here. Blanking these unconditionally would
+    // overwrite its good access token with "", and syncWorkspaceSecrets would then
+    // publish an empty LINEAR_OAUTH_TOKEN= over its live linear.env, bricking the
+    // agent's Linear access. Carry existing values forward and only default to ""
+    // when there is genuinely nothing to preserve (matches onboard-wizard.ts).
     upsertAgent({
       name: agentName,
       displayName: typeof body.displayName === "string" ? body.displayName : undefined,
-      linearUserId: "",
+      linearUserId: existing?.linearUserId ?? "",
       clientId,
       clientSecret,
-      accessToken: "",
-      refreshToken: "",
+      accessToken: existing?.accessToken ?? "",
+      refreshToken: existing?.refreshToken ?? "",
       ...(openclawAgent ? { openclawAgent } : {}),
       ...(hostRaw ? { host: hostRaw } : {}),
     });

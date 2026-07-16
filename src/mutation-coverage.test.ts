@@ -1479,7 +1479,9 @@ describe("agents.ts: uncovered branches (G-21)", () => {
     const expectedPath = path.join(secretsDir, "noah", "linear.env");
     expect(fs.existsSync(expectedPath)).toBe(true);
     const contents = fs.readFileSync(expectedPath, "utf8");
-    expect(contents).toContain("LINEAR_OAUTH_TOKEN=tok-noah");
+    // AI-2308: new agents get a minted proxy token instead of the raw upstream token.
+    expect(contents).toMatch(/LINEAR_OAUTH_TOKEN=lpx_/);
+    expect(contents).not.toContain("LINEAR_OAUTH_TOKEN=tok-noah");
   });
 
   // AC2-AG-3: proxyToken set without proxyUrl — only token line written (line 291-292)
