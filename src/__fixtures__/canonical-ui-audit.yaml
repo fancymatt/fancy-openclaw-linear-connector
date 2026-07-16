@@ -1,19 +1,18 @@
 # ui-audit — Archetype B (orchestrator) workflow definition
-# spec of record: AI-2207 (description + failure-path comment 2026-07-13)
-# owner: steward (intake/cap-hit), visual-reviewer (planning/capture/review/fail)
+# spec of record: AI-2207 + AI-2525
+# owner: steward (intake/cap-hit), visual-reviewer (planning/review/fail),
+#         browser-automation (capture)
 # version history: bump `version` on any state/edge change.
 #
-# Visual audit gate for user-facing sprints. Spawned conditionally by the sprint
-# steward at milestone-close time when any impl ticket carried a `ui-impact`
-# label or touched CSS/TSX in frontend directories.
+# Visual audit gate for user-facing sprints.
+#
+# v1 (AI-2207): visual-reviewer handled capture as manual walkthrough.
+# v2 (AI-2525): capture automated via browser-automation role (Playwright).
 #
 # Verbatim copy of the live instance config at:
 #   /home/node/linear-connector/workflows/ui-audit.yaml (host: Nakazawa)
 # Used as a test fixture so CI can exercise the canonical schema without
 # depending on the host being present. Keep in sync with the live instance file.
-#
-# Capture state uses visual-reviewer for v1 (manual walkthrough). The `browser-
-# automation` role and Playwright-driven capture are follow-up work (AI-2525).
 #
 # State machine:
 #   intake → planning → capture → review → done ✓
@@ -24,7 +23,7 @@
 #                                                → abandon → escape ✗
 
 id: ui-audit
-version: 1
+version: 2
 archetype: orchestrator
 entry_state: intake
 
@@ -39,35 +38,27 @@ states:
     owner_role: steward
     kind: normal
     native_state: todo
-    # Sprint steward spawns this ticket with affected screen list derived from
-    # impl tickets' acceptance criteria. Accept → assign visual reviewer and start.
-    # Waive → no ui-impact tickets in sprint; unblocks milestone close immediately.
     transitions:
       - command: accept
         to: planning
         assign: { mode: required }
       - command: waive
-        to: done-waived      # sprint had no ui-impact — gate bypassed
+        to: done-waived
       - command: demote
-        to: __ad_hoc__       # ticket leaves the workflow entirely
+        to: __ad_hoc__
 
   - id: planning
     owner_role: visual-reviewer
     kind: normal
     native_state: thinking
-    # Confirm the screen list, select breakpoints (desktop ≥1280px, tablet 768px,
-    # mobile 375px), determine baseline strategy (regression vs. first-run).
     transitions:
       - command: begin-capture
         to: capture
 
   - id: capture
-    owner_role: visual-reviewer     # v1: manual screenshot walkthrough
-    kind: normal                    # follow-up AI ticket: Playwright browser-automation (AI-2525)
+    owner_role: browser-automation
+    kind: normal
     native_state: doing
-    # Walk every affected screen at each breakpoint. Attach screenshots to ticket.
-    # If baselines exist: run pixel diff and flag deviations. Save new baselines
-    # on first-run or when baseline drift is intentional (Class 3).
     transitions:
       - command: complete-capture
         to: review
@@ -76,57 +67,46 @@ states:
     owner_role: visual-reviewer
     kind: normal
     native_state: thinking
-    # Produce a structured verdict. Post issue table on fail (class 1-3,
-    # severity blocker/follow-up, action). No new blockers → pass.
-    # All issues are follow-ups → pass-with-followups (sprint may close).
     transitions:
       - command: pass
-        to: done                    # clean pass — no issues found
+        to: done
       - command: pass-with-followups
-        to: done                    # all issues are follow-ups; sprint may close;
-                                    #   reviewer MUST file follow-up tickets before this command
+        to: done
       - command: fail
-        to: fail                    # at least one blocker issue found
+        to: fail
 
   - id: fail
     owner_role: visual-reviewer
     kind: normal
     native_state: todo
-    # Reviewer files fix tickets per failure class, then decides next action.
-    # retry-capture: loop back to capture after fix is deployed (max 2x per screen;
-    #   reviewer tracks the count — escalate when cap is hit).
-    # resolve: all blockers were reclassified as follow-ups after deeper review.
-    # escalate: retry cap exhausted; hand to steward for a waive-or-abandon decision.
     transitions:
       - command: retry-capture
-        to: capture                 # fix deployed; re-run for affected screens only
+        to: capture
       - command: resolve
-        to: done                    # reclassified: all issues are follow-ups
+        to: done
       - command: escalate
-        to: cap-hit                 # retry cap hit; steward decides
+        to: cap-hit
 
   - id: cap-hit
     owner_role: steward
     kind: normal
     native_state: todo
-    # Retry cap exhausted. Steward decides: accept the state and waive the blocker
-    # (with explicit reason), or abandon the audit as unresolvable this sprint.
     transitions:
       - command: waive
-        to: done-waived             # steward explicitly accepts known regression
+        to: done-waived
       - command: abandon
-        to: escape                  # sprint closes without visual gate; escalation warranted
+        to: escape
 
   - id: done
     kind: terminal
     native_state: done
-    satisfies_parent_barrier: true   # unblocks sprint milestone close gate
+    satisfies_parent_barrier: true
 
   - id: done-waived
     kind: terminal
     native_state: done
-    satisfies_parent_barrier: true   # sprint may close (gate waived or no ui-impact)
+    satisfies_parent_barrier: true
 
   - id: escape
     kind: terminal
-    native_state: invalid            # abnormal exit; steward determines if Matt escalation warranted
+    native_state: invalid
