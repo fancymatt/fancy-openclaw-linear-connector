@@ -755,7 +755,7 @@ docker run -d \
   -v ./data:/data \
   -v ./secrets:/secrets \
   -v ./config/agents.json:/config/agents.json:ro \
-  ghcr.io/fancymatt/openclaw-linear-connector:latest
+  ghcr.io/fancyfleet/fancy-openclaw-linear-connector:latest
 ```
 
 ### Volume Mounts

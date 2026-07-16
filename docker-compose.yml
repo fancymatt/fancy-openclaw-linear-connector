@@ -1,6 +1,6 @@
 services:
   linear-connector:
-    image: ghcr.io/fancymatt/openclaw-linear-connector:latest
+    image: ghcr.io/fancyfleet/fancy-openclaw-linear-connector:latest
     container_name: linear-connector
     restart: unless-stopped
     ports:
