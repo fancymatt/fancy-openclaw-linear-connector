@@ -58,9 +58,19 @@ export interface AgentConfig {
    * MUST be the agent's own URL. Never populate it from a global env URL — that
    * points at a single gateway and strands every other agent as "Unknown agent"
    * (see the trap note in `src/webhook/index.ts`).
+   *
+   * AI-2515 — **writing this field (with `gatewayToken`) is a live cutover for
+   * this agent, not inert prep.** This file hot-reloads and delivery selects the
+   * gateway path on presence of the two fields alone. No enable flag gates it;
+   * `REQUIRE_GATEWAY_DELIVERY` does not gate it either — despite the name, that
+   * flag only controls whether an *unpopulated* agent refuses. Every delivery
+   * path for this agent moves at once (dispatch, wake-ups, managing-wake,
+   * stuck-delegate-detector, stale-session re-poke). Selection is per-agent, so
+   * populate one agent at a time to canary. See `src/delivery/deliver.ts`.
    */
   gatewayUrl?: string;
-  /** AI-2420: Per-agent operator token for the gateway `/v1` API (sent as `Authorization: Bearer <token>`). */
+  /** AI-2420: Per-agent operator token for the gateway `/v1` API (sent as `Authorization: Bearer <token>`).
+   *  AI-2515: second half of the live switch — see the cutover note on `gatewayUrl`. */
   gatewayToken?: string;
   /** Maximum concurrent sessions this agent can handle. Overrides the global default. */
   maxConcurrent?: number;

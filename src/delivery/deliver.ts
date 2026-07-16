@@ -16,18 +16,41 @@ export interface DeliveryConfig {
   /** Gateway OpenAI-compatible API URL (e.g. http://10.10.0.105:18789/v1/chat/completions).
    *  When both gatewayUrl+gatewayToken and hooksUrl+hooksToken are present, the
    *  gateway API path is preferred — it uses x-openclaw-session-key instead of
-   *  the hook payload field, avoiding the need for allowRequestSessionKey=true. */
+   *  the hook payload field, avoiding the need for allowRequestSessionKey=true.
+   *
+   *  **These two fields ARE the switch.** Setting both moves this agent's live
+   *  delivery to the gateway immediately — there is no separate enable, and no
+   *  env var holds it back. See the note at `haveGatewayApi` in
+   *  `deliverMessageToAgent` before populating them (AI-2515). */
   gatewayUrl?: string;
-  /** Gateway operator token for the OpenAI-compatible API (Authorization: Bearer <token>). */
+  /** Gateway operator token for the OpenAI-compatible API (Authorization: Bearer <token>).
+   *  Second half of the switch described on `gatewayUrl` — presence of both
+   *  selects the gateway path. */
   gatewayToken?: string;
   /**
-   * AI-2420: When true, gateway-API delivery is *required* — an agent without
-   * both `gatewayUrl` and `gatewayToken` fails loud instead of silently falling
-   * back to the hook payload-`sessionKey` path (which needs
-   * `allowRequestSessionKey=true` and would silently break once the fleet flips
-   * that flag off). When undefined, the delivery layer reads the fleet switch
-   * from `REQUIRE_GATEWAY_DELIVERY` (default off — preserves the hooks fallback
-   * during the rollout window, AI-2112 scope-4).
+   * AI-2420: **This does not select the delivery path.** It only decides what
+   * happens to an agent that has *no* `gatewayUrl`+`gatewayToken`: refuse, or
+   * fall back to hooks. Nothing here can stop a *populated* agent from using
+   * the gateway — path selection is field presence alone (see `haveGatewayApi`
+   * in `deliverMessageToAgent`).
+   *
+   * When true, gateway-API delivery is *required* — an agent without both
+   * fields fails loud instead of silently falling back to the hook
+   * payload-`sessionKey` path (which needs `allowRequestSessionKey=true` and
+   * would silently break once the fleet flips that flag off). When undefined,
+   * the delivery layer reads the fleet switch from `REQUIRE_GATEWAY_DELIVERY`
+   * (default off — preserves the hooks fallback during the rollout window,
+   * AI-2112 scope-4).
+   *
+   * AI-2515 — the name is a known footgun and is kept only because the rollout
+   * depends on its fail-loud behavior. `REQUIRE_GATEWAY_DELIVERY=false` reads
+   * like "gateway delivery is off", so it invites the inference that populating
+   * `gatewayUrl`/`gatewayToken` is inert prep. It is not: that write is a live
+   * cutover for that agent. Two independent sessions made exactly this
+   * misreading and came within one refusal of scoping a 27-agent live cutover
+   * as "safe prep" (AI-2511, and the AI-2112 07-15 rollout note). If you are
+   * about to write a rollout plan on the strength of this flag being off, the
+   * flag is not what you think it is.
    */
   requireGatewayApi?: boolean;
   timeoutMs?: number;
@@ -131,6 +154,24 @@ export async function deliverMessageToAgent(
   // Prefer the Gateway OpenAI-compatible API path when configured — it uses
   // x-openclaw-session-key header routing instead of the hook payload field,
   // which lets us flip allowRequestSessionKey=false (AI-2111).
+  //
+  // AI-2515 — THIS LINE IS THE SWITCH. Path selection is field presence and
+  // nothing else: no enable flag gates it, and REQUIRE_GATEWAY_DELIVERY does
+  // not (it only reaches the refusal branch below). `agents.json` hot-reloads,
+  // so writing gatewayUrl+gatewayToken for an agent moves that agent's live
+  // delivery from hooks to /v1 the moment the file lands. Populating is a
+  // cutover, not inert prep — stage it per agent and treat each write as a
+  // production change.
+  //
+  // Granularity is per-agent, which is the one piece of good news: every
+  // DeliveryConfig is built from that agent's own agents.json entry (never a
+  // global URL — the fleet is multi-gateway), so populating one agent cuts over
+  // exactly that agent. That is what makes a canary possible without any code.
+  //
+  // Blast radius is not per-agent, though: deliverToAgent delegates here, so
+  // this single selection is shared by EVERY delivery path for that agent —
+  // Linear webhook dispatch, wake-ups (bag/wake-up.ts), managing-wake, the
+  // stuck-delegate-detector, and stale-session re-poke all move together.
   const haveGatewayApi = Boolean(config.gatewayUrl && config.gatewayToken);
 
   // AI-2420: fail-loud when gateway delivery is mandated fleet-wide but this
@@ -138,6 +179,10 @@ export async function deliverMessageToAgent(
   // would deliver via the payload `sessionKey` field, which silently stops
   // working once `allowRequestSessionKey` flips to false — surfacing as
   // mis-routed/dropped dispatches rather than an error. Refuse instead.
+  //
+  // AI-2515: this branch is the ONLY thing REQUIRE_GATEWAY_DELIVERY gates. Note
+  // the predicate — it fires only when the agent is UNpopulated. A populated
+  // agent never reaches it and goes to the gateway regardless of this flag.
   const requireGatewayApi = config.requireGatewayApi ?? process.env.REQUIRE_GATEWAY_DELIVERY === "true";
   if (requireGatewayApi && !haveGatewayApi) {
     const summary =
