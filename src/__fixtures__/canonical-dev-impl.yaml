@@ -47,9 +47,16 @@
 #   In-flight tickets at the old `state:deployment` / `state:host-deploy` labels
 #   are migrated via escape → re-intake (the state labels no longer exist in the
 #   def, so the gate rejects any command from them — operators must escape).
+#
+# v11 (2026-07-16, AI-2463 — Astrid): add ac-validate → deploy edge for stale artifact.
+#   New transition `ac-mismatch` from ac-validate back to deploy, so a validator
+#   who finds the running artifact does not include the merge commit can route
+#   the ticket to a redeploy without routing through a dev body (the code is
+#   correct; the artifact is stale). Feedback categories: ac-mismatch, stale-artifact.
+#   `assign: { mode: auto }` routes to host-deploy (Grover), not role dev.
 
 id: dev-impl
-version: 10
+version: 11
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
 
@@ -212,6 +219,11 @@ states:
     # Final gate (design note, 2026-06-10): re-verify the DEPLOYED artifact
     # satisfies the captured acceptance criteria in real conditions before `done`.
     # Closes the "every step verified the artifact, none verified the outcome" gap.
+    #
+    # AI-2463: ac-mismatch transition routes back to deploy when the running
+    # artifact is stale (code is correct, deploy didn't land). Unlike ac-fail,
+    # this targets host-deploy (Grover), not role dev — the code is fine, the
+    # artifact just needs redeploying. Feedback categories: ac-mismatch, stale-artifact.
     transitions:
       - command: validated
         to: done
@@ -227,6 +239,15 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+      - command: ac-mismatch
+        to: deploy
+        requires_comment: true
+        feedback:
+          required: true
+          category_enum:
+            - ac-mismatch
+            - stale-artifact
+        assign: { mode: auto }     # auto-assigns to host-deploy (Grover), not role dev
 
   - id: done
     kind: terminal
