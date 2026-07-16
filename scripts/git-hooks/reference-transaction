@@ -38,6 +38,23 @@
 # Escape hatch: OC_GIT_UNSAFE=1 (human, having read the above).
 set -uo pipefail
 
+# ── Version stamp (INF-19) ────────────────────────────────────────────────────
+# Bump this whenever the veto logic below changes. Two jobs:
+#   1. Provenance — a refusal prints this, and `reference-transaction --version`
+#      prints it, so a bug report can state which hook ACTUALLY ran (the whole
+#      INF-17 misdiagnosis was a stale armed copy printing a since-removed lie).
+#   2. Drift detection — scripts/connector-reftxn-arm.sh --check compares the
+#      armed copy to the tracked source by content; this stamp makes the mismatch
+#      human-legible. The armed copy is byte-identical to source, so a lower
+#      version here than in scripts/git-hooks/ means the armed copy is stale.
+REFTXN_HOOK_VERSION="2026.07.16+atomic-veto"
+
+# Health-check / provenance path: `reference-transaction --version` prints the
+# stamp of the copy that is actually installed, then exits. git only ever invokes
+# this hook with a transaction state ($1 = prepared|committed|aborted), so a
+# --version arg is unambiguous and safe.
+[ "${1:-}" = "--version" ] && { printf '%s\n' "$REFTXN_HOOK_VERSION"; exit 0; }
+
 [ "${1:-}" = "prepared" ] || exit 0
 [ "${OC_GIT_UNSAFE:-}" = "1" ] && exit 0
 
@@ -122,4 +139,6 @@ cat >&2 <<'MSG'
   Human override, having read the above: OC_GIT_UNSAFE=1 git ... (AI-2481)
 ──────────────────────────────────────────────────────────────────────────
 MSG
+# Provenance stamp so a bug report names the hook that actually vetoed (INF-19).
+echo "  [reference-transaction hook version: $REFTXN_HOOK_VERSION]" >&2
 exit 1
