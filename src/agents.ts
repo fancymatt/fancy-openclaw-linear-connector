@@ -617,15 +617,24 @@ export function updateAgentMetadata(
 
 export function upsertAgent(config: AgentConfig): { isNew: boolean } {
   // Match by name first (for partial entries that don't have linearUserId yet)
-  // then fall back to linearUserId for token refresh updates
+  // then fall back to linearUserId for token refresh updates. The fallback must
+  // not fire on a falsy id: partial entries are written with linearUserId ""
+  // (admin.ts, onboard-wizard.ts), so an unguarded lookup matches an unrelated
+  // partial and would clobber it on the next onboard.
   const existing = _agents.find((a) => a.name === config.name) ??
-    _agents.find((a) => a.linearUserId === config.linearUserId);
+    (config.linearUserId
+      ? _agents.find((a) => a.linearUserId === config.linearUserId)
+      : undefined);
   if (existing) {
+    // Key the write off the resolved entry, not a re-derived name predicate:
+    // an entry found via the linearUserId fallback has a different name, so
+    // matching on name again would write nothing and still report isNew: false.
+    //
     // Reconcile the merged entry, not the incoming patch: a partial upsert that
     // omits refreshToken must not read as "no credential" when the stored entry
     // has one.
     _agents = _agents.map((a) =>
-      a.name === config.name
+      a === existing
         ? reconcileStatusWithCredential({ ...a, ...config })
         : a
     );

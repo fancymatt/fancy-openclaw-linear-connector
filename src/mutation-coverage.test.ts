@@ -1547,10 +1547,12 @@ describe("agents.ts: uncovered branches (G-21)", () => {
     expect(tok).toBeUndefined();
   });
 
-  // AC2-AG-7: upsertAgent matches existing by linearUserId when name differs (line 312)
-  // The upsert first matches by name; if no name match, it falls through to linearUserId.
-  // A mutant removing the fallback lookup would create a duplicate instead of updating.
-  it("updates an existing agent matched by linearUserId when the name also matches", () => {
+  // AC2-AG-7: upsertAgent updates an existing agent on the name-match path.
+  // Note this does NOT reach the linearUserId fallback despite its original
+  // name: both upserts below pass name "igor", so the name match short-circuits
+  // and a mutant removing the fallback lookup survives here. The fallback and
+  // its falsy-id guard are covered in ai-2453-upsert-rename-write.test.ts.
+  it("updates an existing agent matched by name", () => {
     const secretsPath = path.join(dir, "existing.env");
     upsertAgent({
       name: "igor",
