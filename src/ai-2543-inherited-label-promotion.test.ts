@@ -632,6 +632,50 @@ describe("AI-2543 SITE 1 — governed transition on a sub-team with inherited st
     expect(landed.stateId).toBe("s-doing");
   });
 
+  /**
+   * AI-2543 diagnostic contract (raised by Ai on the ticket, 2026-07-17T00:46Z,
+   * corroborated from AGI-5): the fallback is also what MASKED this failure. By
+   * returning a foreign id instead of null it sends the caller on to the atomic
+   * write, so an unresolvable label surfaces as `atomic-mutation-failed`
+   * (mutation-class) instead of the self-describing `label-resolve-failed`
+   * (label-resolve-class, workflow-gate.ts:3658). That single swap is why this
+   * was chased first as an artifact-gate bug and then as AI-2532. Without this
+   * pin the next occurrence is just as opaque even after AI-2544 lands.
+   */
+  it("AC1 (fail-closed): an unresolvable inherited conflict fails label-resolve-class, NOT mutation-class", async () => {
+    const fake = makeFakeLinear(
+      {
+        teams: [LIF_TEAM, GEN_TEAM],
+        labels: [
+          { id: "lbl-lif-wf", name: "wf:dev-impl", teamId: LIF_TEAM },
+          { id: "lbl-lif-intake", name: "state:intake", teamId: LIF_TEAM },
+          { id: "lbl-gen-impl", name: "state:implementation", teamId: GEN_TEAM },
+        ],
+        promotionFails: true,
+        issue: {
+          internalId: "lif-issue-uuid",
+          identifier: "LIF-35",
+          teamId: LIF_TEAM,
+          labelIds: ["lbl-lif-wf", "lbl-lif-intake"],
+          delegateId: "u-astrid",
+          stateId: "s-todo",
+        },
+      },
+      originalFetch,
+    );
+    globalThis.fetch = fake.fetch;
+
+    const res = await acceptToImplementation();
+
+    expect(res.body._workflowTransition).toBeDefined();
+    expect(res.body._workflowTransition.status).toBe("failed");
+    // Today: the borrowed id reaches the atomic write and this reads
+    // "atomic-mutation-failed" — the opacity that misrouted the investigation.
+    expect(res.body._workflowTransition.code).toBe("label-resolve-failed");
+    // An unusable label id must never reach the write at all.
+    expect(fake.calls.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(false);
+  });
+
   // ── AC3 no-regression control: this SHOULD pass today and must keep passing ──
 
   it("AC3 (no-regression): an AI-team transition that owns its labels never enters the fallback or promotion path", async () => {
