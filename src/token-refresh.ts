@@ -11,7 +11,7 @@
  * visible alert once every attempt has failed.
  */
 
-import { getAgents, updateTokens, recordTokenFailure, isAgentLocal, isPolledForLinear } from "./agents.js";
+import { getAgents, getTokenStatus, updateTokens, recordTokenFailure, isAgentLocal, isPolledForLinear } from "./agents.js";
 import type { AgentConfig } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
 import { notify } from "./alerts/alert-bus.js";
@@ -152,15 +152,16 @@ async function refreshAgent(agent: AgentConfig, opts: RefreshOptions = {}): Prom
     `Token refresh exhausted all ${maxAttempts} attempts for ${agent.name}: ${last.ok ? "" : last.reason}`,
   );
 
-  const agentCfg = getAgents().find((a) => a.name === agent.name);
-  const deadline = agentCfg?.expiresAt
-    ? ` — token expires at ${agentCfg.expiresAt}`
+  const status = getTokenStatus(agent.name);
+  const tokenState = status?.state ?? "unknown";
+  const deadline = status?.expiresAt
+    ? ` — token expires at ${status.expiresAt}`
     : " — no expiry recorded (token may already be expired or was never refreshed)";
 
   notify({
     severity: "critical",
     source: "token-refresh",
-    title: `Linear OAuth refresh failed for ${agent.name} after ${maxAttempts} attempts${deadline}`,
+    title: `Linear OAuth refresh failed for ${agent.name} (state: ${tokenState}) after ${maxAttempts} attempts${deadline}`,
     detail: last.ok ? undefined : last.reason,
     agent: agent.name,
   });
