@@ -505,6 +505,25 @@ export function validateFanoutSpec(
         }
       }
     }
+
+    // INF-41: validate config default child_workflow against the registry.
+    // When at least one finding lacks a per-entry [wf:...] marker, the config
+    // default applies to that finding — the default must be registered.
+    // Marker-less findings have child_workflow undefined; the default is
+    // applied at spawn time (finding.child_workflow ?? childWorkflowLabel).
+    const hasMarkerLessFindings = findings.some((f) => !f.child_workflow);
+    if (hasMarkerLessFindings && config.child_workflow) {
+      const defId = config.child_workflow.startsWith("wf:") ? config.child_workflow.slice(3) : config.child_workflow;
+      if (!registeredWorkflows.has(config.child_workflow) && !registeredWorkflows.has(defId)) {
+        return {
+          ok: false,
+          reason: `fan-out config default child_workflow '${config.child_workflow}' is not a registered workflow. ` +
+            `The config default applies to marker-less spec entries (no [wf:...] per-entry override), but no workflow ` +
+            `definition for '${config.child_workflow}' was found. Register the workflow def or ensure all spec entries ` +
+            `declare an explicit [wf:...] marker referencing a registered workflow, then retry.`,
+        };
+      }
+    }
   }
   return { ok: true, findings };
 }
@@ -764,7 +783,6 @@ async function fetchIssueTeamAndParent(
 }
 
 /**
- * Create a single child issue in Linear.
  * Returns the child's human-readable identifier (e.g. "AI-1443") on success.
  */
 async function createChildIssue(
