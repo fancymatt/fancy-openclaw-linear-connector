@@ -12,6 +12,12 @@ export interface RouteResult {
   event: LinearEvent;
   routingReason?: "delegate" | "assignee" | "mention" | "body-mention" | "department-prefix" | "steward-escalation";
   coalescedCount?: number;
+  /**
+   * INF-38: Canonical identifier resolved from the event UUID at delivery time.
+   * When set, this is the live identifier (post-move) and should be used in
+   * delivery messages instead of the event-captured identifier.
+   */
+  canonicalIdentifier?: string;
 }
 
 /** Connector service configuration. */

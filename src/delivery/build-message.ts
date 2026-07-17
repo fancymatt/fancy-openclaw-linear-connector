@@ -123,15 +123,16 @@ export async function buildDeliveryMessage(route: RouteResult, authToken?: strin
   const actor = route.event.actor;
   const actorName = actor?.name ?? "Someone";
 
-  // Extract issue identifier from various event shapes
+  // INF-38: prefer the sessionKey-derived identifier (canonicalised at delivery
+  // time by deliverToAgent) over the event-captured identifier, which may be
+  // stale after a team move.
+  const identifier = route.sessionKey.replace("linear-", "");
+
+  // Title is cosmetic display text only — captured from the event, fine to use
+  // as-is (title doesn't change on team move).
   const data = (route.event.data ?? {}) as Record<string, unknown>;
   const sessionData = data.agentSession as Record<string, unknown> | undefined;
   const issueData = (data.issue ?? sessionData?.issue ?? data) as Record<string, unknown>;
-  const identifier = String(
-    issueData?.identifier ??
-      (data as Record<string, unknown>).issueIdentifier ??
-      route.sessionKey.replace("linear-", ""),
-  );
   const title = String(
     issueData?.title ?? (data as Record<string, unknown>).issueTitle ?? "",
   );

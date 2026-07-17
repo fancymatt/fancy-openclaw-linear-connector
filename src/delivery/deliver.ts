@@ -4,6 +4,8 @@ import { createLogger, componentLogger } from "../logger.js";
 import { buildDeliveryMessage } from "./build-message.js";
 import { getAccessToken } from "../agents.js";
 import { getActiveCanonVersion } from "../policy/universal-canon.js";
+import { resolveCanonicalIdentifierFromEvent } from "../canonical-identifier.js";
+import { normalizeSessionKey } from "../session-key.js";
 
 const log = componentLogger(createLogger(), "delivery");
 
@@ -130,6 +132,22 @@ export async function deliverToAgent(
   const authToken = rawToken
     ? /^Bearer\s+/i.test(rawToken) ? rawToken : `Bearer ${rawToken}`
     : undefined;
+
+  // INF-38: resolve UUID → live identifier so that pre- and post-move
+  // dispatches for the same issue use one sessionKey. Fail-open: if the
+  // resolve fails or the event has no UUID, route.sessionKey is unchanged.
+  const canonicalIdentifier = await resolveCanonicalIdentifierFromEvent(route.event, authToken);
+  if (canonicalIdentifier) {
+    const canonicalKey = normalizeSessionKey(`linear-${canonicalIdentifier}`);
+    const capturedKey = route.sessionKey;
+    if (canonicalKey !== capturedKey) {
+      log.info(
+        `INF-38: canonicalised sessionKey ${capturedKey} → ${canonicalKey} (issue moved teams)`,
+      );
+      route.sessionKey = canonicalKey;
+    }
+  }
+
   const message = await buildDeliveryMessage(route, authToken);
   // AI-1848: stamp the canon version that was injected by buildDeliveryMessage.
   const canonVersion = getActiveCanonVersion();
