@@ -35,6 +35,7 @@ import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-
 import { registerDelegationReconciliationCron, runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
+import { registerLabelSyncAuditCron } from "./cron/label-sync-audit.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
@@ -1523,6 +1524,18 @@ if (isEntryPoint) {
     log.info(`AI-1773: SLA sweep cron registered (cadence=${slaCadenceMs ?? 300_000}ms, store=${slaBreachStorePath}, defs=${slaWorkflowDefPath})`);
   } else {
     log.warn("AI-1773: SLA sweep cron NOT registered — no Linear auth token available");
+  }
+
+  // AI-2554: label-sync audit cron — periodic check for proxy-store vs Linear state divergence.
+  const labelSyncAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
+  if (labelSyncAuthToken) {
+    registerLabelSyncAuditCron({
+      authToken: labelSyncAuthToken,
+      enrolledTicketsStore,
+    });
+    log.info("AI-2554: label-sync audit cron registered (interval=15m)");
+  } else {
+    log.warn("AI-2554: label-sync audit cron NOT registered — no Linear auth token available");
   }
 
   // G-20: scheduled gate-silently-off canary (AI-1552, §5.1)
