@@ -158,3 +158,111 @@ describe("findOrCreateLabel — group-aware resolution (AI-2176)", () => {
     expect(logged).toContain("state:product-definition");
   });
 });
+
+// ── AI-2020: fetchLastCommentByUser tests ────────────────────────────────
+// The helper returns the last non-empty comment from the specified user, or
+// null if none found. Comments are returned in ascending order from the API;
+// the helper scans newest-to-oldest to find the target user's last comment.
+
+import { fetchLastCommentByUser } from "./linear-helpers.js";
+
+describe("fetchLastCommentByUser — AI-2020", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const USER_ID = "target-user-uuid";
+
+  function makeCommentFetch(
+    comments: Array<{ body: string; createdAt: string; user: { id: string } | null }>,
+  ): typeof globalThis.fetch {
+    return async (url: unknown, init?: RequestInit) => {
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("LastCommentByUser")) {
+          return new Response(
+            JSON.stringify({
+              data: {
+                issue: {
+                  comments: { nodes: comments },
+                },
+              },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+      }
+      return originalFetch(url, init);
+    };
+  }
+
+  it("returns the last (newest) comment from the specified user", async () => {
+    globalThis.fetch = makeCommentFetch([
+      { body: "First comment from target", createdAt: "2026-07-17T10:00:00Z", user: { id: USER_ID } },
+      { body: "Comment from other user", createdAt: "2026-07-17T11:00:00Z", user: { id: "other-uuid" } },
+      { body: "Last comment from target", createdAt: "2026-07-17T12:00:00Z", user: { id: USER_ID } },
+    ]);
+    const result = await fetchLastCommentByUser("AI-2020", USER_ID, "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result!.body).toBe("Last comment from target");
+    expect(result!.createdAt).toBe("2026-07-17T12:00:00Z");
+  });
+
+  it("returns null when the specified user has no comments", async () => {
+    globalThis.fetch = makeCommentFetch([
+      { body: "Comment from other user", createdAt: "2026-07-17T10:00:00Z", user: { id: "other-uuid" } },
+      { body: "Another comment", createdAt: "2026-07-17T11:00:00Z", user: { id: "other-uuid-2" } },
+    ]);
+    const result = await fetchLastCommentByUser("AI-2020", USER_ID, "Bearer tok");
+    expect(result).toBeNull();
+  });
+
+  it("returns null when there are no comments at all", async () => {
+    globalThis.fetch = makeCommentFetch([]);
+    const result = await fetchLastCommentByUser("AI-2020", USER_ID, "Bearer tok");
+    expect(result).toBeNull();
+  });
+
+  it("skips empty-body comments from the target user", async () => {
+    globalThis.fetch = makeCommentFetch([
+      { body: "", createdAt: "2026-07-17T10:00:00Z", user: { id: USER_ID } },
+      { body: "   ", createdAt: "2026-07-17T11:00:00Z", user: { id: USER_ID } },
+      { body: "Real comment", createdAt: "2026-07-17T12:00:00Z", user: { id: USER_ID } },
+    ]);
+    const result = await fetchLastCommentByUser("AI-2020", USER_ID, "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result!.body).toBe("Real comment");
+  });
+
+  it("returns null when the user only has empty-body comments", async () => {
+    globalThis.fetch = makeCommentFetch([
+      { body: "", createdAt: "2026-07-17T10:00:00Z", user: { id: USER_ID } },
+      { body: "   ", createdAt: "2026-07-17T11:00:00Z", user: { id: USER_ID } },
+    ]);
+    const result = await fetchLastCommentByUser("AI-2020", USER_ID, "Bearer tok");
+    expect(result).toBeNull();
+  });
+
+  it("returns null and does not throw when API call fails", async () => {
+    globalThis.fetch = async () => { throw new Error("network error"); };
+    const result = await fetchLastCommentByUser("AI-2020", USER_ID, "Bearer tok");
+    expect(result).toBeNull();
+  });
+
+  it("returns null when issue is not found", async () => {
+    globalThis.fetch = async () => {
+      return new Response(
+        JSON.stringify({ data: { issue: null } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    };
+    const result = await fetchLastCommentByUser("nonexistent-id", USER_ID, "Bearer tok");
+    expect(result).toBeNull();
+  });
+});
