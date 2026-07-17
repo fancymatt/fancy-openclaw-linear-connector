@@ -407,7 +407,13 @@ describe("AC1: executeFanout per-entry child_workflow", () => {
 
   function makeFetch(
     parentDescription: string,
-    existingTeamLabels: Array<{ id: string; name: string }> = [],
+    existingTeamLabels: Array<{ id: string; name: string }> = [
+      { id: "wf-scope", name: "wf:sprint-arm-scope" },
+      { id: "wf-ux", name: "wf:sprint-arm-ux" },
+      { id: "wf-design", name: "wf:sprint-arm-design" },
+      { id: "wf-spike", name: "wf:sprint-arm-spike" },
+      { id: "state-intake", name: "state:intake" },
+    ],
   ): typeof globalThis.fetch {
     let childCount = 0;
     return async (url, init) => {
@@ -482,15 +488,21 @@ describe("AC1: executeFanout per-entry child_workflow", () => {
     expect(result.created).toBe(4);
     expect(result.refused).toBe(false);
 
-    // Each child must have its own workflow label, NOT the fanout-level default.
+    // INF-27 AC2: mint guard uses findLabel, not ensureLabel, so labels pre-existing
+    // in TeamLabels are never created. Verify children carry the correct labels instead.
     const labelCreates = fetchCalls.filter(
       (c) => c.query.includes("issueLabelCreate") && !c.query.includes("issueCreate"),
     );
-    const labelNames = labelCreates.map((c) => c.variables.name as string);
-    expect(labelNames).toContain("wf:sprint-arm-scope");
-    expect(labelNames).toContain("wf:sprint-arm-ux");
-    expect(labelNames).toContain("wf:sprint-arm-design");
-    expect(labelNames).toContain("wf:sprint-arm-spike");
+    expect(labelCreates).toHaveLength(0);
+    const childCreates = fetchCalls.filter((c) => c.query.includes("issueCreate"));
+    expect(childCreates).toHaveLength(4);
+    const childLabelSets = childCreates.map((c) => (c.variables.input as Record<string, unknown>).labelIds as string[]);
+    // Each child carries its distinct per-entry workflow label.
+    const allChildLabels = new Set(childLabelSets.flat());
+    expect(allChildLabels).toContain("wf-scope");
+    expect(allChildLabels).toContain("wf-ux");
+    expect(allChildLabels).toContain("wf-design");
+    expect(allChildLabels).toContain("wf-spike");
     // The fanout-level default should NOT be the only label used for all children.
     // Count how many times the fanout default was used — it should appear once
     // (for the first child which uses it) or not at all if per-entry overrides.
@@ -501,6 +513,8 @@ describe("AC1: executeFanout per-entry child_workflow", () => {
     const existingTeamLabels = [
       { id: "wf-scope", name: "wf:sprint-arm-scope" },
       { id: "wf-ux", name: "wf:sprint-arm-ux" },
+      { id: "wf-design", name: "wf:sprint-arm-design" },
+      { id: "wf-spike", name: "wf:sprint-arm-spike" },
       { id: "state-intake", name: "state:intake" },
     ];
     globalThis.fetch = makeFetch(PER_ENTRY_SPEC, existingTeamLabels);
@@ -564,17 +578,15 @@ describe("AC1: executeFanout per-entry child_workflow", () => {
     });
 
     expect(result.created).toBe(4);
-    // All children should get the fanout-level default label
-    const labelCreates = fetchCalls.filter(
-      (c) => c.query.includes("issueLabelCreate") && !c.query.includes("issueCreate"),
-    );
-    const labelNames = labelCreates.map((c) => c.variables.name as string);
-    for (const name of labelNames) {
-      // Each child should get the default wf:sprint-arm-scope label
-      // (only one such label needed since all children share it)
+    // INF-27 AC2: mint guard uses findLabel, so wf:sprint-arm-scope is found
+    // in TeamLabels and never created. Verify children carry it instead.
+    const childCreates = fetchCalls.filter((c) => c.query.includes("issueCreate"));
+    expect(childCreates.length).toBe(4);
+    for (const createCall of childCreates) {
+      const input = createCall.variables.input as Record<string, unknown>;
+      const labelIds = input.labelIds as string[];
+      expect(labelIds).toContain("wf-scope");
     }
-    // The fanout-level default label must have been created/used
-    expect(labelNames).toContain("wf:sprint-arm-scope");
   });
 });
 
@@ -735,7 +747,15 @@ describe("AC2: applyStateTransition refuses spawn with unregistered per-entry wo
         return jsonResp({ issue: { id: "parent-internal-id", team: { id: "team-uuid" }, labels: { nodes: parentLabels } } });
       }
       if (query.includes("TeamLabels")) {
-        return jsonResp({ team: { labels: { nodes: [] } } });
+        return jsonResp({
+          team: { labels: { nodes: [
+            { id: "wf-scope", name: "wf:sprint-arm-scope" },
+            { id: "wf-ux", name: "wf:sprint-arm-ux" },
+            { id: "wf-design", name: "wf:sprint-arm-design" },
+            { id: "wf-spike", name: "wf:sprint-arm-spike" },
+            { id: "state-intake", name: "state:intake" },
+          ] } },
+        });
       }
       if (query.includes("TeamStates")) {
         return jsonResp({
@@ -855,7 +875,12 @@ describe("AC3: backward compatibility — entries without per-entry markers", ()
         return jsonResp({ issue: { children: { nodes: [] } } });
       }
       if (query.includes("TeamLabels")) {
-        return jsonResp({ team: { labels: { nodes: [] } } });
+        return jsonResp({
+          team: { labels: { nodes: [
+            { id: "wf-scope", name: "wf:sprint-arm-scope" },
+            { id: "state-intake", name: "state:intake" },
+          ] } },
+        });
       }
       if (query.includes("issueLabelCreate") && !query.includes("issueCreate")) {
         const name = (parsed.variables as Record<string, unknown>).name as string;
@@ -882,12 +907,14 @@ describe("AC3: backward compatibility — entries without per-entry markers", ()
     });
 
     expect(result.created).toBe(4);
-    // All children should have the default wf:sprint-arm-scope label
-    const labelCreates = fetchCalls.filter(
-      (c) => c.query.includes("issueLabelCreate") && !c.query.includes("issueCreate"),
-    );
-    // Should have created the default label (possibly only once since all children share it)
-    expect(labelCreates.some((c) => (c.variables.name as string) === "wf:sprint-arm-scope")).toBe(true);
+    // INF-27 AC2: mint guard finds wf:sprint-arm-scope in TeamLabels; verify children carry it.
+    const childCreates = fetchCalls.filter((c) => c.query.includes("issueCreate"));
+    expect(childCreates.length).toBe(4);
+    for (const createCall of childCreates) {
+      const input = createCall.variables.input as Record<string, unknown>;
+      const labelIds = input.labelIds as string[];
+      expect(labelIds).toContain("wf-scope");
+    }
 
     globalThis.fetch = originalFetch;
   });
@@ -1005,7 +1032,15 @@ describe("AC4: barrier auto-advance with heterogeneous per-workflow children", (
         });
       }
       if (query.includes("TeamLabels")) {
-        return jsonResp({ team: { labels: { nodes: [] } } });
+        return jsonResp({
+          team: { labels: { nodes: [
+            { id: "wf-scope", name: "wf:sprint-arm-scope" },
+            { id: "wf-ux", name: "wf:sprint-arm-ux" },
+            { id: "wf-design", name: "wf:sprint-arm-design" },
+            { id: "wf-spike", name: "wf:sprint-arm-spike" },
+            { id: "state-intake", name: "state:intake" },
+          ] } },
+        });
       }
       if (query.includes("issueLabelCreate")) {
         const name = (parsed.variables as Record<string, unknown>).name as string;
@@ -1072,7 +1107,15 @@ describe("AC4: barrier auto-advance with heterogeneous per-workflow children", (
         });
       }
       if (query.includes("TeamLabels")) {
-        return jsonResp({ team: { labels: { nodes: [] } } });
+        return jsonResp({
+          team: { labels: { nodes: [
+            { id: "wf-scope", name: "wf:sprint-arm-scope" },
+            { id: "wf-ux", name: "wf:sprint-arm-ux" },
+            { id: "wf-design", name: "wf:sprint-arm-design" },
+            { id: "wf-spike", name: "wf:sprint-arm-spike" },
+            { id: "state-intake", name: "state:intake" },
+          ] } },
+        });
       }
       throw new Error(`unexpected query: ${query.slice(0, 80)}`);
     };
@@ -1276,7 +1319,15 @@ describe("Integration: end-to-end spawn with per-entry child workflows", () => {
         return jsonResp({ issue: { children: { nodes: [] } } });
       }
       if (query.includes("TeamLabels")) {
-        return jsonResp({ team: { labels: { nodes: [] } } });
+        return jsonResp({
+          team: { labels: { nodes: [
+            { id: "wf-scope", name: "wf:sprint-arm-scope" },
+            { id: "wf-ux", name: "wf:sprint-arm-ux" },
+            { id: "wf-design", name: "wf:sprint-arm-design" },
+            { id: "wf-spike", name: "wf:sprint-arm-spike" },
+            { id: "state-intake", name: "state:intake" },
+          ] } },
+        });
       }
       if (query.includes("issueLabelCreate") && !query.includes("issueCreate")) {
         const name = (parsed.variables as Record<string, unknown>).name as string;
@@ -1307,17 +1358,16 @@ describe("Integration: end-to-end spawn with per-entry child workflows", () => {
     const childCreates = fetchCalls.filter((c) => c.query.includes("issueCreate"));
     expect(childCreates.length).toBe(4);
 
-    // Each child gets a distinct per-entry workflow label
-    const labelCreates = fetchCalls.filter(
-      (c) => c.query.includes("issueLabelCreate") && !c.query.includes("issueCreate"),
-    );
-    const labelNames = labelCreates.map((c) => c.variables.name as string);
-    expect(labelNames).toContain("wf:sprint-arm-scope");
-    expect(labelNames).toContain("wf:sprint-arm-ux");
-    expect(labelNames).toContain("wf:sprint-arm-design");
-    expect(labelNames).toContain("wf:sprint-arm-spike");
-    // All children also get state:intake
-    expect(labelNames).toContain("state:intake");
+    // INF-27 AC2: labels pre-exist in TeamLabels, check children carry them.
+    const childCreates2 = fetchCalls.filter((c) => c.query.includes("issueCreate"));
+    expect(childCreates2.length).toBe(4);
+    const allChildLabelIds = childCreates2.map((c) => (c.variables.input as Record<string, unknown>).labelIds as string[]);
+    const flatLabels = new Set(allChildLabelIds.flat());
+    expect(flatLabels).toContain("wf-scope");
+    expect(flatLabels).toContain("wf-ux");
+    expect(flatLabels).toContain("wf-design");
+    expect(flatLabels).toContain("wf-spike");
+    expect(flatLabels).toContain("state-intake");
   });
 });
 

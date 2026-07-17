@@ -470,7 +470,7 @@ describe("INF-32 AC4 — regression: second fanout on one parent mints its child
       }
       if (query.includes("TeamLabels")) {
         return new Response(
-          JSON.stringify({ data: { team: { labels: { nodes: [] } } } }),
+          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "label-wf:dev-impl", name: "wf:dev-impl" }, { id: "label-state:intake", name: "state:intake" }, { id: "label-wf:sprint-arm-ux", name: "wf:sprint-arm-ux" }] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -540,11 +540,19 @@ describe("INF-32 AC4 — regression: second fanout on one parent mints its child
     globalThis.fetch = makeFetch(existing);
     await executeFanout("AI-1439", "Bearer tok", FANOUT_B, { skipPreview: true } as never);
 
-    // The wf:* label for the SECOND fan-out's workflow must have been resolved.
+    // INF-27 AC2: mint guard uses findLabel (lookup-only), so wf:sprint-arm-ux
+    // is found in TeamLabels and never created. Verify children carry it instead.
     const labelCalls = fetchCalls.filter((c) => String(c.body.query ?? "").includes("issueLabelCreate"));
     const labelNames = labelCalls.map((c) => (c.body.variables as Record<string, unknown>).name);
-    expect(labelNames).toContain(WF_B);
+    expect(labelNames).not.toContain(WF_B);
     expect(labelNames).not.toContain(WF_A);
+    const childCreates = fetchCalls.filter((c) => String(c.body.query ?? "").includes("issueCreate"));
+    for (const call of childCreates) {
+      const vars = call.body.variables as Record<string, unknown>;
+      const input = vars.input as Record<string, unknown>;
+      const labelIds = input.labelIds as string[];
+      expect(labelIds).toContain("label-wf:sprint-arm-ux");
+    }
   });
 
   it("re-entering the SAME fanout twice still mints nothing (no duplicate-spawn regression)", async () => {

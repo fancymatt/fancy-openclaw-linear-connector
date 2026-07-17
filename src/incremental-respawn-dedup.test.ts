@@ -223,7 +223,7 @@ describe("AI-1994 — executeFanout incremental dedup (mocked Linear API)", () =
       }
       if (query.includes("TeamLabels")) {
         return new Response(
-          JSON.stringify({ data: { team: { labels: { nodes: [] } } } }),
+          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "label-wf:dev-impl", name: "wf:dev-impl" }, { id: "label-state:intake", name: "state:intake" }] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }

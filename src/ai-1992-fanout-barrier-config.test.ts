@@ -421,7 +421,7 @@ describe("AI-1992 executeFanout — child workflow type comes from config, wf:* 
         );
       }
       if (query.includes("TeamLabels")) {
-        return new Response(JSON.stringify({ data: { team: { labels: { nodes: [] } } } }), {
+        return new Response(JSON.stringify({ data: { team: { labels: { nodes: [{ id: "label-wf:dev-impl", name: "wf:dev-impl" }, { id: "label-state:intake", name: "state:intake" }, { id: "label-wf:sprint-arm", name: "wf:sprint-arm" }, { id: "label-wf:custom-child", name: "wf:custom-child" }] } } } }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
         });
@@ -468,15 +468,25 @@ describe("AI-1992 executeFanout — child workflow type comes from config, wf:* 
     const result = await executeFanout("AI-1992", "Bearer tok", config, { skipPreview: true });
 
     expect(result.created).toBeGreaterThanOrEqual(1);
+    // INF-27 AC2: mint guard uses findLabel (lookup-only), so the label is
+    // found in TeamLabels and never created. Assert the child used the correct
+    // label on creation instead.
     const madeCustomLabel = fetchCalls.some(
       (c) => c.query.includes("issueLabelCreate") && c.variables.name === "wf:custom-child",
     );
-    expect(madeCustomLabel).toBe(true);
+    expect(madeCustomLabel).toBe(false);
     // Must NOT fall back to the old hardcoded child label.
     const madeHardcoded = fetchCalls.some(
       (c) => c.query.includes("issueLabelCreate") && c.variables.name === "wf:dev-impl",
     );
     expect(madeHardcoded).toBe(false);
+    // The created child should carry the custom workflow label.
+    const createCalls = fetchCalls.filter((c) => c.query.includes("issueCreate"));
+    for (const call of createCalls) {
+      const input = call.variables.input as Record<string, unknown>;
+      const labelIds = input.labelIds as string[];
+      expect(labelIds).toContain("label-wf:custom-child");
+    }
   });
 });
 
@@ -588,7 +598,7 @@ function makeFanoutIntegrationFetch(opts: {
       });
     }
     if (query.includes("TeamLabels")) {
-      return json({ team: { labels: { nodes: [] } } });
+      return json({ team: { labels: { nodes: [{ id: "label-wf:dev-impl", name: "wf:dev-impl" }, { id: "label-state:intake", name: "state:intake" }, { id: "label-wf:sprint-arm", name: "wf:sprint-arm" }, { id: "label-wf:custom-child", name: "wf:custom-child" }] } } });
     }
     if (query.includes("issueLabelCreate") && !query.includes("issueCreate")) {
       const name = (parsed.variables as Record<string, unknown>).name as string;
@@ -644,7 +654,7 @@ function makeBarrierFetch(opts: {
       return json({ issue: { id: "parent-internal-id", team: { id: "team-uuid" }, labels: { nodes: parentLabels } } });
     }
     if (query.includes("TeamLabels")) {
-      return json({ team: { labels: { nodes: [] } } });
+      return json({ team: { labels: { nodes: [{ id: "label-wf:dev-impl", name: "wf:dev-impl" }, { id: "label-state:intake", name: "state:intake" }, { id: "label-wf:sprint-arm", name: "wf:sprint-arm" }, { id: "label-wf:custom-child", name: "wf:custom-child" }] } } });
     }
     if (query.includes("issueLabelCreate")) {
       const name = (parsed.variables as Record<string, unknown>).name as string;
@@ -828,8 +838,15 @@ describe("AI-1992 two-phase synthetic def — end to end", () => {
     expect(record.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(true);
     const childCreates = record.filter((c) => c.query.includes("issueCreate"));
     expect(childCreates.length).toBeGreaterThanOrEqual(2);
-    // Children are minted under the phase-1 child workflow label.
-    expect(record.some((c) => c.query.includes("issueLabelCreate") && c.variables.name === "wf:sprint-arm")).toBe(true);
+    // INF-27 AC2: wf:sprint-arm is found in TeamLabels (findLabel, not ensureLabel).
+    const labelCreate = record.some((c) => c.query.includes("issueLabelCreate") && c.variables.name === "wf:sprint-arm");
+    expect(labelCreate).toBe(false);
+    // Children carry wf:sprint-arm label on creation.
+    for (const createCall of childCreates) {
+      const input = createCall.variables.input as Record<string, unknown>;
+      const labelIds = input.labelIds as string[];
+      expect(labelIds).toContain("label-wf:sprint-arm");
+    }
   });
 
   it("AC4 barrier 1: all phase-1 children terminal advances managing-arm → impl (config-driven, non-hardcoded workflow)", async () => {
@@ -861,7 +878,15 @@ describe("AI-1992 two-phase synthetic def — end to end", () => {
     expect(record.some((c) => c.query.includes("ApplyAtomicTransition"))).toBe(true);
     const childCreates = record.filter((c) => c.query.includes("issueCreate"));
     expect(childCreates.length).toBeGreaterThanOrEqual(2);
-    expect(record.some((c) => c.query.includes("issueLabelCreate") && c.variables.name === "wf:dev-impl")).toBe(true);
+    // INF-27 AC2: wf:dev-impl is found via findLabel, so no label creation.
+    const devImplCreated = record.some((c) => c.query.includes("issueLabelCreate") && c.variables.name === "wf:dev-impl");
+    expect(devImplCreated).toBe(false);
+    // Children carry wf:dev-impl label on creation.
+    for (const createCall of childCreates) {
+      const input = createCall.variables.input as Record<string, unknown>;
+      const labelIds = input.labelIds as string[];
+      expect(labelIds).toContain("label-wf:dev-impl");
+    }
   });
 
   it("AC4 barrier 2: all phase-2 children terminal advances managing-impl → done", async () => {

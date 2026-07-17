@@ -273,7 +273,7 @@ describe("executeFanout — mocked Linear API", () => {
       description: string | null;
       parentIssueId: string | null;
     };
-    /** Existing team labels. */
+    /** Existing team labels. Default: wf:dev-impl + state:intake for backward compat with INF-27 AC2 mint guard. */
     teamLabels?: Array<{ id: string; name: string }>;
     /** Internal UUID for the parent issue. */
     parentInternalId?: string;
@@ -329,9 +329,13 @@ describe("executeFanout — mocked Linear API", () => {
 
       // Team labels lookup
       if (query.includes("TeamLabels")) {
+        const labels = opts.teamLabels ?? [
+          { id: "label-wf:dev-impl", name: "wf:dev-impl" },
+          { id: "label-state:intake", name: "state:intake" },
+        ];
         return new Response(
           JSON.stringify({
-            data: { team: { labels: { nodes: opts.teamLabels ?? [] } } },
+            data: { team: { labels: { nodes: labels } } },
           }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
@@ -773,7 +777,10 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
       { id: "wf-lbl", name: "wf:ux-audit" },
       { id: "state-lbl", name: "state:spawning" },
     ];
-    const teamLabels = opts.teamLabels ?? [];
+    const teamLabels = opts.teamLabels ?? [
+        { id: "label-wf:dev-impl", name: "wf:dev-impl" },
+        { id: "label-state:intake", name: "state:intake" },
+      ];
     const parentTitle = opts.parentTitle ?? "UX Audit";
     const parentDescription = opts.parentDescription ?? "## Findings\n- **Finding A**: Desc A\n- **Finding B**: Desc B\n";
     let childCount = 0;
