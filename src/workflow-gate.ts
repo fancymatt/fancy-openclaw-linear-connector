@@ -247,6 +247,11 @@ export interface WorkflowDef {
    * than silently stranding in-flight tickets.
    */
   strand_acknowledged?: string[];
+  /** INF-42: Waiver mechanism — invariant_skip per-def. Accepted keys:
+   * "barrier-before-managing", "fanout-before-barrier". Unrecognized keys cause
+   * a hard validation failure (no silent misspellings). The skip is per-def,
+   * not per-state. */
+  invariant_skip?: string[];
   states: WorkflowState[];
 }
 
@@ -475,6 +480,16 @@ export async function loadWorkflowRegistry(): Promise<Map<string, WorkflowDef>> 
 
   _registryCache = registry;
   return registry;
+}
+
+/**
+ * Sync accessor for the cached registry. Returns the registry if already
+ * loaded, or null if the cache is empty (not yet loaded). Used by the
+ * conformance validator (INF-42) to check child_workflow resolution without
+ * requiring an async call when the registry is already in memory.
+ */
+export function getCachedRegistrySync(): Map<string, WorkflowDef> | null {
+  return _registryCache;
 }
 
 /** Invalidate the in-process workflow registry cache (used in tests & live-reload). */

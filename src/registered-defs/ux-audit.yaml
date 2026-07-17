@@ -1,0 +1,91 @@
+# ux-audit — Archetype B (orchestrator) workflow definition
+# design.md §14, §16.1
+# owner: steward (intake), UX researcher (auditing/review), engine (spawning)
+# version history: bump `version` on any state/edge change; in-flight tickets
+#   use the version stamped at their creation time (design.md §12).
+#
+# Verbatim copy of the canonical vault file at:
+#   ai-systems/projects/fleet-orchestration-redesign/workflows/ux-audit.yaml
+# Used as a test fixture so CI can exercise the canonical schema without
+# depending on the vault being present. Keep in sync with the vault source.
+#
+# Phase 5 / B-1 (AI-1438): definition + validation only — no engine/runtime logic.
+# Phase 5 / B-4 (AI-1441): disposition review + parent-AC gate (F2b, §5.6).
+
+id: ux-audit
+version: 2
+archetype: orchestrator
+entry_state: intake
+
+break_glass:
+  command: escape               # x-openclaw-linear-intent value that triggers break-glass (§4.4)
+  to: escape
+  owner_role: steward           # implicit escape edge from EVERY state (design.md §4.4)
+
+states:
+
+  - id: intake
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: accept
+        to: auditing
+        assign: { mode: required }
+      - command: demote
+        to: __ad_hoc__          # ticket leaves the workflow entirely (design.md §4.5)
+
+  - id: auditing
+    owner_role: ux-researcher
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: complete-audit
+        to: spawning
+
+  - id: spawning
+    owner_role: engine
+    kind: normal
+    native_state: doing
+    # AI-1992: declarative fan-out (migrated from the hardcoded ux-audit/sprint
+    # allowlist + wf:dev-impl child label). Identical behavior: spawn mints
+    # wf:dev-impl children, one per finding in the description's Findings section.
+    fanout:
+      spec_source: findings
+      child_workflow: wf:dev-impl
+    transitions:
+      - command: spawn
+        to: managing
+
+  - id: managing
+    owner_role: ux-researcher   # co-owned with engine (engine fills engine role)
+    kind: normal
+    native_state: managing
+    barrier: true               # AI-1992: N→1 barrier (migrated from BARRIER_WORKFLOWS)
+    transitions:
+      - command: complete
+        to: review              # barrier auto-advances to review (B-3), not done
+
+  # ── Review: disposition + parent-AC gate (F2b, §5.6) ───────────────────
+  # B-4 (AI-1441): The researcher dispositions the aggregate from review.
+  # → done is gated on the parent's own AC (not the sum of children, §5.6).
+  # → spawning creates follow-up children for gaps found during review.
+  - id: review
+    owner_role: ux-researcher
+    kind: normal
+    native_state: thinking
+    transitions:
+      - command: approve
+        to: done                # gated by parent-AC check (§5.6 F2b) — engine enforces
+      - command: request-rework
+        to: spawning            # follow-up children for gaps
+
+  - id: done
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true   # uniform terminal contract (design.md §5.4)
+
+  - id: escape
+    kind: terminal
+    native_state: invalid
+    # break-glass terminal; steward decides if Matt escalation is warranted (design.md §11)

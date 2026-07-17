@@ -1,0 +1,161 @@
+# task — Archetype A workflow definition (the general delegated request)
+# design.md §13b, §16.1 (role-binding modes), §16.5 (department roster)
+# owner: steward (Astrid)
+# version history: bump `version` on any state/edge change; in-flight tickets
+#   use the version stamped at their creation time (design.md §12).
+#
+# Purpose: "ask a department to do something." Second Archetype-A workflow;
+#   reuses the dev-impl engine entirely (single-command transition+assign §4.3,
+#   break-glass §4.4, categorized feedback §8.2). Adds NO engine features — only
+#   role-binding modes and a department roster.
+#
+# Anti-orphan property (born from AI-1375): `done` is reachable ONLY through
+#   `sign-off`, owned by the requester. No state has a "drop the delegate / set
+#   To Do" exit, so a task cannot be abandoned and the requester always closes
+#   it. Two gates, not redundant: department-head `review` = "is this good work?"
+#   (domain quality); requester `sign-off` = "is this what I asked for?" (fit).
+#
+# Completion path (all forward edges are `generic: continue`, so a single agent
+#   verb — `linear continue-workflow` — carries a ticket the whole way):
+#     intake --request--> routing --assign--> doing --submit--> review
+#            --approve--> sign-off --accept--> done
+#   `request-revision` walks the two revision edges (review→doing, sign-off→doing).
+#
+# Break-glass (AI-2095): escape RE-ENTERS the workflow at `intake`, it does NOT
+#   land in a terminal state. Before AI-2095, break_glass.to pointed at a
+#   terminal `escape` state (native Invalid) whose only legal move was `escape`
+#   again — a roach motel: an escaped ticket could never reach a clean terminal
+#   by agent verbs (GEN-103 wedged there; AI-1755 stalled). This is the exact
+#   trap dev-impl already removed in AI-1710; task.yaml now matches that proven
+#   model. From `intake` an escaped ticket has a full forward path to `done`
+#   (via continue-workflow) AND a `demote` exit to ad-hoc — so it is always
+#   dispositionable without human DB surgery. A ticket already carrying a stale
+#   `state:escape` label (created before this fix) recovers by running `escape`
+#   once more: break-glass short-circuits state validation and lands it at
+#   intake.
+#
+# Role-binding modes (design.md §16.1):
+#   - requester        → instance   (pinned at creation; ∈ {matt, ai}; Ai is the
+#                                     de-facto sign-off authority)
+#   - department-head  → domain-routed (resolved from the department the requester
+#                                     picked at intake, via department-roster.yaml
+#                                     §16.5; pinned for the ticket, so `routing`
+#                                     and `review` share the SAME head)
+#   - worker           → static-from-department (legal set = the chosen
+#                                     department's workers; `not-self` so the head
+#                                     can't assign itself and self-review)
+#   Astrid is the catch-all head/reviewer when no department matches.
+#
+# Single-domain only: a request spanning domains decomposes into a mini-sprint
+#   (Archetype C, §14b), it is not a `task`.
+
+id: task
+version: 2                      # AI-2095: break_glass.to intake + terminal escape state removed
+archetype: single-task         # single-task | orchestrator | feature-initiative
+entry_state: intake
+
+break_glass:
+  command: escape
+  to: intake                   # AI-2095: re-enter recoverably at intake, not a terminal trap
+  owner_role: steward          # implicit escape edge from EVERY state (design.md §4.4)
+
+# AI-2095: v2 removes the terminal `escape` state. AC3 (AI-1914) refuses to
+#   activate a def that drops a state without a migrations mapping — and, more
+#   importantly, this mapping is what auto-migrates the already-wedged tickets:
+#   the def-state-migration sweep relabels every `state:escape` ticket (GEN-103,
+#   AI-1755) to `state:intake`, from which continue-workflow carries it to done.
+#   Without this line the v2 def would fail closed on load AND the live escaped
+#   tickets would remain stranded. Mapping target = break_glass.to (intake).
+migrations:
+  escape: intake
+
+states:
+
+  - id: intake
+    owner_role: requester      # instance-bound at creation (∈ {matt, ai}) — pinning unimplemented
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: request
+        to: routing
+        generic: continue      # `linear continue-workflow` — routing auto-assigns the head (singleton)
+      - command: demote
+        to: __ad_hoc__         # leaves the workflow entirely (design.md §4.5) — also the escape exit
+
+  - id: routing
+    owner_role: department-head    # resolved from chosen department; pinning unimplemented
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: assign
+        to: doing
+        generic: continue          # `linear continue-workflow <worker>`
+        assign:
+          mode: required           # multi-body worker role — explicit target mandatory
+          constraint: not-self     # head cannot self-assign the worker slot (ENFORCED)
+
+  - id: doing
+    owner_role: worker
+    kind: normal
+    native_state: todo
+    # entered from intake-routing/assign, review/request-changes, and
+    # sign-off/reject — one worker work-phase, no awaiting-vs-doing split.
+    transitions:
+      - command: submit
+        to: review
+        generic: continue      # `linear continue-workflow` — review auto-assigns the head (singleton)
+
+  - id: review
+    owner_role: department-head    # SAME body as routing (domain-routed, pinned)
+    kind: normal
+    native_state: todo
+    sla: 24h                       # time-in-state; breach → stall escalation (design.md §5.5)
+    transitions:
+      - command: approve
+        to: sign-off
+        generic: continue      # `linear continue-workflow` — sign-off auto-assigns the requester (singleton)
+      - command: request-changes
+        to: doing
+        generic: revision      # `linear request-revision`
+        assign: { default: prior-implementer }   # returns to the worker who submitted (ENFORCED, def-driven)
+        feedback:
+          required: true
+          category_enum:
+            - incomplete
+            - off-brief
+            - quality
+            - scope-creep
+            - correctness
+
+  - id: sign-off
+    owner_role: requester          # SAME body as intake (instance-bound: matt or ai)
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: accept
+        to: done                   # terminal
+        generic: continue          # `linear continue-workflow`
+      - command: reject
+        to: doing
+        generic: revision          # `linear request-revision`
+        assign: { default: prior-implementer }   # returns to the worker who submitted (ENFORCED, def-driven)
+        feedback:
+          required: true
+          category_enum:
+            - incomplete
+            - off-brief
+            - quality
+            - scope-creep
+            - correctness
+
+  - id: done
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true   # uniform terminal contract (design.md §5.4)
+
+  # AI-2095: the terminal `escape` state (native_state: invalid) was REMOVED.
+  # It was a roach motel — break-glass landed here and the only legal move was
+  # `escape` again, so an escaped ticket could never reach a clean terminal by
+  # agent verbs. break_glass.to now points at `intake` (see above), matching the
+  # dev-impl AI-1710 model, so no ticket can land in a terminal escape state and
+  # any legacy `state:escape` ticket recovers by escaping once more into intake.

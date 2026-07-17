@@ -1,0 +1,88 @@
+# sprint — Archetype C (feature-initiative) workflow definition
+# design.md §14b, §16.1
+# owner: steward (intake), ux-researcher (ux-shaping), engine (spawning),
+#   sprint-owner + engine co-owner (managing), sprint-owner → Matt (validating)
+# version history: bump `version` on any state/edge change; in-flight tickets
+#   use the version stamped at their creation time (design.md §12).
+#
+# Verbatim copy of the canonical vault file at:
+#   ai-systems/projects/fleet-orchestration-redesign/workflows/sprint.yaml
+# Used as a test fixture so CI can exercise the canonical schema without
+# depending on the vault being present. Keep in sync with the vault source.
+#
+# Phase 6 / C-1 (AI-1471): definition + validation only — no engine/runtime logic.
+
+id: sprint
+version: 1
+archetype: feature-initiative
+entry_state: intake
+
+break_glass:
+  command: escape               # x-openclaw-linear-intent value that triggers break-glass (§4.4)
+  to: escape
+  owner_role: steward           # implicit escape edge from EVERY state (design.md §4.4)
+
+states:
+
+  - id: intake
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: accept
+        to: ux-shaping
+        requires_artifact: true   # §5.7 item 1: sprint-plan doc must be bound at intake
+        assign: { mode: required }
+      - command: demote
+        to: __ad_hoc__          # ticket leaves the workflow entirely (design.md §4.5)
+
+  - id: ux-shaping
+    owner_role: ux-researcher   # person — not an engine role
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: submit
+        to: spawning
+
+  - id: spawning
+    owner_role: engine
+    kind: normal
+    native_state: doing
+    # AI-1992: declarative fan-out (migrated from the hardcoded ux-audit/sprint
+    # allowlist + wf:dev-impl child label). Identical behavior: spawn mints
+    # wf:dev-impl children, one per finding in the description's Findings section.
+    fanout:
+      spec_source: findings
+      child_workflow: wf:dev-impl
+    transitions:
+      - command: spawn
+        to: managing
+
+  - id: managing
+    owner_role: sprint-owner    # co-owned with engine (engine fills engine role)
+    kind: normal
+    native_state: managing
+    barrier: true               # AI-1992: N→1 barrier (migrated from BARRIER_WORKFLOWS)
+    transitions:
+      - command: complete
+        to: validating          # barrier auto-advances to validating, not done
+
+  - id: validating
+    owner_role: sprint-owner    # handoff → Matt for final approval
+    kind: normal
+    native_state: thinking
+    transitions:
+      - command: approve
+        to: done
+      - command: request-rework
+        to: spawning
+
+  - id: done
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true   # uniform terminal contract (design.md §5.4)
+
+  - id: escape
+    kind: terminal
+    native_state: invalid
+    # break-glass terminal; steward decides if Matt escalation is warranted (design.md §11)
