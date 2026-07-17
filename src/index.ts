@@ -32,6 +32,7 @@ import { getCircuitBreakerHealth } from "./dispatch-circuit-breaker.js";
 import { registerDistillationCron, createProdGenerationContext } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
+import { registerDoneDetectorCron } from "./cron/done-ticket-detector-cron.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { registerDelegationReconciliationCron, runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
 import { registerRegistryIntegrityCron } from "./registry-integrity-cron.js";
@@ -1567,6 +1568,14 @@ if (isEntryPoint) {
 
   // G-20: scheduled gate-silently-off canary (AI-1552, §5.1)
   registerG20CanaryCron();
+
+  // AI-2576: periodic done-ticket detector — flag Done tickets missing from main
+  registerDoneDetectorCron({
+    repoPath: process.env.DONE_DETECTOR_REPO_PATH ?? process.env.REPO_BASE_PATH,
+    lookbackDays: parseInt(process.env.DONE_DETECTOR_LOOKBACK_DAYS ?? "14", 10),
+    graceHours: parseInt(process.env.DONE_DETECTOR_GRACE_HOURS ?? "4", 10),
+    pollIntervalMs: parseInt(process.env.DONE_DETECTOR_POLL_INTERVAL_MS ?? String(60 * 60 * 1000), 10),
+  });
 
   // AI-1838: out-of-band mutation reconcile sweep. Detects state/label/delegate
   // changes that bypassed the proxy gate (raw token → api.linear.app direct).
