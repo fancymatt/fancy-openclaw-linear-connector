@@ -4602,6 +4602,32 @@ export interface TeamEnrollConfig {
   [teamKey: string]: string;
 }
 
+export interface AutoEnrollLiveness {
+  active: boolean;
+  enrolledCount: number;
+  suppressedDemotedCount: number;
+  lastEnrolledAt: string | null;
+  lastSuppressedAt: string | null;
+}
+
+let autoEnrollLiveness: AutoEnrollLiveness = {
+  active: false,
+  enrolledCount: 0,
+  suppressedDemotedCount: 0,
+  lastEnrolledAt: null,
+  lastSuppressedAt: null,
+};
+
+/** AI-2542: Mark auto-enroll live only where the webhook path is actually wired. */
+export function markAutoEnrollRegistered(): void {
+  autoEnrollLiveness = { ...autoEnrollLiveness, active: true };
+}
+
+/** AI-2542: Liveness snapshot for /health.autoEnroll. */
+export function getAutoEnrollLiveness(): AutoEnrollLiveness {
+  return { ...autoEnrollLiveness };
+}
+
 export interface AutoEnrollInfo {
   /** Display identifier or UUID passed in. */
   issueId: string;
@@ -4637,6 +4663,7 @@ export async function autoEnrollByTeam(
   authToken: string,
   config?: TeamEnrollConfig,
   onEnroll?: (info: AutoEnrollInfo) => void,
+  enrolledTicketsStore?: EnrolledTicketsStore,
 ): Promise<{ enrolled: boolean; entryState?: string }> {
   const enrollConfig = config ?? DEFAULT_TEAM_ENROLL_CONFIG;
   const workflowId = enrollConfig[teamKey];
@@ -4652,6 +4679,19 @@ export async function autoEnrollByTeam(
   const existingWorkflowId = getWorkflowId(labelNames);
   if (existingWorkflowId) {
     return { enrolled: false }; // already has a wf:* label — skip
+  }
+
+  // AI-2542: A governed demote/escape removes wf/state labels, then Linear
+  // echoes an Issue webhook. Suppress only that same ticket while its last
+  // lifecycle event remains demoted; later genuine enrollment overwrites it.
+  if (enrolledTicketsStore?.wasDemoted(issue.identifier)) {
+    autoEnrollLiveness = {
+      ...autoEnrollLiveness,
+      suppressedDemotedCount: autoEnrollLiveness.suppressedDemotedCount + 1,
+      lastSuppressedAt: new Date().toISOString(),
+    };
+    log.info(`workflow-gate: autoEnrollByTeam: skipping ${issue.identifier} (team=${teamKey}) because last enrolled-ticket event is demoted`);
+    return { enrolled: false };
   }
 
   // Ticket has no wf:* label. Enroll into the configured workflow.
@@ -4697,6 +4737,11 @@ export async function autoEnrollByTeam(
   }
 
   log.info(`workflow-gate: autoEnrollByTeam: stamped '${wfLabelName}' + '${stateLabelName}' on ${issueId} (team=${teamKey})`);
+  autoEnrollLiveness = {
+    ...autoEnrollLiveness,
+    enrolledCount: autoEnrollLiveness.enrolledCount + 1,
+    lastEnrolledAt: new Date().toISOString(),
+  };
 
   try {
     onEnroll?.({

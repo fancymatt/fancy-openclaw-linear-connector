@@ -21,7 +21,7 @@ import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgent
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, markAutoEnrollRegistered } from "../workflow-gate.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
@@ -175,6 +175,7 @@ export function createWebhookRouter(
     "phantomFetchabilityGate",
     "primary webhook dispatch path (dispatchRoute → assertDispatchTargetFetchable)",
   );
+  markAutoEnrollRegistered();
 
   if (NUDGE_DEDUP_WINDOW_MS > 0) {
     log.info(`Nudge dedup enabled: ${NUDGE_DEDUP_WINDOW_MS}ms window`);
@@ -379,7 +380,7 @@ export function createWebhookRouter(
                 sessionKey: normalizeSessionKey(enrollIdentifier),
                 detail: { workflowId: info.workflowId, entryState: info.entryState, teamKey: info.teamKey },
               });
-            }).then((result) => {
+            }, enrolledTicketsStore).then((result) => {
               if (result.enrolled) {
                 log.info(`Auto-enrolled: stamped wf:dev-impl + state:${result.entryState} on ${enrollIssueId} (team=AI)`);
               }

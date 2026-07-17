@@ -129,6 +129,18 @@ describe("AI-1799 AC1: EnrolledTicketsStore — mirror lifecycle", () => {
     expect(row!.terminal).toBe(1);
   });
 
+  it("demoteEnrolled() creates a tombstone for a ticket with no prior mirror row", () => {
+    store.demoteEnrolled("AI-1009");
+
+    const row = store.getByTicketId("AI-1009");
+    expect(row).not.toBeNull();
+    expect(row!.workflow).toBe("unknown");
+    expect(row!.state).toBe("__ad_hoc__");
+    expect(row!.terminal).toBe(1);
+    expect(row!.last_event_kind).toBe("demoted");
+    expect(store.wasDemoted("AI-1009")).toBe(true);
+  });
+
   it("persisted rows survive store reopen (durable sqlite, not in-memory)", () => {
     store.enroll({ ticketId: "AI-1008", workflow: "dev-impl", state: "intake", delegate: "ai" });
     store.recordTransition({ ticketId: "AI-1008", toState: "write-tests", delegate: "tdd", eventKind: "accept" });

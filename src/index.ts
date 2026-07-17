@@ -19,7 +19,7 @@ import { deliverToAgent, deliverMessageToAgent, type DeliveryConfig, DeliveryThr
 import { buildWorkflowAwareDeliveryMessage } from "./delivery/build-message.js";
 import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, NoActivityDetector, StuckDelegateDetector, HoldRetryTracker, resignalPendingTickets, replayPendingBag, ManagingPoller } from "./bag/index.js";
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
-import { getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
+import { getAutoEnrollLiveness, getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
 import { getDefStateMigrationLiveness, registerDefStateMigrationRunner } from "./def-state-migration.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus } from "./engagement-status.js";
@@ -374,6 +374,8 @@ export function createApp(options?: CreateAppOptions) {
       // check ran on load (migratedCount 0 allowed), observable at ac-validate
       // without waiting for a def change.
       workflowMigrations: getDefStateMigrationLiveness(),
+      // AI-2542: auto-enroll liveness and demote/escape suppression counters.
+      autoEnroll: getAutoEnrollLiveness(),
       // AI-1908 AC5: per-agent OAuth token status. Exposes lastRefreshOkAt,
       // expiresAt (from the real expires_in, not assumed ~24h), lastFailure,
       // and a computed state (healthy/stale/expired/failing). Powers the
