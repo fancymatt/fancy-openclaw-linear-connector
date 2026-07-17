@@ -26,6 +26,7 @@
  */
 
 import { componentLogger, createLogger } from "./logger.js";
+import { findLabel, findOrCreateLabel } from "./linear-helpers.js";
 import { generateSpawnPreview, checkCaps, formatPreviewComment, formatCapRefusalComment, parseSpawnCaps, type SpawnPreview, type CapCheckResult, type SpawnCaps } from "./spawn-preview.js";
 import type { FanoutConfig, SpawnIfConfig, WorkflowDef } from "./workflow-gate.js";
 
@@ -682,73 +683,6 @@ async function fetchIssueTeamAndParent(
 }
 
 /**
- * Resolve a label ID by name within a team. Creates the label if it doesn't exist.
- */
-async function ensureLabel(
-  teamId: string,
-  labelName: string,
-  authToken: string,
-): Promise<string | null> {
-  // Look up existing
-  const lookupQuery = `
-    query TeamLabels($teamId: String!) {
-      team(id: $teamId) {
-        labels { nodes { id name } }
-      }
-    }
-  `;
-  try {
-    const lookupRes = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query: lookupQuery, variables: { teamId } }),
-    });
-    type LookupResp = { data?: { team?: { labels: { nodes: Array<{ id: string; name: string }> } } } };
-    const lookupData = (await lookupRes.json()) as LookupResp;
-    const existing = (lookupData.data?.team?.labels?.nodes ?? []).find(
-      (n) => n.name === labelName,
-    );
-    if (existing) return existing.id;
-  } catch (err) {
-    log.error(`fanout: label lookup failed for ${labelName}: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
-
-  // Create
-  const createMutation = `
-    mutation CreateLabel($teamId: String!, $name: String!, $color: String!) {
-      issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color }) {
-        success
-        issueLabel { id }
-      }
-    }
-  `;
-  try {
-    const createRes = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({
-        query: createMutation,
-        variables: { teamId, name: labelName, color: "#94a3b8" },
-      }),
-    });
-    type CreateResp = {
-      data?: { issueLabelCreate?: { success: boolean; issueLabel?: { id: string } } };
-    };
-    const createData = (await createRes.json()) as CreateResp;
-    const result = createData.data?.issueLabelCreate;
-    if (result?.success && result.issueLabel) {
-      log.info(`fanout: created label '${labelName}' in team ${teamId}`);
-      return result.issueLabel.id;
-    }
-    return null;
-  } catch (err) {
-    log.error(`fanout: label creation failed for ${labelName}: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
-}
-
-/**
  * Create a single child issue in Linear.
  * Returns the child's human-readable identifier (e.g. "AI-1443") on success.
  */
@@ -1057,8 +991,34 @@ export async function executeFanout(
     }
   }
 
+  // INF-27 AC2: workflow labels are governed routing contracts. Refuse the
+  // whole fan-out before any mint if the target team lacks any referenced wf:*.
+  const workflowLabelIds = new Map<string, string>();
+  const distinctWorkflowLabels = [...new Set(toSpawn.map((f) => f.child_workflow ?? childWorkflowLabel))];
+  for (const labelName of distinctWorkflowLabels) {
+    const labelId = await findLabel(parentCtx.teamId, labelName, authToken);
+    if (labelId) {
+      workflowLabelIds.set(labelName, labelId);
+    }
+  }
+  const missingWorkflowLabels = distinctWorkflowLabels.filter((labelName) => !workflowLabelIds.has(labelName));
+  if (missingWorkflowLabels.length > 0) {
+    result.refused = true;
+    for (let i = 0; i < toSpawn.length; i++) {
+      const labelName = toSpawn[i].child_workflow ?? childWorkflowLabel;
+      if (!missingWorkflowLabels.includes(labelName)) continue;
+      const message =
+        `Refusing fan-out (INF-27 AC2): workflow label '${labelName}' does not exist in team ${parentCtx.teamId}. ` +
+        "Minting there would produce an inert ticket that no workflow engine picks up. " +
+        "Create the label in the target team, or mint into a team that defines it.";
+      result.errors.push({ findingIndex: i, message });
+      log.error(`fanout: ${message}`);
+    }
+    return result;
+  }
+
   // 3. Ensure the state:intake label exists (shared by all children).
-  const stateLabelId = await ensureLabel(parentCtx.teamId, "state:intake", authToken);
+  const stateLabelId = await findOrCreateLabel(parentCtx.teamId, "state:intake", authToken);
   if (!stateLabelId) {
     result.errors.push({
       findingIndex: -1,
@@ -1087,7 +1047,7 @@ export async function executeFanout(
 
     // AI-2199: per-entry child workflow override. Falls back to config default.
     const findingWorkflow = finding.child_workflow ?? childWorkflowLabel;
-    const wfLabelId = await ensureLabel(parentCtx.teamId, findingWorkflow, authToken);
+    const wfLabelId = workflowLabelIds.get(findingWorkflow);
     if (!wfLabelId) {
       result.errors.push({
         findingIndex: i,

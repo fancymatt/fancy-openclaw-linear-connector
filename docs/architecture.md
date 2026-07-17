@@ -6,6 +6,8 @@ Core boundary:
 - Linear holds business truth
 - the connector holds only operational state needed for delivery, deduplication, queueing, and recovery
 
+Related recovery note: [Escape and Rewind](escape-and-rewind.md) covers workflow-specific escape semantics and the steward rewind verb.
+
 ## PendingWorkBag / SessionTracker lifecycle
 
 Linear webhook delivery is intentionally pull-based:

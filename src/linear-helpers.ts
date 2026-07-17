@@ -37,6 +37,69 @@ export interface IssueWithLabels {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
+async function lookupTeamLabels(
+  teamId: string,
+  labelName: string,
+  authToken: string,
+): Promise<{ nodes: LabelNode[]; error: boolean }> {
+  const colonIdx = labelName.indexOf(":");
+  const lookupQuery = `
+    query TeamLabels($teamId: String!) {
+      team(id: $teamId) {
+        labels(first: 250) { nodes { id name isGroup parent { id name } } }
+      }
+    }
+  `;
+  try {
+    const lookupRes = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: lookupQuery, variables: { teamId } }),
+    });
+    type LookupResp = { data?: { team?: { labels: { nodes: LabelNode[] } } }; errors?: unknown };
+    const lookupData = (await lookupRes.json()) as LookupResp;
+    if (lookupData.errors) {
+      log.warn(`team label lookup GraphQL errors for team=${teamId} label='${labelName}': ${JSON.stringify(lookupData.errors)}`);
+    }
+    return { nodes: lookupData.data?.team?.labels?.nodes ?? [], error: false };
+  } catch (err) {
+    log.error(`label lookup failed for ${labelName}: ${err instanceof Error ? err.message : String(err)}`);
+    return { nodes: [], error: true };
+  }
+}
+
+function findLabelInNodes(nodes: LabelNode[], labelName: string): string | null {
+  const colonIdx = labelName.indexOf(":");
+  const groupName = colonIdx > 0 ? labelName.slice(0, colonIdx) : null;
+  const childName = colonIdx > 0 ? labelName.slice(colonIdx + 1) : labelName;
+
+  const flat = nodes.find((n) => n.name === labelName && !n.isGroup);
+  if (flat) return flat.id;
+  if (groupName) {
+    const child = nodes.find(
+      (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName,
+    );
+    if (child) return child.id;
+  }
+  return null;
+}
+
+/**
+ * Find an existing label by name in a team.
+ *
+ * Returns the label UUID, or null when absent or lookup fails.
+ */
+export async function findLabel(
+  teamId: string,
+  labelName: string,
+  authToken: string,
+): Promise<string | null> {
+  // INF-27 AC2: lookup-only twin of findOrCreateLabel for guarded wf:* labels.
+  const lookup = await lookupTeamLabels(teamId, labelName, authToken);
+  if (lookup.error) return null;
+  return findLabelInNodes(lookup.nodes, labelName);
+}
+
 /**
  * Find an existing label by name in a team, or create it if missing.
  *
@@ -56,41 +119,13 @@ export async function findOrCreateLabel(
   const groupName = colonIdx > 0 ? labelName.slice(0, colonIdx) : null;
   const childName = colonIdx > 0 ? labelName.slice(colonIdx + 1) : labelName;
 
-  // Look up existing
-  const lookupQuery = `
-    query TeamLabels($teamId: String!) {
-      team(id: $teamId) {
-        labels(first: 250) { nodes { id name isGroup parent { id name } } }
-      }
-    }
-  `;
-  let nodes: LabelNode[] = [];
-  try {
-    const lookupRes = await fetch(LINEAR_API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: authToken },
-      body: JSON.stringify({ query: lookupQuery, variables: { teamId } }),
-    });
-    type LookupResp = { data?: { team?: { labels: { nodes: LabelNode[] } } }; errors?: unknown };
-    const lookupData = (await lookupRes.json()) as LookupResp;
-    if (lookupData.errors) {
-      log.warn(`team label lookup GraphQL errors for team=${teamId} label='${labelName}': ${JSON.stringify(lookupData.errors)}`);
-    }
-    nodes = lookupData.data?.team?.labels?.nodes ?? [];
-    // (a) Flat exact match — unchanged behavior.
-    const flat = nodes.find((n) => n.name === labelName && !n.isGroup);
-    if (flat) return flat.id;
-    // (b) Group-child match.
-    if (groupName) {
-      const child = nodes.find(
-        (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName,
-      );
-      if (child) return child.id;
-    }
-  } catch (err) {
-    log.error(`label lookup failed for ${labelName}: ${err instanceof Error ? err.message : String(err)}`);
+  const lookup = await lookupTeamLabels(teamId, labelName, authToken);
+  if (lookup.error) {
     return null;
   }
+  const nodes = lookup.nodes;
+  const existing = findLabelInNodes(nodes, labelName);
+  if (existing) return existing;
 
   // Create — as a group child when the namespace is group-owned, else flat.
   const group = groupName ? nodes.find((n) => n.isGroup && n.name === groupName) : undefined;

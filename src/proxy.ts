@@ -31,7 +31,7 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
@@ -672,6 +672,92 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         }
         const migrateText = await migrateRes.text();
         res.status(migrateRes.status).set("Content-Type", "application/json").send(migrateText);
+        return;
+      }
+
+      // INF-27 AC3: steward break-glass rewind to a named live state in the
+      // ticket's own workflow. This is not a def transition and must not fall
+      // through to the normal transition-legality path.
+      if (effectiveIntent === "rewind") {
+        const rewindTarget = (req.headers["x-openclaw-rewind-target"] as string | undefined) ?? null;
+
+        let hasBreakGlass = false;
+        try {
+          hasBreakGlass = await bodyHasCapability(agentId, "workflow:break-glass");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`rewind-audit agent=${agentId} authorized=false result=identity-check-failed${ticketCtx}: ${msg}`);
+          res.status(200).json({ errors: [{ message: `[Proxy] rewind rejected: capability check failed for caller '${agentId}' (${msg}). Required capability: workflow:break-glass.` }] });
+          return;
+        }
+        if (!hasBreakGlass) {
+          log.warn(`rewind-audit agent=${agentId} authorized=false${ticketCtx} target=${rewindTarget ?? "(none)"}`);
+          res.status(200).json({ errors: [{ message: `[Proxy] rewind rejected: caller '${agentId}' does not hold workflow:break-glass.` }] });
+          return;
+        }
+
+        let def: Awaited<ReturnType<typeof loadWorkflowDefById>> = null;
+        try {
+          const labels = await fetchWorkflowLabels(issueId ?? "", authorization);
+          const workflowId = getWorkflowId(labels);
+          def = workflowId ? await loadWorkflowDefById(workflowId) : null;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`rewind-target-check-failed agent=${agentId}${ticketCtx}: ${msg}`);
+          res.status(200).json({ errors: [{ message: `[Proxy] rewind rejected: could not resolve the workflow def to validate the target (${msg}).` }] });
+          return;
+        }
+        if (!rewindTarget || !def || !def.states.some((s) => s.id === rewindTarget)) {
+          log.warn(`rewind-block agent=${agentId}${ticketCtx} target=${rewindTarget ?? "(none)"}: not a live-def state`);
+          res.status(200).json({ errors: [{ message: `[Proxy] rewind rejected: target '${rewindTarget ?? "(missing)"}' is not a state in the ticket's workflow def. Supply a live state with X-Openclaw-Rewind-Target.` }] });
+          return;
+        }
+
+        const rewindResult = await setStateAtomic(issueId ?? "", rewindTarget, undefined, authorization, {
+          operationalEventStore: deps?.operationalEventStore,
+        });
+        if (!rewindResult.ok) {
+          log.warn(`rewind-audit agent=${agentId} authorized=true result=state-write-failed${ticketCtx} target=${rewindTarget}: ${rewindResult.error}`);
+          res.status(200).json({ errors: [{ message: `[Proxy] rewind failed: ${rewindResult.error}` }] });
+          return;
+        }
+
+        log.warn(`rewind-audit agent=${agentId} authorized=true${ticketCtx} ${rewindResult.from ?? "(unknown)"}→${rewindTarget}`);
+        deps?.operationalEventStore?.append({
+          outcome: "state-rewound",
+          type: "state-rewind",
+          agent: agentId,
+          key: issueId ?? undefined,
+          detail: { from: rewindResult.from, to: rewindTarget, via: "steward-verb" },
+        });
+        deps?.mutationAuditStore?.append({
+          source: "proxy",
+          ticket: issueId ?? "",
+          changeType: "state",
+          oldValue: rewindResult.from,
+          newValue: rewindTarget,
+          actorId: agentId,
+          opName: "rewind",
+          intent: "steward break-glass rewind",
+        });
+
+        const commentIssueId = rewindResult.internalId ?? issueId;
+        if (commentIssueId) {
+          const commentBody =
+            `[Steward rewind by ${agentId}] state:${rewindResult.from ?? "?"} -> state:${rewindTarget} - break-glass rewind (INF-27 AC3). This is a rewind, not an escape: the ticket remains live in its workflow.`;
+          await fetch(LINEAR_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: authorization },
+            body: JSON.stringify({
+              query: `mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }`,
+              variables: { issueId: commentIssueId, body: commentBody },
+            }),
+          }).catch((err: unknown) => {
+            log.warn(`rewind audit comment failed for ${commentIssueId}: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        }
+
+        res.status(200).json({ data: { rewind: { success: true, from: rewindResult.from, to: rewindTarget } } });
         return;
       }
 
