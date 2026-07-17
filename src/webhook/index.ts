@@ -12,6 +12,7 @@ import type { DispatchIdempotencyStore } from "../store/dispatch-idempotency-sto
 import type { DispatchLeaseStore } from "../store/dispatch-lease-store.js";
 import { extractWebhookMutations } from "./mutation-extraction.js";
 import { routeEvent, routeEventAll, unresolvedRoutingCandidates } from "../router.js";
+import { resolveCanonicalIdentifier } from "../canonical-identifier.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
 import { deliverToAgent, DeliveryThrottle, type DeliveryConfig, assertDispatchTargetFetchable } from "../delivery/index.js";
 import { markDispatchIntegrityGateActive } from "../dispatch-integrity-state.js";
@@ -513,7 +514,28 @@ export function createWebhookRouter(
       }
 
       await enrichCommentEventForRouting(event);
-      const routes = routeEventAll(event);
+
+      // ── INF-38: canonicalise the identifier before it becomes a routing key ──
+      // Linear identifiers are retired by a team move, and a webhook payload
+      // snapshots the identifier that was live when the event was emitted. Since
+      // the session key is identifier-derived and `ticketId = route.sessionKey`
+      // is the dispatch idempotency PK, a pre-move and a post-move event for one
+      // issue would otherwise fork it into two concurrent sessions. Resolving the
+      // stable issue UUID to the identifier that is live *now* collapses both
+      // onto one key — and canonicalises the idempotency PK for free.
+      //
+      // Resolved once per event, not once per route: every route for an event
+      // concerns the same issue, and this keeps the added cost at one Linear
+      // round-trip per event (cached) regardless of mention fan-out.
+      //
+      // Fail-open: resolveCanonicalIdentifier returns null on any failure and
+      // routing falls back to the captured identifier. A resolve failure must
+      // never drop a dispatch.
+      const canonicalIdentifier = await resolveCanonicalIdentifier(
+        event,
+        issueIdentifierFromEvent(event),
+      );
+      const routes = routeEventAll(event, canonicalIdentifier ?? undefined);
       if (routes.length === 0) {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
         const noRouteData = (event as { data?: Record<string, unknown> }).data;

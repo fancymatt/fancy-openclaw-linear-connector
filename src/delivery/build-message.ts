@@ -127,8 +127,16 @@ export async function buildDeliveryMessage(route: RouteResult, authToken?: strin
   const data = (route.event.data ?? {}) as Record<string, unknown>;
   const sessionData = data.agentSession as Record<string, unknown> | undefined;
   const issueData = (data.issue ?? sessionData?.issue ?? data) as Record<string, unknown>;
+  // INF-38: prefer the identifier resolved from the issue UUID at routing time.
+  // The payload's `identifier` is the enqueue-time capture, which a team move
+  // retires. A retired identifier still resolves (Linear keeps it as an alias,
+  // verified live), so rendering it is not a dead link — but it names the ticket
+  // differently from the session the agent is woken in, and differently from how
+  // every other agent on the ticket now refers to it. Falls back to the capture
+  // when the resolve failed or the event carried no issue UUID.
   const identifier = String(
-    issueData?.identifier ??
+    route.canonicalIdentifier ??
+      issueData?.identifier ??
       (data as Record<string, unknown>).issueIdentifier ??
       route.sessionKey.replace("linear-", ""),
   );

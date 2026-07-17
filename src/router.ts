@@ -336,9 +336,16 @@ export function unresolvedRoutingCandidates(event: LinearEvent): string[] {
 function buildRouteResult(
   target: { name: string; reason: "delegate" | "assignee" | "mention" | "body-mention" | "department-prefix" | "steward-escalation" },
   event: LinearEvent,
+  canonicalIdentifier?: string,
 ): RouteResult {
   const openclawName = getOpenclawAgentName(target.name);
-  const identifier = extractIssueIdentifier(event);
+  // INF-38: the identifier in the payload is a snapshot taken when the event was
+  // emitted, and identifiers are retired by a team move. Prefer the identifier
+  // resolved from the stable issue UUID so pre-move and post-move events for one
+  // issue land on one session key. `canonicalIdentifier` is absent on the
+  // fail-open path (no UUID in the event, or the resolve failed), which keeps the
+  // pre-INF-38 behaviour of routing on the capture.
+  const identifier = canonicalIdentifier ?? extractIssueIdentifier(event);
   const rawKey = identifier
     ? `linear-${identifier}`
     : `linear-${event.type}-${Date.now()}`;
@@ -363,6 +370,7 @@ function buildRouteResult(
     priority: 0,
     event,
     routingReason: target.reason,
+    ...(canonicalIdentifier ? { canonicalIdentifier } : {}),
   };
 }
 
@@ -370,10 +378,10 @@ function buildRouteResult(
  * Route a Linear event to an OpenClaw agent.
  * Returns a RouteResult if routing succeeded, null if no agent found or suppressed.
  */
-export function routeEvent(event: LinearEvent): RouteResult | null {
+export function routeEvent(event: LinearEvent, canonicalIdentifier?: string): RouteResult | null {
   const result = extractAgentTarget(event);
   if (!result || "suppressed" in result) return null;
-  return buildRouteResult(result, event);
+  return buildRouteResult(result, event, canonicalIdentifier);
 }
 
 /**
@@ -381,8 +389,14 @@ export function routeEvent(event: LinearEvent): RouteResult | null {
  * assignee → first mention, exactly as routeEvent) plus one mention route per
  * additional registered agent mentioned in the event (audit #3 — previously
  * only the first mentioned agent was ever woken).
+ *
+ * INF-38: `canonicalIdentifier`, when supplied, is the identifier resolved from
+ * the event's stable issue UUID at routing time. Every route built here keys its
+ * session on it, so a pre-move and a post-move event for one issue produce one
+ * session key. Omitting it preserves the pre-INF-38 behaviour of routing on the
+ * identifier captured in the payload.
  */
-export function routeEventAll(event: LinearEvent): RouteResult[] {
+export function routeEventAll(event: LinearEvent, canonicalIdentifier?: string): RouteResult[] {
   const primary = extractAgentTarget(event);
 
   // AI-2170: if the guard intentionally suppressed this event, return empty
@@ -392,10 +406,10 @@ export function routeEventAll(event: LinearEvent): RouteResult[] {
   }
 
   if (primary) {
-    const routes = [buildRouteResult(primary, event)];
+    const routes = [buildRouteResult(primary, event, canonicalIdentifier)];
     for (const name of extractAdditionalMentionTargets(event, primary.name)) {
       log.info(`Fan-out mention route: ${name} (primary: ${primary.name})`);
-      routes.push(buildRouteResult({ name, reason: "mention" }, event));
+      routes.push(buildRouteResult({ name, reason: "mention" }, event, canonicalIdentifier));
     }
     return routes;
   }
@@ -418,13 +432,17 @@ export function routeEventAll(event: LinearEvent): RouteResult[] {
   //     it even though it carries an identifier.
   const roster = getCachedRoster();
   if (roster) {
-    const identifier = extractIssueIdentifier(event);
+    // INF-38: department routing matches on the identifier's team prefix, so it
+    // must see the live identifier too — a ticket moved out of AI into INF is an
+    // INF ticket now, and a stale `AI-` prefix would route it to the department
+    // it just left.
+    const identifier = canonicalIdentifier ?? extractIssueIdentifier(event);
     const decision = resolveRoute(identifier, event.type, roster, null);
     if (decision.reason === "department-prefix") {
       log.info(
         `Department route: ${event.type} identifier=${identifier} → ${decision.target} (prefix=${decision.matchedPrefix})`,
       );
-      return [buildRouteResult({ name: decision.target, reason: "department-prefix" }, event)];
+      return [buildRouteResult({ name: decision.target, reason: "department-prefix" }, event, canonicalIdentifier)];
     }
     if (
       decision.reason === "steward-escalation" &&
@@ -434,7 +452,7 @@ export function routeEventAll(event: LinearEvent): RouteResult[] {
       log.info(
         `Steward escalation: ${event.type} identifier=${identifier} → ${decision.target} (prefix matched no department)`,
       );
-      return [buildRouteResult({ name: decision.target, reason: "steward-escalation" }, event)];
+      return [buildRouteResult({ name: decision.target, reason: "steward-escalation" }, event, canonicalIdentifier)];
     }
   }
   return [];
