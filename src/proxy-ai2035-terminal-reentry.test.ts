@@ -150,10 +150,11 @@ const TEAM_LABELS = {
     team: {
       labels: {
         nodes: [
-          { id: "ac-validate-lbl", name: "state:ac-validate" },
-          { id: "implementation-lbl", name: "state:implementation" },
-          { id: "intake-lbl", name: "state:intake" },
-          { id: "done-lbl", name: "state:done" },
+          // AI-2557: injected team ownership for inherited-label filtering.
+          { id: "ac-validate-lbl", name: "state:ac-validate", team: { id: "team-uuid" } },
+          { id: "implementation-lbl", name: "state:implementation", team: { id: "team-uuid" } },
+          { id: "intake-lbl", name: "state:intake", team: { id: "team-uuid" } },
+          { id: "done-lbl", name: "state:done", team: { id: "team-uuid" } },
         ],
       },
     },

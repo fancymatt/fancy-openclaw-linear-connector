@@ -941,8 +941,9 @@ const TEAM_LABELS_WITH_CR = {
     team: {
       labels: {
         nodes: [
-          { id: "cr-lbl", name: "state:code-review" },
-          { id: "impl-lbl", name: "state:implementation" },
+          // AI-2557: injected team ownership for inherited-label filtering.
+          { id: "cr-lbl", name: "state:code-review", team: { id: "team-uuid" } },
+          { id: "impl-lbl", name: "state:implementation", team: { id: "team-uuid" } },
         ],
       },
     },

@@ -24,6 +24,8 @@ interface LabelFixture {
   name: string;
   isGroup?: boolean;
   parent?: { id: string; name: string } | null;
+  /** AI-2557: team ownership for inherited-label filtering. */
+  team?: { id: string };
 }
 
 interface FetchLog {
@@ -34,11 +36,17 @@ interface FetchLog {
  * Build a fetch mock that returns `labels` on the TeamLabels lookup and a
  * configurable outcome on issueLabelCreate. Records every create input so tests
  * can assert whether a flat or group-child create was issued.
+ *
+ * The teamFilterOverride parameter sets the `team.id` injected into labels that
+ * lack an explicit team. Defaults to the `teamId` argument passed to
+ * findOrCreateLabel (for production behavior). A caller can set it to a
+ * different team ID to simulate an inherited label from a parent team.
  */
 function makeFetch(
   labels: LabelFixture[],
   createOutcome: { success: boolean; id?: string; errors?: unknown },
   log: FetchLog,
+  teamFilterOverride?: string,
 ): typeof globalThis.fetch {
   return (async (_url: string, init?: RequestInit) => {
     const bodyText =
@@ -48,8 +56,21 @@ function makeFetch(
           ? init.body.toString()
           : "";
     if (bodyText.includes("TeamLabels")) {
+      // Extract the teamId from the query variables to inject team ownership
+      // for AI-2557 inherited-label filtering.
+      let queryTeamId = teamFilterOverride ?? "";
+      if (!queryTeamId) {
+        try {
+          const parsed = JSON.parse(bodyText) as { variables?: Record<string, unknown> };
+          queryTeamId = (parsed.variables?.teamId as string) ?? "";
+        } catch { /* ignore */ }
+      }
+      const enrichedLabels = labels.map((l) => ({
+        ...l,
+        team: l.team ?? (queryTeamId ? { id: queryTeamId } : undefined),
+      }));
       return new Response(
-        JSON.stringify({ data: { team: { labels: { nodes: labels } } } }),
+        JSON.stringify({ data: { team: { labels: { nodes: enrichedLabels } } } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }

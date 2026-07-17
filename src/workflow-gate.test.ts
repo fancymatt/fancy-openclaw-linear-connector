@@ -878,7 +878,7 @@ type FetchCall = {
 function makeTransitionFetch(opts: {
   issueLabels: Array<{ id: string; name: string }>;
   teamId?: string;
-  teamLabels?: Array<{ id: string; name: string }>;
+  teamLabels?: Array<{ id: string; name: string; team?: { id: string } }>;
   issueUpdateSuccess?: boolean;
   /** Override to simulate a fetch error for the issue fetch. */
   issueError?: boolean;
@@ -926,8 +926,10 @@ function makeTransitionFetch(opts: {
     }
 
     if (query.includes("TeamLabels")) {
+      // AI-2557: inject team ownership so the team-id filter matches.
+      const enrichedLabels = teamLabels.map((l) => ({ ...l, team: l.team ?? { id: teamId } }));
       return new Response(
-        JSON.stringify({ data: { team: { labels: { nodes: teamLabels } } } }),
+        JSON.stringify({ data: { team: { labels: { nodes: enrichedLabels } } } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -3725,7 +3727,7 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
       // Team label lookup (findOrCreateLabel)
       if (bodyText.includes("TeamLabels")) {
         return new Response(
-          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-ux-shaping", name: "state:ux-shaping" }] } } } }),
+          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-ux-shaping", name: "state:ux-shaping", team: { id: "team-uuid" } }] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -3811,7 +3813,7 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
       }
       if (bodyText.includes("TeamLabels")) {
         return new Response(
-          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-ux-shaping", name: "state:ux-shaping" }] } } } }),
+          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-ux-shaping", name: "state:ux-shaping", team: { id: "team-uuid" } }] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -3894,7 +3896,7 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
       }
       if (bodyText.includes("TeamLabels")) {
         return new Response(
-          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-escape", name: "state:escape" }] } } } }),
+          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-escape", name: "state:escape", team: { id: "team-uuid" } }] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -3955,7 +3957,7 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
       }
       if (bodyText.includes("TeamLabels")) {
         return new Response(
-          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-done", name: "state:done" }] } } } }),
+          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-done", name: "state:done", team: { id: "team-uuid" } }] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -4022,7 +4024,7 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
       }
       if (bodyText.includes("TeamLabels")) {
         return new Response(
-          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-done", name: "state:done" }] } } } }),
+          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-done", name: "state:done", team: { id: "team-uuid" } }] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -4344,7 +4346,7 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
           ] } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
         }
         if (bodyText.includes("TeamLabels")) {
-          return new Response(JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-done", name: "state:done" }] } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+          return new Response(JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-done", name: "state:done", team: { id: "team-uuid" } }] } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
         }
         if (bodyText.includes("commentCreate")) {
           diagnosticComment = true;
@@ -4373,7 +4375,7 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
           ] } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
         }
         if (bodyText.includes("TeamLabels")) {
-          return new Response(JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-done", name: "state:done" }] } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+          return new Response(JSON.stringify({ data: { team: { labels: { nodes: [{ id: "lbl-done", name: "state:done", team: { id: "team-uuid" } }] } } } }), { status: 200, headers: { "Content-Type": "application/json" } });
         }
         if (bodyText.includes("issueUpdate") && bodyText.includes("labelIds")) {
           labelSwapHappened = true;
@@ -6109,7 +6111,7 @@ describe("enrollIfMissing — enrollment gap repair", () => {
   function makeEnrollFetch(opts: {
     labels: Array<{ id: string; name: string }>;
     teamId?: string;
-    teamLabels?: Array<{ id: string; name: string }>;
+    teamLabels?: Array<{ id: string; name: string; team?: { id: string } }>;
     issueError?: boolean;
     updateSuccess?: boolean;
   }): { fetch: typeof globalThis.fetch; calls: Array<{ query: string; variables: Record<string, unknown> }> } {
@@ -6142,8 +6144,10 @@ describe("enrollIfMissing — enrollment gap repair", () => {
       }
 
       if (query.includes("TeamLabels")) {
+        // AI-2557: inject team ownership so the team-id filter matches.
+        const enrichedLabels = teamLabels.map((l) => ({ ...l, team: l.team ?? { id: teamId } }));
         return new Response(
-          JSON.stringify({ data: { team: { labels: { nodes: teamLabels } } } }),
+          JSON.stringify({ data: { team: { labels: { nodes: enrichedLabels } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -7021,7 +7025,7 @@ describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () 
 
       if (q.includes("TeamLabels")) {
         return new Response(
-          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "impl-lbl", name: "state:implementation" }] } } } }),
+          JSON.stringify({ data: { team: { labels: { nodes: [{ id: "impl-lbl", name: "state:implementation", team: { id: "team-uuid" } }] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }

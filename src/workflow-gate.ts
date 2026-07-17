@@ -684,6 +684,9 @@ interface LabelNode {
   isGroup?: boolean;
   /** AI-2176: the parent group of this label, when it is a group child. */
   parent?: { id: string; name: string } | null;
+  /** AI-2557: the team that owns this label. Undefined when the query doesn't select it.
+   *  Used to reject inherited parent-team label IDs that Linear rejects on atomic write. */
+  team?: { id: string };
 }
 
 interface TicketContext {
@@ -862,7 +865,7 @@ async function findOrCreateLabel(
   const lookupQuery = `
     query TeamLabels($teamId: String!) {
       team(id: $teamId) {
-        labels(first: 250) { nodes { id name isGroup parent { id name } } }
+        labels(first: 250) { nodes { id name isGroup team { id } parent { id name } } }
       }
     }
   `;
@@ -880,12 +883,16 @@ async function findOrCreateLabel(
     }
     nodes = lookupData.data?.team?.labels?.nodes ?? [];
     // (a) Flat exact match — GEN and the flat state:* labels LIF already carries.
-    const flat = nodes.find((n) => n.name === labelName && !n.isGroup);
+    // AI-2557: only return the label ID if it is owned by the requesting team.
+    // Inherited parent-team labels pass the name check but Linear rejects their ID
+    // on atomic issueUpdate(labelIds:). A non-matching team falls through to create
+    // → inherited conflict → replaceTeamLabels promotion (AI-2543).
+    const flat = nodes.find((n) => n.name === labelName && !n.isGroup && n.team?.id === teamId);
     if (flat) return flat.id;
     // (b) Group-child match — the label is modeled as a child of a `groupName` group.
     if (groupName) {
       const child = nodes.find(
-        (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName,
+        (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName && n.team?.id === teamId,
       );
       if (child) return child.id;
     }
