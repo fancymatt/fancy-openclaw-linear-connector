@@ -3456,8 +3456,17 @@ export async function applyStateTransition(
   // AI-1813 fix: break-glass (escape) must be legal when no state:* label is
   // present — that's precisely the corruption escape exists to recover from.
   // The no-source-state guard below applies only to non-break-glass intents.
+  // AI-2262: `park` is not a workflow transition — it demotes the ticket out of
+  // the workflow (removes state:* and wf:* labels) and clears delegate + assignee.
+  // This mirrors the __ad_hoc__ demotion path below, which handles the actual
+  // label removal. The CLI's forwarded issueUpdate carries the native Backlog
+  // stateId, delegateId: null, and assigneeId: null — the proxy now exempts
+  // the nulls (stripNullDelegateAssigneeFields) so they reach Linear directly.
   if (intent === breakGlassCommand) {
     toStateName = def.break_glass?.to ?? "escape";
+  } else if (intent === "park") {
+    toStateName = "__ad_hoc__";
+    log.info(`workflow-gate: B2 apply: ${issueId} parking — demoting to __ad_hoc__`);
   } else {
     if (!currentStateName) {
       log.warn(`workflow-gate: B2 apply: no state:* label on ${issueId} — skipping`);

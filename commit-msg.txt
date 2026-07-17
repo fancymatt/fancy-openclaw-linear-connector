@@ -1,0 +1,33 @@
+fix(AI-2262): register park intent — clear delegate+assignee, demote workflow tickets
+
+The `linear park <id>` command reports success but silently leaves the
+delegate and assignee intact, so parked tickets keep re-dispatching to
+their parker. Root cause: the CLI sends delegateId:null and assigneeId:null
+with intent `park`, but the connector's proxy has no `park` handler —
+stripNullDelegateAssigneeFields strips the nulls as ungoverned direct field
+writes, and applyStateTransition sees no matching workflow transition and
+silently skips.
+
+Three changes:
+
+1. **stripNullDelegateAssigneeFields (proxy.ts)** — Add 'park' to the
+   exemption list alongside 'needs-human' and 'complete', so the null
+   delegateId/assigneeId reach Linear for ad-hoc tickets.
+
+2. **checkRawMutationInterception bypass (proxy.ts)** — Skip the raw
+   mutation interceptor for 'park' intent. The park command legitimately
+   sends stateId + null delegate/assignee as its contract; exempting it
+   from interception lets the mutation forward while B2 handles the
+   workflow demotion.
+
+3. **applyStateTransition (workflow-gate.ts)** — Treat 'park' as a
+   demotion to __ad_hoc__ on workflow-labeled tickets, removing state:*
+   and wf:* labels while the CLI's forwarded mutation clears the Linear
+   native state + delegate/assignee fields.
+
+Unchanged: the `complete` pattern (stripNullDelegateAssigneeFields exemption
+only, no workflow-gate handler) is intentionally different. `complete` targets
+a terminal workflow state through a def transition, so the normal transition
+resolution handles it. `park` is not a workflow transition — it is a generic
+deprioritization verb that should work on any ticket regardless of workflow
+state.
