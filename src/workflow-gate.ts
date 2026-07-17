@@ -4105,9 +4105,15 @@ export async function applyStateTransition(
           clearAppliedState(issue.identifier);
           return { status: "applied", code: "transition-applied", from: currentStateName, to: toStateName };
         }
-        log.info(
-          `workflow-gate: AI-1730: onManagingEntry returned no transition for ${issueId} — children still active`,
-        );
+        if (barrierResult.error) {
+          log.warn(
+            `workflow-gate: AI-1730: onManagingEntry barrier held for ${issueId} — ${barrierResult.error}`,
+          );
+        } else {
+          log.info(
+            `workflow-gate: AI-1730: onManagingEntry returned no transition for ${issueId} — children still active`,
+          );
+        }
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

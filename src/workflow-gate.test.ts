@@ -3566,6 +3566,153 @@ bodies:
     const childrenFetch = calls.find((c) => c.query.includes("ParentChildren"));
     expect(childrenFetch).toBeUndefined();
   });
+
+  it("INF-43: logs barrier hold (not 'children still active') when child set is unreadable", async () => {
+    process.env.WORKFLOW_DEFS_DIR = path.resolve(process.cwd(), "src/__fixtures__");
+    resetWorkflowCache();
+
+    // Simulate an unreadable child set: ParentChildren returns GraphQL errors
+    const unreadableFetch: typeof globalThis.fetch = async (url, init) => {
+      if (typeof url !== "string" || !url.includes("api.linear.app")) {
+        throw new Error("unexpected fetch call");
+      }
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string; variables?: Record<string, unknown> };
+      calls.push({ query: parsed.query ?? "", variables: parsed.variables as Record<string, unknown> | undefined });
+      const q = parsed.query ?? "";
+
+      // State transition: fetch issue with labels
+      if (q.includes("IssueWithLabels")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { id: "child-internal-id", team: { id: "team-uuid" }, labels: { nodes: [{ id: "wf-lbl", name: "wf:dev-impl" }, { id: "state-lbl", name: "state:ac-validate" }] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Team label lookup
+      if (q.includes("TeamLabels")) {
+        return new Response(
+          JSON.stringify({ data: { team: { labels: { nodes: [] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Team states
+      if (q.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({ data: { team: { states: { nodes: [
+            { id: "state-backlog-uuid", name: "Backlog", type: "unstarted" },
+            { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+            { id: "state-doing-uuid", name: "Doing", type: "started" },
+            { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+            { id: "state-managing-uuid", name: "Managing", type: "started" },
+            { id: "state-done-uuid", name: "Done", type: "completed" },
+            { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+          ] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Label create
+      if (q.includes("issueLabelCreate")) {
+        return new Response(
+          JSON.stringify({ data: { issueLabelCreate: { success: true, issueLabel: { id: "label-x" } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // State transition: issueUpdate
+      if (q.includes("ApplyAtomicTransition")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Barrier: fetch parent identifier
+      if (q.includes("ChildParent")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { parent: { identifier: "AI-1439" } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Barrier: fetch parent state
+      if (q.includes("ParentState") || q.includes("ParentLabels")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { id: "parent-internal-id", team: { id: "team-uuid" }, labels: { nodes: [{ id: "wf-lbl", name: "wf:ux-audit" }, { id: "state-lbl", name: "state:managing" }] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Barrier: fetch parent with label IDs
+      if (q.includes("IssueLabels") && !q.includes("IssueWithLabels")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { id: "parent-internal-id", team: { id: "team-uuid" }, labels: { nodes: [{ id: "wf-lbl", name: "wf:ux-audit" }, { id: "state-lbl", name: "state:managing" }] } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Barrier: fetch children — UNREADABLE (GraphQL errors)
+      if (q.includes("ParentChildren")) {
+        return new Response(
+          JSON.stringify({ errors: [{ message: "Something went wrong reading children" }] }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Barrier: label swap
+      if (q.includes("UpdateLabels")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Barrier: comment
+      if (q.includes("commentCreate")) {
+        return new Response(
+          JSON.stringify({ data: { commentCreate: { success: true, comment: { id: "comment-id" } } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Barrier: resolve internal ID
+      if (q.includes("issue(id: $id) { id }") && !q.includes("team") && !q.includes("parent") && !q.includes("labels") && !q.includes("branch")) {
+        return new Response(
+          JSON.stringify({ data: { issue: { id: "parent-internal-id" } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      return new Response(JSON.stringify({ data: {} }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+
+    globalThis.fetch = unreadableFetch;
+
+    await applyStateTransition("validated", "AI-2001", "Bearer tok");
+
+    // State transition should still happen (child moves to done)
+    const stateTransition = calls.find((c) => c.query.includes("ApplyAtomicTransition"));
+    expect(stateTransition).toBeDefined();
+
+    // Barrier should fetch children
+    const childrenFetch = calls.find((c) => c.query.includes("ParentChildren"));
+    expect(childrenFetch).toBeDefined();
+
+    // The barrier should NOT have transitioned the parent (no UpdateLabels)
+    const barrierTransition = calls.find((c) => c.query.includes("UpdateLabels"));
+    expect(barrierTransition).toBeUndefined();
+
+    // The barrier SHOULD have posted an alarm comment (INF-34: unreadable set = hold + alarm)
+    const commentCall = calls.find((c) => c.query.includes("commentCreate"));
+    expect(commentCall).toBeDefined();
+
+    // Restore single-file ux-audit workflow def for sibling tests
+    delete process.env.WORKFLOW_DEFS_DIR;
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
+    resetWorkflowCache();
+  });
 });
 
 // ── Phase 6 / C-1: sprint workflow definition validation (AI-1471) ──────────
