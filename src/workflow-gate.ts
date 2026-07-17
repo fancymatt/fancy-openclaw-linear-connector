@@ -1213,56 +1213,56 @@ async function findOrCreateLabel(
       `workflow-gate: B2 label create FAIL-CLOSED for '${labelName}' in team ${teamId} (${group ? `child of group '${groupName}'` : "flat"}): success=${result?.success ?? "null"} errors=${errorBody}`,
     );
 
-    // AI-2176 inherited-label fallback: when a sub-team (e.g. LIF) tries to create a
-    // label that conflicts with an inherited label from a parent team (e.g. GEN),
-    // Linear rejects the create with "conflicting inherited label". The inherited
-    // label's ID is still usable for issue mutations on the sub-team. Fall back to
-    // querying all org teams for the label by name (org has ~3 teams; acceptable).
+    // AI-2543 inherited-label promotion: Linear rejects a parent-team create with
+    // "conflicting inherited label" and tells us to use `replaceTeamLabels` to promote
+    // the label to this team. Retry with the promotion argument; the promoted label
+    // is then owned by this team and accepted on issueUpdate.
+    // (Replaces the AI-2176 fallback that borrowed the parent id — that id is rejected
+    // by Linear's issueUpdate, blocking all governed transitions on the sub-team.)
     const isInheritedConflict = createData.errors &&
       Array.isArray(createData.errors) &&
       createData.errors.some((e: Record<string, unknown>) =>
         typeof e.message === "string" && e.message.includes("conflicting inherited label"),
       );
     if (isInheritedConflict) {
-      log.info(`workflow-gate: attempting inherited-label fallback for '${labelName}' on team ${teamId}`);
-      try {
-        // Fetch all teams in the org, then search each for the label.
-        const teamsQuery = `query OrgTeams { teams { nodes { id } } }`;
-        const teamsRes = await fetch(LINEAR_API_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: authToken },
-          body: JSON.stringify({ query: teamsQuery }),
-        });
-        const teamsData = (await teamsRes.json()) as {
-          data?: { teams?: { nodes: Array<{ id: string }> } };
-        };
-        const teamIds = teamsData.data?.teams?.nodes?.map((t) => t.id).filter((id) => id !== teamId) ?? [];
-        for (const otherTeamId of teamIds) {
-          const otherLabelsQuery = `
-            query OtherTeamLabels($tid: String!) {
-              team(id: $tid) {
-                labels(first: 250) { nodes { id name } }
-              }
-            }
-          `;
-          const otherRes = await fetch(LINEAR_API_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: authToken },
-            body: JSON.stringify({ query: otherLabelsQuery, variables: { tid: otherTeamId } }),
-          });
-          const otherData = (await otherRes.json()) as {
-            data?: { team?: { labels: { nodes: Array<{ id: string; name: string }> } } };
-          };
-          const match = otherData.data?.team?.labels?.nodes?.find((l) => l.name === labelName);
-          if (match) {
-            log.info(`workflow-gate: inherited-label fallback found '${labelName}' as id=${match.id} on team ${otherTeamId} (usable on sub-team ${teamId})`);
-            return match.id;
+      log.info(`workflow-gate: attempting inherited-label promotion for '${labelName}' on team ${teamId}`);
+      const promoteMutation = group
+        ? `
+        mutation PromoteLabel($teamId: String!, $name: String!, $color: String!, $parentId: String!, $replaceTeamLabels: Boolean!) {
+          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, parentId: $parentId, replaceTeamLabels: $replaceTeamLabels }) {
+            success
+            issueLabel { id }
           }
         }
-        log.warn(`workflow-gate: inherited-label fallback found no org-wide match for '${labelName}' across ${teamIds.length} teams`);
-      } catch (fallbackErr) {
-        const fallbackMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-        log.warn(`workflow-gate: inherited-label fallback query failed: ${fallbackMsg}`);
+      `
+        : `
+        mutation PromoteLabel($teamId: String!, $name: String!, $color: String!, $replaceTeamLabels: Boolean!) {
+          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, replaceTeamLabels: $replaceTeamLabels }) {
+            success
+            issueLabel { id }
+          }
+        }
+      `;
+      const promoteVars = group
+        ? { teamId, name: createName, color: "#94a3b8", parentId: group.id, replaceTeamLabels: true }
+        : { teamId, name: createName, color: "#94a3b8", replaceTeamLabels: true };
+      try {
+        const promoteRes = await fetch(LINEAR_API_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: authToken },
+          body: JSON.stringify({ query: promoteMutation, variables: promoteVars }),
+        });
+        const promoteData = (await promoteRes.json()) as CreateResp;
+        const promoteResult = promoteData.data?.issueLabelCreate;
+        if (promoteResult?.success && promoteResult.issueLabel) {
+          log.info(`workflow-gate: promoted inherited label '${labelName}' to team ${teamId} as id=${promoteResult.issueLabel.id}`);
+          return promoteResult.issueLabel.id;
+        }
+        const errBody = promoteData.errors ? JSON.stringify(promoteData.errors) : "none";
+        log.warn(`workflow-gate: inherited-label promotion FAILED for '${labelName}' on team ${teamId}: success=${promoteResult?.success ?? "null"} errors=${errBody}`);
+      } catch (promoteErr) {
+        const promoteMsg = promoteErr instanceof Error ? promoteErr.message : String(promoteErr);
+        log.warn(`workflow-gate: inherited-label promotion query failed: ${promoteMsg}`);
       }
     }
 
