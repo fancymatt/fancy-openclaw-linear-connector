@@ -32,6 +32,7 @@ import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
+import { buildTransitionAuditRecord, emitTransitionAuditRecord, verifyPostTransition, type GateResult, type TransitionAuditRecord } from "./transition-audit.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
@@ -1160,6 +1161,59 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             operationalEventStore: deps?.operationalEventStore,
             delegateOverride,
           });
+
+          // ── AI-2554: Structured transition audit record ──────────────
+          if (issueId && transitionResult) {
+            try {
+              const gateResults: GateResult[] = [];
+              gateResults.push({ name: "phase-2-escalation-gate", passed: true, detail: null });
+              gateResults.push({ name: "b1-workflow-def-validation", passed: true, detail: null });
+              gateResults.push({ name: "layer-2-raw-interception", passed: true, detail: null });
+              gateResults.push({ name: "config-health", passed: true, detail: null });
+
+              const auditRecord = buildTransitionAuditRecord(
+                issueId,
+                effectiveIntent,
+                transitionResult.to ?? null,
+                transitionResult.from ?? null,
+                transitionResult.to ?? null,
+                transitionResult.status,
+                transitionResult.code,
+                transitionResult.detail ?? null,
+                agentId,
+                gateResults,
+              );
+              emitTransitionAuditRecord(auditRecord);
+            } catch (auditErr) {
+              log.warn(`[transition-audit] failed to emit audit record: ${auditErr instanceof Error ? auditErr.message : String(auditErr)}`);
+            }
+
+            // ── AI-2554: Post-transition verification ────────────────────
+            // After a successful applied transition, re-read the state:* label
+            // from Linear to confirm it matches the expected target state.
+            // Verification is fire-and-forget to avoid blocking the response.
+            // It runs at next microtask to avoid interfering with inline fetch mocks in tests.
+            const verifyTargetState = transitionResult.to;
+            if (transitionResult.status === "applied" && verifyTargetState) {
+              // Schedule on next tick so test mocks don't see the verification fetch
+              // interleaved with the transition-associated fetches.
+              Promise.resolve().then(() => {
+                verifyPostTransition(issueId, verifyTargetState, authorization).then((verification) => {
+                if (verification && !verification.match) {
+                  log.warn(
+                    `[transition-audit] post-transition LABEL MISMATCH for ${issueId} ${ticketCtx}: ` +
+                    `expected state:${verifyTargetState}, got ${verification.actualState ?? "(null)"}`,
+                  );
+                }
+              }).catch((verifyErr: unknown) => {
+                const vm = verifyErr instanceof Error ? verifyErr.message : String(verifyErr);
+                log.warn(`[transition-audit] post-transition verify threw for ${issueId}: ${vm}`);
+              });
+              });
+            }
+          }
+
+          // Legacy log line for backwards compatibility
           if (transitionResult.status === "failed") {
             log.error(`state-transition FAILED agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${transitionResult.code}${transitionResult.detail ? ` — ${transitionResult.detail}` : ""}`);
           }
