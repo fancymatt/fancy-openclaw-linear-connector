@@ -3328,7 +3328,22 @@ export async function applyStateTransition(
     const keepIds = issue.labels
       .filter((l) => !l.name.startsWith("state:") && !l.name.startsWith("wf:"))
       .map((l) => l.id);
-    await issueUpdateLabels(issue.internalId, keepIds, authToken);
+    const labelsApplied = await issueUpdateLabels(issue.internalId, keepIds, authToken);
+    if (!labelsApplied) {
+      log.error(
+        `workflow-gate: B2 apply: FAILED — ${issueId} demoted to __ad_hoc__ but label mutation returned false`,
+      );
+      emitTransitionWriteFailure({
+        identifier: issue.identifier ?? issueId,
+        from: currentStateName,
+        to: "__ad_hoc__",
+        intent,
+        agent: options?.bodyId ?? null,
+        outcome: { ok: false, attempts: 1, failureKind: "mutation", divergent: [], unverified: false },
+        operationalEventStore: options?.operationalEventStore,
+      });
+      return { status: "failed", code: "atomic-mutation-failed", detail: `__ad_hoc__ demote label mutation did not apply`, from: currentStateName, to: "__ad_hoc__" };
+    }
     // AI-1534: ticket left the workflow — drop any cached state so it can't
     // override a later live read.
     clearAppliedState(issue.identifier);
