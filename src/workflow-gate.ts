@@ -3996,12 +3996,26 @@ export async function applyStateTransition(
   // already validated pre-transition (AC5) and the findings stashed in
   // `pendingFanout`, so this never re-guesses the spec.
   // Fail-open: fan-out errors are logged and never block the transition.
+  // INF-37: set when this tick's fan-out could not evaluate its spawn_if
+  // predicate. A failed evaluation suppresses the mint, which manufactures the
+  // zero children the barrier below would read as vacuous satisfaction — so the
+  // barrier must not auto-advance on it. Scoped to the spawn_if read failure;
+  // the general "attempted N, minted 0" case is INF-28's recorded outcome.
+  let spawnIfFailed = false;
+
   if (applied && pendingFanout) {
     try {
       log.info(`workflow-gate: AI-1992 fan-out: triggering fan-out for ${issueId} (${currentStateName} → ${toStateName}, child=${pendingFanout.config.child_workflow})`);
       const fanoutResult = await executeFanout(issueId, authToken, pendingFanout.config, {
         findingsOverride: pendingFanout.findings,
       });
+      if (fanoutResult.spawnIfResult?.outcome === "failed") {
+        spawnIfFailed = true;
+        log.warn(
+          `workflow-gate: INF-37: spawn_if evaluation FAILED for ${issueId} — ` +
+          `suppressing barrier auto-advance (${fanoutResult.spawnIfResult.reason})`,
+        );
+      }
       if (fanoutResult.created > 0) {
         log.info(
           `workflow-gate: B-2 fan-out: ${fanoutResult.created} child(ren) created for ${issueId}: ${fanoutResult.childIdentifiers.join(", ")}`,
@@ -4024,7 +4038,13 @@ export async function applyStateTransition(
   // barrier is already satisfied. This is a no-op when children are in-progress
   // — it only fires when all children are terminal or none exist. Barrier-ness
   // is config-driven (any state declaring `barrier: true`), not just "managing".
-  if (applied && destStateNode?.barrier === true) {
+  //
+  // INF-37: `spawnIfFailed` gates this. Fail-closed at the mint is fail-open at
+  // the barrier: the spawn was suppressed because the predicate could not be
+  // read, so `fetchChildren` returns [] and evaluateBarrier vacuously satisfies.
+  // The parent staying in its barrier state IS the alarm — with zero children,
+  // onChildTerminal can never fire, so nothing re-wakes it silently.
+  if (applied && destStateNode?.barrier === true && !spawnIfFailed) {
     try {
       const barrierResult = await onManagingEntry(issueId, authToken);
       if (barrierResult) {
