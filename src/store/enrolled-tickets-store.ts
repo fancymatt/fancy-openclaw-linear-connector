@@ -183,11 +183,31 @@ export class EnrolledTicketsStore {
   /** AC1: Mark a ticket as having left the workflow (demoted to ad-hoc). */
   demoteEnrolled(ticketId: string): void {
     const now = preciseTimestamp();
-    this.db
+    const result = this.db
       .prepare(
         `UPDATE enrolled_tickets SET terminal = 1, last_event_kind = 'demoted', last_event_at = ? WHERE ticket_id = ?`,
       )
       .run(now, ticketId);
+
+    // AI-2542: Demote/escape must leave a durable tombstone even when the
+    // mirror had no prior row; otherwise the webhook echo looks brand-new and
+    // auto-enroll stamps wf/state labels back onto the ticket.
+    if (result.changes === 0) {
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO enrolled_tickets (ticket_id, workflow, state, delegate, entered_state_at, enrolled_at, last_event_kind, last_event_at, terminal)
+           VALUES (?, 'unknown', '__ad_hoc__', NULL, ?, ?, 'demoted', ?, 1)`,
+        )
+        .run(ticketId, now, now, now);
+    }
+  }
+
+  /** AI-2542: True when the last lifecycle event was a governed demote/escape. */
+  wasDemoted(ticketId: string): boolean {
+    const row = this.db
+      .prepare(`SELECT last_event_kind FROM enrolled_tickets WHERE ticket_id = ?`)
+      .get(ticketId) as { last_event_kind: string | null } | undefined;
+    return row?.last_event_kind === "demoted";
   }
 
   /**
