@@ -292,9 +292,16 @@ export async function dispositionToDone(
   }
 
   // 4. Post disposition summary comment
-  const childSummary = children.length > 0
-    ? children.map((c) => `- ${c.identifier}: ${c.workflowState ?? "unknown"}`).join("\n")
-    : "No children";
+  //
+  //    INF-34: the rollup is audit context, and this disposition is gated on the
+  //    parent's own AC (§5.6) rather than on the children — so an unreadable
+  //    child set does not block it. It must not be rendered as "No children"
+  //    either: that writes a false rollup into the audit record.
+  const childSummary = children === null
+    ? "_Children could not be read (Linear API read failed) — rollup unavailable._"
+    : children.length > 0
+      ? children.map((c) => `- ${c.identifier}: ${c.workflowState ?? "unknown"}`).join("\n")
+      : "No children";
   const commentBody =
     `[Disposition] Parent AC satisfied — advancing review → done.\n\n` +
     `**AC gate:** ${acGate.reason}\n\n` +

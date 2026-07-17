@@ -188,13 +188,20 @@ describe("evaluateBarrier — mocked Linear API", () => {
     expect(result.terminalCount).toBe(2);
   });
 
-  it("returns allTerminal=true on API error (empty fallback = vacuous, AI-1730)", async () => {
+  it("does NOT report satisfaction on API error — unreadable ≠ empty (INF-34)", async () => {
     globalThis.fetch = async () => { throw new Error("network error"); };
 
     const result = await evaluateBarrier("AI-1439", "Bearer tok");
-    // AI-1730: fetchChildren returns [] on error, which is vacuous satisfaction
-    expect(result.allTerminal).toBe(true);
-    expect(result.totalChildren).toBe(0);
+
+    // INF-34: this assertion is inverted from its original form, deliberately.
+    // It previously read `allTerminal: true` on a network error and credited
+    // that to AI-1730's vacuous-satisfaction contract. That conflated the two
+    // cases AI-1730 is careful to separate: "read zero children" (vacuously
+    // satisfied — still true, still tested in barrier-zero-child.test.ts) and
+    // "could not read the children" (unknown). The test encoded the defect it
+    // should have caught, so the fail-open was green in CI for its whole life.
+    expect(result.allTerminal).toBe(false);
+    expect(result.readFailed).toBe(true);
   });
 });
 

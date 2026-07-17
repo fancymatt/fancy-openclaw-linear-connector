@@ -106,6 +106,13 @@ export interface BarrierResult {
   terminalCount: number;
   /** Details of each child. */
   children: ChildState[];
+  /**
+   * INF-34: the child set could not be read. Distinct from a successful read of
+   * zero children — `totalChildren: 0` alone cannot tell the two apart, and
+   * reading an unreadable set as empty satisfies the barrier vacuously.
+   * When true, `allTerminal` is false and the barrier must not advance.
+   */
+  readFailed?: boolean;
 }
 
 /** Result of a barrier auto-transition attempt. */
@@ -298,11 +305,22 @@ export async function fetchParentIdentifier(
 /**
  * Fetch all children of a parent issue with their labels.
  * Returns the children's identifiers and label names.
+ *
+ * INF-34: returns **null** when the child set could not be read, and `[]` only
+ * for a successful read of a parent that genuinely has no children. The two are
+ * not interchangeable: `evaluateBarrier` reads `[]` as vacuous satisfaction
+ * (the AI-1730 contract, which is correct), so reporting a failed read as an
+ * empty one advances a parent past a barrier whose children it never read.
+ *
+ * A read is a failure if the request throws, the response is non-2xx, the body
+ * is unparseable, the body carries GraphQL `errors`, or the issue/children
+ * connection is absent — the last is malformed for a connection field, and
+ * guessing "empty" from it is the same fail-open in a different disguise.
  */
 export async function fetchChildren(
   parentIdentifier: string,
   authToken: string,
-): Promise<ChildState[]> {
+): Promise<ChildState[] | null> {
   const query = `
     query ParentChildren($id: String!) {
       issue(id: $id) {
@@ -315,13 +333,27 @@ export async function fetchChildren(
       }
     }
   `;
+  const failed = (reason: string): null => {
+    log.error(
+      `barrier: failed to fetch children for ${parentIdentifier}: ${reason} — ` +
+      `treating as UNREADABLE (not zero children); barrier will not advance`,
+    );
+    return null;
+  };
+
   try {
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query, variables: { id: parentIdentifier } }),
     });
+
+    if (!res.ok) {
+      return failed(`HTTP ${res.status} ${res.statusText}`);
+    }
+
     type Resp = {
+      errors?: Array<{ message?: string }>;
       data?: {
         issue?: {
           children?: {
@@ -330,11 +362,32 @@ export async function fetchChildren(
               labels?: { nodes?: Array<{ name: string }> };
             }>;
           };
-        };
+        } | null;
       };
     };
-    const data = (await res.json()) as Resp;
-    const nodes = data.data?.issue?.children?.nodes ?? [];
+
+    let data: Resp;
+    try {
+      data = (await res.json()) as Resp;
+    } catch (err) {
+      return failed(`unparseable response body: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // A GraphQL error is a failed read even at HTTP 200 — Linear returns
+    // `{ errors: [...] }` with no usable `data` on an internal error.
+    if (data.errors?.length) {
+      const messages = data.errors.map((e) => e.message ?? "unknown").join("; ");
+      return failed(`GraphQL errors: ${messages}`);
+    }
+
+    // Belt-and-braces: without this the `.map` below throws on undefined and the
+    // outer catch reaches the same `null`, but via a TypeError that reads like a
+    // code bug rather than the read failure it is. Explicit beats incidental.
+    const nodes = data.data?.issue?.children?.nodes;
+    if (!nodes) {
+      return failed("response contained no issue.children.nodes connection");
+    }
+
     return nodes.map((node) => {
       const labels = (node.labels?.nodes ?? []).map((l) => l.name);
       return {
@@ -345,8 +398,7 @@ export async function fetchChildren(
       };
     });
   } catch (err) {
-    log.error(`barrier: failed to fetch children for ${parentIdentifier}: ${err instanceof Error ? err.message : String(err)}`);
-    return [];
+    return failed(err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -404,12 +456,24 @@ async function fetchParentState(
  * a terminal workflow state. Returns the evaluation result.
  *
  * This is a pure evaluation — it does not mutate anything.
+ *
+ * INF-34: an unreadable child set is reported as `readFailed` and never as
+ * satisfaction. Fail-closed is the correct posture here specifically, against
+ * this codebase's general fail-open lean: failing open on a *read* of barrier
+ * state converts a transient network blip into silent state corruption that
+ * nothing downstream can detect, because the parent has already moved on.
  */
 export async function evaluateBarrier(
   parentIdentifier: string,
   authToken: string,
 ): Promise<BarrierResult> {
   const children = await fetchChildren(parentIdentifier, authToken);
+
+  // INF-34: could not read the children ≠ has no children. Must precede the
+  // zero-children check below, which would otherwise read this as satisfied.
+  if (children === null) {
+    return { allTerminal: false, totalChildren: 0, terminalCount: 0, children: [], readFailed: true };
+  }
 
   // AI-1730: zero children = vacuous satisfaction (barrier is trivially met).
   if (children.length === 0) {
@@ -423,6 +487,51 @@ export async function evaluateBarrier(
     terminalCount,
     children,
   };
+}
+
+const UNREADABLE_CHILDREN_ERROR = "Failed to read child set — barrier held (INF-34)";
+
+/**
+ * INF-34: surface an unreadable child set. The barrier holds the parent in
+ * place, which is recoverable — but a barrier that silently stops evaluating
+ * is its own failure mode, so the hold is alarmed at error level and named on
+ * the ticket. A parent that stays put is recoverable; one that has fallen
+ * through is LIF-2.
+ *
+ * Best-effort: a comment failure must not mask the read failure it reports.
+ */
+async function alarmUnreadableChildren(
+  parentIdentifier: string,
+  authToken: string,
+): Promise<void> {
+  log.error(
+    `barrier: ${parentIdentifier} — child set unreadable; holding the barrier. ` +
+    `The parent stays in its barrier state until the children can be read.`,
+  );
+  try {
+    const internalId = await resolveInternalId(parentIdentifier, authToken);
+    if (!internalId) {
+      log.error(`barrier: cannot alarm unreadable child set — failed to resolve ${parentIdentifier}`);
+      return;
+    }
+    await postComment(
+      internalId,
+      `[Barrier] **Child set unreadable — barrier held on ${parentIdentifier}.**\n\n` +
+      `The barrier could not read this parent's children (Linear API read failed). ` +
+      `It is holding rather than advancing: an unreadable child set is not an empty one, ` +
+      `and advancing on a read that never happened would move this parent past children ` +
+      `that may still be in progress.\n\n` +
+      `No action is required if this was a transient API error — the barrier re-evaluates ` +
+      `on the next child transition. If this repeats, the read itself is broken and needs ` +
+      `investigation. See the connector logs for the underlying error.`,
+      authToken,
+    );
+  } catch (err) {
+    log.error(
+      `barrier: failed to post unreadable-child-set alarm for ${parentIdentifier}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 /**
@@ -458,6 +567,14 @@ export async function attemptBarrierTransition(
   const barrier = await evaluateBarrier(parentIdentifier, authToken);
   result.terminalCount = barrier.terminalCount;
   result.totalChildren = barrier.totalChildren;
+
+  // INF-34: fail closed on an unreadable child set. Checked before allTerminal
+  // so the hold is alarmed rather than logged as a routine not-ready-yet.
+  if (barrier.readFailed) {
+    result.error = UNREADABLE_CHILDREN_ERROR;
+    await alarmUnreadableChildren(parentIdentifier, authToken);
+    return result;
+  }
 
   // AI-1730: zero children is now a valid barrier state (vacuous satisfaction);
   // do NOT early-return — fall through to the managing-state check.
@@ -607,6 +724,21 @@ export async function onManagingEntry(
 ): Promise<BarrierTransitionResult | null> {
   // 1. Evaluate the barrier
   const barrier = await evaluateBarrier(parentIdentifier, authToken);
+
+  // INF-34: an unreadable child set is not "children still active" — returning
+  // null here would be logged by the caller as normal flow, which is how the
+  // original fail-open deleted its own alarm. Return a result carrying the
+  // error instead, and hold the parent in place.
+  if (barrier.readFailed) {
+    await alarmUnreadableChildren(parentIdentifier, authToken);
+    return {
+      transitioned: false,
+      parentIdentifier,
+      terminalCount: 0,
+      totalChildren: 0,
+      error: UNREADABLE_CHILDREN_ERROR,
+    };
+  }
 
   // 2. If barrier is not satisfied, return null (normal flow — children still active)
   if (!barrier.allTerminal) {
@@ -967,6 +1099,17 @@ export async function detectStalledChildren(
   accountant?: DeferralAccountant,
 ): Promise<StalledChild[]> {
   const children = await fetchChildren(parentIdentifier, authToken);
+  // INF-34: an unreadable child set yields no stall detection this round rather
+  // than a confident "nothing is stalled". Stall detection is advisory and
+  // re-runs on the next poll, so holding is not required here — but the empty
+  // result must not be mistaken for a healthy read.
+  if (children === null) {
+    log.error(
+      `barrier: cannot detect stalled children for ${parentIdentifier} — child set unreadable; ` +
+      `skipping this round (no stall conclusions drawn)`,
+    );
+    return [];
+  }
   const stalled: StalledChild[] = [];
 
   // Load workflow def if not provided
@@ -1085,7 +1228,11 @@ export async function surfaceStalledChildren(
 
   const events: StallEvent[] = stalled.map((child) => buildStallEvent(child));
 
-  const children = await fetchChildren(parentIdentifier, authToken);
+  // INF-34: `stalled` is non-empty here, so the child set read moments ago in
+  // detectStalledChildren succeeded. A failure on this second read is transient;
+  // report the stall events without the full-roster context rather than dropping
+  // detections that were made against a good read.
+  const children = await fetchChildren(parentIdentifier, authToken) ?? [];
   const message = buildShepherdingMessage(parentIdentifier, children, stalled);
 
   const internalId = await resolveInternalId(parentIdentifier, authToken);
