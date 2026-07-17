@@ -20,8 +20,12 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, jest } from "@jest/globals";
-import { applyEngagementStatus } from "./engagement-status.js";
-import { resetNativeStateCache } from "./workflow-gate.js";
+import { applyEngagementStatus, registerEngagementNativeStateOverlay } from "./engagement-status.js";
+import { resetNativeStateCache, resetWorkflowCache } from "./workflow-gate.js";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ── Shared test fixtures ─────────────────────────────────────────────────────
 
@@ -150,6 +154,22 @@ describe("AI-2568: engagement overlay honors workflow native_state (Option B)", 
   // first consulting the ticket's current workflow's state native_state declaration.
 
   describe("AC1: native_state: todo overrides 'doing' semantic for workflow tickets", () => {
+    beforeEach(() => {
+      // Point the workflow registry at the real dev-impl.yaml so
+      // loadWorkflowDefById can resolve the "write-tests" state's
+      // native_state: todo declaration.
+      const defsDir = path.resolve(__dirname, "registered-defs");
+      process.env.WORKFLOW_DEFS_DIR = defsDir;
+      resetWorkflowCache();
+      resetNativeStateCache();
+      registerEngagementNativeStateOverlay();
+    });
+
+    afterEach(() => {
+      delete process.env.WORKFLOW_DEFS_DIR;
+      resetWorkflowCache();
+    });
+
     it("writes to 'To Do' UUID when workflow state declares native_state: todo [CURRENTLY WRITES DOING UUID]", async () => {
       // Ticket is in state "write-tests" whose native_state in dev-impl.yaml is
       // "todo". Current Linear stateName is "To Do" (matching that native projection).
@@ -352,10 +372,16 @@ describe("AC4: bootstrap registers native_state-aware engagement overlay", () =>
   beforeEach(() => {
     originalFetch = globalThis.fetch;
     resetNativeStateCache();
+    // Point at the real dev-impl.yaml so createApp can load the registry
+    const defsDir = path.resolve(__dirname, "registered-defs");
+    process.env.WORKFLOW_DEFS_DIR = defsDir;
+    resetWorkflowCache();
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    delete process.env.WORKFLOW_DEFS_DIR;
+    resetWorkflowCache();
   });
 
   it("createApp wiring makes applyEngagementStatus resolve native_state from workflow state [CURRENTLY WRITES DOING UUID]", async () => {
@@ -405,24 +431,29 @@ describe("AC4: bootstrap registers native_state-aware engagement overlay", () =>
 
 describe("AC5: startup log line confirms overlay registration", () => {
   let originalFetch: typeof globalThis.fetch;
-  let stderrWriteSpy: jest.SpyInstance;
-  let stderrOutput: string;
+  let consoleErrorSpy: jest.SpyInstance;
+  let consoleOutput: string;
 
   beforeEach(() => {
     originalFetch = globalThis.fetch;
     resetNativeStateCache();
-    stderrOutput = "";
-    stderrWriteSpy = jest.spyOn(process.stderr, "write").mockImplementation(
-      (chunk: string | Uint8Array) => {
-        stderrOutput += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
-        return true;
+    // Point at the real dev-impl.yaml so createApp can load the registry
+    const defsDir = path.resolve(__dirname, "registered-defs");
+    process.env.WORKFLOW_DEFS_DIR = defsDir;
+    resetWorkflowCache();
+    consoleOutput = "";
+    consoleErrorSpy = jest.spyOn(console, "error").mockImplementation(
+      (...args: unknown[]) => {
+        consoleOutput += args.map((a) => String(a)).join(" ") + "\n";
       },
     );
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
-    stderrWriteSpy?.mockRestore();
+    consoleErrorSpy?.mockRestore();
+    delete process.env.WORKFLOW_DEFS_DIR;
+    resetWorkflowCache();
   });
 
   it("createApp emits a log line confirming the native_state-aware engagement overlay is registered", async () => {
@@ -436,8 +467,8 @@ describe("AC5: startup log line confirms overlay registration", () => {
     await new Promise((r) => setTimeout(r, 50)); // Allow async log writes to flush
 
     // FAILS: no such log line is emitted
-    expect(stderrOutput).toMatch(
-      /native_state-aware|AI-2568|engagement.*overlay.*register|register.*engagement.*overlay/,
+    expect(consoleOutput).toMatch(
+      /native_state-aware.*overlay.*registered.*AI-2568/,
     );
 
     appInstance?.sessionTracker?.close();

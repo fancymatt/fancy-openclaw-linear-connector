@@ -22,7 +22,7 @@ import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { getAutoEnrollLiveness, getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
 import { getDefStateMigrationLiveness, registerDefStateMigrationRunner } from "./def-state-migration.js";
 import { normalizeSessionKey } from "./session-key.js";
-import { applyEngagementStatus } from "./engagement-status.js";
+import { applyEngagementStatus, registerEngagementNativeStateOverlay } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
 import { buildSnapshot, writeSnapshot, appendDigestEntry, fetchLinearTicketState, recoverTicket, STALE_CLASS_NAMES, type StaleSnapshot, type ForensicsConfig } from "./bag/stale-session-forensics.js";
 import { checkLinearIssueRouting } from "./linear-actionable.js";
@@ -222,6 +222,9 @@ export function createApp(options?: CreateAppOptions) {
   // AI-1773/AI-1775 shipped without. `subscribed` records the second half: the
   // transition handler in workflow-gate receives this exact instance.
   registerObservationWritePath(observationStore, { subscribed: true });
+  // AI-2568: enable native_state-aware engagement overlay so "doing" semantics
+  // respect the workflow state's native_state declaration on delegate assignment.
+  registerEngagementNativeStateOverlay();
 
   // Raw body capture for webhook signature validation.
   app.use(

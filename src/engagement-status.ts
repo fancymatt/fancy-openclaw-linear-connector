@@ -24,9 +24,25 @@
  */
 
 import { createLogger, componentLogger } from "./logger.js";
-import { resolveNativeStateId } from "./workflow-gate.js";
+import { resolveNativeStateId, loadWorkflowDefById, getWorkflowId, getCurrentState } from "./workflow-gate.js";
 
 const log = componentLogger(createLogger(), "engagement-status");
+
+// AI-2568: when enabled, applyEngagementStatus reads the ticket's workflow
+// state's native_state declaration on "doing" semantics. Enabled at bootstrap
+// by registerEngagementNativeStateOverlay().
+let _nativeStateAware = false;
+
+/**
+ * Enable native_state-aware engagement overlay (AI-2568). Called from
+ * createApp() at server bootstrap. Emits a startup log line (AC5).
+ * Once enabled, "doing" semantics on a workflow ticket with a state that
+ * declares native_state: todo will resolve to the "To Do" UUID.
+ */
+export function registerEngagementNativeStateOverlay(): void {
+  _nativeStateAware = true;
+  log.info("[engagement-status] native_state-aware overlay registered (AI-2568)");
+}
 
 const LINEAR_API_URL = "https://api.linear.app/graphql";
 
@@ -152,11 +168,47 @@ export async function applyEngagementStatus(
       return;
     }
 
-    const targetStateId = await resolveNativeStateId(issue.teamId, semantic, authHeader);
+    // AI-2568 (Option B): when native_state awareness is active and we're about
+    // to write "doing" on a workflow ticket, check if the current workflow state
+    // declares a different native_state (e.g. "todo"). If so, use that instead.
+    let effectiveSemantic = semantic;
+    if (_nativeStateAware && semantic === "doing") {
+      try {
+        const workflowId = getWorkflowId(issue.labels);
+        if (workflowId) {
+          const def = await loadWorkflowDefById(workflowId);
+          if (def) {
+            const stateId = getCurrentState(issue.labels, def);
+            if (stateId) {
+              const state = def.states.find((s) => s.id === stateId);
+              if (state?.native_state) {
+                effectiveSemantic = state.native_state as EngagementSemantic;
+                log.info(
+                  `engagement: ${identifier} → effective semantic "${effectiveSemantic}" ` +
+                    `(resolved from workflow state "${stateId}" native_state) instead of "${semantic}"`,
+                );
+              }
+            }
+          }
+        }
+      } catch (err) {
+        // Fail-open: if the registry isn't loaded (ad-hoc env, test without
+        // bootstrap), fall back to the original semantic. Native_state awareness
+        // is an optimization — a missed projection is cosmetic.
+        log.warn(
+          `engagement: ${identifier} → native_state resolution failed: ` +
+            `${err instanceof Error ? err.message : String(err)}. Falling back to "${semantic}".`,
+        );
+      }
+    }
+
+    const targetStateId = await resolveNativeStateId(issue.teamId, effectiveSemantic, authHeader);
     if (!targetStateId) return; // resolver already logged
     // "todo" is a session-end reset — always write to reliably clear the engagement
     // signal even if Linear already shows To Do (prior flip may have been skipped).
-    if (semantic !== "todo" && targetStateId === issue.stateId) return;
+    // effectiveSemantic ensures the idempotent guard uses the resolved native_state
+    // (e.g. "todo") rather than the raw "doing" semantic.
+    if (effectiveSemantic !== "todo" && targetStateId === issue.stateId) return;
 
     // AC2/AI-1548: pre-write re-check. B2 may have written state:done between the
     // initial fetch (above) and this issueUpdate. Re-read to ensure the overlay
@@ -177,9 +229,9 @@ export async function applyEngagementStatus(
     type UpdResp = { data?: { issueUpdate?: { success?: boolean } } };
     const ok = ((await res.json()) as UpdResp).data?.issueUpdate?.success ?? false;
     if (ok) {
-      log.info(`engagement: ${identifier} → ${semantic} (from "${issue.stateName}")`);
+      log.info(`engagement: ${identifier} → ${effectiveSemantic} (from "${issue.stateName}")`);
     } else {
-      log.warn(`engagement: ${identifier} → ${semantic} write returned success=false`);
+      log.warn(`engagement: ${identifier} → ${effectiveSemantic} write returned success=false`);
     }
   } catch (err) {
     log.warn(`engagement: ${identifier} → ${semantic} failed: ${err instanceof Error ? err.message : String(err)}`);
