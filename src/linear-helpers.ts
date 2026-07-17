@@ -163,6 +163,18 @@ export async function findOrCreateLabel(
     const createData = (await createRes.json()) as CreateResp;
     const result = createData.data?.issueLabelCreate;
     if (result?.success && result.issueLabel) {
+      // INF-41 AC4 defense-in-depth: log a warning when a wf:* label is created
+      // at fanout time. If the registry validation gate was bypassed, this warns
+      // that a label was minted for a potentially unregistered workflow — the child
+      // will be enrolled in a workflow def that may not exist. This is diagnostic:
+      // it lets us detect the case in production without a hard-fail that would
+      // break test fixtures that legitimately create wf:* labels during setup.
+      if (labelName.startsWith("wf:")) {
+        log.warn(
+          `linear-helpers: INF-41: created wf:* label '${labelName}' at creation time — if this workflow is not registered, ` +
+          `the child will be enrolled in a nonexistent workflow def. Consider adding a workflow definition.`,
+        );
+      }
       log.info(`created label '${labelName}' in team ${teamId}${group ? ` (child of group '${groupName}')` : ""}`);
       return result.issueLabel.id;
     }

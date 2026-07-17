@@ -428,12 +428,20 @@ describe("executeFanout — mocked Linear API", () => {
       },
     });
 
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true });
 
     expect(result.created).toBe(2);
     expect(result.childIdentifiers).toHaveLength(2);
   });
 
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
   it("AI-1992 (AC5): refuses — no children — when the description has no parseable spec", async () => {
     globalThis.fetch = makeFanoutFetch({
       parentContext: {
@@ -514,7 +522,10 @@ describe("executeFanout — mocked Linear API", () => {
     ];
 
     // Only first child succeeds
-    globalThis.fetch = makeFanoutFetch({ successCount: 1 });
+    globalThis.fetch = makeFanoutFetch({ successCount: 1, teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ] });
 
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
@@ -532,7 +543,12 @@ describe("executeFanout — mocked Linear API", () => {
       { title: "Orchestrator-type finding that might spawn its own children" },
     ];
 
-    globalThis.fetch = makeFanoutFetch({});
+    globalThis.fetch = makeFanoutFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+    });
 
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
@@ -552,7 +568,12 @@ describe("executeFanout — mocked Linear API", () => {
       { title: "Finding B" },
     ];
 
-    globalThis.fetch = makeFanoutFetch({});
+    globalThis.fetch = makeFanoutFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+    });
 
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
@@ -574,7 +595,10 @@ describe("executeFanout — mocked Linear API", () => {
       { title: "Finding B" },
     ];
 
-    globalThis.fetch = makeFanoutFetch({ parentInternalId: "parent-uuid-123" });
+    globalThis.fetch = makeFanoutFetch({ parentInternalId: "parent-uuid-123", teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ] });
 
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
@@ -701,11 +725,11 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
   let originalFetch: typeof globalThis.fetch;
   let fetchCalls: Array<{ url: string; body: Record<string, unknown> }>;
   let uxDir: string;
-  let originalWorkflowPath: string | undefined;
+  let originalWorkflowDefsDir: string | undefined;
   let originalPolicyPath: string | undefined;
 
   beforeAll(() => {
-    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    originalWorkflowDefsDir = process.env.WORKFLOW_DEFS_DIR;
     originalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
 
     uxDir = fs.mkdtempSync(path.join(os.tmpdir(), "fanout-integration-"));
@@ -728,15 +752,26 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     process.env.AGENTS_FILE = agentsFile;
     reloadAgents();
 
-    process.env.WORKFLOW_DEF_PATH = CANONICAL_UX_AUDIT_FIXTURE;
+    // INF-41: switch from WORKFLOW_DEF_PATH (single-file) to WORKFLOW_DEFS_DIR
+    // so the registry includes both ux-audit AND dev-impl (the fanout config
+    // default child_workflow is wf:dev-impl, which must be registered).
+    fs.copyFileSync(CANONICAL_UX_AUDIT_FIXTURE, path.join(uxDir, "canonical-ux-audit.yaml"));
+    fs.copyFileSync(
+      path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml"),
+      path.join(uxDir, "canonical-dev-impl.yaml"),
+    );
+    process.env.WORKFLOW_DEFS_DIR = uxDir;
+    delete process.env.WORKFLOW_DEF_PATH;
   });
 
   afterAll(() => {
-    if (originalWorkflowPath !== undefined) {
-      process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    if (originalWorkflowDefsDir !== undefined) {
+      process.env.WORKFLOW_DEFS_DIR = originalWorkflowDefsDir;
     } else {
-      delete process.env.WORKFLOW_DEF_PATH;
+      delete process.env.WORKFLOW_DEFS_DIR;
     }
+    // Restore WORKFLOW_DEF_PATH to undefined (was not set before this test)
+    delete process.env.WORKFLOW_DEF_PATH;
     if (originalPolicyPath !== undefined) {
       process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
     } else {
