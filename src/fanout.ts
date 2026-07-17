@@ -109,10 +109,25 @@ export interface ExistingChild {
   childWorkflow?: string;
 }
 
+/**
+ * INF-37: what a spawn_if evaluation actually concluded.
+ *
+ * `waived` and `failed` both suppress the spawn, but they mean opposite things:
+ * `waived` is an answer, `failed` is the absence of one. Callers must be able to
+ * tell them apart without reading `reason` — see SpawnIfResult.outcome.
+ */
+export type SpawnIfOutcome = "fire" | "waived" | "failed";
+
 /** AI-2523: Result of a spawn_if predicate evaluation. */
 export interface SpawnIfResult {
   /** Whether the predicate passed — children should be spawned. */
   shouldSpawn: boolean;
+  /**
+   * INF-37: the structural discriminant. `shouldSpawn: false` alone cannot
+   * distinguish "the predicate evaluated false" (waived) from "the predicate
+   * could not be evaluated" (failed) — an unreadable answer is not a `no`.
+   */
+  outcome: SpawnIfOutcome;
   /** Human-readable explanation of the evaluation outcome. */
   reason: string;
   /** Identifiers of closed children that carried the target label (empty when waived). */
@@ -578,6 +593,12 @@ interface ParentChildrenResponse {
  *
  * On query failure, an error is returned (fail-closed: no spawn), and the
  * caller (executeFanout) is expected to post a failure comment.
+ *
+ * INF-37: every exit is tagged with an `outcome` discriminant. Fail-closed at
+ * the mint is fail-open at the barrier — suppressing the spawn is precisely what
+ * manufactures the zero children that `evaluateBarrier` reads as vacuous
+ * satisfaction. A caller that cannot tell `waived` from `failed` will advance the
+ * parent past a sprint that never started.
  */
 export async function evaluateSpawnIf(
   parentInternalId: string,
@@ -591,18 +612,44 @@ export async function evaluateSpawnIf(
       body: JSON.stringify({ query: PARENT_CHILDREN_QUERY, variables: { id: parentInternalId } }),
     });
 
+    if (!res.ok) {
+      return {
+        shouldSpawn: false,
+        outcome: "failed",
+        reason: `spawn_if evaluation failed: HTTP ${res.status} — children query returned a non-OK response`,
+        matchedChildren: [],
+      };
+    }
+
     const data = (await res.json()) as ParentChildrenResponse;
 
     if (data.errors?.length) {
       const errorMsg = data.errors.map((e) => e.message).join("; ");
       return {
         shouldSpawn: false,
+        outcome: "failed",
         reason: `spawn_if evaluation failed: GraphQL error — ${errorMsg}`,
         matchedChildren: [],
       };
     }
 
-    const children = data.data?.issue?.children?.nodes ?? [];
+    // INF-37: an absent `issue` is a read failure, not a childless parent.
+    // `data.data?.issue?.children?.nodes ?? []` used to collapse the two, so a
+    // 200 that simply didn't carry the issue (permission scope, deletion, a
+    // partial response) presented as "parent has no children" → waive → the
+    // barrier advanced. This matches fetchTicketContext's `if (!issue)` posture
+    // in workflow-gate.ts, which already treats a missing issue as fetchFailed.
+    const issue = data.data?.issue;
+    if (!issue) {
+      return {
+        shouldSpawn: false,
+        outcome: "failed",
+        reason: `spawn_if evaluation failed: children query returned no issue for ${parentInternalId} — cannot evaluate the predicate`,
+        matchedChildren: [],
+      };
+    }
+
+    const children = issue.children?.nodes ?? [];
     const targetLabel = spawnIf.label_present;
 
     // Filter to closed children (native state type === "completed")
@@ -616,6 +663,7 @@ export async function evaluateSpawnIf(
     if (matchedChildren.length > 0) {
       return {
         shouldSpawn: true,
+        outcome: "fire",
         reason: `spawn_if predicate matched: ${matchedChildren.length} closed child(ren) carry the '${targetLabel}' label (${matchedChildren.join(", ")})`,
         matchedChildren,
       };
@@ -625,6 +673,7 @@ export async function evaluateSpawnIf(
     if (children.length === 0) {
       return {
         shouldSpawn: false,
+        outcome: "waived",
         reason: `spawn_if predicate waived: parent has no children — no '${targetLabel}' label found anywhere`,
         matchedChildren: [],
       };
@@ -635,6 +684,7 @@ export async function evaluateSpawnIf(
       const openChildren = children.map((c) => c.identifier).join(", ");
       return {
         shouldSpawn: false,
+        outcome: "waived",
         reason: `spawn_if predicate waived: no closed children yet (${children.length} open child(ren) — ${openChildren}) — none carry '${targetLabel}'`,
         matchedChildren: [],
       };
@@ -642,6 +692,7 @@ export async function evaluateSpawnIf(
 
     return {
       shouldSpawn: false,
+      outcome: "waived",
       reason: `spawn_if predicate waived: ${closedCount} closed child(ren) checked, none carry the '${targetLabel}' label`,
       matchedChildren: [],
     };
@@ -649,6 +700,7 @@ export async function evaluateSpawnIf(
     const msg = err instanceof Error ? err.message : String(err);
     return {
       shouldSpawn: false,
+      outcome: "failed",
       reason: `spawn_if evaluation failed: query error — ${msg}`,
       matchedChildren: [],
     };
@@ -1030,7 +1082,11 @@ export async function executeFanout(
     result.spawnIfResult = siResult;
 
     if (!siResult.shouldSpawn) {
-      const isError = siResult.reason.startsWith("spawn_if evaluation failed");
+      // INF-37: structural discriminant. This used to be
+      // `siResult.reason.startsWith("spawn_if evaluation failed")` — a parse of a
+      // human-readable string built for humans. Rewording that message silently
+      // reclassified an error as a waive, which satisfies the barrier.
+      const isError = siResult.outcome === "failed";
 
       if (isError) {
         result.errors.push({
