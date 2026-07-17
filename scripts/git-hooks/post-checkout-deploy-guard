@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# post-checkout-deploy-guard — INF-55: defend the deploy worktree against
+# accidental `git checkout` / `git switch` to any branch other than
+# release-1.4.
+#
+# This is a tracked source file that `connector-reftxn-arm.sh` copies into the
+# common hooks dir as `post-checkout`. See the installed copy's header for
+# full design rationale.
+#
+# Bump this version whenever the logic below changes, so drift detection works.
+GUARD_VERSION="INF-55.2026.07.17"
+
+set -uo pipefail
+
+[ "${OC_GIT_UNSAFE:-}" = "1" ] && exit 0
+[ "${3:-}" = "1" ] || exit 0
+
+# Identify the CURRENT worktree from GIT_DIR (set by git).
+GITDIR="${GIT_DIR:-}"
+case "$GITDIR" in
+  */worktrees/fancy-openclaw-linear-connector-deploy) ;;
+  *) exit 0 ;;
+esac
+
+NEW_BRANCH=""
+BRANCH_REF="$(git symbolic-ref -q HEAD 2>/dev/null || true)"
+case "$BRANCH_REF" in
+  refs/heads/*) NEW_BRANCH="${BRANCH_REF#refs/heads/}" ;;
+esac
+
+[ "$NEW_BRANCH" = "release-1.4" ] && exit 0
+
+if [ -z "$NEW_BRANCH" ]; then
+  cat >&2 <<'MSG'
+ERROR [INF-55]: Detached HEAD checkout blocked in the deploy worktree.
+  The deploy worktree must remain on release-1.4. Detaching HEAD onto a raw
+  commit or remote ref would break the running service.
+  Auto-restoring to release-1.4.
+MSG
+else
+  cat >&2 <<MSG
+ERROR [INF-55]: Branch checkout blocked in the deploy worktree.
+  The deploy worktree must remain on release-1.4. You just switched to
+  '$NEW_BRANCH', which would break the running service.
+  Auto-restoring to release-1.4.
+MSG
+fi
+
+if ! git checkout --quiet release-1.4 2>/dev/null; then
+  prev="${1:-}"
+  [ -n "$prev" ] && [ "$prev" != "0000000000000000000000000000000000000000" ] \
+    && git checkout --quiet "$prev" 2>/dev/null || true
+fi
+
+exit 1
