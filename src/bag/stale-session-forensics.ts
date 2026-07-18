@@ -612,6 +612,8 @@ interface LinearIssueState {
   identifier: string;
   state: { name: string; type: string } | null;
   comments: { nodes: Array<{ id: string; createdAt: string }> };
+  trashed?: boolean | null;
+  archivedAt?: string | null;
 }
 
 /**
@@ -643,6 +645,8 @@ export async function fetchLinearTicketState(
             id
             identifier
             state { name type }
+            trashed
+            archivedAt
             comments(first: 1, orderBy: createdAt) { nodes { id createdAt } }
           }
         }`,

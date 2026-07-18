@@ -59,6 +59,12 @@ export interface LinearIssueWithRelations extends LinearIssueReference {
   delegate?: LinearUserReference | null;
   assignee?: LinearUserReference | null;
   relations?: { nodes?: LinearIssueRelation[] | null } | null;
+  /** INF-83: whether the ticket is soft-deleted (trashed). Trashed tickets
+   *  are still fetchable but reject commentCreate. */
+  trashed?: boolean | null;
+  /** INF-83: when the ticket was archived. Archived tickets have the same
+   *  constraint as trashed — they are fetchable but not dispatchable. */
+  archivedAt?: string | null;
 }
 
 /** How the dispatch route to this agent was decided. */
@@ -235,6 +241,8 @@ export async function checkLinearIssueRouting(
             delegate { id name app }
             assignee { id name app }
             state { name type }
+            trashed
+            archivedAt
             relations(first: 50) {
               nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
             }
@@ -273,6 +281,14 @@ export async function checkLinearIssueRouting(
     }
     if (isBlockedByOpenIssue(issue)) {
       log.info(`Dropping pending Linear ticket ${identifier}: blocked by unfinished prerequisite`);
+      return { actionable: false, failOpen: false };
+    }
+    // INF-83: archived/trashed tickets are fetchable but not dispatchable —
+    // commentCreate fails on them with "Entity not found: Issue", and any
+    // agent woken on them will bounce commentless. Reject at the liveness
+    // gate before a dispatch is armed.
+    if (issue.trashed || issue.archivedAt) {
+      log.info(`Dropping ${routingReason ?? "unrouted"} event for ${identifier}: ticket is ${issue.trashed ? "trashed" : "archived"}`);
       return { actionable: false, failOpen: false };
     }
 
@@ -366,6 +382,8 @@ export async function isLinearIssueActionable(ticketId: string, agentId: string)
           issue(id: $id) {
             id identifier
             state { name type }
+            trashed
+            archivedAt
             relations(first: 50) {
               nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
             }
@@ -393,6 +411,13 @@ export async function isLinearIssueActionable(ticketId: string, agentId: string)
     const issue = body.data?.issue;
     if (!issue) {
       log.info(`Dropping pending Linear ticket ${identifier}: issue no longer exists`);
+      return false;
+    }
+
+    // INF-83: archived/trashed tickets are not dispatchable — they fail
+    // commentCreate with "Entity not found: Issue". Treat as non-actionable.
+    if (issue.trashed || issue.archivedAt) {
+      log.info(`Dropping pending Linear ticket ${identifier}: ticket is ${issue.trashed ? "trashed" : "archived"}`);
       return false;
     }
 
