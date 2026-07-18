@@ -78,15 +78,19 @@ describe("dispatch-lease-delivery (AI-2564)", () => {
     const dbPath = makeTempDbPath();
     const leaseStore = new DispatchLeaseStore(dbPath);
 
-    // Pre-establish a lease (simulating an active session)
+    // Pre-establish a lease (simulating an active session).
+    // Use Date.now() — not the static T0 — so the lease is still
+    // active when deliverToAgent calls acquire() at real time.
+    // (AI-2564 post-impl: T0 drifted far enough in CI to expire the lease.)
     leaseStore.acquire(AGENT_ID, TICKET_KEY, {
-      nowMs: T0,
+      nowMs: Date.now(),
       updatedAt: UPDATED_AT_OLD,
     });
 
     // Capture console output — the implementation must log
     // "dispatch deduped: live session exists" when a lease refuses.
-    const logSpy = jest.spyOn(console, "info").mockImplementation(() => {});
+    // Note: connector's createLogger routes ALL levels through console.error.
+    const logSpy = jest.spyOn(console, "error").mockImplementation(() => {});
 
     const result = await deliverToAgent(
       makeRoute(),
@@ -125,9 +129,10 @@ describe("dispatch-lease-delivery (AI-2564)", () => {
     const dbPath = makeTempDbPath();
     const leaseStore = new DispatchLeaseStore(dbPath);
 
-    // Old lease exists with stale state
+    // Old lease exists with stale state.
+    // Use Date.now() for consistency — see AC1 note above.
     leaseStore.acquire(AGENT_ID, TICKET_KEY, {
-      nowMs: T0,
+      nowMs: Date.now(),
       updatedAt: UPDATED_AT_OLD,
     });
 
