@@ -2546,10 +2546,12 @@ export async function checkWorkflowRules(
   // block when partial evidence exists (has branch but no PR = pushed but never
   // reviewed). Also fail-open on null (transient API failure) after one retry.
   //
-  // NOTE(AI-2476): The AI-1795 no-CI-auto-deploy guard (below) keys on
-  // `intent === "deploy"` and is also dead. It needs independent redesign
-  // (separate ticket) — its premise of a choice between two forward exits no
-  // longer exists in v14.
+  // NOTE(INF-62): The AI-1795 no-CI-auto-deploy guard (below) was re-armed.
+  // The old `intent === "deploy"` check was replaced with a destination-state
+  // check: the guard fires when a transition from a non-deploy state goes
+  // directly to ac-validate on a flagged repo. The guard's premise (blocking
+  // merge→ac-validate skip on no-CI-auto-deploy repos) is now enforced on
+  // the resolved transition's destination, not the caller's verb.
   if ((currentState === 'merge' || currentState === 'deploy') && intent === 'continue') {
     let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     // AI-1497: retry once on null — transient Linear API failure during
@@ -2600,32 +2602,38 @@ export async function checkWorkflowRules(
     }
   }
 
-  // AI-1795: no-CI-auto-deploy guard. On repos flagged `ci_auto_deploy: false`
-  // in the instance deploy policy, `deploy` (merge → ac-validate directly) is
-  // rejected: merge alone leaves the running service on the old build, and
-  // ac-validate would verify a stale artifact (recurred twice on AI-1775).
-  // The legal exit for such repos is `handoff-host-deploy` → host-deploy,
-  // which is never blocked here. Repo resolution: `repo:*` labels + GitHub
-  // attachments; unresolvable or unflagged repos pass (guard is opt-in per
-  // repo). Break-glass is exempt (steward recovery path, identity-gated).
-  if (intent === "deploy" && !breakGlassOverride) {
+  // AI-1795: no-CI-auto-deploy guard (re-armed for v10+ generic continue, INF-62).
+  // On repos flagged `ci_auto_deploy: false` in the instance deploy policy, a
+  // `continue` transition from merge (or any non-deploy state) that goes directly
+  // to ac-validate is rejected: merging alone leaves the running service on the
+  // old build, and ac-validate would verify a stale artifact without the deploy
+  // state ever being traversed (recurred twice on AI-1775, bypassed again on
+  // GEN-198 by dead guard, INF-62).
+  // The old guard keyed on `intent === "deploy"` — the v8 literal command that
+  // AI-1872 (v10) replaced with `generic: continue`. The guard now fires when
+  // the resolved transition's destination is `ac-validate` from a non-deploy
+  // state, detecting the deploy-skip regardless of the intent string.
+  // Repo resolution: `repo:*` labels + GitHub attachments; unresolvable or
+  // unflagged repos pass (guard is opt-in per repo). Break-glass is exempt.
+  if (!breakGlassOverride && (match.to === 'ac-validate' && currentState !== 'deploy' || intent === 'deploy')) {
     const repoRefs = await resolveTicketRepoRefs(labels, issueId, authToken);
     const flagged = reposWithoutCiAutoDeploy(repoRefs);
     if (flagged.length > 0) {
       const repoList = flagged.join("', '");
-      log.warn(`workflow-gate: AI-1795 no-CI-auto-deploy guard blocked 'deploy' on ${issueId} (repo '${repoList}', agent=${bodyId})`);
+      log.warn(`workflow-gate: AI-1795 no-CI-auto-deploy guard blocked '${intent}' on ${issueId} (repo '${repoList}', agent=${bodyId})`);
       notify({
         severity: "warning",
         source: "deploy-policy",
-        title: `no-CI-auto-deploy guard blocked 'deploy' (repo: ${flagged.join(", ")})`,
-        detail: `Ticket ${issueId}: 'deploy' would advance to ac-validate without the merged artifact running. Agent must use 'handoff-host-deploy' → host-deploy instead.`,
+        title: `no-CI-auto-deploy guard blocked (repo: ${flagged.join(", ")})`,
+        detail: `Ticket ${issueId}: '${intent}' would advance to ac-validate (from ${currentState}) without the merged artifact running through the deploy state. Route through host-deploy instead.`,
         agent: bodyId,
         ticket: issueId,
       });
-      const legalMoves = [...transitions.filter((t) => t.command !== "deploy").map((t) => cliVerbFor(t)), breakGlassCommand].join(", ");
+      const legalMoves = [...transitions.filter((t) => t.command !== intent).map((t) => cliVerbFor(t)), breakGlassCommand].join(", ");
       return (
-        `[Proxy] 'deploy' blocked: repo '${repoList}' has no CI auto-deploy — merging alone leaves the running service on the old build, ` +
-        `and AC validation would verify a stale artifact. Use 'handoff-host-deploy' to route through host-deploy instead. ` +
+        `[Proxy] '${intent}' blocked: repo '${repoList}' has no CI auto-deploy — merging alone leaves ` +
+        `the running service on the old build, and AC validation would verify a stale artifact. ` +
+        `Use 'handoff-host-deploy' to route through host-deploy instead. ` +
         `Legal moves: ${legalMoves}.`
       );
     }
