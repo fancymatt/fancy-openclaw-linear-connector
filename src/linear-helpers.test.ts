@@ -24,6 +24,7 @@ interface LabelFixture {
   name: string;
   isGroup?: boolean;
   parent?: { id: string; name: string } | null;
+  team?: { id: string };
 }
 
 interface FetchLog {
@@ -90,7 +91,7 @@ describe("findOrCreateLabel — group-aware resolution (AI-2176)", () => {
 
   it("returns the id of an existing flat label without creating (GEN path)", async () => {
     globalThis.fetch = makeFetch(
-      [{ id: "flat-uuid", name: "state:product-definition" }],
+      [{ id: "flat-uuid", name: "state:product-definition", team: { id: "team-gen" } }],
       { success: false },
       log,
     );
@@ -102,12 +103,13 @@ describe("findOrCreateLabel — group-aware resolution (AI-2176)", () => {
   it("resolves an existing group child without creating (LIF nested path)", async () => {
     globalThis.fetch = makeFetch(
       [
-        { id: "grp-uuid", name: "state", isGroup: true },
+        { id: "grp-uuid", name: "state", isGroup: true, team: { id: "team-lif" } },
         {
           id: "child-uuid",
           name: "product-definition",
           isGroup: false,
           parent: { id: "grp-uuid", name: "state" },
+          team: { id: "team-lif" },
         },
       ],
       { success: false },
@@ -120,7 +122,7 @@ describe("findOrCreateLabel — group-aware resolution (AI-2176)", () => {
 
   it("creates the label under the group when the group exists but the child is missing", async () => {
     globalThis.fetch = makeFetch(
-      [{ id: "grp-uuid", name: "state", isGroup: true }],
+      [{ id: "grp-uuid", name: "state", isGroup: true, team: { id: "team-lif" } }],
       { success: true, id: "new-child-uuid" },
       log,
     );
@@ -141,6 +143,28 @@ describe("findOrCreateLabel — group-aware resolution (AI-2176)", () => {
     expect(log.createInputs).toHaveLength(1);
     expect(log.createInputs[0]).toMatchObject({ name: "state:product-definition" });
     expect(log.createInputs[0]).not.toHaveProperty("parentId");
+  });
+
+  it("rejects inherited parent-team label and falls through to create (AI-2557)", async () => {
+    // A label named "state:product-definition" exists but is owned by team-gen
+    // (the parent team). findOrCreateLabel("team-lif", ...) must NOT return
+    // the inherited label ID — it must fall through to create → replaceTeamLabels.
+    globalThis.fetch = makeFetch(
+      [
+        {
+          id: "gen-label-uuid",
+          name: "state:product-definition",
+          team: { id: "team-gen" },
+        },
+      ],
+      { success: true, id: "lif-label-uuid" },
+      log,
+    );
+    const id = await findOrCreateLabel("team-lif", "state:product-definition", "Bearer t");
+    // Must NOT return gen-label-uuid — that's the inherited label from parent team.
+    expect(id).toBe("lif-label-uuid");
+    expect(id).not.toBe("gen-label-uuid");
+    expect(log.createInputs).toHaveLength(1); // create attempted
   });
 
   it("fail-closes to null AND logs the raw GraphQL errors body on create failure (AI-2177)", async () => {
