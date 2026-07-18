@@ -1225,12 +1225,13 @@ async function findOrCreateLabel(
     // Inherited parent-team labels pass the name check but Linear rejects their ID
     // on atomic issueUpdate(labelIds:). A non-matching team falls through to create
     // → inherited conflict → replaceTeamLabels promotion (AI-2543).
-    const flat = nodes.find((n) => n.name === labelName && !n.isGroup && n.team?.id === teamId);
+    // Labels without a `team` field (compatibility/default) always match.
+    const flat = nodes.find((n) => n.name === labelName && !n.isGroup && (n.team == null || n.team.id === teamId));
     if (flat) return flat.id;
     // (b) Group-child match — the label is modeled as a child of a `groupName` group.
     if (groupName) {
       const child = nodes.find(
-        (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName && n.team?.id === teamId,
+        (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName && (n.team == null || n.team.id === teamId),
       );
       if (child) return child.id;
     }
