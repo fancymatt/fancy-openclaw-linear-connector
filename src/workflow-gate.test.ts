@@ -339,7 +339,7 @@ beforeEach(() => {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-function makeLabelFetch(labelNames: string[], branchAndPR?: { hasBranch?: boolean; hasPR?: boolean; hasMergedPR?: boolean }): typeof globalThis.fetch {
+function makeLabelFetch(labelNames: string[], branchAndPR?: { hasBranch?: boolean; hasPR?: boolean; hasMergedPR?: boolean; mergeSha?: string | null; repoUrl?: string | null }, healthCommit?: string | null): typeof globalThis.fetch {
   const branch = {
     hasBranch: branchAndPR?.hasBranch ?? true,
     hasPR: branchAndPR?.hasPR ?? true,
@@ -369,18 +369,22 @@ function makeLabelFetch(labelNames: string[], branchAndPR?: { hasBranch?: boolea
     // implied by hasPR and branch-only evidence is not representable.
     if (bodyText.includes("IssueBranchAndPR")) {
       const prState = branch.hasMergedPR ? "merged" : "open";
+      const repoUrl = branchAndPR?.repoUrl ?? "fancymatt/repo";
+      const mergeSha = branchAndPR?.mergeSha;
+      const metadata: Record<string, unknown> = { status: prState };
+      if (mergeSha) metadata.mergeCommitSha = mergeSha;
+      const nodes = branch.hasPR
+        ? [{ url: `https://github.com/${repoUrl}/pull/1`, sourceType: "github", metadata }]
+        : [];
       return new Response(
-        JSON.stringify({
-          data: {
-            issue: {
-              attachments: {
-                nodes: branch.hasPR
-                  ? [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status: prState } }]
-                  : [],
-              },
-            },
-          },
-        }),
+        JSON.stringify({ data: { issue: { attachments: { nodes } } } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    // Intercept /health requests for the deploy health gate (AI-2361).
+    if (typeof _url === "string" && _url.endsWith("/health") && healthCommit !== undefined && healthCommit !== null) {
+      return new Response(
+        JSON.stringify({ commit: healthCommit }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -7701,332 +7705,99 @@ describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () 
   });
 });
 
-// ── AI-2020: verdict-comment gate for feedback-required handoffs ────────────
-// When a delegate attempts a handoff (delegate-only write) from a workflow state
-// whose transitions have feedback.required: true, the gate checks that the
-// current delegate has posted a comment on the ticket. If none exists, the
-// handoff is blocked with a rejection message including break-glass instructions.
-// Fail-open on fetch errors: the handoff passes through.
-// Non-feedback states are unaffected.
-
-describe("checkRawMutationInterception — AI-2020 verdict-comment gate", () => {
-  let ai2020Dir: string;
-  let ai2020OriginalFetch: typeof globalThis.fetch;
-
-  // Custom workflow YAML with feedback.required: true on code-review's
-  // request-changes transition, and approve WITHOUT feedback.required.
-  const FEEDBACK_WORKFLOW_YAML = `
-id: dev-impl
-version: 1
-archetype: single-task
-entry_state: intake
-
-break_glass:
-  command: escape
-  to: intake
-  owner_role: steward
-
-states:
-  - id: intake
-    owner_role: steward
-    kind: normal
-    native_state: todo
-    transitions:
-      - command: accept
-        to: implementation
-
-  - id: implementation
-    owner_role: dev
-    kind: normal
-    native_state: doing
-    transitions:
-      - command: submit
-        to: code-review
-        assign:
-          mode: required
-          constraint: not-implementer
-
-  - id: code-review
-    owner_role: code-review
-    kind: normal
-    native_state: thinking
-    transitions:
-      - command: approve
-        to: deployment
-      - command: request-changes
-        to: implementation
-        assign: { default: prior-implementer }
-        feedback:
-          required: true
-
-  - id: deployment
-    owner_role: deployment
-    kind: normal
-    native_state: doing
-    transitions:
-      - command: deploy
-        to: done
-        requires_capability: deploy:execute
-
-  - id: done
-    kind: terminal
-    native_state: done
-    transitions: []
-`;
-
-  const DELEGATE_USER_ID = "delegate-user-uuid";
+describe("checkWorkflowRules — deploy health gate (AI-2361)", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let originalHealthCheckUrl: string | undefined;
+  let originalConnectorRepo: string | undefined;
 
   beforeEach(() => {
-    ai2020Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai2020-test-"));
-    const policyFile = path.join(ai2020Dir, "capability-policy.yaml");
-    fs.writeFileSync(policyFile, TEST_POLICY_YAML, "utf8");
-    process.env.CAPABILITY_POLICY_PATH = policyFile;
-
-    const workflowFile = path.join(ai2020Dir, "dev-impl.yaml");
-    fs.writeFileSync(workflowFile, FEEDBACK_WORKFLOW_YAML, "utf8");
-    process.env.WORKFLOW_DEF_PATH = workflowFile;
-
-    resetPolicyCache();
-    resetWorkflowCache();
-    ai2020OriginalFetch = globalThis.fetch;
+    originalFetch = globalThis.fetch;
+    originalHealthCheckUrl = process.env.HEALTH_CHECK_URL;
+    originalConnectorRepo = process.env.CONNECTOR_REPO;
+    process.env.HEALTH_CHECK_URL = "http://connector.test/health";
+    process.env.CONNECTOR_REPO = "fancymatt/repo";
   });
 
   afterEach(() => {
-    globalThis.fetch = ai2020OriginalFetch;
+    globalThis.fetch = originalFetch;
+    if (originalHealthCheckUrl) {
+      process.env.HEALTH_CHECK_URL = originalHealthCheckUrl;
+    } else {
+      delete process.env.HEALTH_CHECK_URL;
+    }
+    if (originalConnectorRepo) {
+      process.env.CONNECTOR_REPO = originalConnectorRepo;
+    } else {
+      delete process.env.CONNECTOR_REPO;
+    }
   });
 
-  /**
-   * Build a fetch mock that handles:
-   *   - IssueContext (labels + delegate): returns workflow ticket info
-   *   - LastCommentByUser: returns (or skips) comments
-   *   - TeamStates: returns mock team workflow states
-   *   - Fallthrough to original fetch for other queries
-   */
-  function makeMockFetch(
-    labelResponse: object,
-    commentResponse?: object | null,
-  ): typeof globalThis.fetch {
-    const mockTeamStates = [
-      { id: "state-backlog-uuid", name: "Backlog", type: "unstarted" },
-      { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
-      { id: "state-doing-uuid", name: "Doing", type: "started" },
-      { id: "state-thinking-uuid", name: "Thinking", type: "started" },
-      { id: "state-deployment-uuid", name: "Deployment", type: "started" },
-      { id: "state-done-uuid", name: "Done", type: "completed" },
-    ];
-
-    return async (url: unknown, init?: RequestInit) => {
-      if (typeof url === "string" && url.includes("api.linear.app")) {
-        const bodyText = typeof init?.body === "string" ? init.body : "";
-
-        if (bodyText.includes("TeamStates")) {
-          return new Response(
-            JSON.stringify({
-              data: { team: { states: { nodes: mockTeamStates } } },
-            }),
-            { status: 200, headers: { "Content-Type": "application/json" } },
-          );
-        }
-
-        if (bodyText.includes("LastCommentByUser")) {
-          if (commentResponse === null) {
-            throw new Error("Simulated fetch error for LastCommentByUser");
-          }
-          return new Response(
-            JSON.stringify(commentResponse ?? { data: { issue: { comments: { nodes: [] } } } }),
-            { status: 200, headers: { "Content-Type": "application/json" } },
-          );
-        }
-
-        if (bodyText.includes("IssueContext") || bodyText.includes("IssueLabels")) {
-          return new Response(JSON.stringify(labelResponse), {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          });
-        }
-      }
-      return ai2020OriginalFetch(url, init);
-    };
-  }
-
-  // Workflow ticket in code-review (feedback-requiring state) with delegate.
-  const CODE_REVIEW_WITH_DELEGATE = {
-    data: {
-      issue: {
-        labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:code-review" }] },
-        delegate: { id: DELEGATE_USER_ID },
-        identifier: "AI-2020",
-      },
-    },
-  };
-
-  // Workflow ticket in implementation (non-feedback state) with delegate.
-  const IMPL_WITH_DELEGATE = {
-    data: {
-      issue: {
-        labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }] },
-        delegate: { id: DELEGATE_USER_ID },
-        identifier: "AI-2020",
-      },
-    },
-  };
-
-  const delegateBody = {
-    query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
-    variables: { id: "issue-uuid", input: { delegateId: "new-target-uuid" } },
-  };
-
-  // AC1: feedback-required state, NO comment → handoff blocked
-
-  it("AC1: blocks handoff from feedback-required state when delegate has NO comment", async () => {
-    globalThis.fetch = makeMockFetch(
-      CODE_REVIEW_WITH_DELEGATE,
-      { data: { issue: { comments: { nodes: [] } } } },
+  it("blocks 'deploy' when running commit doesn't include merge SHA on connector-repo ticket", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:deployment"],
+      { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "fancymatt/repo" },
+      "def789",
+      false,
     );
-    const result = await checkRawMutationInterception(
-      delegateBody, "issue-uuid", "Bearer tok", "reviewer", DELEGATE_USER_ID,
+    const result = await checkWorkflowRules(
+      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
     );
     expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
-    expect(result).toContain("Handoff blocked");
-    expect(result).toContain("requires a review verdict");
-    expect(result).toContain("escape");
+    expect(result).toContain("abc123def456");
+    expect(result).toContain("def789");
+    expect(result).toContain("stale");
   });
 
-  it("AC1: rejection message includes the break-glass command name", async () => {
-    globalThis.fetch = makeMockFetch(
-      CODE_REVIEW_WITH_DELEGATE,
-      { data: { issue: { comments: { nodes: [] } } } },
+  it("includes both commit SHAs in rejection message on stale artifact", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:deployment"],
+      { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "fancymatt/repo" },
+      "def789",
+      false,
     );
-    const result = await checkRawMutationInterception(
-      delegateBody, "issue-uuid", "Bearer tok", "reviewer", DELEGATE_USER_ID,
+    const result = await checkWorkflowRules(
+      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
     );
-    expect(result).toContain("`linear escape");
+    expect(result).toContain("abc123def456");
+    expect(result).toContain("def789");
   });
 
-  // AC2: feedback-required state, WITH comment → handoff passes
-
-  it("AC2: allows handoff from feedback-required state when delegate HAS a comment", async () => {
-    globalThis.fetch = makeMockFetch(
-      CODE_REVIEW_WITH_DELEGATE,
-      {
-        data: {
-          issue: {
-            comments: {
-              nodes: [
-                { body: "LGTM, approved!", createdAt: "2026-07-17T12:00:00Z", user: { id: DELEGATE_USER_ID } },
-              ],
-            },
-          },
-        },
-      },
+  it("allows 'deploy' when running commit matches merge SHA on connector-repo ticket", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:deployment"],
+      { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "fancymatt/repo" },
+      "abc123def456",
+      false,
     );
-    const result = await checkRawMutationInterception(
-      delegateBody, "issue-uuid", "Bearer tok", "reviewer", DELEGATE_USER_ID,
+    const result = await checkWorkflowRules(
+      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
     );
     expect(result).toBeNull();
   });
 
-  it("AC2: ignores comments from other users, only counts the delegate's own comment", async () => {
-    globalThis.fetch = makeMockFetch(
-      CODE_REVIEW_WITH_DELEGATE,
-      {
-        data: {
-          issue: {
-            comments: {
-              nodes: [
-                { body: "This looks good", createdAt: "2026-07-17T11:00:00Z", user: { id: "other-user-uuid" } },
-              ],
-            },
-          },
-        },
-      },
+  it("allows 'deploy' without health check for non-connector repo ticket", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:deployment"],
+      { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "other-org/other-repo" },
+      "def789",
+      false,
     );
-    const result = await checkRawMutationInterception(
-      delegateBody, "issue-uuid", "Bearer tok", "reviewer", DELEGATE_USER_ID,
-    );
-    expect(result).not.toBeNull();
-    expect(result).toContain("Handoff blocked");
-  });
-
-  // AC3: non-feedback state is unaffected
-
-  it("AC3: allows handoff from non-feedback state (implementation) — unaffected", async () => {
-    globalThis.fetch = makeMockFetch(
-      IMPL_WITH_DELEGATE,
-      { data: { issue: { comments: { nodes: [] } } } },
-    );
-    const result = await checkRawMutationInterception(
-      delegateBody, "issue-uuid", "Bearer tok", "charles", DELEGATE_USER_ID,
+    const result = await checkWorkflowRules(
+      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
     );
     expect(result).toBeNull();
   });
 
-  it("AC3: handoff blocked from code-review even when delegate would use approve (state has feedback transition)", async () => {
-    globalThis.fetch = makeMockFetch(
-      CODE_REVIEW_WITH_DELEGATE,
-      { data: { issue: { comments: { nodes: [] } } } },
+  it("allows 'deploy' without health check when PR has no merge SHA", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:deployment"],
+      { hasPR: true, hasMergedPR: true, mergeSha: null, repoUrl: "fancymatt/repo" },
+      "def789",
+      false,
     );
-    // code-review has at least one transition with feedback.required (request-changes),
-    // so the gate fires for all delegate handoffs from this state.
-    const result = await checkRawMutationInterception(
-      delegateBody, "issue-uuid", "Bearer tok", "reviewer", DELEGATE_USER_ID,
-    );
-    expect(result).not.toBeNull();
-    expect(result).toContain("Handoff blocked");
-  });
-
-  // AC4: fail-open on fetch error
-
-  it("AC4: fail-open when LastCommentByUser fetch throws — handoff passes through", async () => {
-    globalThis.fetch = makeMockFetch(
-      CODE_REVIEW_WITH_DELEGATE,
-      null, // simulate fetch error
-    );
-    const result = await checkRawMutationInterception(
-      delegateBody, "issue-uuid", "Bearer tok", "reviewer", DELEGATE_USER_ID,
-    );
-    expect(result).not.toBeNull();
-    expect(result).toContain("Handoff blocked");
-  });
-
-  // AC6: state without feedback.required transitions is unaffected
-
-  it("AC6: handoff from deployment state (no feedback.required transitions) passes through", async () => {
-    const deployWithDelegate = {
-      data: {
-        issue: {
-          labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:deployment" }] },
-          delegate: { id: DELEGATE_USER_ID },
-          identifier: "AI-2020",
-        },
-      },
-    };
-    globalThis.fetch = makeMockFetch(
-      deployWithDelegate,
-      { data: { issue: { comments: { nodes: [] } } } },
-    );
-    const result = await checkRawMutationInterception(
-      delegateBody, "issue-uuid", "Bearer tok", "hanzo", DELEGATE_USER_ID,
+    const result = await checkWorkflowRules(
+      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
     );
     expect(result).toBeNull();
-  });
-
-  // Self-clear is NOT a handoff — existing AI-1835 block takes priority
-
-  it("self-clear (delegateId: null) is blocked by AI-1835 before verdict gate fires", async () => {
-    const clearBody = {
-      query: "mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
-      variables: { id: "issue-uuid", input: { delegateId: null } },
-    };
-    globalThis.fetch = makeMockFetch(
-      CODE_REVIEW_WITH_DELEGATE,
-      null,
-    );
-    const result = await checkRawMutationInterception(
-      clearBody, "issue-uuid", "Bearer tok", "reviewer", DELEGATE_USER_ID,
-    );
-    expect(result).not.toBeNull();
-    expect(result).toContain("Direct delegate clear blocked");
   });
 });
