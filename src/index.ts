@@ -48,6 +48,7 @@ import { ProposalStore } from "./store/proposal-store.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
 import { getRegisteredCrons } from "./cron/registry.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
+import { getDetectorState } from "./done-ticket-detector-state.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
@@ -342,6 +343,9 @@ export function createApp(options?: CreateAppOptions) {
       // AI-2009 AC7: first-action watchdog liveness — scheduled + armedCount,
       // observable at ac-validate without waiting for a deadline breach.
       firstActionWatchdog: getFirstActionWatchdogState(),
+      // AI-2468 AC2: done-ticket detector liveness — scheduled + last-run
+      // visibility, observable at ac-validate without waiting for a cron tick.
+      doneTicketDetector: getDetectorState(),
       // AI-1848 (Pillar 2 D1): universal policy canon liveness — confirms
       // the canon file loaded and its version, observable at ac-validate
       // without waiting for a dispatch trigger.
@@ -1595,6 +1599,7 @@ if (isEntryPoint) {
   registerG20CanaryCron();
 
   // AI-2576: periodic done-ticket detector — flag Done tickets missing from main
+  // (uses git log --grep <ticket-id> to check commit messages).
   registerDoneDetectorCron({
     repoPath: process.env.DONE_DETECTOR_REPO_PATH ?? process.env.REPO_BASE_PATH,
     lookbackDays: parseInt(process.env.DONE_DETECTOR_LOOKBACK_DAYS ?? "14", 10),
