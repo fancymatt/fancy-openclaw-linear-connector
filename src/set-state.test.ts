@@ -210,6 +210,7 @@ describe("setStateAtomic (AI-1546)", () => {
   });
 
   beforeEach(() => {
+    process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH = path.join(dir, "def-state-snapshot.json");
     process.env.WORKFLOW_DEF_PATH = path.join(dir, "dev-impl.yaml");
     process.env.CAPABILITY_POLICY_PATH = path.join(dir, "capability-policy.yaml");
     process.env.AGENTS_FILE = path.join(dir, "agents.json");
@@ -221,6 +222,7 @@ describe("setStateAtomic (AI-1546)", () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    delete process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH;
     delete process.env.WORKFLOW_DEF_PATH;
     delete process.env.CAPABILITY_POLICY_PATH;
     delete process.env.AGENTS_FILE;
@@ -476,6 +478,7 @@ describe("setStateAtomic — INF-58 multi-body role re-dispatch", () => {
   let inf58OriginalAgentsFile: string | undefined;
   let inf58OriginalEncryptionKey: string | undefined;
   let inf58OriginalEncryptionKeyFile: string | undefined;
+  let inf58OriginalSnapshot: string | undefined;
   const INF58_NO_AGENTS_PATH: string = path.join(os.tmpdir(), "connector-jest-no-agents.json");
 
   const INF58_MULTI_BODY_WORKFLOW = `
@@ -575,6 +578,8 @@ bodies:
     inf58OriginalEncryptionKeyFile = process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
     delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
     delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+    inf58OriginalSnapshot = process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH;
+    process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH = path.join(inf58Dir, "def-state-snapshot.json");
 
     const policyFile = path.join(inf58Dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, INF58_MULTI_BODY_POLICY, "utf8");
@@ -626,6 +631,9 @@ bodies:
     else delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
     if (inf58OriginalEncryptionKeyFile !== undefined) process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE = inf58OriginalEncryptionKeyFile;
     else delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+
+    if (inf58OriginalSnapshot !== undefined) process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH = inf58OriginalSnapshot;
+    else delete process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH;
 
     fs.rmSync(inf58Dir, { recursive: true, force: true });
   });
@@ -769,6 +777,7 @@ describe("POST /admin/api/set-state (AI-1546 / AC2)", () => {
     const policyFile = writePolicyYaml(dir);
     const agentsFile = writeAgents(dir);
 
+    process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH = path.join(dir, "def-state-snapshot.json");
     process.env.ADMIN_SECRET = ADMIN_SECRET;
     process.env.WORKFLOW_DEF_PATH = workflowFile;
     process.env.CAPABILITY_POLICY_PATH = policyFile;
@@ -791,6 +800,7 @@ describe("POST /admin/api/set-state (AI-1546 / AC2)", () => {
     appState.agentQueue.close();
     appState.operationalEventStore.close();
     globalThis.fetch = originalFetch;
+    delete process.env.WORKFLOW_DEF_STATE_SNAPSHOT_PATH;
     delete process.env.ADMIN_SECRET;
     delete process.env.WORKFLOW_DEF_PATH;
     delete process.env.CAPABILITY_POLICY_PATH;
