@@ -339,7 +339,7 @@ beforeEach(() => {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-function makeLabelFetch(labelNames: string[], branchAndPR?: { hasBranch?: boolean; hasPR?: boolean; hasMergedPR?: boolean }): typeof globalThis.fetch {
+function makeLabelFetch(labelNames: string[], branchAndPR?: { hasBranch?: boolean; hasPR?: boolean; hasMergedPR?: boolean; mergeSha?: string | null; repoUrl?: string | null }, healthCommit?: string | null): typeof globalThis.fetch {
   const branch = {
     hasBranch: branchAndPR?.hasBranch ?? true,
     hasPR: branchAndPR?.hasPR ?? true,
@@ -369,18 +369,22 @@ function makeLabelFetch(labelNames: string[], branchAndPR?: { hasBranch?: boolea
     // implied by hasPR and branch-only evidence is not representable.
     if (bodyText.includes("IssueBranchAndPR")) {
       const prState = branch.hasMergedPR ? "merged" : "open";
+      const repoUrl = branchAndPR?.repoUrl ?? "fancymatt/repo";
+      const mergeSha = branchAndPR?.mergeSha;
+      const metadata: Record<string, unknown> = { status: prState };
+      if (mergeSha) metadata.mergeCommitSha = mergeSha;
+      const nodes = branch.hasPR
+        ? [{ url: `https://github.com/${repoUrl}/pull/1`, sourceType: "github", metadata }]
+        : [];
       return new Response(
-        JSON.stringify({
-          data: {
-            issue: {
-              attachments: {
-                nodes: branch.hasPR
-                  ? [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status: prState } }]
-                  : [],
-              },
-            },
-          },
-        }),
+        JSON.stringify({ data: { issue: { attachments: { nodes } } } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    // Intercept /health requests for the deploy health gate (AI-2361).
+    if (typeof _url === "string" && _url.endsWith("/health") && healthCommit !== undefined && healthCommit !== null) {
+      return new Response(
+        JSON.stringify({ commit: healthCommit }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -8028,5 +8032,128 @@ states:
     );
     expect(result).not.toBeNull();
     expect(result).toContain("Direct delegate clear blocked");
+  });
+});
+
+describe("checkWorkflowRules — deploy health gate (AI-2361)", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let originalHealthCheckUrl: string | undefined;
+  let originalConnectorRepo: string | undefined;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    originalHealthCheckUrl = process.env.HEALTH_CHECK_URL;
+    originalConnectorRepo = process.env.CONNECTOR_REPO;
+    // Point health check at a known mockable URL
+    process.env.HEALTH_CHECK_URL = "http://connector:3100/health";
+    process.env.CONNECTOR_REPO = "fancyfleet/fancy-openclaw-linear-connector";
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    if (originalHealthCheckUrl !== undefined) {
+      process.env.HEALTH_CHECK_URL = originalHealthCheckUrl;
+    } else {
+      delete process.env.HEALTH_CHECK_URL;
+    }
+    if (originalConnectorRepo !== undefined) {
+      process.env.CONNECTOR_REPO = originalConnectorRepo;
+    } else {
+      delete process.env.CONNECTOR_REPO;
+    }
+  });
+
+  // ── AC1: blocks deploy when running commit doesn't include merge SHA ──
+
+  it("blocks 'deploy' when running commit doesn't include merge SHA on connector-repo ticket", async () => {
+    const mergeSha = "abc123def4567890abcdef1234567890abcdef12";
+    const runningCommit = "def7890abcdef1234567890abcdef1234567890a";
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:deployment"],
+      { hasBranch: true, hasPR: true, hasMergedPR: true, mergeSha, repoUrl: "fancyfleet/fancy-openclaw-linear-connector" },
+      runningCommit,
+    );
+    const result = await checkWorkflowRules(
+      "deploy",
+      "issue-uuid",
+      "Bearer tok",
+      "hanzo",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain(runningCommit);
+    expect(result).toContain(mergeSha);
+  });
+
+  // ── AC1 message quality: both SHAs named ──
+
+  it("includes both commit SHAs in rejection message on stale artifact", async () => {
+    const mergeSha = "abc123def4567890abcdef1234567890abcdef12";
+    const runningCommit = "def7890abcdef1234567890abcdef1234567890a";
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:deployment"],
+      { hasBranch: true, hasPR: true, hasMergedPR: true, mergeSha, repoUrl: "fancyfleet/fancy-openclaw-linear-connector" },
+      runningCommit,
+    );
+    const result = await checkWorkflowRules(
+      "deploy",
+      "issue-uuid",
+      "Bearer tok",
+      "hanzo",
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain(mergeSha);
+    expect(result).toContain(runningCommit);
+  });
+
+  // ── AC1 positive: matching commit allows through ──
+
+  it("allows 'deploy' when running commit matches merge SHA on connector-repo ticket", async () => {
+    const mergeSha = "abcdef1234567890abcdef1234567890abcdef12";
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:deployment"],
+      { hasBranch: true, hasPR: true, hasMergedPR: true, mergeSha, repoUrl: "fancyfleet/fancy-openclaw-linear-connector" },
+      mergeSha, // health returns the same commit
+    );
+    const result = await checkWorkflowRules(
+      "deploy",
+      "issue-uuid",
+      "Bearer tok",
+      "hanzo",
+    );
+    expect(result).toBeNull(); // allowed (no block message)
+  });
+
+  // ── AC2: non-connector repo passes through ──
+
+  it("allows 'deploy' without health check for non-connector repo ticket", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:deployment"],
+      { hasBranch: true, hasPR: true, hasMergedPR: true, mergeSha: "abc123", repoUrl: "fancymatt/other-repo" },
+      // healthCommit not set — should not be called
+    );
+    const result = await checkWorkflowRules(
+      "deploy",
+      "issue-uuid",
+      "Bearer tok",
+      "hanzo",
+    );
+    expect(result).toBeNull(); // allowed (non-connector, pass-through)
+  });
+
+  // ── AC2 edge: missing mergeSha passes through ──
+
+  it("allows 'deploy' without health check when PR has no merge SHA", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:deployment"],
+      { hasBranch: true, hasPR: true, hasMergedPR: true, mergeSha: null, repoUrl: "fancyfleet/fancy-openclaw-linear-connector" },
+      // healthCommit not set — should not be called
+    );
+    const result = await checkWorkflowRules(
+      "deploy",
+      "issue-uuid",
+      "Bearer tok",
+      "hanzo",
+    );
+    expect(result).toBeNull(); // allowed (no merge SHA, pass-through)
   });
 });

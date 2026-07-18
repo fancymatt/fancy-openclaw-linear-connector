@@ -1610,6 +1610,10 @@ interface BranchAndPRStatus {
   hasPR: boolean;
   /** True when the issue has at least one merged pull request. */
   hasMergedPR: boolean;
+  /** Merge commit SHA from GitHub, if available (AI-2361 deploy health gate). */
+  mergeSha?: string | null;
+  /** GitHub repo URL (e.g. "fancyfleet/fancy-openclaw-linear-connector"), if available. */
+  repoUrl?: string | null;
 }
 
 /**
@@ -1692,15 +1696,73 @@ async function fetchBranchAndPRStatus(
       const status = (meta as { status?: unknown; state?: unknown }).status ?? (meta as { state?: unknown }).state;
       return typeof status === "string" && status.toLowerCase() === "merged";
     });
+    // Extract merge SHA and repo URL from the first merged PR (AI-2361 deploy health gate).
+    let mergeSha: string | null = null;
+    let repoUrl: string | null = null;
+    for (const pr of prNodes) {
+      const meta = pr.metadata ?? {};
+      const sha = (meta as { mergeCommitSha?: unknown; mergeSha?: unknown }).mergeCommitSha ?? (meta as { mergeSha?: unknown }).mergeSha;
+      if (typeof sha === "string" && sha.length > 0) {
+        mergeSha = sha;
+      }
+      if (typeof pr.url === "string") {
+        const m = pr.url.match(/github\.com\/([^/]+\/[^/]+)\/pull/);
+        if (m) repoUrl = m[1];
+      }
+      // Use the first merged PR with available data
+      if (mergeSha || repoUrl) break;
+    }
     return {
       // Attachments cannot see branches directly; a PR implies a pushed branch.
       hasBranch: hasPR,
       hasPR,
       hasMergedPR,
+      mergeSha,
+      repoUrl,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: branch/PR fetch failed for ${issueId}: ${msg}`);
+    return null;
+  }
+}
+
+// ── Deploy health gate (AI-2361): verify running artifact contains merge SHA ──
+
+/**
+ * Check if a given repo URL matches the connector repo (which has a verifiable
+ * /health endpoint). Uses the CONNECTOR_REPO env var (defaults to the
+ * fancyfleet/fancy-openclaw-linear-connector identifier) to determine the
+ * connector repo identity.
+ */
+function isConnectorRepo(repoUrl: string | null | undefined): boolean {
+  if (!repoUrl) return false;
+  const connectorRepo = process.env.CONNECTOR_REPO ?? "fancyfleet/fancy-openclaw-linear-connector";
+  return repoUrl.toLowerCase() === connectorRepo.toLowerCase();
+}
+
+/**
+ * Fetch the running connector's /health commit hash.
+ * Uses the HEALTH_CHECK_URL env var, defaulting to http://localhost:3100/health.
+ * Returns null on any error (fail-open for non-connector scenarios).
+ */
+async function fetchHealthCommit(): Promise<string | null> {
+  const url = process.env.HEALTH_CHECK_URL ?? "http://localhost:3100/health";
+  try {
+    const res = await fetch(url, { method: "GET", signal: AbortSignal.timeout(5000) });
+    if (!res.ok) {
+      log.warn(`workflow-gate: /health check returned ${res.status} from ${url}`);
+      return null;
+    }
+    const body = (await res.json()) as { commit?: unknown };
+    if (typeof body.commit !== "string") {
+      log.warn(`workflow-gate: /health response missing 'commit' field from ${url}`);
+      return null;
+    }
+    return body.commit;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: /health fetch failed from ${url}: ${msg}`);
     return null;
   }
 }
@@ -2593,6 +2655,60 @@ export async function checkWorkflowRules(
         );
       }
       log.info(`workflow-gate: done gate: ${issueId} passed (has branch + PR, not yet merged)`);
+    }
+  }
+
+  // ── AI-2361: Deploy health gate ───────────────────────────────────────
+  // When a ticket transitions forward from a deploy state on a connector repo
+  // ticket, verify the running connector's /health commit includes the merge SHA.
+  // This prevents stale-artifact tickets from reaching ac-validate (see AI-2357).
+  // Non-connector repos, missing merge SHA, and non-forward transitions (reject)
+  // are all pass-through.
+  if ((currentState?.includes('deploy') ?? false) && intent !== 'reject') {
+    const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+    if (branchStatus) {
+      const repo = branchStatus.repoUrl;
+      const mergeSha = branchStatus.mergeSha;
+      if (!mergeSha) {
+        log.info(`workflow-gate: deploy health gate: ${issueId} — no merge SHA available (passing through)`);
+      } else if (!isConnectorRepo(repo)) {
+        log.info(`workflow-gate: deploy health gate: ${issueId} — non-connector repo '${repo}' (passing through)`);
+      } else {
+        const runningCommit = await fetchHealthCommit();
+        if (runningCommit === null) {
+          // Health check unavailable — fail-closed for connector repo tickets:
+          // if we can't verify the artifact, don't let stale builds through.
+          log.warn(`workflow-gate: deploy health gate: ${issueId} — /health unreachable, blocking deploy`);
+          notify({
+            severity: "warning",
+            source: "deploy-health-gate",
+            title: "Deploy health gate: /health unreachable",
+            detail: `Ticket ${issueId} on connector repo: /health returned no commit — blocking deploy to prevent stale-artifact validation.`,
+            ticket: issueId,
+            dedupKey: `deploy-health|${issueId}`,
+          });
+          return `[Proxy] '${intent}' blocked: the running connector's /health endpoint is unreachable. ` +
+            `Cannot verify the running artifact contains merge SHA ${mergeSha}. Ensure the connector is running and try again.`;
+        }
+        // Check if the running commit includes the merge SHA (prefix match supports
+        // short SHAs, contains supports cases where the merge is an ancestor).
+        if (!runningCommit.startsWith(mergeSha) && !runningCommit.includes(mergeSha)) {
+          log.warn(`workflow-gate: deploy health gate: ${issueId} — stale artifact (running=${runningCommit}, merge=${mergeSha})`);
+          notify({
+            severity: "warning",
+            source: "deploy-health-gate",
+            title: `Deploy health gate: stale artifact (running=${runningCommit.slice(0,7)}, merge=${mergeSha.slice(0,7)})`,
+            detail: `Ticket ${issueId}: running commit '${runningCommit}' does not contain merge SHA '${mergeSha}'. ` +
+              `The running connector artifact was not built from this merge and would verify a stale build through ac-validate. ` +
+              `Deploy the new artifact (host restart or redeploy) before continuing.`,
+            ticket: issueId,
+          });
+          return `[Proxy] '${intent}' blocked: stale connector artifact. ` +
+            `Running commit: ${runningCommit}, merge SHA: ${mergeSha}. ` +
+            `The running connector was not built from this merge. Deploy the new artifact (restart/redeploy) before continuing.`;
+        }
+        log.info(`workflow-gate: deploy health gate: ${issueId} passed (running ${runningCommit.slice(0,7)} matches merge ${mergeSha.slice(0,7)})`);
+      }
     }
   }
 
