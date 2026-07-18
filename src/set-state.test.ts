@@ -474,6 +474,9 @@ describe("setStateAtomic — INF-58 multi-body role re-dispatch", () => {
   let inf58OriginalWorkflowPath: string | undefined;
   let inf58OriginalPolicyPath: string | undefined;
   let inf58OriginalAgentsFile: string | undefined;
+  let inf58OriginalEncryptionKey: string | undefined;
+  let inf58OriginalEncryptionKeyFile: string | undefined;
+  const INF58_NO_AGENTS_PATH: string = path.join(os.tmpdir(), "connector-jest-no-agents.json");
 
   const INF58_MULTI_BODY_WORKFLOW = `
 id: dev-impl
@@ -565,6 +568,14 @@ bodies:
     inf58Dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf58-"));
     inf58OriginalFetch = globalThis.fetch;
 
+    // Isolate from the encrypted production agents.json — capture and clear
+    // encryption key env vars so reloadAgents() never tries to decrypt
+    // the default agents.json when AGENTS_FILE falls back.
+    inf58OriginalEncryptionKey = process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    inf58OriginalEncryptionKeyFile = process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
+
     const policyFile = path.join(inf58Dir, "capability-policy.yaml");
     fs.writeFileSync(policyFile, INF58_MULTI_BODY_POLICY, "utf8");
     inf58OriginalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
@@ -600,9 +611,21 @@ bodies:
     if (inf58OriginalPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = inf58OriginalPolicyPath;
     else delete process.env.CAPABILITY_POLICY_PATH;
 
-    if (inf58OriginalAgentsFile !== undefined) process.env.AGENTS_FILE = inf58OriginalAgentsFile;
-    else delete process.env.AGENTS_FILE;
+    // Reset AGENTS_FILE to a safe dummy path before reload, so the fallback
+    // to DEFAULT_AGENTS_PATH (the encrypted production agents.json) never
+    // fires when the parent describe's afterEach left AGENTS_FILE unset.
+    if (inf58OriginalAgentsFile !== undefined) {
+      process.env.AGENTS_FILE = inf58OriginalAgentsFile;
+    } else {
+      process.env.AGENTS_FILE = INF58_NO_AGENTS_PATH;
+    }
     reloadAgents();
+
+    // Restore encryption key env vars after the reload completes.
+    if (inf58OriginalEncryptionKey !== undefined) process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = inf58OriginalEncryptionKey;
+    else delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    if (inf58OriginalEncryptionKeyFile !== undefined) process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE = inf58OriginalEncryptionKeyFile;
+    else delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
 
     fs.rmSync(inf58Dir, { recursive: true, force: true });
   });
