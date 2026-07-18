@@ -206,27 +206,23 @@ export async function findOrCreateLabel(
         typeof e.message === "string" && e.message.includes("conflicting inherited label"),
       );
     if (isInheritedConflict) {
-      log.info(`inherited-label promotion for '${labelName}' on team ${teamId}`);
-      const promoteMutation = group
-        ? `
-        mutation PromoteLabel($teamId: String!, $name: String!, $color: String!, $parentId: String!, $replaceTeamLabels: Boolean!) {
-          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, parentId: $parentId, replaceTeamLabels: $replaceTeamLabels }) {
-            success
-            issueLabel { id }
-          }
-        }
-      `
-        : `
-        mutation PromoteLabel($teamId: String!, $name: String!, $color: String!, $replaceTeamLabels: Boolean!) {
-          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, replaceTeamLabels: $replaceTeamLabels }) {
+      // AI-2543 + AGI-12: Linear's IssueLabelCreateInput does NOT accept
+      // `replaceTeamLabels` — it was removed from the schema. A plain retry
+      // with `teamId` just repeats the same rejected create. Instead, omit
+      // `teamId` to create a WORKSPACE-LEVEL label (visible to all teams),
+      // which cannot have inheritance conflicts and is accepted by every
+      // team's issueUpdate. For workflow state labels (state:*) this is also
+      // semantically correct — they are universal, not team-specific.
+      log.info(`inherited-label promotion for '${labelName}' — retrying as workspace-level label`);
+      const promoteMutation = `
+        mutation PromoteLabel($name: String!, $color: String!) {
+          issueLabelCreate(input: { name: $name, color: $color }) {
             success
             issueLabel { id }
           }
         }
       `;
-      const promoteVars = group
-        ? { teamId, name: createName, color: "#94a3b8", parentId: group.id, replaceTeamLabels: true }
-        : { teamId, name: createName, color: "#94a3b8", replaceTeamLabels: true };
+      const promoteVars = { name: createName, color: "#94a3b8" };
       try {
         const promoteRes = await fetch(LINEAR_API_URL, {
           method: "POST",
