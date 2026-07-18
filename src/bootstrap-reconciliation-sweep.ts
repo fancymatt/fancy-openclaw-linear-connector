@@ -13,8 +13,11 @@
  * Design notes:
  *   - Query: batch Linear search for wf:* labeled tickets, filter client-side
  *     for no state:* label and past grace window.
- *   - Heal: re-fetch issue context (idempotency) then call `applyBootstrapToIssue`
- *     — the exact same core the webhook bootstrap uses.
+ *   - Heal (Pass 1 — unenrolled): re-fetch issue context (idempotency) then
+ *     call `applyBootstrapToIssue` — the exact same core the webhook bootstrap uses.
+ *   - Heal (Pass 2 — enrolled, AI-2016 AC3): for tickets WITH state:* labels that
+ *     are native-Done with merged PRs, strip wf:* and state:* labels and clear
+ *     delegate so the workflow record closes.
  *   - Alert: each heal emits a warning via the alert bus (`bootstrap-reconciled`).
  *   - Race-safe: the idempotency re-fetch inside the heal path prevents
  *     double-bootstrap when a late webhook lands between query and heal.
@@ -68,6 +71,179 @@ export interface ReconciliationSweepResult {
   withinGrace: number;
   /** Non-fatal errors encountered during the sweep. */
   errors: string[];
+}
+
+// ── Enrolled-ticket helpers (AI-2016 AC3) ────────────────────────────────────
+
+interface EnrolledTicketNativeState {
+  state: { id: string; name: string; type: string } | null;
+  delegate: { id: string } | null;
+}
+
+/**
+ * Fetch native state and delegate for an enrolled ticket.
+ * Uses a query name that includes "IssueContext" so test mocks can intercept it
+ * without the "IssueWithLabels" exclusion.
+ */
+async function queryEnrolledTicketState(
+  issueId: string,
+  authToken: string,
+  fetchFn: typeof fetch,
+): Promise<EnrolledTicketNativeState | null> {
+  const query = `
+    query IssueContextSweep($id: String!) {
+      issue(id: $id) {
+        id
+        state { id name type }
+        delegate { id }
+      }
+    }
+  `;
+  try {
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    type Resp = {
+      data?: {
+        issue?: {
+          state: { id: string; name: string; type: string } | null;
+          delegate: { id: string } | null;
+        } | null;
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const issue = data.data?.issue;
+    if (!issue) return null;
+    return {
+      state: issue.state,
+      delegate: issue.delegate,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch PR merge status for an enrolled ticket (inline — mirrors
+ * fetchBranchAndPRStatus from workflow-gate.ts but avoids the export dependency).
+ */
+async function queryEnrolledPRStatus(
+  issueId: string,
+  authToken: string,
+  fetchFn: typeof fetch,
+): Promise<{ hasMergedPR: boolean } | null> {
+  const query = `
+    query IssueBranchAndPR($id: String!) {
+      issue(id: $id) {
+        attachments {
+          nodes {
+            url
+            sourceType
+            metadata
+          }
+        }
+      }
+    }
+  `;
+  try {
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    type Resp = {
+      data?: {
+        issue?: {
+          attachments: { nodes: Array<{ url?: string | null; sourceType?: string | null; metadata?: Record<string, unknown> | null }> };
+        } | null;
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const nodes = data.data?.issue?.attachments?.nodes ?? [];
+    const prNodes = nodes.filter((n) =>
+      typeof n.url === "string" && /github\.com\/[^/]+\/[^/]+\/pull\/\d+/i.test(n.url),
+    );
+    const hasMergedPR = prNodes.some((n) => {
+      const meta = n.metadata ?? {};
+      const status = (meta as { status?: unknown; state?: unknown }).status ?? (meta as { state?: unknown }).state;
+      return typeof status === "string" && status.toLowerCase() === "merged";
+    });
+    return { hasMergedPR };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Heal an enrolled ticket that is native-Done with merged PRs:
+ * strip wf:* and state:* labels, clear delegate.
+ *
+ * Uses the injected fetchFn (not global fetch) so tests can mock it.
+ * Inlines the queries rather than calling shared helpers because those
+ * helpers use globalThis.fetch which the mock cannot intercept.
+ */
+async function closeEnrolledTicket(
+  issueId: string,
+  authToken: string,
+  fetchFn: typeof fetch,
+): Promise<boolean> {
+  // Re-fetch to get label IDs for stripping (IssueWithLabels query)
+  const labelsQuery = `
+    query IssueWithLabelsForClose($id: String!) {
+      issue(id: $id) {
+        id
+        identifier
+        team { id }
+        labels { nodes { id name } }
+      }
+    }
+  `;
+  let issueLabels: Array<{ id: string; name: string }> = [];
+  try {
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: labelsQuery, variables: { id: issueId } }),
+    });
+    type LResp = {
+      data?: { issue?: { labels: { nodes: Array<{ id: string; name: string }> } } | null };
+    };
+    const data = (await res.json()) as LResp;
+    issueLabels = data.data?.issue?.labels?.nodes ?? [];
+  } catch {
+    return false;
+  }
+
+  // Filter OUT labels that start with wf:* or state:*
+  const keepIds = issueLabels
+    .filter((l) => !l.name.startsWith("state:") && !l.name.startsWith("wf:"))
+    .map((l) => l.id);
+
+  // Clear delegate and set remaining labels in one mutation
+  const mutation = `
+    mutation CloseEnrolledTicket($issueId: String!, $labelIds: [String!]!) {
+      issueUpdate(id: $issueId, input: { labelIds: $labelIds, delegateId: null }) {
+        success
+      }
+    }
+  `;
+  try {
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({
+        query: mutation,
+        variables: { issueId, labelIds: keepIds },
+      }),
+    });
+    type MResp = { data?: { issueUpdate?: { success: boolean } } };
+    const data = (await res.json()) as MResp;
+    return data.data?.issueUpdate?.success ?? false;
+  } catch {
+    return false;
+  }
 }
 
 // ── Sweep query ──────────────────────────────────────────────────────────────
@@ -188,11 +364,11 @@ export async function runBootstrapReconciliationSweep(
 
   result.scanned = candidates.length;
 
-  // ── Filter + heal ──────────────────────────────────────────────────────
+  // ── Pass 1: Unenrolled tickets ────────────────────────────────────────────
   for (const ticket of candidates) {
     // Filter: must have a wf:* label but NO state:* label
     const hasStateLabel = ticket.labels.some((l) => l.name.startsWith("state:"));
-    if (hasStateLabel) continue; // already enrolled — skip
+    if (hasStateLabel) continue; // already enrolled — handled in Pass 2
 
     // Filter: grace window — give the webhook time to arrive
     const updatedAtMs = new Date(ticket.updatedAt).getTime();
@@ -264,6 +440,57 @@ export async function runBootstrapReconciliationSweep(
         severity: "warning",
         source: "bootstrap-reconciled",
         title: `Bootstrap reconciliation heal error for ${ticket.identifier}`,
+        detail: { error: msg },
+        ticket: ticket.identifier,
+      });
+    }
+  }
+
+  // ── Pass 2: Enrolled tickets that are native-Done with merged PRs (AI-2016 AC3) ──
+  for (const ticket of candidates) {
+    const hasStateLabel = ticket.labels.some((l) => l.name.startsWith("state:"));
+    if (!hasStateLabel) continue; // only enrolled tickets
+
+    try {
+      // Fetch native state — must be terminal (completed) to auto-close
+      const stateData = await queryEnrolledTicketState(ticket.id, authToken, fetchFn);
+      if (!stateData || !stateData.state || stateData.state.type !== "completed") continue;
+
+      // Fetch PR status — must have merged PRs to confirm shipped
+      const prStatus = await queryEnrolledPRStatus(ticket.id, authToken, fetchFn);
+      if (!prStatus || !prStatus.hasMergedPR) continue;
+
+      // Native-Done + merged PRs: close the workflow record
+      const closed = await closeEnrolledTicket(ticket.id, authToken, fetchFn);
+      if (closed) {
+        result.healed++;
+        log.info(
+          `bootstrap-reconciliation: closed enrolled shipped ticket ${ticket.identifier}` +
+          ` (native state: ${stateData.state.name}, merged PRs confirmed)`,
+        );
+        alertBus.notify({
+          severity: "warning",
+          source: "bootstrap-reconciled",
+          title: `Bootstrap reconciliation closed enrolled shipped ticket ${ticket.identifier}`,
+          detail: {
+            ticket: ticket.identifier,
+            issueId: ticket.id,
+            nativeState: stateData.state.name,
+          },
+          ticket: ticket.identifier,
+        });
+      } else {
+        result.errors.push(`close enrolled mutation failed for ${ticket.identifier}`);
+        log.warn(`bootstrap-reconciliation: close enrolled mutation returned false for ${ticket.identifier}`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      result.errors.push(`enrolled-ticket close failed for ${ticket.identifier}: ${msg}`);
+      log.error(`bootstrap-reconciliation: enrolled-ticket close error for ${ticket.identifier}: ${msg}`);
+      alertBus.notify({
+        severity: "warning",
+        source: "bootstrap-reconciled",
+        title: `Bootstrap reconciliation enrolled-ticket error for ${ticket.identifier}`,
         detail: { error: msg },
         ticket: ticket.identifier,
       });
