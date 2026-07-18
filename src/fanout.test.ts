@@ -426,22 +426,18 @@ describe("executeFanout — mocked Linear API", () => {
         description: "## Findings\n- **Finding A**: Description A\n- **Finding B**: Description B\n",
         parentIssueId: null,
       },
-    });
-
       teamLabels: [
         { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
         { id: "existing-state-intake", name: "state:intake" },
       ],
+    });
+
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true });
 
     expect(result.created).toBe(2);
     expect(result.childIdentifiers).toHaveLength(2);
   });
 
-      teamLabels: [
-        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
-        { id: "existing-state-intake", name: "state:intake" },
-      ],
   it("AI-1992 (AC5): refuses — no children — when the description has no parseable spec", async () => {
     globalThis.fetch = makeFanoutFetch({
       parentContext: {
