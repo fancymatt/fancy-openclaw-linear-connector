@@ -31,8 +31,10 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
+import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
 import { buildTransitionAuditRecord, emitTransitionAuditRecord, verifyPostTransition, type GateResult, type TransitionAuditRecord } from "./transition-audit.js";
+import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
@@ -486,6 +488,8 @@ export interface ProxyDeps {
    * idempotent; calling it multiple times for the same agent+ticket is harmless.
    */
   onProxyCall?: (agentId: string, ticketId: string) => void;
+  /** AI-2565: dispatch lease store for CAS stale-snapshot enforcement on terminal transitions. */
+  dispatchLeaseStore?: DispatchLeaseStore;
 }
 
 export async function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void> {
@@ -901,6 +905,28 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         }
         res.status(200).json(gateDeclineResponse);
         return;
+      }
+
+      // ====================================================================
+      // AI-2565: CAS stale-snapshot check for terminal transitions.
+      // Runs after B1 (workflow rules) passes but before the forward mutation.
+      // Only applies to terminal/routing intents (handoff-work, complete-work,
+      // needs-human, refuse-work).
+      // ====================================================================
+      if (issueId && effectiveIntent) {
+        const staleRejection = await checkStaleSnapshotForTerminal(
+          effectiveIntent,
+          issueId,
+          agentId,
+          authorization,
+          callerLinearUserId,
+          deps?.dispatchLeaseStore,
+        );
+        if (staleRejection) {
+          log.warn(`stale-snapshot-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${staleRejection}`);
+          res.status(200).json({ errors: [{ message: staleRejection }] });
+          return;
+        }
       }
 
       // AI-1860: first successful authorization — store the snapshot so subsequent
