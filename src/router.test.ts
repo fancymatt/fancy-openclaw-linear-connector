@@ -527,3 +527,341 @@ describe("routeEventAll", () => {
     expect(routes).toEqual([]);
   });
 });
+
+// ── INF-59: Same-column workflow advance suppresses next-owner dispatch ──────
+// The isStateTransition check in extractAgentTarget only looks for native
+// stateId in updatedFrom. For same-column workflow advances (GEN-198 class),
+// the native stateId does not change — only the state:* label (via labelIds)
+// and/or the delegate change. isStateTransition must also recognize label
+// changes as workflow state transitions.
+//
+// Fix: extend isStateTransition to return true when labelIds is in updatedFrom.
+
+describe("INF-59 — same-column workflow advance dispatches next owner", () => {
+  const HANZO_ID = "e7a64973-e186-2117-0000-00000000dead";
+  const TDD_ID   = "aabbccdd-1111-2222-3333-444444444444";
+
+  let agentsFile: string;
+
+  beforeEach(() => {
+    agentsFile = makeTempAgentsFile([
+      ...BASE_AGENTS,
+      {
+        name: "tdd",
+        linearUserId: TDD_ID,
+        openclawAgent: "tdd",
+        clientId: "c4",
+        clientSecret: "s4",
+        accessToken: "tok4",
+        refreshToken: "ref4",
+      },
+      {
+        name: "hanzo",
+        linearUserId: HANZO_ID,
+        openclawAgent: "hanzo",
+        clientId: "c5",
+        clientSecret: "s5",
+        accessToken: "tok5",
+        refreshToken: "ref5",
+      },
+    ]);
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTS_FILE;
+    fs.rmSync(path.dirname(agentsFile), { recursive: true, force: true });
+  });
+
+  // ── AC1: same-column advance dispatches next owner ──────────────────────
+  // When a governed transition advances state:* label and/or delegate but
+  // native stateId is unchanged, isStateTransition must treat it as a
+  // workflow state change so dispatch fires.
+
+  describe("AC1 — same-column advance dispatches the next owner", () => {
+    test("same-column advance with labelIds change (no stateId, no delegate change) dispatches to the current delegate", () => {
+      // This is the core bug: review(own_role=tdd) → sign-off(own_role=tdd)
+      // in the same native column. Labels changed (state:* swapped) but
+      // neither stateId nor delegate changed. Current code suppresses this
+      // as "no-change delegate write." Fix: labelIds in updatedFrom is a
+      // workflow state transition when the PROXY is the actor.
+      const event = makeIssueEvent({
+        actorId: CHARLES_ID,   // proxy actor
+        delegateId: TDD_ID,
+        delegateName: "tdd",
+        identifier: "GEN-199",
+        updatedFrom: { labelIds: ["old-state-label-uuid"] },
+      });
+      const result = extractAgentTarget(event);
+      // Must NOT be suppressed — this is a genuine workflow advance.
+      expect(result).not.toEqual({ suppressed: true });
+      expect(result).not.toBeNull();
+      expect((result as { name: string }).name).toBe("tdd");
+      expect((result as { reason: string }).reason).toBe("delegate");
+    });
+
+    test("same-column advance with labelIds + delegate change dispatches to the new delegate", () => {
+      // GEN-198 scenario: review(own_role=tdd) → sign-off(own_role=astrid).
+      // Delegate changes AND labelIds changes. Current code already passes
+      // because delegateId in updatedFrom lets the guard through. Regression
+      // guard: fix must not break this case.
+      const event = makeIssueEvent({
+        delegateId: ASTRID_ID,
+        delegateName: "astrid",
+        identifier: "GEN-198",
+        updatedFrom: {
+          delegateId: TDD_ID,
+          labelIds: ["old-state-label-uuid"],
+        },
+      });
+      const result = extractAgentTarget(event);
+      expect(result).not.toBeNull();
+      expect((result as { name: string }).name).toBe("astrid");
+      expect((result as { reason: string }).reason).toBe("delegate");
+    });
+
+    test("self-triggered same-column advance (actor is target agent) dispatches when labels changed", () => {
+      // Agent advances its own ticket to another same-column state where it
+      // is also the owner. Actor=target agent, labelIds changed, no stateId
+      // change. Self-trigger filter currently suppresses because
+      // isStateTransition is false. Fix: labelIds in updatedFrom makes
+      // isStateTransition true → self-trigger filter allows dispatch.
+      const event = makeIssueEvent({
+        actorId: CHARLES_ID,
+        delegateId: CHARLES_ID,
+        delegateName: "charles",
+        identifier: "AI-2400",
+        updatedFrom: { labelIds: ["old-state-label-uuid"] },
+      });
+      const result = extractAgentTarget(event);
+      // Must NOT be suppressed — same-agent same-column advance.
+      expect(result).not.toEqual({ suppressed: true });
+      expect(result).not.toBeNull();
+      expect((result as { name: string }).name).toBe("charles");
+    });
+
+    test("cross-column advance (stateId in updatedFrom) still dispatches (no regression)", () => {
+      // Traditional cross-column advance: stateId changed. Must still work
+      // as before — no regression from the isStateTransition fix.
+      const event = makeIssueEvent({
+        delegateId: CHARLES_ID,
+        identifier: "AI-2401",
+        updatedFrom: { stateId: "prev-native-state-uuid" },
+      });
+      const result = extractAgentTarget(event);
+      expect(result).not.toBeNull();
+      expect((result as { name: string }).name).toBe("charles");
+    });
+
+    test("label-only edit (no delegate change, no state advance) is NOT a state transition (no regression)", () => {
+      // A plain label-edit event (adding/removing a non-state label) must
+      // still be suppressed when updatedFrom has only labelIds and no
+      // delegate change — it is NOT a workflow advance. This verifies that
+      // the isStateTransition fix does not turn every label edit into a
+      // dispatch.
+      const event = makeIssueEvent({
+        delegateId: CHARLES_ID,
+        identifier: "AI-2402",
+        updatedFrom: { labelIds: ["prev-label-uuid"] },
+      });
+      // NON-actor agent (actor !== target) — hits the AI-1573 guard.
+      // Before fix: suppressed because !isStateTransition.
+      // With fix where isStateTransition includes labelIds: would allow
+      // through. That's not desired for arbitrary label edits.
+      //
+      // So isStateTransition alone is too broad. The fix should only
+      // activate labelIds-as-transition when there's evidence of a
+      // workflow advance. Evidence: actor IS one of our agents (proxy
+      // made the change) OR delegateId also changed.
+      //
+      // For this case (external human actor, no delegate change),
+      // must still suppress.
+      const result = extractAgentTarget(event);
+      expect(result).toEqual({ suppressed: true });
+    });
+  });
+
+  // ── AC2: No double-dispatch ──────────────────────────────────────────────
+  // Same-column advance that also happens to produce a native state change
+  // must not wake the owner twice.
+
+  describe("AC2 — no double-dispatch on same-column advance", () => {
+    test("same-column advance with BOTH labelIds and stateId in updatedFrom dispatches once (not suppressed, not doubled)", () => {
+      // Edge case: an advance where BOTH labelIds and stateId changed.
+      // isStateTransition was already true from stateId; labelIds addition
+      // must not cause double-suppression or double-dispatch.
+      const event = makeIssueEvent({
+        delegateId: CHARLES_ID,
+        identifier: "AI-2403",
+        updatedFrom: {
+          stateId: "prev-native-state-uuid",
+          labelIds: ["old-state-label-uuid"],
+        },
+      });
+      // Must dispatch once (not suppressed), not doubled.
+      const result = extractAgentTarget(event);
+      expect(result).not.toEqual({ suppressed: true });
+      expect(result).not.toBeNull();
+
+      // routeEventAll confirms exactly one route.
+      const routes = routeEventAll(event);
+      expect(routes).toHaveLength(1);
+      expect(routes[0].agentId).toBe("charles");
+    });
+
+    test("proxy-governed advance must not produce duplicate wake via routeEventAll", () => {
+      // When the proxy (actor is an agent) does a same-column advance that
+      // changes both delegate and labels, routeEventAll must not fan out
+      // to the actor in addition to the target delegate.
+      const event = makeIssueEvent({
+        actorId: TDD_ID,
+        delegateId: ASTRID_ID,
+        delegateName: "astrid",
+        identifier: "GEN-198",
+        updatedFrom: {
+          delegateId: TDD_ID,
+          labelIds: ["old-state-label-uuid"],
+        },
+      });
+      const routes = routeEventAll(event);
+      // Exactly one route: astrid (the new delegate). TDD (the actor)
+      // must not be fanned out to as a mention.
+      expect(routes).toHaveLength(1);
+      expect(routes[0].agentId).toBe("astrid");
+    });
+  });
+
+  // ── AC3: Regression coverage ─────────────────────────────────────────────
+  // Three specific regression tests per AC3.
+
+  describe("AC3 — regression coverage", () => {
+    test("same-column advance (labelIds only, proxy actor) → next owner dispatched", () => {
+      // Label change with proxy actor represents a state:* transition.
+      // Delegate unchanged. Must dispatch to the current delegate.
+      const event = makeIssueEvent({
+        actorId: CHARLES_ID,
+        delegateId: CHARLES_ID,
+        identifier: "REG-1",
+        updatedFrom: { labelIds: ["prev-label-uuid"] },
+      });
+      const result = extractAgentTarget(event);
+      expect(result).not.toEqual({ suppressed: true });
+      expect(result).not.toBeNull();
+      expect((result as { name: string }).name).toBe("charles");
+    });
+
+    test("same-column advance → no duplicate wake (idempotency is downstream, router must not double-route)", () => {
+      // routeEventAll must produce exactly one route for a same-column
+      // advance where delegate changes and labels change.
+      const event = makeIssueEvent({
+        delegateId: ASTRID_ID,
+        identifier: "REG-2",
+        updatedFrom: {
+          delegateId: CHARLES_ID,
+          labelIds: ["prev-label-uuid"],
+        },
+      });
+      const routes = routeEventAll(event);
+      expect(routes).toHaveLength(1);
+      expect(routes[0].agentId).toBe("astrid");
+      expect(routes[0].routingReason).toBe("delegate");
+    });
+
+    test("cross-column advance unchanged behavior", () => {
+      // Cross-column advance: stateId changed. Must route exactly once
+      // to the new delegate.
+      const event = makeIssueEvent({
+        delegateId: ASTRID_ID,
+        identifier: "REG-3",
+        updatedFrom: {
+          stateId: "prev-native-state-uuid",
+          delegateId: CHARLES_ID,
+        },
+      });
+      const routes = routeEventAll(event);
+      expect(routes).toHaveLength(1);
+      expect(routes[0].agentId).toBe("astrid");
+    });
+  });
+
+  // ── AC4: GEN-198 fixture replay ───────────────────────────────────────────
+  // A fixture replaying review → merge same-column advance asserts the
+  // merge owner (Hanzo) is dispatched without manual intervention.
+
+  describe("AC4 — GEN-198 fixture replay", () => {
+    test("review → merge same-column advance dispatches hanzo (merge owner)", () => {
+      // Simulates the GEN-198 chain:
+      //   review(owner=tdd, native=todo) → merge(owner=hanzo, native=todo)
+      // Native stateId unchanged. Labels changed (state:review→state:merge).
+      // Delegate changed (tdd→hanzo).
+      //
+      // This is the proxy (ai) making the mutation, so the actor is
+      // the OAuth app user whose linearUserId maps to an agent.
+      // For this test we use charles as the acting proxy agent.
+      const event = makeIssueEvent({
+        actorId: CHARLES_ID,
+        delegateId: HANZO_ID,
+        delegateName: "hanzo",
+        identifier: "GEN-198",
+        updatedFrom: {
+          delegateId: TDD_ID,
+          labelIds: ["old-state-label-uuid"],
+        },
+      });
+
+      // extractAgentTarget must not suppress this — it's a genuine
+      // workflow advance to the merge state.
+      const result = extractAgentTarget(event);
+      expect(result).not.toEqual({ suppressed: true });
+      expect(result).not.toBeNull();
+      expect((result as { name: string }).name).toBe("hanzo");
+
+      // routeEventAll must produce exactly one route to hanzo.
+      const routes = routeEventAll(event);
+      expect(routes).toHaveLength(1);
+      expect(routes[0].agentId).toBe("hanzo");
+      expect(routes[0].routingReason).toBe("delegate");
+    });
+
+    test("review → sign-off → merge chain: each step dispatches the correct owner", () => {
+      // Same as above but tests the first step: review(owner=tdd) →
+      // sign-off(owner=astrid). Both in the same native column (todo).
+      const event = makeIssueEvent({
+        actorId: CHARLES_ID,
+        delegateId: ASTRID_ID,
+        delegateName: "astrid",
+        identifier: "GEN-198",
+        updatedFrom: {
+          delegateId: TDD_ID,
+          labelIds: ["old-state-label-uuid"],
+        },
+      });
+
+      const result = extractAgentTarget(event);
+      expect(result).not.toEqual({ suppressed: true });
+      expect(result).not.toBeNull();
+      expect((result as { name: string }).name).toBe("astrid");
+
+      const routes = routeEventAll(event);
+      expect(routes).toHaveLength(1);
+      expect(routes[0].agentId).toBe("astrid");
+    });
+
+    test("cross-column control: write-tests → implementation (todo→doing) still dispatches igor (no regression)", () => {
+      // Cross-column advance: stateId changes (todo→doing).
+      // Must dispatch normally.
+      const event = makeIssueEvent({
+        delegateId: CHARLES_ID,
+        identifier: "GEN-198",
+        updatedFrom: {
+          stateId: "prev-native-todo-uuid",
+          delegateId: TDD_ID,
+        },
+      });
+      const routes = routeEventAll(event);
+      expect(routes).toHaveLength(1);
+      expect(routes[0].agentId).toBe("charles");
+    });
+  });
+});
