@@ -47,12 +47,13 @@ jobs:
         env:
           TAGS_META: ${{ needs.meta.outputs.tags }}
         run: |
-          SUFFIXED=""
-          while IFS= read -r TAG; do
-            [ -z "$TAG" ] && continue
-            SUFFIXED="${SUFFIXED} ${TAG}-amd64"
-          done <<< "$TAGS_META"
-          echo "tags=${SUFFIXED# }" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<TAGS_EOF"
+            if [ -n "$TAGS_META" ]; then
+              echo "$TAGS_META" | sed 's/$/-amd64/'
+            fi
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
       - name: Build and push (amd64)
         uses: docker/build-push-action@v6
         with:
@@ -84,12 +85,13 @@ jobs:
         env:
           TAGS_META: ${{ needs.meta.outputs.tags }}
         run: |
-          SUFFIXED=""
-          while IFS= read -r TAG; do
-            [ -z "$TAG" ] && continue
-            SUFFIXED="${SUFFIXED} ${TAG}-arm64"
-          done <<< "$TAGS_META"
-          echo "tags=${SUFFIXED# }" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<TAGS_EOF"
+            if [ -n "$TAGS_META" ]; then
+              echo "$TAGS_META" | sed 's/$/-arm64/'
+            fi
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
       - name: Build and push (arm64)
         uses: docker/build-push-action@v6
         with:
