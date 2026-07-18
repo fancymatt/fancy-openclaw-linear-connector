@@ -220,18 +220,19 @@ describe("broker proxy-token model", () => {
     expect(env).not.toContain("real-secret-token");
   });
 
-  test("new agent with no proxyToken gets one minted and the real token never lands in env", () => {
+  test("new agent with no proxyToken gets one minted, proxyUrl auto-set, and real token never lands in env", () => {
     const secretsPath = path.join(dir, "linear.env");
     const result = upsertAgent({ ...makeAgent(secretsPath), accessToken: "real-secret-token" });
     expect(result.isNew).toBe(true);
 
     const agent = getAgents().find((a) => a.name === "charles")!;
     expect(agent.proxyToken).toMatch(/^lpx_/);
+    expect(agent.proxyUrl).toBeTruthy();
 
     const env = fs.readFileSync(secretsPath, "utf8");
     expect(env).toContain(agent.proxyToken!);
+    expect(env).toContain("LINEAR_PROXY_URL=http://localhost:3100/proxy/graphql");
     expect(env).not.toContain("real-secret-token");
-    expect(env).not.toContain("LINEAR_PROXY_URL");
   });
 
   test("token refresh does not leak the real token into a provisioned agent's env", () => {
@@ -250,6 +251,68 @@ describe("broker proxy-token model", () => {
     expect(env).not.toContain("rotated-real-token");
     // The rotated real token still lands in the vault for the proxy to use.
     expect(getAccessToken("charles")).toBe("rotated-real-token");
+  });
+
+  test("LINEAR_CONNECTOR_PROXY_URL env var overrides default proxyUrl", () => {
+    const originalProxyUrl = process.env.LINEAR_CONNECTOR_PROXY_URL;
+    process.env.LINEAR_CONNECTOR_PROXY_URL = "http://proxy.internal:9999/graphql";
+    const secretsPath = path.join(dir, "linear.env");
+    const result = upsertAgent({ ...makeAgent(secretsPath), accessToken: "real-secret-token" });
+    expect(result.isNew).toBe(true);
+
+    const agent = getAgents().find((a) => a.name === "charles")!;
+    expect(agent.proxyUrl).toBe("http://proxy.internal:9999/graphql");
+
+    const env = fs.readFileSync(secretsPath, "utf8");
+    expect(env).toContain("LINEAR_PROXY_URL=http://proxy.internal:9999/graphql");
+
+    process.env.LINEAR_CONNECTOR_PROXY_URL = originalProxyUrl;
+  });
+
+  test("explicit proxyUrl in config is preserved, not overwritten by default", () => {
+    const secretsPath = path.join(dir, "linear.env");
+    const result = upsertAgent({
+      ...makeAgent(secretsPath),
+      accessToken: "real-secret-token",
+      proxyToken: "lpx_manual",
+      proxyUrl: "http://custom:4000/proxy",
+    });
+    expect(result.isNew).toBe(true);
+
+    const agent = getAgents().find((a) => a.name === "charles")!;
+    expect(agent.proxyToken).toBe("lpx_manual");
+    expect(agent.proxyUrl).toBe("http://custom:4000/proxy");
+
+    const env = fs.readFileSync(secretsPath, "utf8");
+    expect(env).toContain("LINEAR_PROXY_URL=http://custom:4000/proxy");
+  });
+
+  test("partial agent transitioning to full credentials gets both proxyToken and proxyUrl", () => {
+    const secretsPath = path.join(dir, "linear.env");
+    // Create a partial entry (no accessToken yet — like the onboarding wizard)
+    const partial = makeAgent(secretsPath);
+    upsertAgent({
+      ...partial,
+      accessToken: "",
+      refreshToken: "",
+    });
+
+    // Now OAuth callback fills tokens — partial→full transition
+    const result = upsertAgent({
+      ...partial,
+      accessToken: "real-oauth-token",
+      refreshToken: "real-refresh-token",
+    });
+    expect(result.isNew).toBe(false);
+
+    const agent = getAgents().find((a) => a.name === "charles")!;
+    expect(agent.proxyToken).toMatch(/^lpx_/);
+    expect(agent.proxyUrl).toBeTruthy();
+
+    const env = fs.readFileSync(secretsPath, "utf8");
+    expect(env).toContain("LINEAR_OAUTH_TOKEN=lpx_");
+    expect(env).toContain("LINEAR_PROXY_URL");
+    expect(env).not.toContain("real-oauth-token");
   });
 });
 

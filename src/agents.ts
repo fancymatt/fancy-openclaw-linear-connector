@@ -727,6 +727,23 @@ export function mintProxyToken(): string {
   return "lpx_" + crypto.randomBytes(24).toString("hex");
 }
 
+/**
+ * Derive the default proxy URL for the connector.
+ * Reads `LINEAR_CONNECTOR_PROXY_URL` env var first, then falls back to
+ * `http://localhost:{PORT}/proxy/graphql` where PORT defaults to 3100.
+ * Returns `undefined` only when no reasonable default can be constructed.
+ */
+function getDefaultProxyUrl(): string | undefined {
+  if (process.env.LINEAR_CONNECTOR_PROXY_URL) {
+    return process.env.LINEAR_CONNECTOR_PROXY_URL;
+  }
+  const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
+  if (Number.isFinite(port)) {
+    return `http://localhost:${port}/proxy/graphql`;
+  }
+  return undefined;
+}
+
 export function upsertAgent(config: AgentConfig): { isNew: boolean } {
   // Match by name first (for partial entries that don't have linearUserId yet)
   // then fall back to linearUserId for token refresh updates. The fallback must
@@ -754,6 +771,7 @@ export function upsertAgent(config: AgentConfig): { isNew: boolean } {
       // publishing the raw upstream token, the exact leak AI-2308 closes.
       if (needsProxyToken(merged)) {
         merged.proxyToken = mintProxyToken();
+        if (!merged.proxyUrl) merged.proxyUrl = getDefaultProxyUrl();
       }
       return merged;
     });
@@ -767,6 +785,7 @@ export function upsertAgent(config: AgentConfig): { isNew: boolean } {
   // agents with an existing proxyToken are untouched.
   if (needsProxyToken(config)) {
     config.proxyToken = mintProxyToken();
+    if (!config.proxyUrl) config.proxyUrl = getDefaultProxyUrl();
   }
 
   _agents.push(reconcileStatusWithCredential(config));
