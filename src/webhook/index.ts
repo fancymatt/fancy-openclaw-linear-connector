@@ -27,6 +27,7 @@ import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
 import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, markAutoEnrollRegistered } from "../workflow-gate.js";
+import { checkLabelSyncForTicket, emitLabelSyncWarning } from "../transition-audit.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
@@ -398,6 +399,23 @@ export function createWebhookRouter(
               log.warn(`autoEnrollByTeam failed for ${enrollIssueId}: ${err instanceof Error ? err.message : String(err)}`);
             });
           }
+
+          // ── AI-2554: On-webhook label-sync audit ──────────────────────────
+          // Lightweight single-ticket check on Issue webhooks: compare proxy-store
+          // recorded state against Linear's current state. Runs in background;
+          // never blocks routing.
+          checkLabelSyncForTicket(enrollIdentifier, enrollToken).then((divergence) => {
+            if (divergence) {
+              emitLabelSyncWarning(divergence);
+              log.warn(
+                `[webhook] label-sync audit: divergence detected for ${enrollIdentifier} ` +
+                `(proxy: ${divergence.proxyState ?? "(none)"}, linear: ${divergence.linearStateLabel ?? "(none)"})`,
+              );
+            }
+          }).catch((auditErr) => {
+            const am = auditErr instanceof Error ? auditErr.message : String(auditErr);
+            log.warn(`[webhook] label-sync audit failed for ${enrollIdentifier}: ${am}`);
+          });
         }
       }
 

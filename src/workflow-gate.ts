@@ -2072,15 +2072,16 @@ export async function checkWorkflowRules(
   // (signaling they believe this is a workflow command), fail closed.
   // Break-glass override bypasses this check.
   if (fetchFailed && !breakGlassOverride) {
-    // Safety: begin-work and note pass through even on fetch failure because:
+    // Safety: begin-work, note, complete, and cancel pass through even on fetch failure because:
     //   - begin-work on an ad-hoc ticket is harmless (labels are empty → getWorkflowId
     //     returns null → pass-through below), and it's the only way to add a wf:*
     //     label to start workflowing a ticket.
     //   - note is informational-only and never mutates state, so allowing it through
     //     is safe even if we can't verify workflow membership.
+    //   - complete and cancel on an ad-hoc ticket close it without workflow validation.
     // All other intents are rejected because they would mutate workflow state without
     //     being able to validate the move.
-    const looksLikeWorkflowCommand = intent !== "begin-work" && intent !== "note";
+    const looksLikeWorkflowCommand = intent !== "begin-work" && intent !== "note" && intent !== "complete" && intent !== "cancel";
     if (looksLikeWorkflowCommand) {
       log.error(`workflow-gate: FAIL-CLOSED — context fetch failed for ${issueId}, cannot determine if workflow ticket — rejecting '${intent}'`);
       return (
@@ -2125,14 +2126,17 @@ export async function checkWorkflowRules(
       "rewind",
       "handoff-work",
       "set-state",
+      "complete",
+      "cancel",
     ];
     if (!safeOnUnarmed.includes(intent)) {
       log.warn(`workflow-gate: rejecting '${intent}' on unarmed ticket ${issueId} — no \`wf:*\` label`);
       return (
         `[Proxy] '${intent}' is only valid on workflow tickets ` +
         `(ticket ${issueId} has no \`wf:*\` label). ` +
-        `Use \`linear begin-work ${issueId}\` to enroll the ticket in a workflow, ` +
-        `or \`linear observe-issue ${issueId}\` for read-only inspection.`
+        `Use \`linear complete ${issueId}\` to close this ad-hoc ticket, ` +
+        `\`linear cancel ${issueId}\` to cancel it, ` +
+        `or \`linear begin-work ${issueId}\` to enroll it in a workflow.`
       );
     }
     return null;
@@ -5075,9 +5079,29 @@ export async function setStateAtomic(
             `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${roleBodies[0]}' (role '${ownerRole}') after advancing to '${targetState}'`,
           );
         } else if (roleBodies.length > 1) {
-          log.warn(
-            `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has multiple bodies (${roleBodies.join(", ")}); delegate manually`,
-          );
+          // INF-58: when delegate is already resolved for a multi-body role,
+          // dispatch directly to the delegate body instead of skipping.
+          if (resolvedDelegateId != null) {
+            const delegateBody = roleBodies.find(b => {
+              const agent = getAgent(b);
+              return agent?.linearUserId === resolvedDelegateId;
+            });
+            if (delegateBody) {
+              await options.sendWakeUp(delegateBody, ticketIdentifier);
+              redispatched = delegateBody;
+              log.info(
+                `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${delegateBody}' (role '${ownerRole}') after advancing to '${targetState}' — delegate pre-set for multi-body role`,
+              );
+            } else {
+              log.warn(
+                `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — delegate (linearUserId=${resolvedDelegateId}) is not a member of role '${ownerRole}'`,
+              );
+            }
+          } else {
+            log.warn(
+              `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has multiple bodies (${roleBodies.join(", ")}); delegate manually`,
+            );
+          }
         } else {
           log.warn(
             `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has no bodies`,
