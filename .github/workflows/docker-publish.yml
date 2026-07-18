@@ -44,12 +44,15 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Derive arch-suffixed tags
         id: archtags
+        env:
+          TAGS_META: ${{ needs.meta.outputs.tags }}
         run: |
-          TAGS=""
-          for TAG in ${{ needs.meta.outputs.tags }}; do
-            TAGS="${TAGS} ${TAG}-amd64"
-          done
-          echo "tags=${TAGS# }" >> "$GITHUB_OUTPUT"
+          SUFFIXED=""
+          while IFS= read -r TAG; do
+            [ -z "$TAG" ] && continue
+            SUFFIXED="${SUFFIXED} ${TAG}-amd64"
+          done <<< "$TAGS_META"
+          echo "tags=${SUFFIXED# }" >> "$GITHUB_OUTPUT"
       - name: Build and push (amd64)
         uses: docker/build-push-action@v6
         with:
@@ -78,12 +81,15 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Derive arch-suffixed tags
         id: archtags
+        env:
+          TAGS_META: ${{ needs.meta.outputs.tags }}
         run: |
-          TAGS=""
-          for TAG in ${{ needs.meta.outputs.tags }}; do
-            TAGS="${TAGS} ${TAG}-arm64"
-          done
-          echo "tags=${TAGS# }" >> "$GITHUB_OUTPUT"
+          SUFFIXED=""
+          while IFS= read -r TAG; do
+            [ -z "$TAG" ] && continue
+            SUFFIXED="${SUFFIXED} ${TAG}-arm64"
+          done <<< "$TAGS_META"
+          echo "tags=${SUFFIXED# }" >> "$GITHUB_OUTPUT"
       - name: Build and push (arm64)
         uses: docker/build-push-action@v6
         with:
@@ -109,8 +115,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Create and push multi-arch manifest
+        env:
+          TAGS_META: ${{ needs.meta.outputs.tags }}
         run: |
-          for TAG in ${{ needs.meta.outputs.tags }}; do
+          while IFS= read -r TAG; do
+            [ -z "$TAG" ] && continue
             AMD64="${TAG}-amd64"
             ARM64="${TAG}-arm64"
             echo "Creating manifest: ${TAG} ← ${AMD64} + ${ARM64}"
@@ -118,10 +127,13 @@ jobs:
               -t "${TAG}" \
               "${AMD64}" \
               "${ARM64}"
-          done
+          done <<< "$TAGS_META"
       - name: Verify manifests
+        env:
+          TAGS_META: ${{ needs.meta.outputs.tags }}
         run: |
-          for TAG in ${{ needs.meta.outputs.tags }}; do
+          while IFS= read -r TAG; do
+            [ -z "$TAG" ] && continue
             echo "=== ${TAG} ==="
             docker buildx imagetools inspect "${TAG}" 2>/dev/null | head -8
-          done
+          done <<< "$TAGS_META"
