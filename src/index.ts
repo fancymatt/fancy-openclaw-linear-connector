@@ -21,6 +21,7 @@ import { PendingWorkBag, SessionTracker, DispatchAckTracker, DispatchWatchdog, N
 import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { getAutoEnrollLiveness, getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
 import { getDefStateMigrationLiveness, registerDefStateMigrationRunner } from "./def-state-migration.js";
+import { getFixtureDriftLiveness, runFixtureDriftCheck } from "./fixture-drift-detector.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus, registerEngagementNativeStateOverlay } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
@@ -379,6 +380,11 @@ export function createApp(options?: CreateAppOptions) {
       // check ran on load (migratedCount 0 allowed), observable at ac-validate
       // without waiting for a def change.
       workflowMigrations: getDefStateMigrationLiveness(),
+      // AI-1894 AC3: fixture-drift liveness — shows whether all deployed
+      // workflow defs match their canonical fixtures. healthy=true when all
+      // are in sync; entries list per-def details. Observable at ac-validate
+      // without waiting for a dispatch trigger.
+      fixtureDrift: getFixtureDriftLiveness(),
       // AI-2542: auto-enroll liveness and demote/escape suppression counters.
       autoEnroll: getAutoEnrollLiveness(),
       // AI-1908 AC5: per-agent OAuth token status. Exposes lastRefreshOkAt,
@@ -1274,6 +1280,12 @@ if (isEntryPoint) {
 
   // Watch agents.json for external changes — no restart needed to add agents
   watchAgentsFile();
+
+  // AI-1894 AC3: run the fixture-drift check at bootstrap so /health
+  // reflects the current state. Fire-and-forget; logs + alerts on drift.
+  runFixtureDriftCheck().catch((err: unknown) => {
+    log.error(`fixture-drift bootstrap check failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
 
   // Phase 2 (rebuild): assert agents.json ⇄ capability-policy agreement at
   // startup and on every registry hot-reload. Drift alerts, never crashes.
