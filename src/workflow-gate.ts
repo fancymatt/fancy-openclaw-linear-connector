@@ -3965,7 +3965,16 @@ export async function applyStateTransition(
   // Step 2: Resolve the next delegate.
   // AI-1493: Deterministic owner-routing for ALL transitions.
   const destStateNode = def.states.find((s) => s.id === toStateName);
-  const destOwnerRole = destStateNode?.owner_role;
+  // §4.4 break-glass (escape): the steward who performs the escape owns the
+  // post-escape ticket, not the destination state's owner_role — otherwise
+  // escape routes to a multi-body role (e.g. task.yaml's `requester`) and
+  // fails closed with "multi-body role requires a --target"; the comment
+  // posts but the state label never lands (fixes INF-67). This matches
+  // dev-impl's design where intake.owner_role is steward, so escape works
+  // identically whether the YAML declares intake.owner_role or not.
+  const destOwnerRole = intent === breakGlassCommand
+    ? def.break_glass?.owner_role
+    : destStateNode?.owner_role;
   const isTerminal = destStateNode?.kind === 'terminal' || !destOwnerRole;
   let resolvedDelegateId: string | null | undefined = undefined;
 
