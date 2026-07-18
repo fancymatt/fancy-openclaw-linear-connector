@@ -143,10 +143,11 @@ async function deliverWithSlot(
   route: RouteResult,
   config: DeliveryConfig,
   throttle?: DeliveryThrottle,
+  dispatchLeaseStore?: DispatchLeaseStore,
 ): Promise<Awaited<ReturnType<typeof deliverToAgent>>> {
   if (throttle) await throttle.acquireSlot();
   try {
-    return await deliverToAgent(route, config);
+    return await deliverToAgent(route, config, dispatchLeaseStore);
   } finally {
     if (throttle) throttle.releaseSlot();
   }
@@ -483,7 +484,7 @@ export function createWebhookRouter(
                   await throttle.wait(wakeRoute.agentId);
                   throttle.record(wakeRoute.agentId);
                 }
-                const wakeResult = await deliverWithSlot(wakeRoute, wakeDeliveryConfig, throttle);
+                const wakeResult = await deliverWithSlot(wakeRoute, wakeDeliveryConfig, throttle, dispatchLeaseStore);
                 log.info(
                   `Bootstrap wake delivered to ${bootstrapResult.delegateAgentName} for ${bootstrapResult.ticketIdentifier} (runId=${wakeResult.runId ?? "ok"})`,
                 );
@@ -1094,7 +1095,7 @@ export function createWebhookRouter(
               await throttle.wait(route.agentId);
               throttle.record(route.agentId);
             }
-            const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle);
+            const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle, dispatchLeaseStore);
             bag.removeTicket(agentName, normalizedTicketId);
             appendOperationalEvent(operationalEventStore, {
               outcome: sameTicketResult.runId ? "dispatch-accepted" : "delivered",
@@ -1173,7 +1174,7 @@ export function createWebhookRouter(
           await throttle.wait(route.agentId);
           throttle.record(route.agentId);
         }
-        const directResult = await deliverWithSlot(route, deliveryConfig, throttle);
+        const directResult = await deliverWithSlot(route, deliveryConfig, throttle, dispatchLeaseStore);
         appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null, wakeId, plane: "connector", detail: directResult.canonVersion ? { canonVersion: directResult.canonVersion } : undefined });
         // Direct deliveries (incl. comment-routed wakes into an existing
         // session) must register the dispatch and flip engagement → Thinking
@@ -1195,7 +1196,7 @@ export function createWebhookRouter(
                 await throttle.wait(route.agentId);
                 throttle.record(route.agentId);
               }
-              const drainResult = await deliverWithSlot(next, deliveryConfig, throttle);
+              const drainResult = await deliverWithSlot(next, deliveryConfig, throttle, dispatchLeaseStore);
               appendOperationalEvent(operationalEventStore, { outcome: drainResult.runId ? "dispatch-accepted" : "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, runId: drainResult.runId ?? null, detail: drainResult.canonVersion ? { canonVersion: drainResult.canonVersion } : undefined });
             } catch (err) {
               log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);
