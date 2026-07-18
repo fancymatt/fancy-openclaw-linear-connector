@@ -401,13 +401,16 @@ describe("AC3: gate dispatches by wf: label from registry", () => {
     expect(result).toBeNull();
   });
 
-  it("ad-hoc ticket (no wf: label) remains pass-through", async () => {
+  it("ad-hoc ticket (no wf: label) rejects workflow verbs", async () => {
     process.env.WORKFLOW_DEFS_DIR = registryDir;
     globalThis.fetch = makeLabelFetch(["bug", "priority:high"]);
 
     const result = await checkWorkflowRules("anything", "issue-uuid", "Bearer tok", "charles");
 
-    expect(result).toBeNull();
+    // INF-35: workflow transition verbs reject on ad-hoc tickets.
+    expect(result).not.toBeNull();
+    expect(result).toMatch(/only valid on workflow tickets/);
+    expect(result).toMatch(/no `wf:\*` label/);
   });
 });
 
