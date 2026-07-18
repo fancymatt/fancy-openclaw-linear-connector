@@ -180,6 +180,7 @@ states:
 
   - id: done
     kind: terminal
+    barrier: true
     native_state: done
     satisfies_parent_barrier: true
 
