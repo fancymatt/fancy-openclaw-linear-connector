@@ -662,7 +662,12 @@ states:
   // A ticket with no wf:* label must pass through regardless of intent.
   // A mutant inverting the workflowId null check would enforce ALL tickets.
 
-  it("passes through any intent on an ad-hoc (non-workflow) ticket", async () => {
+  // ── AC1-WG-8 (INF-35): workflow transition verbs on non-workflow tickets fail ───
+  // INF-35 changed ad-hoc ticket handling: workflow transition verbs now reject
+  // with an error message instead of silently passing through. Safe verbs (note,
+  // begin-work, observe-issue) remain pass-through.
+
+  it("rejects workflow transition verbs on an ad-hoc (non-workflow) ticket", async () => {
     const policyFile = writeTmpYaml(dir, "policy.yaml", POLICY_SINGLE_DEV);
     const wfFile = writeTmpYaml(dir, "wf.yaml", WORKFLOW_DEV_IMPL);
     process.env.CAPABILITY_POLICY_PATH = policyFile;
@@ -686,7 +691,9 @@ states:
       "charles",
     );
 
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result).toMatch(/only valid on workflow tickets/);
+    expect(result).toMatch(/no `wf:\*` label/);
   });
 
   // ── AC2-WG-9: unknown workflow wf:* label is pass-through (AI-1530) ───

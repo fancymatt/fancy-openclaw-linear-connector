@@ -31,6 +31,7 @@ import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { resetWorkflowCache } from "./workflow-gate.js";
 import { resetConfigHealth } from "./config-health.js";
+import { type WorkflowDef } from "./workflow-gate.js";
 
 const TEST_POLICY_YAML = `
 capabilities:
@@ -83,6 +84,7 @@ function writePolicyFile(dir: string): string {
 
 describe("AI-2417: generic delegate-routing verbs inject assigneeId:null for app-user delegate persistence", () => {
   let dir: string;
+  let wfDir: string;
   let appState: ReturnType<typeof createApp>;
   let originalFetch: typeof globalThis.fetch;
   /** Captured issueUpdate mutations forwarded to the Linear API. */
@@ -90,8 +92,15 @@ describe("AI-2417: generic delegate-routing verbs inject assigneeId:null for app
 
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-2417-"));
+    wfDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-2417-wf-"));
+    // Copy a dev-impl workflow def so the registry recognizes wf:dev-impl labels
+    fs.copyFileSync(
+      path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml"),
+      path.join(wfDir, "dev-impl.yaml"),
+    );
     process.env.AGENTS_FILE = writeAgents(dir);
     process.env.CAPABILITY_POLICY_PATH = writePolicyFile(dir);
+    process.env.WORKFLOW_DEFS_DIR = wfDir;
     resetPolicyCache();
     resetWorkflowCache();
     resetConfigHealth();
@@ -115,15 +124,16 @@ describe("AI-2417: generic delegate-routing verbs inject assigneeId:null for app
           forwardedBodies.push(parsed as { variables?: { input?: Record<string, unknown> } });
         }
 
-        // Context reads: ad-hoc ticket (no wf:* label), currently delegated to the
-        // caller (ai) with no assignee — exactly the GEN-178 shape.
+        // Context reads: governed ticket (wf:dev-impl) so workflow verbs are allowed
+        // through. The AI-2417 fix targets the proxy's forward path, not the ad-hoc
+        // gate — we need the verb to reach mutation forwarding.
         if (query.includes("IssueContext") || (query.includes("labels") && query.includes("delegate"))) {
           return new Response(
             JSON.stringify({
               data: {
                 issue: {
                   identifier: "GEN-178",
-                  labels: { nodes: [{ name: "bug" }] },
+                  labels: { nodes: [{ name: "wf:dev-impl" }, { name: "bug" }] },
                   delegate: { id: "u-ai" },
                 },
               },
@@ -144,7 +154,9 @@ describe("AI-2417: generic delegate-routing verbs inject assigneeId:null for app
   afterEach(() => {
     globalThis.fetch = originalFetch;
     fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(wfDir, { recursive: true, force: true });
     delete process.env.CAPABILITY_POLICY_PATH;
+    delete process.env.WORKFLOW_DEFS_DIR;
     delete process.env.AGENTS_FILE;
   });
 
