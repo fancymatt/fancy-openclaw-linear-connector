@@ -232,7 +232,7 @@ export async function findOrCreateLabel(
         const promoteData = (await promoteRes.json()) as CreateResp;
         const promoteResult = promoteData.data?.issueLabelCreate;
         if (promoteResult?.success && promoteResult.issueLabel) {
-          log.info(`promoted inherited label '${labelName}' to team ${teamId} as id=${promoteResult.issueLabel.id}`);
+          log.info(`promoted inherited label '${labelName}' as workspace-level id=${promoteResult.issueLabel.id}`);
           return promoteResult.issueLabel.id;
         }
         const errBody = promoteData.errors ? JSON.stringify(promoteData.errors) : "none";
