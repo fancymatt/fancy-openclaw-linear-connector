@@ -401,11 +401,21 @@ describe("AC3: gate dispatches by wf: label from registry", () => {
     expect(result).toBeNull();
   });
 
-  it("ad-hoc ticket (no wf: label) remains pass-through", async () => {
+  it("ad-hoc ticket (no wf: label) rejects transition verbs (INF-35)", async () => {
     process.env.WORKFLOW_DEFS_DIR = registryDir;
     globalThis.fetch = makeLabelFetch(["bug", "priority:high"]);
 
     const result = await checkWorkflowRules("anything", "issue-uuid", "Bearer tok", "charles");
+
+    expect(result).not.toBeNull();
+    expect(result).toEqual(expect.stringContaining("only valid on workflow tickets"));
+  });
+
+  it("ad-hoc ticket (no wf: label) allows safe verbs through (INF-35)", async () => {
+    process.env.WORKFLOW_DEFS_DIR = registryDir;
+    globalThis.fetch = makeLabelFetch(["bug", "priority:high"]);
+
+    const result = await checkWorkflowRules("note", "issue-uuid", "Bearer tok", "charles");
 
     expect(result).toBeNull();
   });
