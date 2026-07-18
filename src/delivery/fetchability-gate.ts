@@ -43,6 +43,15 @@ export interface DispatchTargetFetchability {
    *  reads back non-null. Optional — callers that cannot cheaply read the live
    *  state omit it and retain existence-only behavior. */
   liveState?: { name?: string | null; type?: string | null } | null;
+  /** INF-83 — whether the ticket is trashed (soft-deleted) at delivery time.
+   *  Archived/trashed tickets are still fetchable via the Linear API but cannot
+   *  have comments posted to them (commentCreate fails with Entity not found),
+   *  so agents woken on them will bounce commentless. Optional — when unset the
+   *  gate falls through to the existing fetchable/terminal check. */
+  trashed?: boolean | null;
+  /** INF-83 — the ticket's archivedAt timestamp. A non-null value means the
+   *  ticket is archived and not dispatchable (same constraint as trashed). */
+  archivedAt?: string | null;
 }
 
 export interface DispatchFetchabilityDecision {
@@ -78,6 +87,19 @@ export function assertDispatchTargetFetchable(
         dispatch: false,
         severity: "warn",
         reason: `${target.ticketId} is terminally closed (${label}) at delivery — dropping dispatch (no re-poke for a completed ticket)`,
+      };
+    }
+    // INF-83: archive/trash check. An archived/trashed ticket is fetchable but
+    // not dispatchable — commentCreate fails with Entity not found. When the
+    // caller threads trashed/archivedAt, drop it here. Unset ⇒ unknown ⇒
+    // fail-open (caller didn't read the field, typically a C4 re-poke on an
+    // older linearState shape).
+    if (target.trashed || target.archivedAt) {
+      const label = target.trashed ? "trashed" : "archived";
+      return {
+        dispatch: false,
+        severity: "warn",
+        reason: `${target.ticketId} is ${label} at delivery — dropping dispatch (archived/trashed tickets reject comments)`,
       };
     }
     return { dispatch: true, severity: "ok", reason: `${target.ticketId} fetchable at delivery` };
