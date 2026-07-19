@@ -3693,6 +3693,9 @@ async function fetchFanoutSpecDescription(issueId: string, authToken: string): P
 /**
  * AI-1992: Post a plain workflow comment on a governed ticket (e.g. the
  * fan-out refusal notice). Fail-open — a failed comment never changes control flow.
+ *
+ * INF-127: Added response validation — checks HTTP status, GraphQL errors, and
+ * commentCreate.success. Exported as _postCommentForTests for testing.
  */
 async function postComment(internalIssueId: string, body: string, authToken: string): Promise<void> {
   const mutation = `
@@ -3701,15 +3704,43 @@ async function postComment(internalIssueId: string, body: string, authToken: str
     }
   `;
   try {
-    await fetch(LINEAR_API_URL, {
+    const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query: mutation, variables: { issueId: internalIssueId, body } }),
     });
+
+    const bodyText = await res.text();
+
+    if (!res.ok) {
+      log.error(`workflow-gate: postComment HTTP ${res.status} on ${internalIssueId}: ${bodyText.slice(0, 500)}`);
+      return;
+    }
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(bodyText);
+    } catch {
+      log.error(`workflow-gate: postComment unparseable JSON on ${internalIssueId} (HTTP ${res.status}): ${bodyText.slice(0, 500)}`);
+      return;
+    }
+
+    if (parsed.errors && parsed.errors.length > 0) {
+      const errorDetail = parsed.errors.map((e: any) => e.message ?? JSON.stringify(e)).join("; ");
+      log.error(`workflow-gate: postComment GraphQL error on ${internalIssueId}: ${errorDetail}`);
+      return;
+    }
+
+    const commentCreate = parsed?.data?.commentCreate;
+    if (!commentCreate || commentCreate.success !== true) {
+      log.error(`workflow-gate: postComment commentCreate.success !== true on ${internalIssueId}: ${JSON.stringify(commentCreate ?? null)}`);
+      return;
+    }
   } catch (err) {
     log.warn(`workflow-gate: failed to post comment on ${internalIssueId}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
+export const _postCommentForTests = postComment;
 
 /**
  * INF-12: the single exit for every `delegate-unresolved` fail-close.
