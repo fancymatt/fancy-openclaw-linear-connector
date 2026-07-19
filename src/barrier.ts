@@ -37,6 +37,7 @@
 
 import { componentLogger, createLogger } from "./logger.js";
 import { loadWorkflowDef, loadWorkflowDefById, loadWorkflowRegistry, getWorkflowId, getCurrentState, type WorkflowDef, type WorkflowState } from "./workflow-gate.js";
+import { getFanoutOutcome } from "./fanout-outcome-store.js";
 import {
   LINEAR_API_URL,
   findOrCreateLabel,
@@ -480,11 +481,39 @@ async function fetchParentState(
  * state converts a transient network blip into silent state corruption that
  * nothing downstream can detect, because the parent has already moved on.
  */
+/**
+ * INF-28: optional set of expected child identifiers for barrier evaluation.
+ * When provided, only these children are considered — all others are ignored.
+ * This prevents stale siblings (from prior cycles) from pre-satisfying the
+ * barrier. When absent, all children are evaluated (current behavior).
+ */
+export type ExpectedChildrenFilter = string[] | undefined;
+
 export async function evaluateBarrier(
   parentIdentifier: string,
   authToken: string,
+  expectedChildren?: ExpectedChildrenFilter,
 ): Promise<BarrierResult> {
   const children = await fetchChildren(parentIdentifier, authToken);
+
+  // INF-28: filter to the expected set if provided. This is the core fix:
+  // waiting on exactly the children this cycle's fan-out produced, not the
+  // accumulated history of all children the parent has ever had.
+  if (children !== null && expectedChildren && expectedChildren.length > 0) {
+    const filtered = children.filter((c) => expectedChildren.includes(c.identifier));
+    if (filtered.length === 0) {
+      // No expected children found — treat as zero, which means
+      // all-terminal (vacuous satisfaction for the expected set).
+      return { allTerminal: true, totalChildren: 0, terminalCount: 0, children: [] };
+    }
+    const terminalCount = filtered.filter((c) => c.isTerminal).length;
+    return {
+      allTerminal: terminalCount === filtered.length,
+      totalChildren: filtered.length,
+      terminalCount,
+      children: filtered,
+    };
+  }
 
   // INF-34: could not read the children ≠ has no children. Must precede the
   // zero-children check below, which would otherwise read this as satisfied.
@@ -617,11 +646,19 @@ async function alarmOrphanedChildren(
  * AC1: Last child terminal → parent auto-moves managing → review with no
  *      manual nudge.
  */
+/**
+ * INF-28: attempt a barrier transition, optionally scoped to an expected child set.
+ * When `expectedChildren` is provided, only those children are evaluated.
+ * When absent, reads the recorded fan-out outcome from the store (if any) and
+ * uses the `awaiting` set as the filter. Falls back to all children (current
+ * behavior) when no outcome or the outcome has no child set.
+ */
 export async function attemptBarrierTransition(
   parentIdentifier: string,
   authToken: string,
   workflowDef?: WorkflowDef,
   prefetchedParentState?: { labels: string[]; internalId: string; teamId: string } | null,
+  expectedChildren?: ExpectedChildrenFilter,
 ): Promise<BarrierTransitionResult> {
   const result: BarrierTransitionResult = {
     transitioned: false,
@@ -630,8 +667,48 @@ export async function attemptBarrierTransition(
     totalChildren: 0,
   };
 
+  // INF-28: resolve expected children from the store if not provided.
+  // This handles the onChildTerminal path where the outcome was recorded
+  // when the parent entered the barrier state.
+  let childFilter = expectedChildren;
+  let outcomeType: string | undefined;
+  if (childFilter === undefined) {
+    const outcome = await getFanoutOutcome(parentIdentifier);
+    if (outcome) {
+      outcomeType = outcome.outcome;
+      if (outcome.outcome === "awaiting" && outcome.childIdentifiers && outcome.childIdentifiers.length > 0) {
+        childFilter = outcome.childIdentifiers;
+        log.info(
+          `barrier: INF-28 attemptBarrierTransition scoped to recorded set for ${parentIdentifier}: ` +
+          `${childFilter.join(", ")}`,
+        );
+      }
+    }
+  }
+
+  // INF-28: a recorded non-proceed outcome (refused, failed, or pending-approval)
+  // means the barrier must not advance from this path either. Even if the
+  // children list is empty (AI-1730 vacuous satisfaction), the outcome tells us
+  // the parent is blocked deliberately — the fan-out did not produce a valid set.
+  if (outcomeType === "refused" || outcomeType === "failed") {
+    result.error = `Fan-out ${outcomeType} — barrier held (INF-28, from recorded outcome)`;
+    log.warn(
+      `barrier: INF-28 attemptBarrierTransition: ${parentIdentifier} has recorded outcome ` +
+      `'${outcomeType}' — barrier will not advance`,
+    );
+    return result;
+  }
+  if (outcomeType === "pending-approval") {
+    result.error = "Fan-out pending steward approval — barrier held (INF-28)";
+    log.info(
+      `barrier: INF-28 attemptBarrierTransition: ${parentIdentifier} has recorded outcome ` +
+      `'pending-approval' — barrier will not advance`,
+    );
+    return result;
+  }
+
   // 1. Evaluate barrier
-  const barrier = await evaluateBarrier(parentIdentifier, authToken);
+  const barrier = await evaluateBarrier(parentIdentifier, authToken, childFilter);
   result.terminalCount = barrier.terminalCount;
   result.totalChildren = barrier.totalChildren;
 
@@ -663,7 +740,7 @@ export async function attemptBarrierTransition(
     return result; // Not an error — just not ready yet
   }
 
-  // 2. Verify parent is in managing state
+  // 2. Verify parent is in a barrier state
   //    Use pre-fetched state if provided (avoids redundant API call)
   const parentState = prefetchedParentState ?? await fetchParentState(parentIdentifier, authToken);
   if (!parentState) {
@@ -780,17 +857,19 @@ function resolveBarrierTarget(def: WorkflowDef, state: WorkflowState): string | 
 }
 
 /**
- * AI-1730: Entry-time barrier check for a parent entering the managing state.
+ * AI-1730 / INF-28: Entry-time barrier check for a parent entering a barrier state.
  *
  * Called unconditionally after the fan-out block in workflow-gate.ts.
- * This is a no-op when children are in-progress — it only fires when
- * the barrier is already satisfied (zero children or all children already
- * terminal at entry time).
  *
- * Steps:
- *   1. Fetch children of the parent.
- *   2. If evaluateBarrier reports allTerminal, attempt the transition.
- *   3. Otherwise return null (children still in progress, normal flow).
+ * INF-28: Before evaluating children, reads the recorded fan-out outcome from the
+ * store. The outcome tells the barrier what happened at fan-out time:
+ *
+ * | Outcome | Behavior |
+ * |---------|----------|
+ * | `awaiting:[ids]` | Filter children to the recorded set; wait on those only |
+ * | `not-declared` / `waived` / absent | Current behavior (all children all-terminal) |
+ * | `refused` / `failed` | Block + alarm (barrier cannot advance) |
+ * | `pending-approval` | Block, no alarm (steward will wake it) |
  *
  * Returns BarrierTransitionResult if a transition was attempted,
  * null if the barrier is not yet satisfied (not an error).
@@ -799,7 +878,98 @@ export async function onManagingEntry(
   parentIdentifier: string,
   authToken: string,
 ): Promise<BarrierTransitionResult | null> {
-  // 1. Evaluate the barrier
+  // INF-28: Read the recorded fan-out outcome, if any.
+  const outcome = await getFanoutOutcome(parentIdentifier);
+
+  // INF-28: Handle non-advancing outcomes that block with or without alarm.
+  if (outcome) {
+    switch (outcome.outcome) {
+      case "refused": {
+        log.warn(
+          `barrier: INF-28 outcome 'refused' for ${parentIdentifier} — ` +
+          `fan-out was refused (bad spec / cap violation). Barrier will not advance.`,
+        );
+        return {
+          transitioned: false,
+          parentIdentifier,
+          terminalCount: 0,
+          totalChildren: 0,
+          error: "Fan-out refused — barrier held (INF-28)",
+        };
+      }
+      case "failed": {
+        log.error(
+          `barrier: INF-28 outcome 'failed' for ${parentIdentifier} — ` +
+          `fan-out attempted but failed to create children. Barrier will not advance.`,
+        );
+        return {
+          transitioned: false,
+          parentIdentifier,
+          terminalCount: 0,
+          totalChildren: 0,
+          error: "Fan-out failed — barrier held (INF-28)",
+        };
+      }
+      case "pending-approval": {
+        log.info(
+          `barrier: INF-28 outcome 'pending-approval' for ${parentIdentifier} — ` +
+          `steward approval outstanding. Barrier will not advance until approved.`,
+        );
+        return {
+          transitioned: false,
+          parentIdentifier,
+          terminalCount: 0,
+          totalChildren: 0,
+          error: "Fan-out pending steward approval — barrier held (INF-28)",
+        };
+      }
+      case "awaiting": {
+        // Use the recorded set as the expected children filter.
+        // All other children (stale siblings from prior cycles) are ignored.
+        if (outcome.childIdentifiers && outcome.childIdentifiers.length > 0) {
+          log.info(
+            `barrier: INF-28 outcome 'awaiting' for ${parentIdentifier} — ` +
+            `evaluating barrier against ${outcome.childIdentifiers.length} recorded child(ren) ` +
+            `(${outcome.childIdentifiers.join(", ")})`,
+          );
+          const barrier = await evaluateBarrier(parentIdentifier, authToken, outcome.childIdentifiers);
+
+          if (barrier.readFailed) {
+            await alarmUnreadableChildren(parentIdentifier, authToken);
+            return {
+              transitioned: false,
+              parentIdentifier,
+              terminalCount: 0,
+              totalChildren: 0,
+              error: UNREADABLE_CHILDREN_ERROR,
+            };
+          }
+
+          if (!barrier.allTerminal) {
+            return null;
+          }
+
+          log.info(
+            `barrier: INF-28 onManagingEntry: awaiting set all-terminal for ${parentIdentifier} ` +
+            `(${barrier.terminalCount}/${barrier.totalChildren}) — attempting transition`,
+          );
+          return attemptBarrierTransition(parentIdentifier, authToken);
+        }
+        // fall through: empty awaiting set → treat as claimed (no children to wait on)
+        break;
+      }
+      case "not-declared":
+      case "waived": {
+        log.info(
+          `barrier: INF-28 outcome '${outcome.outcome}' for ${parentIdentifier} — ` +
+          `using current behavior (no spec-matched children to constrain)`,
+        );
+        break; // fall through to current behavior
+      }
+    }
+  }
+
+  // 1. Evaluate the barrier (current behavior for absent / not-declared / waived)
   const barrier = await evaluateBarrier(parentIdentifier, authToken);
 
   // INF-34: an unreadable child set is not "children still active" — returning

@@ -45,6 +45,7 @@ import { recordObservation } from "./store/observation-write-path.js";
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout, validateFanoutSpec, type Finding } from "./fanout.js";
+import { recordFanoutOutcome } from "./fanout-outcome-store.js";
 import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
 import { fetchLastCommentByUser } from "./linear-helpers.js";
@@ -4242,12 +4243,24 @@ export async function applyStateTransition(
   // already validated pre-transition (AC5) and the findings stashed in
   // `pendingFanout`, so this never re-guesses the spec.
   // Fail-open: fan-out errors are logged and never block the transition.
+  // INF-37: set when a spawn_if predicate could not be *evaluated* (as opposed
+  // to evaluating false). Zero children then means "we never found out", not
+  // "none were needed" — so the barrier below must not read it as vacuous
+  // satisfaction. Scoped deliberately to the spawn_if failure: the surrounding
+  // fan-out fail-open (above) is a separate, deliberate contract.
+  let spawnIfEvaluationFailed = false;
+  // INF-28: set when the fanout outcome record could not be persisted.
+  // A write failure must suppress the barrier auto-advance (stale record → stale
+  // set → all-terminal → advance would re-create LIF-2).
+  let fanoutRecordWriteFailed = false;
+
   if (applied && pendingFanout) {
     try {
       log.info(`workflow-gate: AI-1992 fan-out: triggering fan-out for ${issueId} (${currentStateName} → ${toStateName}, child=${pendingFanout.config.child_workflow})`);
       const fanoutResult = await executeFanout(issueId, authToken, pendingFanout.config, {
         findingsOverride: pendingFanout.findings,
       });
+      spawnIfEvaluationFailed = fanoutResult.spawnIfResult?.outcome === "failed";
       if (fanoutResult.created > 0) {
         log.info(
           `workflow-gate: B-2 fan-out: ${fanoutResult.created} child(ren) created for ${issueId}: ${fanoutResult.childIdentifiers.join(", ")}`,
@@ -4259,18 +4272,89 @@ export async function applyStateTransition(
       if (fanoutResult.created > 0) {
         await postFanoutSummaryComment(issue.internalId, fanoutResult, authToken);
       }
+
+      // ── INF-28: Record fanout outcome to store ────────────────────────
+      // Derive the outcome from the fanout result and persist it before the
+      // barrier check runs. The barrier reads this outcome to know which children
+      // to wait on, or whether to block+alarm.
+      if (!spawnIfEvaluationFailed) {
+        const now = new Date().toISOString();
+        let outcomeType: string;
+        let childIds: string[] | undefined;
+
+        if (fanoutResult.refused) {
+          outcomeType = "refused";
+        } else if (fanoutResult.pendingApproval) {
+          outcomeType = "pending-approval";
+        } else if (fanoutResult.spawnIfResult && !fanoutResult.spawnIfResult.shouldSpawn) {
+          // Verified waive (spawnIfResult.outcome === "waived")
+          outcomeType = "waived";
+        } else if (fanoutResult.created === 0 && fanoutResult.errors.length > 0) {
+          outcomeType = "failed";
+        } else if (fanoutResult.attempted > 0 && fanoutResult.created === 0) {
+          // Attempted N, minted 0 — rare but distinct from waived
+          outcomeType = "failed";
+        } else if (fanoutResult.specMatchedChildren.length > 0) {
+          outcomeType = "awaiting";
+          childIds = fanoutResult.specMatchedChildren;
+        } else if (fanoutResult.created > 0) {
+          // Created children without spec-matched set (fallback — should not happen
+          // with the FanoutResult extension, but be defensive)
+          outcomeType = "awaiting";
+          childIds = fanoutResult.childIdentifiers;
+        } else {
+          // Zero children created, no errors, no refusal — effectively waived
+          outcomeType = "waived";
+        }
+
+        try {
+          await recordFanoutOutcome(issueId, {
+            outcome: outcomeType as "refused" | "pending-approval" | "waived" | "failed" | "awaiting",
+            childIdentifiers: childIds,
+            recordedAt: now,
+          });
+        } catch (err) {
+          fanoutRecordWriteFailed = true;
+          const writeErr = err instanceof Error ? err.message : String(err);
+          log.error(
+            `workflow-gate: INF-28: failed to persist fanout outcome for ${issueId}: ${writeErr}. ` +
+            `Barrier auto-advance will be suppressed.`,
+          );
+        }
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      log.warn(`workflow-gate: B-2 fan-out: fan-out failed for ${issueId}: ${msg}`);
+      log.warn(`workflow-gate: B-2 fan-out: fan-out execution failed for ${issueId}: ${msg}`);
     }
   }
 
-  // ── AI-1730 + AI-1992: Zero-child barrier auto-advance on barrier entry ──
+  // ── AI-1730 + AI-1992 + INF-28: Barrier auto-advance on barrier entry ──
   // After the fan-out block (which may create 0..N children), check if the
   // barrier is already satisfied. This is a no-op when children are in-progress
   // — it only fires when all children are terminal or none exist. Barrier-ness
   // is config-driven (any state declaring `barrier: true`), not just "managing".
-  if (applied && destStateNode?.barrier === true) {
+  //
+  // INF-37: `spawnIfEvaluationFailed` — a spawn_if that could not be evaluated
+  // spawned zero children, and zero children is exactly what the AI-1730
+  // vacuous-satisfaction contract advances on — so the parent would sail past
+  // a sprint that never started, on a transient API error, and log it as
+  // healthy. The parent stays in the barrier state, which is recoverable; the
+  // error comment was already posted on the parent by executeFanout.
+  //
+  // INF-28: `fanoutRecordWriteFailed` — if the fanout outcome record could not
+  // be persisted, the barrier has no way to distinguish "waived" from "mint
+  // failed" from "write failed". Advancing would re-create LIF-2 (stale record
+  // → stale set → all-terminal → advance). The parent stays put, which is the
+  // alarm.
+  if (applied && destStateNode?.barrier === true && (spawnIfEvaluationFailed || fanoutRecordWriteFailed)) {
+    const reason = spawnIfEvaluationFailed
+      ? "spawn_if predicate could not be evaluated"
+      : "fanout outcome record could not be persisted";
+    log.error(
+      `workflow-gate: INF-28: skipping barrier auto-advance for ${issueId} — ` +
+      `${reason}. ${issueId} stays in '${toStateName}' pending steward retry.`,
+    );
+  } else if (applied && destStateNode?.barrier === true) {
     try {
       const barrierResult = await onManagingEntry(issueId, authToken);
       if (barrierResult) {

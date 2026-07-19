@@ -160,9 +160,27 @@ export interface FanoutResult {
    * human/steward-driven) — the engine posts a note listing them instead.
    */
   unmatchedChildren: string[];
-  /** AI-2523: result of spawn_if predicate evaluation, if configured. */
+  /**
+   * AI-2523: result of spawn_if predicate evaluation, if configured.
+   */
   spawnIfResult?: SpawnIfResult;
+  /**
+   * INF-28: number of spec entries the fan-out attempted to spawn (toSpawn.length).
+   * Distinguished from `created` — attempted > 0 && created === 0 means the mint
+   * failed, not that the spec was empty or waived.
+   */
+  attempted: number;
+  /**
+   * INF-28: identifiers of all children that match the current spec (newly minted ∪
+   * existing children whose specEntryId is in the current spec). Unlike
+   * `childIdentifiers` (new mints only), this includes pre-existing spec-matched
+   * children, so the barrier can wait on the correct set rather than re-querying
+   * accumulated history.
+   */
+  specMatchedChildren: string[];
 }
+
+
 
 export interface FanoutError {
   findingIndex: number;
@@ -994,6 +1012,8 @@ export async function executeFanout(
     refused: false,
     pendingApproval: false,
     unmatchedChildren: [],
+    attempted: 0,
+    specMatchedChildren: [],
   };
 
   // AI-1992 AC7 (spawn time): the child workflow type is config-driven and MUST
@@ -1052,6 +1072,16 @@ export async function executeFanout(
     childWorkflowLabel,
   );
   result.unmatchedChildren = unmatchedChildren.map((c) => c.identifier);
+  result.attempted = toSpawn.length;
+
+  // INF-28: compute the spec-matched set = existing children whose specEntryId
+  // matches a current finding. New mints are appended later. This is the set
+  // the barrier waits on — not accumulated history (which includes stale siblings).
+  const specFindingIds = new Set(findings.map((f) => f.id).filter(Boolean));
+  const matchedExisting = existingChildren.filter(
+    (c) => specFindingIds.has(c.specEntryId),
+  );
+  result.specMatchedChildren = matchedExisting.map((c) => c.identifier);
 
   if (legacyIdOnlyMatches.length > 0) {
     // INF-32 AC1: a workflow-less child suppressed a spawn on an id-only match.
@@ -1282,6 +1312,10 @@ export async function executeFanout(
       log.warn(`fanout: failed to create child for finding ${i + 1}/${toSpawn.length}: "${childTitle}"`);
     }
   }
+
+  // INF-28: append newly created children to the spec-matched set so the barrier
+  // waits on all children that match the current spec — both existing and minted.
+  result.specMatchedChildren.push(...result.childIdentifiers);
 
   // AI-1992: optional sibling blocking relations (config-driven) — each sibling
   // blocks the next so the managed children run in a defined order. Fail-open:
