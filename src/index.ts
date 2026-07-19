@@ -562,6 +562,10 @@ export function createApp(options?: CreateAppOptions) {
         // exact path whose re-poke of a Done AI-2313 sustained the hourly replay
         // (its rePokeMsg string below matched the 00:52Z specimen verbatim).
         liveState: linearState?.state ?? null,
+        // INF-83: thread trashed/archivedAt so an archived ticket is dropped at
+        // delivery rather than re-poking the agent into a commentless bounce.
+        trashed: linearState?.trashed ?? null,
+        archivedAt: linearState?.archivedAt ?? null,
       });
 
       // AI-2091 §1 (G1, AI-2042): resolve the recipient at DELIVERY time against
