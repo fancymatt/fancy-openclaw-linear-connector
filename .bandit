@@ -1,0 +1,10 @@
+[bandit]
+# PM-2 baseline: suppress known low-risk patterns in the mam-downloader app
+# that are not exploitable in context. Each suppression includes a rationale.
+skips:
+  B101  # assert — heavily used in test suite; production use minimal
+  B311  # random — pseudo-random is acceptable for non-cryptographic use
+exclude:
+  - apps/mam-downloader/tests
+  - apps/mam-downloader/.venv
+  - .venv
