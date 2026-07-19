@@ -34,6 +34,7 @@ import {
   resolveNativeStateId,
   resetNativeStateCache,
   enrollIfMissing,
+  loadWorkflowDef,
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
@@ -7801,3 +7802,374 @@ describe("checkWorkflowRules — deploy health gate (AI-2361)", () => {
     expect(result).toBeNull();
   });
 });
+
+// ── AI-2595: Merge-gate bounce strands dev-impl tickets ───────────────────
+//
+// Three failing tests covering the three acceptance criteria:
+//   AC1: A gate bounce (merge/deploy reject → implementation) MUST attach the
+//        implementing delegate in the same transition (mirror request-changes
+//        semantics).
+//   AC2: handoff-work can write a delegate when source === destination (self-loop).
+//   AC3: Regression test: bounce a dev-impl ticket at the gate, assert delegate ≠ null.
+//
+// Expected to FAIL until the fix is in place:
+//   - AC1 fails because reject transitions on merge/deploy lack
+//     assign: { default: prior-implementer } — the implementer store is never
+//     consulted, delegate falls through to role resolution and strand.
+//   - AC2 fails because applyStateTransition short-circuits with
+//     already-in-state when source === destination, skipping the delegate write.
+//   - AC3 fails as a composite of both bugs.
+
+describe("AI-2595: Gate-bounce delegate strand (merge/deploy reject)", () => {
+  let ai2595Dir: string;
+  let originalPath: string | undefined;
+  let originalFetch: typeof globalThis.fetch;
+
+  const AI2595_WORKFLOW_YAML = `
+id: dev-impl
+version: 10
+archetype: single-task
+entry_state: intake
+
+break_glass:
+  command: escape
+  to: intake
+  owner_role: steward
+
+states:
+  - id: intake
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: accept
+        to: write-tests
+        assign: { mode: auto }
+
+  - id: write-tests
+    owner_role: test-author
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: tests-ready
+        to: implementation
+        assign: { mode: required }
+
+  - id: implementation
+    owner_role: dev
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: submit
+        to: merge
+        assign: { mode: auto }
+      - command: handoff-work
+        to: implementation
+        assign: { default: prior-implementer }
+
+  - id: merge
+    owner_role: deployment
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: continue
+        to: deploy
+        requires_capability: deploy:execute
+        assign: { mode: auto }
+      - command: reject
+        to: implementation
+        requires_comment: true
+        assign: { default: prior-implementer }
+        feedback:
+          required: true
+          category_enum:
+            - missing-tests
+            - style
+
+  - id: deploy
+    owner_role: host-deploy
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: continue
+        to: done
+        requires_capability: infra:ssh
+        assign: { mode: auto }
+      - command: reject
+        to: implementation
+        requires_comment: true
+        assign: { default: prior-implementer }
+        feedback:
+          required: true
+          category_enum:
+            - missing-tests
+
+  - id: done
+    kind: terminal
+    native_state: done
+    transitions: []
+`;
+
+  const AI2595_POLICY_YAML = `
+capabilities:
+  - id: linear:transition
+  - id: human:escalate
+  - id: workflow:break-glass
+  - id: deploy:execute
+  - id: infra:ssh
+
+containers:
+  - id: dev
+    grants: [linear:transition]
+  - id: deployment
+    grants: [linear:transition, deploy:execute]
+  - id: host-deploy
+    grants: [linear:transition, infra:ssh]
+  - id: steward
+    grants: [linear:transition, human:escalate, workflow:break-glass]
+  - id: test-author-container
+    grants: [linear:transition]
+
+roles:
+  - id: dev
+    requires: [linear:transition]
+  - id: deployment
+    requires: [deploy:execute]
+  - id: host-deploy
+    requires: [infra:ssh]
+  - id: steward
+    requires: [human:escalate]
+  - id: test-author
+    requires: [linear:transition]
+
+bodies:
+  - id: hanzo
+    container: deployment
+    fills_roles: [deployment]
+  - id: grover
+    container: host-deploy
+    fills_roles: [host-deploy]
+  - id: charles
+    container: dev
+    fills_roles: [dev]
+  - id: tdd
+    container: test-author-container
+    fills_roles: [test-author]
+  - id: astrid
+    container: steward
+    fills_roles: [steward]
+`;
+
+  beforeAll(() => {
+    ai2595Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai2595-test-"));
+
+    const policyFile = path.join(ai2595Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, AI2595_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai2595Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, AI2595_WORKFLOW_YAML, "utf8");
+    originalPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    // Isolate implementer store to a suite-specific temp file so prior
+    // test runs can't poison the prior-implementer lookup (AI-2595 AC1).
+    process.env.IMPLEMENTER_STORE_PATH = path.join(ai2595Dir, "implementer-store.json");
+
+    const agentsFile = path.join(ai2595Dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-client", clientSecret: "c-secret", accessToken: "c-token", refreshToken: "c-refresh" },
+        { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-client", clientSecret: "h-secret", accessToken: "h-token", refreshToken: "h-refresh" },
+        { name: "grover", linearUserId: "grover-linear-uuid", clientId: "g-client", clientSecret: "g-secret", accessToken: "g-token", refreshToken: "g-refresh" },
+        { name: "tdd", linearUserId: "tdd-linear-uuid", clientId: "t-client", clientSecret: "t-secret", accessToken: "t-token", refreshToken: "t-refresh" },
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+        { name: "igor", linearUserId: "igor-linear-uuid", clientId: "i-client", clientSecret: "i-secret", accessToken: "i-token", refreshToken: "i-refresh" },
+        { name: "felix", linearUserId: "felix-linear-uuid", clientId: "f-client", clientSecret: "f-secret", accessToken: "f-token", refreshToken: "f-refresh" },
+        { name: "noah", linearUserId: "noah-linear-uuid", clientId: "n-client", clientSecret: "n-secret", accessToken: "n-token", refreshToken: "n-refresh" },
+        { name: "sage", linearUserId: "sage-linear-uuid", clientId: "s-client", clientSecret: "s-secret", accessToken: "s-token", refreshToken: "s-refresh" },
+      ],
+    }, null, 2), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+  });
+
+  afterAll(() => {
+    if (originalPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+  });
+
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetPolicyCache();
+    clearImplementerStore();
+    fs.rmSync(defStateSnapshotPath(), { force: true });
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  // ── AC1: Gate bounce attaches prior implementer ───────────────────────
+  //
+  // The `reject` transitions on `merge` and `deploy` states in the canonical
+  // dev-impl workflow def do NOT have `assign: { default: prior-implementer }`,
+  // unlike `request-changes` on `code-review`. This means a gate bounce from
+  // merge/deploy → implementation does not re-attach the implementing delegate.
+  //
+  // Fix: add `assign: { default: prior-implementer }` to both `reject`
+  // transitions in the production dev-impl workflow YAML.
+
+  it("AC1: merge reject transition must declare assign.default: prior-implementer", async () => {
+    // Load the test workflow def and verify the merge state's reject transition
+    // is declared with assign.default: prior-implementer (matching request-changes).
+    const def = await loadWorkflowDef();
+    const mergeState = def.states.find((s) => s.id === "merge");
+    expect(mergeState).toBeDefined();
+
+    const rejectTransition = mergeState!.transitions?.find((t) => t.command === "reject");
+    expect(rejectTransition).toBeDefined();
+
+    // FAILS: reject on merge has no assign block — the prior implementer is
+    // never consulted when the gate bounces.
+    expect(rejectTransition!.assign?.default).toBe("prior-implementer");
+  });
+
+  it("AC1: deploy reject transition must declare assign.default: prior-implementer", async () => {
+    const def = await loadWorkflowDef();
+    const deployState = def.states.find((s) => s.id === "deploy");
+    expect(deployState).toBeDefined();
+
+    const rejectTransition = deployState!.transitions?.find((t) => t.command === "reject");
+    expect(rejectTransition).toBeDefined();
+
+    // FAILS: reject on deploy has no assign block — same bug as merge state.
+    expect(rejectTransition!.assign?.default).toBe("prior-implementer");
+  });
+
+  // ── AC2: handoff-work (same-state self-loop) writes delegate ──────────
+  //
+  // FAILS because applyStateTransition has an idempotency short-circuit at
+  // the top of the target-state block: when currentStateName === toStateName
+  // AND the target label is present, it immediately returns
+  // { status: "noop", code: "already-in-state" } — skipping delegate resolution
+  // and the atomic write entirely. A stranded implementation-state ticket
+  // with delegate=null cannot be recovered via handoff-work because the
+  // self-loop never reaches Step 2 delegate resolution.
+  //
+  // Fix: in the same-state (self-loop) case where the transition carries
+  // delegate semantics (assign.default or a re-route verb), resolve and
+  // write the delegate before returning from the idempotency check.
+  //
+  // This test uses a workflow YAML where `implementation` has a
+  // `handoff-work` → `implementation` self-loop transition with
+  // assign: { default: prior-implementer }.
+
+  it("AC2: handoff-work self-loop writes delegate even when state label unchanged", async () => {
+    const { recordImplementer: doRecord } = await import("./implementer-store.js");
+    await doRecord("issue-ai2595-ac2", "charles", "dev-impl");
+
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "impl-lbl", name: "state:implementation" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock;
+
+    const result = await applyStateTransition("handoff-work", "issue-ai2595-ac2", "Bearer tok");
+
+    // FAILS: returns { status: "noop", code: "already-in-state" } because
+    // the idempotency check fires before delegate resolution runs.
+    expect(result.status).toBe("applied");
+    expect(result.code).not.toBe("noop");
+    expect(result.from).toBe("implementation");
+    expect(result.to).toBe("implementation");
+
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.body.variables as { delegateId?: string };
+    // The prior implementer must be written as delegate even though state didn't change
+    expect(vars.delegateId).toBe("charles-linear-uuid");
+  });
+
+  // ── AC3: Full regression — bounce + rescue via handoff ───────────────
+  //
+  // FAILS because AC3 composes both bugs: even if AC1 is fixed (delegate
+  // set on bounce), AC2 would block the recovery handoff-work. The
+  // two-phase test proves neither bug is fully fixed without the other.
+  //
+  // Phase 1: Gate bounce (merge reject → implementation) records the
+  //   implementer and transitions. Delegate should be set by AC1's fix.
+  //
+  // Phase 2: handoff-work (self-loop) re-routes to a different dev body
+  //   within implementation without changing state. Should work by AC2's fix.
+  //
+  // Without AC1 fix: delegate is null after Phase 1 → Phase 2 has nothing to
+  //   re-route → handoff can't target the intended dev.
+  // Without AC2 fix: Phase 1 works but Phase 2 no-ops (already-in-state).
+
+  it("AC3: regression — gate bounce + handoff rescue succeeds without escape", async () => {
+    const { recordImplementer: doRecord, getImplementer: doGet } = await import("./implementer-store.js");
+    const issueId = "issue-ai2595-ac3-regression";
+    await doRecord(issueId, "charles", "dev-impl");
+
+    // Phase 1: Gate bounce — merge reject → implementation
+    const { fetch: mock1, calls: calls1 } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "merge-lbl", name: "state:merge" },
+        { id: "other-lbl", name: "priority:high" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock1;
+
+    const result1 = await applyStateTransition("reject", issueId, "Bearer tok");
+
+    // Phase 1 must succeed — delegate must be non-null after the bounce
+    expect(result1.status).toBe("applied");
+    expect(result1.from).toBe("merge");
+    expect(result1.to).toBe("implementation");
+    expect(result1.code).not.toBe("delegate-unresolved");
+
+    const updateCall1 = calls1.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall1).toBeDefined();
+    const vars1 = updateCall1!.body.variables as { delegateId?: string };
+    expect(vars1.delegateId).not.toBeNull();
+    expect(vars1.delegateId).toBe("charles-linear-uuid");
+
+    // Phase 2: Handoff to igor within implementation (self-loop)
+    // The implementer store still has charles recorded, but we pass a
+    // cliTarget of "igor" to override — simulating handoff-work to igor.
+    const { fetch: mock2, calls: calls2 } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "impl-lbl", name: "state:implementation" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock2;
+
+    const result2 = await applyStateTransition(
+      "handoff-work", issueId, "Bearer tok",
+      { cliTarget: "igor" },
+    );
+
+    // FAILS: returns { status: "noop", code: "already-in-state" }
+    // because the idempotency check fires before the delegate is written.
+    expect(result2.status).toBe("applied");
+    expect(result2.code).not.toBe("noop");
+    expect(result2.from).toBe("implementation");
+    expect(result2.to).toBe("implementation");
+
+    const updateCall2 = calls2.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall2).toBeDefined();
+    const vars2 = updateCall2!.body.variables as { delegateId?: string };
+    // handoff routed to igor — delegate must be igor's Linear user ID
+    expect(vars2.delegateId).toBe("igor-linear-uuid");
+  });
+});
+
