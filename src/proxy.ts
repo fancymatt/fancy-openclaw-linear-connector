@@ -376,6 +376,69 @@ function isMutationRequest(body: GraphQLRequestBody | null): boolean {
   return /^mutation\b/.test(stripped);
 }
 
+/**
+ * True when a string looks like a human-readable Linear issue identifier
+ * (e.g. "BBS-3", "AI-2597") rather than a UUID.
+ */
+function isHumanReadableIdentifier(value: string): boolean {
+  return /^[A-Z]+-\d+$/.test(value);
+}
+
+/**
+ * AI-2597: Resolve a human-readable issue identifier to its internal UUID
+ * before forwarding write mutations. The Linear API's `commentCreate` and
+ * other write mutations require the internal UUID for teams outside the AI
+ * namespace; the CLI may pass identifiers (e.g. "BBS-3") when it lacks
+ * workflow context to pre-resolve them.
+ *
+ * Mutates `body.variables` in-place, replacing identifier values in `issueId`
+ * and `id` keys with the resolved UUID. Returns true if a rewrite occurred.
+ */
+async function resolveMutationIssueIds(
+  body: GraphQLRequestBody | null,
+  authToken: string,
+): Promise<boolean> {
+  if (!body?.variables) return false;
+  const vars = body.variables as Record<string, unknown>;
+
+  // Identifiers that need resolving — one call handles both commentCreate
+  // ($issueId) and issueUpdate ($id) mutation variable keys.
+  const idKeys = ["issueId", "id"];
+  let resolved = false;
+
+  for (const key of idKeys) {
+    const value = vars[key];
+    if (typeof value !== "string" || !isHumanReadableIdentifier(value)) continue;
+
+    try {
+      const res = await fetch(LINEAR_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authToken },
+        body: JSON.stringify({
+          query: `query($id: String!) { issue(id: $id) { id } }`,
+          variables: { id: value },
+        }),
+      });
+      if (!res.ok) {
+        // Fail-open: if the resolution query fails, forward the original
+        // identifier and let the upstream return the appropriate error.
+        continue;
+      }
+      const data = (await res.json()) as { data?: { issue?: { id: string } | null } };
+      const uuid = data.data?.issue?.id;
+      if (uuid && uuid !== value) {
+        vars[key] = uuid;
+        resolved = true;
+      }
+    } catch {
+      // Fail-open on resolution error — the upstream error will be clearer
+      // than a proxy-internal resolution failure.
+    }
+  }
+
+  return resolved;
+}
+
 // AI-1860: TTL for per-command authorization snapshots.
 const COMMAND_AUTH_SNAPSHOT_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -1047,6 +1110,12 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           }
         }
       }
+
+      // AI-2597: resolve human-readable issue identifiers to UUIDs before
+      // forwarding write mutations. This is safe to call on every request —
+      // it's a no-op when variables contain UUIDs or the keys don't exist.
+      await resolveMutationIssueIds(body, authorization);
+
       let upstreamRes: globalThis.Response;
       try {
         upstreamRes = await fetch(LINEAR_API_URL, {
@@ -1357,6 +1426,10 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       createClaim = claim;
     }
   }
+
+  // AI-2597: resolve human-readable issue identifiers to UUIDs before
+  // forwarding write mutations.
+  await resolveMutationIssueIds(body, authorization);
 
   // Non-intent forward path (reads and raw non-workflow mutations).
   let upstreamRes: globalThis.Response;
