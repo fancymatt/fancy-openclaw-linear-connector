@@ -499,25 +499,25 @@ describe("AC3: fixture-drift warning is clean — zero drift after reconciliatio
 // ══════════════════════════════════════════════════════════════════════════════
 
 describe("AC4: Documentation — fixture header explains canonical source & regeneration", () => {
-  it("canonical-dev-impl.yaml header references canonical vault source location", () => {
+  it("canonical-dev-impl.yaml header references deployed def source location", () => {
     const raw = fs.readFileSync(CANONICAL_DEV_IMPL, "utf8");
-    // Must reference the canonical vault file path
-    expect(raw).toMatch(/ai-systems\/projects\/fleet-orchestration-redesign\/workflows/);
-    // Must explain that this is a CI-only copy kept in sync with the vault
+    // Must reference the deployed def as the canonical source (WORKFLOW_DEFS_DIR)
+    expect(raw).toMatch(/WORKFLOW_DEFS_DIR/i);
+    // Must explain that this is a CI-only copy kept in sync
     expect(raw).toMatch(/fixture/i);
     expect(raw).toMatch(/keep in sync/i);
   });
 
-  it("canonical-ux-audit.yaml header references canonical vault source location", () => {
+  it("canonical-ux-audit.yaml header references deployed def source location", () => {
     const raw = fs.readFileSync(CANONICAL_UX_AUDIT, "utf8");
-    expect(raw).toMatch(/ai-systems\/projects\/fleet-orchestration-redesign\/workflows/);
+    expect(raw).toMatch(/WORKFLOW_DEFS_DIR/i);
     expect(raw).toMatch(/fixture/i);
     expect(raw).toMatch(/keep in sync/i);
   });
 
-  it("canonical-sprint.yaml header references canonical vault source location", () => {
+  it("canonical-sprint.yaml header references deployed def source location", () => {
     const raw = fs.readFileSync(CANONICAL_SPRINT, "utf8");
-    expect(raw).toMatch(/ai-systems\/projects\/fleet-orchestration-redesign\/workflows/);
+    expect(raw).toMatch(/WORKFLOW_DEFS_DIR/i);
     expect(raw).toMatch(/fixture/i);
     expect(raw).toMatch(/keep in sync/i);
   });

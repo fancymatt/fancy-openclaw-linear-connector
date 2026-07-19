@@ -1,0 +1,223 @@
+# dev-impl — Archetype A workflow definition
+# design.md §13, §16.1
+# owner: steward (Astrid)
+# version history: bump `version` on any state/edge change; in-flight tickets
+#   use the version stamped at their creation time (design.md §12).
+#
+# This fixture is kept in sync with the deployed workflow definition so CI
+# can exercise the canonical schema without depending on the vault being
+# present. The canonical source is the deployed def under WORKFLOW_DEFS_DIR;
+# fixture drift is detected at /health.fixtureDrift. Keep in sync.
+#
+# Shape principle (design decision 2026-06-06): a STATE is a work-phase — one
+#   kind of work, one owner role; "awaiting X" and "doing X" are the same state.
+#   A TRANSITION is a decision/event (may carry payload) — never a resting place.
+#   Decision-results (`approved`, `merged`) are transitions, not states.
+#   Hanzo's container is the DEPLOYMENT container: merging is one operation it
+#   authorizes (`deploy:execute`), not its definition.
+#
+# Native state projection (AI-1490): each state declares the semantic native
+#   Linear state the CLI should project to when entering that state. v7 (AI-1510)
+#   made native status a pure engagement overlay — every active work-phase rests
+#   at `todo`; the connector cycles To Do → Thinking → Doing off the delegate's
+#   session lifecycle. Terminal states keep semantic value (done→done, escape→invalid).
+#
+# v8 (2026-06-10, Matt directive): test-driven + deploy-real + AC-gate shape.
+#   New states: write-tests (TestDrivenDevelopmentAgent writes failing tests
+#   before implementation), host-deploy (Grover, host-side, the bare-metal half
+#   of deployment Hanzo's container can't reach), ac-validate (the intake steward
+#   re-verifies the deployed artifact against the captured AC before done).
+#   Also reconciled H-7 (AI-1482, Done) stakes/capture_ac/human-signoff config —
+#   it was implemented in code + tests but missing from the production def.
+#
+# v15 (INF-98 reconciliation): reconciled with deployed def at version 15.
+#   Added recovery_actor: ai (AI-1579), renamed stake label keys to stakes:*
+#   namespace (canonical; deployed risk:* migrated to stakes:*), bumped
+#   version to 15, updated break_glass to target intake (v10 change).
+#   State structure preserved as v8 (deployment/host-deploy) — the v13+
+#   merge/deploy structural change is a separate evolution tracked in AI-1872.
+
+id: dev-impl
+version: 15
+archetype: single-task         # single-task | orchestrator | feature-initiative
+entry_state: intake
+
+# AI-1579 (2026-06-13): recovery actor. `ai` (the orchestrator, fills no workflow
+# role) may re-establish a delegate on a ticket whose delegate is currently EMPTY
+# (orphaned) at ANY state — the authorization counterpart to the stale-session
+# recovery machinery. Scoped to the empty-delegate path only.
+recovery_actor: ai
+
+# Phase 6.5 / H-7 (AI-1482): Stakes-threshold sign-off configuration.
+# When a ticket's stakes level meets or exceeds the threshold, the release
+# transition requires a human sign-off (Matt), not an AI agent.
+# Stakes levels: 0 = low (internal only), 1 = medium, 2 = high (external/irreversible).
+# Labels on the ticket: stakes:low, stakes:medium, stakes:high (canonical namespace).
+stakes:
+  threshold: 2                # release from stakes ≥ this level requires human sign-off
+  levels:                     # label name → numeric level mapping
+    stakes:low: 0
+    stakes:medium: 1
+    stakes:high: 2
+
+break_glass:
+  command: escape               # x-openclaw-linear-intent value that triggers break-glass (§4.4)
+  to: intake                    # AI-1710: escape re-enters at intake, not escape terminal
+  owner_role: steward           # implicit escape edge from EVERY state (design.md §4.4)
+
+states:
+
+  - id: intake
+    owner_role: steward
+    kind: normal
+    native_state: todo           # intake itself is Todo
+    transitions:
+      - command: accept
+        to: write-tests
+        assign: { mode: auto }     # test-author is singleton (TestDrivenDevelopmentAgent) — auto-assign
+        # Phase 6.5 / H-7 (AI-1482): capture verbatim AC from the issue description
+        # as the AC of record. ac-validate judges the outcome against this snapshot.
+        capture_ac: true
+      - command: demote
+        to: __ad_hoc__          # ticket leaves the workflow entirely (design.md §4.5)
+
+  - id: write-tests
+    owner_role: test-author     # TestDrivenDevelopmentAgent; dev container (§16.2)
+    kind: normal
+    native_state: todo          # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
+    sla: 48h                    # G-5: per-state SLA; breach → stall escalation
+    # Adversarial-rigor split (design note a, 2026-06-10): a dedicated agent
+    # writes FAILING tests covering all in-scope AC before any implementation,
+    # so an implementer can never fudge test robustness to pass their own work.
+    # test-author is NOT a dev body, so it can never be assigned implementation.
+    transitions:
+      - command: tests-ready
+        to: implementation
+        assign: { mode: required }     # dev is multi-body (felix/noah/sage/igor) — target required, validated vs dev role
+
+  - id: implementation
+    owner_role: dev
+    kind: normal
+    native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
+    sla: 72h                    # G-5: per-state SLA; longer than code-review (days of work vs 24h review cap)
+    # entered from write-tests/tests-ready, code-review/request-changes,
+    # deployment/reject, host-deploy/reject, ac-validate/ac-fail — one dev
+    # work-phase, no awaiting-vs-doing split. Dev makes the failing tests pass.
+    transitions:
+      - command: submit
+        to: code-review
+        assign:
+          mode: required          # reviewer must be explicitly specified (§4.3)
+          constraint: not-implementer  # reviewer must differ from implementer (AI-1475 D2)
+
+  - id: code-review
+    owner_role: code-review
+    kind: normal
+    native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
+    sla: 24h                    # time-in-state; breach → stall escalation (design.md §5.5)
+    # Review contract (v8): Hanzo runs the FULL test suite. Any red ⇒
+    # request-changes with the failing tests named in feedback. `approve` is
+    # legal only when the suite is green AND code quality satisfies the reviewer.
+    transitions:
+      - command: approve
+        to: deployment
+        assign: { mode: auto }
+      - command: request-changes
+        to: implementation
+        feedback:
+          required: true
+          category_enum:
+            - missing-tests
+            - style
+            - scope-creep
+            - correctness
+            - ac-mismatch
+
+  - id: deployment
+    owner_role: deployment      # filled by Hanzo; the deployment container (§16.2)
+    kind: normal
+    native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
+    sla: 4h                     # G-5: per-state SLA; deployment is automated/quick
+    # Hanzo MERGES the PR (deploy:execute, exclusive). Two exits forward:
+    #   - deploy: merge alone is sufficient (CI auto-deploys) → ac-validate.
+    #   - handoff-host-deploy: a bare-metal/host action is required (restart
+    #     connector + roll CLI, run migrations, TestFlight) → host-deploy. Hanzo's
+    #     container has NO host access, so this is structurally a hand-off, not a
+    #     same-state delegate swap (the deployment role is exclusive → Hanzo only).
+    transitions:
+      - command: deploy
+        to: ac-validate
+        requires_capability: deploy:execute   # Layer A enforcement (design.md §16.2)
+        # Phase 6.5 / H-7 (AI-1482): stakes-threshold gate. If the ticket's stakes
+        # level ≥ workflow.stakes.threshold, the deploy must come from a human
+        # sign-off (not an AI agent). Enforced by the connector proxy at deploy time.
+        requires_human_signoff_above_stakes: true
+        assign: { mode: auto }     # ac-validate steward is singleton (Astrid) — auto-assign
+      - command: handoff-host-deploy
+        to: host-deploy
+        assign: { mode: auto }     # host-deploy is singleton (Grover) — auto-assign
+      - command: reject
+        to: implementation
+        feedback:
+          required: true
+          category_enum:
+            - missing-tests
+            - style
+            - scope-creep
+            - correctness
+            - ac-mismatch
+
+  - id: host-deploy
+    owner_role: host-deploy     # filled by Grover; host-side on Nakazawa (§16.2)
+    kind: normal
+    native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
+    sla: 8h                     # G-5: per-state SLA; host deploy needs more time than CI deploy
+    # Bare-metal half of deployment: restart the connector + roll the CLI to
+    # agent containers, run migrations, push TestFlight builds — whatever needs
+    # host access the deployment container lacks. The merge already happened in
+    # `deployment`; this requires host access (infra:ssh), NOT deploy:execute.
+    transitions:
+      - command: host-deployed
+        to: ac-validate
+        requires_capability: infra:ssh
+        requires_human_signoff_above_stakes: true   # H-7 (AI-1482): high-stakes host release needs human sign-off
+        assign: { mode: auto }     # ac-validate steward is singleton (Astrid) — auto-assign
+      - command: reject
+        to: implementation
+        feedback:
+          required: true
+          category_enum:
+            - missing-tests
+            - style
+            - scope-creep
+            - correctness
+            - ac-mismatch
+
+  - id: ac-validate
+    owner_role: steward         # the SAME steward (Astrid) who validated AC at intake
+    kind: normal
+    native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
+    sla: 24h                    # G-5: per-state SLA; final gate validation should complete within a day
+    # Final gate (design note, 2026-06-10): re-verify the DEPLOYED artifact
+    # satisfies the captured acceptance criteria in real conditions before `done`.
+    # Closes the "every step verified the artifact, none verified the outcome" gap.
+    transitions:
+      - command: validated
+        to: done
+        # terminal → no assignment
+      - command: ac-fail
+        to: implementation
+        feedback:
+          required: true
+          category_enum:
+            - missing-tests
+            - style
+            - scope-creep
+            - correctness
+            - ac-mismatch
+
+  - id: done
+    kind: terminal
+    native_state: done           # targetState: "done" → Done
+    satisfies_parent_barrier: true   # uniform terminal contract (design.md §5.4)
+
