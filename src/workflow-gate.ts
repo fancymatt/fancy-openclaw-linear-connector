@@ -3730,6 +3730,83 @@ export async function applyStateTransition(
         );
         return { status: "applied", code: "stale-label-purged", from: currentStateName, to: toStateName };
       }
+      // AI-2595 AC2: same-state (self-loop) delegate resolution.
+      // When source === destination but the transition carries delegate
+      // semantics (assign.default or cliTarget), resolve and write the
+      // delegate before returning from the idempotency check. This allows
+      // handoff-work to re-attach a delegate on a stranded implementation-
+      // state ticket without needing escape.
+      const selfLoopHasDelegateSemantics =
+        matchedTransition?.assign?.default === 'prior-implementer' ||
+        options?.cliTarget !== undefined ||
+        options?.delegateOverride !== undefined;
+
+      if (selfLoopHasDelegateSemantics) {
+        let selfLoopDelegateId: string | null | undefined;
+
+        if (options?.delegateOverride !== undefined) {
+          selfLoopDelegateId = options.delegateOverride;
+          log.info(
+            `workflow-gate: AI-2595 self-loop delegate: using delegateOverride=${selfLoopDelegateId}`,
+          );
+        } else if (options?.cliTarget) {
+          const targetAgent = getAgent(options.cliTarget);
+          if (targetAgent?.linearUserId) {
+            selfLoopDelegateId = targetAgent.linearUserId;
+            log.info(
+              `workflow-gate: AI-2595 self-loop delegate: explicit target '${options.cliTarget}' → ${selfLoopDelegateId}`,
+            );
+          } else {
+            log.error(
+              `workflow-gate: AI-2595 self-loop delegate: CLI target '${options.cliTarget}' has no linearUserId — skipping delegate write`,
+            );
+          }
+        } else if (matchedTransition?.assign?.default === 'prior-implementer') {
+          const priorImplementer = await getImplementer(issueId);
+          if (priorImplementer) {
+            const agent = getAgent(priorImplementer);
+            if (agent?.linearUserId) {
+              selfLoopDelegateId = agent.linearUserId;
+              log.info(
+                `workflow-gate: AI-2595 self-loop delegate: prior implementer '${priorImplementer}' → ${selfLoopDelegateId}`,
+              );
+            } else {
+              log.error(
+                `workflow-gate: AI-2595 self-loop delegate: prior implementer '${priorImplementer}' has no linearUserId — skipping delegate write`,
+              );
+            }
+          } else {
+            log.warn(
+              `workflow-gate: AI-2595 self-loop delegate: no prior implementer recorded for ${issueId} — skipping delegate write`,
+            );
+          }
+        }
+
+        if (selfLoopDelegateId !== undefined) {
+          // Keep the current label set unchanged — only write the delegate.
+          const stableLabelIds = issue.labels.map((l) => l.id);
+          const selfLoopResult = await issueUpdateAtomicVerified(
+            issue.internalId,
+            stableLabelIds,
+            authToken,
+            selfLoopDelegateId,
+            undefined,  // no native state change
+            toStateName,
+          );
+
+          if (selfLoopResult.ok) {
+            log.info(
+              `workflow-gate: AI-2595: ${issueId} wrote delegate=${selfLoopDelegateId} on self-loop (state:${toStateName})`,
+            );
+            return { status: "applied", code: "delegate-written", from: currentStateName, to: toStateName };
+          }
+
+          log.warn(
+            `workflow-gate: AI-2595: self-loop delegate write failed for ${issueId} — falling through to no-op`,
+          );
+        }
+      }
+
       log.info(
         `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' with label present — no-op`,
       );

@@ -7879,6 +7879,7 @@ states:
       - command: reject
         to: implementation
         requires_comment: true
+        assign: { default: prior-implementer }
         feedback:
           required: true
           category_enum:
@@ -7897,6 +7898,7 @@ states:
       - command: reject
         to: implementation
         requires_comment: true
+        assign: { default: prior-implementer }
         feedback:
           required: true
           category_enum:
