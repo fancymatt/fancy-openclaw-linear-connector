@@ -1736,3 +1736,191 @@ export function shouldTriggerFanout(
   if (!isForwardCommand) return null;
   return state.fanout;
 }
+
+// ── INF-115: spec auto-derivation from prior-phase children ────────────────
+
+/**
+ * INF-115: the description section read from each prior-phase child when
+ * deriving. Arm children (wf:sprint-arm-*) carry their approved output in a
+ * `## Findings` section by convention — the same content the steward used to
+ * hand-transcribe into the sprint parent (engine-watch runs 95/97 on LIF-63).
+ */
+const DERIVE_CHILD_SPEC_SECTION = "findings";
+
+/** Marker comment written above an auto-derived spec section. */
+export const AUTO_DERIVED_SPEC_MARKER = "<!-- inf-115:auto-derived";
+
+/**
+ * Match a child's workflow label against an `auto_derive_from` glob.
+ * Supports a single trailing `*` (prefix match) or exact equality:
+ *   "wf:sprint-arm-*"     matches "wf:sprint-arm-scope", "wf:sprint-arm-ux", …
+ *   "wf:sprint-arm-scope" matches only itself.
+ */
+export function childWorkflowMatchesGlob(workflowLabel: string, glob: string): boolean {
+  if (glob.endsWith("*")) {
+    return workflowLabel.startsWith(glob.slice(0, -1));
+  }
+  return workflowLabel === glob;
+}
+
+/**
+ * INF-115: Derive a fan-out spec from a parent's completed prior-phase children.
+ *
+ * The steward used to hand-transcribe arm outputs into the sprint parent's
+ * spec section at every spawn phase. When the fanout config declares
+ * `auto_derive_from` (a glob over prior-phase child wf:* labels), the engine
+ * derives the section itself: each matching terminal child contributes its own
+ * `## Findings` entries (flattened with an `[<identifier>]` prefix), or — when
+ * the child has no structured section — a single entry from the child's title
+ * pointing back at the child ticket.
+ *
+ * Returns null when no matching terminal children exist — the caller leaves
+ * the spec section empty and the spawn refuses later exactly as before
+ * INF-115 (fail-loud path intact).
+ */
+export async function deriveSpecFromPriorChildren(
+  parentInternalId: string,
+  authToken: string,
+  opts: { fromChildWorkflow: string; requireTerminal?: boolean },
+): Promise<Finding[] | null> {
+  const requireTerminal = opts.requireTerminal !== false;
+  const query = `
+    query Inf115PriorPhaseChildren($id: String!) {
+      issue(id: $id) {
+        children {
+          nodes {
+            identifier
+            title
+            description
+            state { name type }
+            labels { nodes { name } }
+          }
+        }
+      }
+    }
+  `;
+  type ChildNode = {
+    identifier: string;
+    title?: string | null;
+    description?: string | null;
+    state?: { name?: string; type?: string } | null;
+    labels?: { nodes?: Array<{ name?: string }> } | null;
+  };
+  let nodes: ChildNode[] = [];
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: parentInternalId } }),
+    });
+    const data = (await res.json()) as {
+      data?: { issue?: { children?: { nodes?: ChildNode[] } | null } | null };
+    };
+    nodes = data.data?.issue?.children?.nodes ?? [];
+  } catch (err) {
+    log.warn(
+      `fanout: INF-115: failed to fetch prior-phase children for ${parentInternalId}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+
+  const findings: Finding[] = [];
+  for (const child of nodes) {
+    const wfLabel = (child.labels?.nodes ?? [])
+      .map((l) => l.name)
+      .find((name): name is string => typeof name === "string" && /^wf:.+/.test(name));
+    if (!wfLabel || !childWorkflowMatchesGlob(wfLabel, opts.fromChildWorkflow)) continue;
+    // "completed" is Linear's terminal state type (Done). Canceled/invalid
+    // children carry no approved output and are excluded with it.
+    if (requireTerminal && child.state?.type !== "completed") continue;
+
+    // Prefer the child's own structured output section; fall back to its title.
+    const childFindings = extractSpecFindings(child.description, DERIVE_CHILD_SPEC_SECTION);
+    if (childFindings.length > 0) {
+      for (const f of childFindings) {
+        findings.push({
+          title: `[${child.identifier}] ${f.title}`,
+          description: f.description,
+        });
+      }
+    } else {
+      const title = (child.title ?? child.identifier).trim();
+      findings.push({
+        title: `[${child.identifier}] ${title}`,
+        description: `Approved output lives on ${child.identifier} (no structured findings section — see the child ticket).`,
+      });
+    }
+  }
+
+  if (findings.length === 0) return null;
+  log.info(
+    `fanout: INF-115: derived ${findings.length} spec entr${findings.length === 1 ? "y" : "ies"} ` +
+    `from prior-phase children of ${parentInternalId} (glob '${opts.fromChildWorkflow}')`,
+  );
+  return findings;
+}
+
+/**
+ * INF-115: Render derived findings as a spec section and append it to the
+ * parent description. Returns the new description, or null when the section
+ * already exists with parseable entries — human-authored content always wins;
+ * derivation never overwrites.
+ */
+export function upsertDerivedSpecSection(
+  description: string | null | undefined,
+  specSource: string,
+  findings: Finding[],
+): string | null {
+  if (findings.length === 0) return null;
+  if (extractSpecFindings(description, specSource).length > 0) return null;
+
+  const heading = `## ${specSource.charAt(0).toUpperCase()}${specSource.slice(1)}`;
+  const lines = findings.map((f) => {
+    // Strip asterisks from titles so they can't break the "**Title**" parse.
+    const title = f.title.replace(/\*+/g, "").trim();
+    return f.description ? `- **${title}**: ${f.description}` : `- **${title}**`;
+  });
+  const section =
+    `${heading}\n\n` +
+    `${AUTO_DERIVED_SPEC_MARKER} — derived from completed prior-phase children; review/edit before spawning -->\n\n` +
+    lines.join("\n") +
+    "\n";
+
+  const base = (description ?? "").trimEnd();
+  return base ? `${base}\n\n${section}` : section;
+}
+
+/**
+ * INF-115: persist an updated description on an issue. Returns true on success.
+ * Fail-open: a failed write just means the steward authors the section by hand
+ * (the pre-INF-115 path).
+ */
+export async function updateIssueDescription(
+  internalIssueId: string,
+  description: string,
+  authToken: string,
+): Promise<boolean> {
+  const mutation = `
+    mutation Inf115UpdateDescription($issueId: String!, $description: String!) {
+      issueUpdate(id: $issueId, input: { description: $description }) {
+        success
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId: internalIssueId, description } }),
+    });
+    const data = (await res.json()) as { data?: { issueUpdate?: { success?: boolean } } };
+    return data.data?.issueUpdate?.success === true;
+  } catch (err) {
+    log.warn(
+      `fanout: INF-115: failed to update description on ${internalIssueId}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}

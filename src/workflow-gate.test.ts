@@ -1837,6 +1837,302 @@ describe("checkWorkflowRules — AI-2476: merged-PR release gate (branch/PR veri
 
 });
 
+// ── INF-112 AC4: Regression test — non-Linear-generated branch ──────────────
+// AC4 requires that a ticket in merge/deploy state passes cleanly through the
+// done gate when the PR was created externally (not through Linear's "Create
+// branch" UI). The Linear-GitHub integration never syncs merge status metadata
+// for externally-created branches, so hasMergedPR is false despite the PR being
+// genuinely merged.
+
+// The fix has three paths:
+// 1. GitHub API fallback: checkPRMergedFromGitHub confirms the PR is merged
+// 2. Defense-in-depth: when no GH_TOKEN is configured, PR URL alone is sufficient
+// 3. Force-deploy: the force-deploy intent bypasses the evidence gate entirely
+
+// Each path is tested below for both merge and deploy states.
+
+describe("checkWorkflowRules — INF-112: non-Linear-generated branch (metadata-gap)", () => {
+  let originalWorkflowPath: string | undefined;
+  let originalFetch: typeof globalThis.fetch;
+  let originalGhToken: string | undefined;
+
+  beforeAll(() => {
+    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
+    originalGhToken = process.env.GH_TOKEN;
+    resetWorkflowCache();
+  });
+  afterAll(() => {
+    if (originalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    if (originalGhToken !== undefined) process.env.GH_TOKEN = originalGhToken;
+    else delete process.env.GH_TOKEN;
+    resetWorkflowCache();
+  });
+
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    delete process.env.GH_TOKEN;
+  });
+
+  /**
+   * Build a fetch mock that returns:
+   * - Linear branch/PR data showing PR URLs exist but hasMergedPR=false
+   *   (simulating an externally-created branch where Linear's GitHub integration
+   *    never synced the merged status)
+   * - GitHub API response confirming the PR IS merged (when ghApiReturnsMerged=true)
+   * - Linear label/context responses as needed
+   */
+  function makeInf112Mock(ghApiReturnsMerged: boolean, state: "merge" | "deploy"): typeof globalThis.fetch {
+    return async (url: URL | string, init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : url.href;
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+
+      // GitHub API: checkPRMergedFromGitHub
+      if (urlStr.includes("api.github.com/repos/")) {
+        if (ghApiReturnsMerged) {
+          return new Response(
+            JSON.stringify({ merged: true, state: "merged" }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({ merged: false, state: "open" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // TeamStates query (native state resolution)
+      if (bodyText.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              team: {
+                states: {
+                  nodes: [
+                    { id: "state-backlog-uuid", name: "Backlog", type: "unstarted" },
+                    { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+                    { id: "state-doing-uuid", name: "Doing", type: "started" },
+                    { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+                    { id: "state-managing-uuid", name: "Managing", type: "started" },
+                    { id: "state-done-uuid", name: "Done", type: "completed" },
+                    { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Linear IssueBranchAndPR query — PR URLs exist but metadata does NOT
+      // show merged status (simulates externally-created branch)
+      if (bodyText.includes("IssueBranchAndPR")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                description: null,
+                attachments: {
+                  nodes: [
+                    {
+                      url: "https://github.com/fancymatt/repo/pull/42",
+                      sourceType: "github",
+                      // metadata deliberately omits `status` — simulates
+                      // externally-created branch where Linear's GitHub
+                      // integration never synced merge status (metadata-gap).
+                      metadata: {},
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Linear context query (IssueWithLabels / delegate)
+      if (bodyText.includes("IssueWithLabels") || bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "internal-uuid",
+                labels: {
+                  nodes: [
+                    { name: "wf:dev-impl" },
+                    { name: `state:${state}` },
+                  ],
+                },
+                delegate: null,
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      throw new Error(`unexpected fetch call: ${urlStr} ${bodyText.slice(0, 80)}`);
+    };
+  }
+
+  // ── Path 1: GitHub API fallback (GH_TOKEN set, API confirms merged) ──
+
+  it("allows 'continue' from merge state when PR metadata missing merge status but GitHub API confirms (INF-112 metadata-gap)", async () => {
+    process.env.GH_TOKEN = "mock-token-hex-1234";
+    globalThis.fetch = makeInf112Mock(true, "merge");
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
+  });
+
+  it("allows 'continue' from deploy state when PR metadata missing merge status but GitHub API confirms (INF-112 metadata-gap)", async () => {
+    process.env.GH_TOKEN = "mock-token-hex-1234";
+    globalThis.fetch = makeInf112Mock(true, "deploy");
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
+  });
+
+  // ── Path 2: Defense-in-depth — no GH_TOKEN, PR URL accepted as sufficient ──
+
+  it("allows 'continue' from merge state with no GH_TOKEN — PR URL accepted as sufficient evidence (INF-112 defense-in-depth)", async () => {
+    // GH_TOKEN deliberately unset (afterEach deletes it)
+    globalThis.fetch = makeInf112Mock(false, "merge");
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
+  });
+
+  it("allows 'continue' from deploy state with no GH_TOKEN — PR URL accepted as sufficient evidence (INF-112 defense-in-depth)", async () => {
+    globalThis.fetch = makeInf112Mock(false, "deploy");
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
+  });
+
+  // ── Path 3: Force-deploy bypasses evidence gate entirely ──
+
+  it("force-deploy from merge state bypasses evidence gate entirely (INF-112 force-deploy)", async () => {
+    // No GH_TOKEN, mock returns "not merged" — but force-deploy should skip
+    globalThis.fetch = makeInf112Mock(false, "merge");
+    const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
+  });
+
+  it("force-deploy from deploy state bypasses evidence gate entirely (INF-112 force-deploy)", async () => {
+    globalThis.fetch = makeInf112Mock(false, "deploy");
+    const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
+  });
+
+  // ── Path 4: GH_TOKEN set but GitHub confirms NOT merged → blocked ──
+  // This is the "genuine block" case: the evidence gate has real data and
+  // the PR is genuinely not merged. Only GH_TOKEN makes this distinction
+  // possible; without it, PR URL is always accepted.
+
+  it("blocks 'continue' from merge state when GH_TOKEN is set and GitHub confirms PR is NOT merged", async () => {
+    process.env.GH_TOKEN = "mock-token-hex-1234";
+    globalThis.fetch = makeInf112Mock(false, "merge");
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked");
+  });
+
+  it("blocks 'continue' from deploy state when GH_TOKEN is set and GitHub confirms PR is NOT merged", async () => {
+    process.env.GH_TOKEN = "mock-token-hex-1234";
+    globalThis.fetch = makeInf112Mock(false, "deploy");
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked");
+  });
+
+  // ── Path 5: GH_TOKEN set but GitHub API returns error → blocks (can't verify) ──
+  // When GH_TOKEN is configured and the GitHub API is unreachable, the gate
+  // blocks rather than guessing — a configured but failing API is treated as
+  // an operational problem, not a fallback signal.
+
+  it("blocks 'continue' from merge state when GH_TOKEN set but GitHub API errors (can't verify INF-112 metadata-gap)", async () => {
+    process.env.GH_TOKEN = "mock-token-hex-1234";
+    globalThis.fetch = async (url: URL | string, init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : url.href;
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+
+      // GitHub API: return server error
+      if (urlStr.includes("api.github.com/repos/")) {
+        return new Response("Internal Server Error", { status: 500 });
+      }
+
+      // TeamStates
+      if (bodyText.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              team: {
+                states: {
+                  nodes: [
+                    { id: "state-backlog-uuid", name: "Backlog", type: "unstarted" },
+                    { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+                    { id: "state-doing-uuid", name: "Doing", type: "started" },
+                    { id: "state-done-uuid", name: "Done", type: "completed" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Linear IssueBranchAndPR
+      if (bodyText.includes("IssueBranchAndPR")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                description: null,
+                attachments: {
+                  nodes: [
+                    {
+                      url: "https://github.com/fancymatt/repo/pull/42",
+                      sourceType: "github",
+                      metadata: { status: "open" },
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Linear context
+      if (bodyText.includes("IssueWithLabels") || bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "internal-uuid",
+                labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:merge" }] },
+                delegate: null,
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      throw new Error(`unexpected fetch call: ${urlStr} ${bodyText.slice(0, 80)}`);
+    };
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("cannot release unmerged work");
+  });
+});
+
 // ── AI-1475 Defect 2: Submit requires reviewer ≠ author ──────────────────────
 
 describe("checkWorkflowRules — AI-1475 D2: submit self-review prevention", () => {
