@@ -2640,7 +2640,7 @@ export async function checkWorkflowRules(
       // alert scrolled past. Now treated as a hard block with an actionable alert.
       log.warn(`workflow-gate: done gate: ${issueId} blocked — no branch/PR evidence`);
       notify({
-        severity: "error",
+        severity: "critical",
         source: "done-gate",
         title: "done gate blocked: no branch/PR evidence (GitHub integration missing?)",
         detail: `Ticket ${issueId} blocked on '${intent}' with zero GitHub attachments. If this fires for every forward move, the Linear GitHub integration is not installed and the merged-PR gate is verifying nothing. Install the integration or use break-glass to bypass.`,
