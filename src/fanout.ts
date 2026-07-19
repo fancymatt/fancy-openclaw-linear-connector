@@ -352,7 +352,7 @@ export function extractSpecFindings(
    * Matches: [wf:sprint-arm-ux → signe] or [wf:sprint-arm-ux]
    * The arrow (→ or ->) separates workflow id from optional delegate.
    */
-  const PER_ENTRY_MARKER_RE = /^\[wf:([^\]\s]+)(?:\s*[→>-]\s*(\S+))?\]\s*/;
+  const PER_ENTRY_MARKER_RE = /^\\?\[wf:([^\s\\\]]+)(?:\s*[→>-]\s*([^\s\\\]]+))?\\?\]\s*/;
 
   if (sectionMatch) {
     const sectionBody = sectionMatch[1];
@@ -976,7 +976,7 @@ async function resolveInitialDelegate(bodyId: string): Promise<string | null> {
  * Steps:
  *   1. Fetch the parent issue's team, title, and description.
  *   2. Extract findings from the description.
- *   3. Ensure required labels exist (wf:dev-impl, state:intake).
+ *   3. Resolve entry-state labels per child workflow and create child issues.
  *   4. Create one child issue per finding, each linked to the parent.
  *   5. Return the result with created count and any partial errors.
  *
@@ -984,8 +984,8 @@ async function resolveInitialDelegate(bodyId: string): Promise<string | null> {
  * after a successful fan-out (or logs a warning on partial failure).
  *
  * AC4 (§5.4): Minting is uniform — children are always created as dev-impl
- * at intake, regardless of whether the child itself might be an orchestrator
- * archetype. No special-casing.
+ * at the child workflow's entry_state, regardless of whether the child itself
+ * might be an orchestrator archetype. No special-casing.
  */
 export async function executeFanout(
   parentIssueId: string,
@@ -1002,6 +1002,16 @@ export async function executeFanout(
      * dedups in production too.
      */
     existingChildren?: ExistingChild[];
+    /**
+     * INF-111: function to resolve the entry state label for a child workflow.
+     * Given a wf:* label (e.g. "wf:sprint-arm-scope"), should return the
+     * appropriate state label (e.g. "state:doing"). When omitted, children
+     * are minted at "state:intake" (legacy default).
+     * This fixes the def-skew bug where mint used "state:intake" while the
+     * live workflow defs had a different entry_state, causing the proxy to
+     * auto-migrate children to escape (terminal).
+     */
+    lookupEntryState?: (workflowLabel: string) => Promise<string | undefined>;
   },
 ): Promise<FanoutResult> {
   const result: FanoutResult = {
@@ -1228,15 +1238,10 @@ export async function executeFanout(
     return result;
   }
 
-  // 3. Ensure the state:intake label exists (shared by all children).
-  const stateLabelId = await findOrCreateLabel(parentCtx.teamId, "state:intake", authToken);
-  if (!stateLabelId) {
-    result.errors.push({
-      findingIndex: -1,
-      message: `Failed to resolve required label state:intake`,
-    });
-    return result;
-  }
+  // 3. State labels are resolved per-workflow in the mint loop below.
+  //    Cache resolved label ids by state name to avoid redundant API calls
+  //    when multiple children share the same workflow entry_state.
+  const stateLabelCache = new Map<string, string>();
 
   // AI-1992: optional initial delegate from config (used as default when
   // per-entry delegate is not set). Resolve once for reuse.
@@ -1266,7 +1271,29 @@ export async function executeFanout(
       });
       continue;
     }
-    const labelIds = [wfLabelId, stateLabelId];
+    // INF-111: resolve entry state label for this child's workflow.
+    // If the caller provided lookupEntryState, use it to get the correct
+    // state label from the workflow definition. Otherwise fall back to
+    // "state:intake" (legacy default). Cache by state name for efficiency.
+    const entryStateLabel = options?.lookupEntryState
+      ? await options.lookupEntryState(findingWorkflow)
+      : undefined;
+    const stateLabelName = entryStateLabel ?? "state:intake";
+    let entryStateLabelId: string | undefined | null = stateLabelCache.get(stateLabelName);
+    if (!entryStateLabelId) {
+      entryStateLabelId = await findOrCreateLabel(parentCtx.teamId, stateLabelName, authToken);
+      if (entryStateLabelId) {
+        stateLabelCache.set(stateLabelName, entryStateLabelId);
+      }
+    }
+    if (!entryStateLabelId) {
+      result.errors.push({
+        findingIndex: i,
+        message: `Failed to resolve required label ${stateLabelName} for workflow '${findingWorkflow}' in finding "${childTitle}"`,
+      });
+      continue;
+    }
+    const labelIds = [wfLabelId, entryStateLabelId];
 
     // AI-2199: per-entry delegate override. Falls back to config default.
     const delegateId = finding.delegate

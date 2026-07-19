@@ -1,23 +1,23 @@
-# sprint-arm-design — Sprint Arm: Design child workflow (v0)
-# owner: cdo (Laren), reviewer (Astrid)
-# last-updated: 2026-07-16
-# status: v0 — registered-def fixture placeholder
+# sprint-arm-design — dev-sprint shaping-arm archetype (design)
+# spec of record: life-os/project-management/dev-sprint-workflow-spec.md (vault,
+#   approved by Matt 2026-07-08). AI-1993.
+# owner: ui-designer (Penny/Laren) does the design shaping; the steward completes it.
 #
-# Registered-def copy for CI conformance validation (INF-42 / INF-45).
-# Canonical source: dev-sprint-workflow-spec.md arm archetype table.
-# Keep in sync when a full YAML is authored in the vault.
+# One of the four shaping arms fanned out by dev-sprint at spawn-arms. Uniform
+# doing → review → done shape; done carries satisfies_parent_barrier: true so
+# the parent managing-arms barrier auto-advances only when all four arms
+# terminate cleanly (AI-1992 engine).
 #
-# INF-45 (2026-07-16): added to registered-defs as child_workflow target
-# for dev-sprint's spawn-arms fanout.
+# Originally registered as v0 stubs (INF-45, 2026-07-16). Updated to v1
+# (INF-111, 2026-07-19) to match the live workflow defs in linear-connector/workflows/.
+# Key change from v0: entry_state: intake → entry_state: doing.
 #
-# Archetype: linear — intake → design → review → done.
-# Content: component choices, layout, interaction model, annotated low-fi;
-# "Sage can start without follow-up" bar.
+# Authority (spec table): review.owner_role: steward resolves to astrid.
 
 id: sprint-arm-design
-version: 0
-archetype: linear
-entry_state: intake
+version: 1
+archetype: single-task
+entry_state: doing
 
 break_glass:
   command: escape
@@ -26,39 +26,35 @@ break_glass:
 
 states:
 
-  - id: intake
-    owner_role: steward
-    kind: normal
-    native_state: todo
-    description: >
-      Receive arm brief from dev-sprint.
-    transitions:
-      - command: begin
-        to: design
-        generic: continue
-
-  - id: design
-    owner_role: implementer
+  - id: doing
+    owner_role: ui-designer
     kind: normal
     native_state: doing
-    description: >
-      Component choices, layout, interaction model, annotated low-fi.
     transitions:
       - command: submit
         to: review
+        assign: { mode: auto }
         generic: continue
 
   - id: review
-    owner_role: reviewer
+    owner_role: steward
     kind: normal
-    native_state: thinking
+    native_state: todo
     transitions:
-      - command: approve
+      - command: accept
         to: done
         generic: continue
       - command: request-changes
-        to: design
+        to: doing
+        assign: { mode: auto }
         generic: revision
+        feedback:
+          required: true
+          category_enum:
+            - incomplete
+            - off-brief
+            - scope-creep
+            - correctness
 
   - id: done
     kind: terminal
