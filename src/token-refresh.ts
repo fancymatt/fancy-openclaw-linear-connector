@@ -17,7 +17,7 @@
  *      token validity, not just timestamp expiry. See INF-51.
  */
 
-import { getAgents, updateTokens, recordTokenFailure, isAgentLocal } from "./agents.js";
+import { getAgents, getTokenStatus, updateTokens, recordTokenFailure, isAgentLocal } from "./agents.js";
 import type { AgentConfig } from "./agents.js";
 import { notify } from "./alerts/alert-bus.js";
 import { createLogger, componentLogger } from "./logger.js";
@@ -203,10 +203,16 @@ function retryDelayMs(attemptIndex: number, rng: () => number): number {
 }
 
 function notifyRefreshFailure(agentName: string, failure: RefreshFailure): void {
+  const status = getTokenStatus(agentName);
+  const tokenState = status?.state ?? "unknown";
+  const deadline = status?.expiresAt
+    ? `; access token expires at ${status.expiresAt}`
+    : "; no access-token expiry recorded";
+
   notify({
     severity: "critical",
     source: "token-refresh",
-    title: `Token refresh failed for ${agentName}`,
+    title: `Token refresh failed for ${agentName} (state: ${tokenState})${deadline}`,
     agent: agentName,
     detail: failure.reason,
   });
