@@ -22,6 +22,7 @@ import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { getAutoEnrollLiveness, getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
 import { getDefStateMigrationLiveness, registerDefStateMigrationRunner } from "./def-state-migration.js";
 import { getFixtureDriftLiveness, runFixtureDriftCheck } from "./fixture-drift-detector.js";
+import { registerTranscriptRedaction, getTranscriptRedactionHealth } from "./transcript-redaction.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus, registerEngagementNativeStateOverlay } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
@@ -390,6 +391,10 @@ export function createApp(options?: CreateAppOptions) {
       // are in sync; entries list per-def details. Observable at ac-validate
       // without waiting for a dispatch trigger.
       fixtureDrift: getFixtureDriftLiveness(),
+      // AI-2582: transcript redaction sweep — periodic .trajectory.jsonl
+      // credential redaction. status is "idle"/"running"/"error"; lastRun
+      // is null before the first sweep fires.
+      transcriptRedaction: getTranscriptRedactionHealth(),
       // AI-2542: auto-enroll liveness and demote/escape suppression counters.
       autoEnroll: getAutoEnrollLiveness(),
       // AI-1908 AC5: per-agent OAuth token status. Exposes lastRefreshOkAt,
@@ -1204,7 +1209,12 @@ export function createApp(options?: CreateAppOptions) {
   // capability-policy bodies against agents.json entries and alerts on mismatches.
   registerRegistryIntegrityCron();
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore };
+  // AI-2582: transcript redaction sweep — periodic .trajectory.jsonl
+  // credential redaction. Registered here so the cron registry and /health
+  // both prove wiring without waiting for a trigger.
+  registerTranscriptRedaction();
+
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, transcriptRedactionHealth: getTranscriptRedactionHealth() };
 }
 
 /**

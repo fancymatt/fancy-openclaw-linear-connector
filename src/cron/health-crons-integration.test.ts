@@ -40,6 +40,7 @@ const EXPECTED_CRONS = [
   "registry-integrity-check", // AI-2359: periodic registry⇄policy integrity check (registered in createApp)
   "rescue-sweep",
   "sla-sweep",
+  "transcript-redaction", // AI-2582: periodic .trajectory.jsonl credential redaction sweep
 ].sort();
 
 const PORT = 4100 + (process.pid % 400);
