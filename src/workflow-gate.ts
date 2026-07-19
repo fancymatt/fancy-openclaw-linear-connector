@@ -44,7 +44,7 @@ import type { ObservationStore } from "./store/observation-store.js";
 import { recordObservation } from "./store/observation-write-path.js";
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent, getAgents } from "./agents.js";
-import { executeFanout, shouldTriggerFanout, validateFanoutSpec, type Finding } from "./fanout.js";
+import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, deriveSpecFromPriorChildren, upsertDerivedSpecSection, updateIssueDescription, type Finding } from "./fanout.js";
 import { recordFanoutOutcome } from "./fanout-outcome-store.js";
 import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
@@ -172,6 +172,13 @@ export interface FanoutConfig {
    *  ONLY if the predicate evaluates to true. When absent, unconditional spawn
    *  behavior is preserved (no regression). */
   spawn_if?: SpawnIfConfig;
+  /** INF-115: glob over prior-phase child `wf:*` labels (trailing `*` = prefix
+   *  match, e.g. "wf:sprint-arm-*"). On ENTRY to this state, when the spec
+   *  section is missing/empty, the engine derives the section from matching
+   *  terminal children and appends it to the parent description — the steward
+   *  reviews/edits it before running the spawn command. Human-authored content
+   *  always wins: an existing non-empty spec section is never overwritten. */
+  auto_derive_from?: string;
 }
 
 export interface WorkflowState {
@@ -842,6 +849,12 @@ export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
         }
         if (cfg.initial_delegate !== undefined && typeof cfg.initial_delegate !== "string") {
           errors.push(`Workflow state '${state.id}' fanout initial_delegate must be a string when present.`);
+        }
+        if (
+          cfg.auto_derive_from !== undefined &&
+          (typeof cfg.auto_derive_from !== "string" || cfg.auto_derive_from.trim() === "")
+        ) {
+          errors.push(`Workflow state '${state.id}' fanout auto_derive_from must be a non-empty string when present.`);
         }
         if (cfg.block_siblings !== undefined && typeof cfg.block_siblings !== "boolean") {
           errors.push(`Workflow state '${state.id}' fanout block_siblings must be a boolean when present.`);
@@ -1680,6 +1693,13 @@ interface BranchAndPRStatus {
   hasPR: boolean;
   /** True when the issue has at least one merged pull request. */
   hasMergedPR: boolean;
+  /**
+   * True when any PR attachment carries explicit status/state metadata
+   * (INF-96). When false, PR URLs exist but Linear's GitHub integration
+   * didn't sync merge status — the INF-112 metadata-gap case for
+   * externally-created branches.
+   */
+  prMetadataAvailable: boolean;
   /** URLs of PR attachments found on the issue (INF-112). */
   prUrls: string[];
 }
@@ -1710,6 +1730,7 @@ async function fetchBranchAndPRStatus(
   const query = `
     query IssueBranchAndPR($id: String!) {
       issue(id: $id) {
+        description
         attachments {
           nodes {
             url
@@ -1732,7 +1753,7 @@ async function fetchBranchAndPRStatus(
       metadata?: Record<string, unknown> | null;
     };
     type PRResp = {
-      data?: { issue?: { attachments?: { nodes: AttachmentNode[] } } };
+      data?: { issue?: { description?: string | null; attachments?: { nodes: AttachmentNode[] } } };
       errors?: Array<{ message?: string; extensions?: { code?: string } }>;
     };
     const data = (await res.json()) as PRResp;
@@ -1759,18 +1780,53 @@ async function fetchBranchAndPRStatus(
     const nodes = issue.attachments?.nodes ?? [];
     const prNodes = nodes.filter((n) => typeof n.url === "string" && /github\.com\/[^/]+\/[^/]+\/pull\/\d+/i.test(n.url));
     const hasPR = prNodes.length > 0;
-    const hasMergedPR = prNodes.some((n) => {
+    // hasMergedPR: any PR attachment has metadata.status === "merged".
+    // prMetadataAvailable: any PR attachment has explicit status/state metadata
+    // ("merged", "open", etc.), as opposed to the INF-112 metadata-gap case
+    // where the attachment URL exists but Linear's GitHub integration didn't
+    // sync merge status (externally-created branches).
+    let hasMergedPR = false;
+    let prMetadataAvailable = false;
+    for (const n of prNodes) {
       const meta = n.metadata ?? {};
       const status = (meta as { status?: unknown; state?: unknown }).status ?? (meta as { state?: unknown }).state;
-      return typeof status === "string" && status.toLowerCase() === "merged";
-    });
-    const prUrls = prNodes.map((n) => n.url ?? "");
+      if (typeof status === "string") {
+        prMetadataAvailable = true;
+        if (status.toLowerCase() === "merged") {
+          hasMergedPR = true;
+        }
+      }
+    }
+    const attachmentPrUrls = prNodes.map((n) => n.url ?? "");
+
+    // INF-121: Fall back to scanning the issue description for GitHub PR URLs
+    // when no attachment-based PR evidence exists. This covers the case where
+    // Linear's GitHub integration is not installed or didn't correlate the PR
+    // (externally-created branches, no attachment metadata sync).
+    const descPrUrls: string[] = [];
+    const desc = issue.description ?? "";
+    if (!hasPR && desc) {
+      const descPrPattern = /https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/gi;
+      let match: RegExpExecArray | null;
+      while ((match = descPrPattern.exec(desc)) !== null) {
+        descPrUrls.push(match[0]);
+      }
+      if (descPrUrls.length > 0) {
+        log.info(`workflow-gate: found ${descPrUrls.length} PR URL(s) in issue description for ${issueId} (INF-121 description fallback)`);
+      }
+    }
+
+    const allPrUrls = [...attachmentPrUrls, ...descPrUrls];
     return {
       // Attachments cannot see branches directly; a PR implies a pushed branch.
-      hasBranch: hasPR,
-      hasPR,
+      // INF-121: hasBranch/hasPR also true when only description-based URLs exist.
+      // prMetadataAvailable: true when any PR attachment has explicit status/state metadata.
+      // False for externally-created branches (INF-112 metadata-gap case).
+      hasBranch: hasPR || descPrUrls.length > 0,
+      hasPR: hasPR || descPrUrls.length > 0,
       hasMergedPR,
-      prUrls,
+      prMetadataAvailable,
+      prUrls: allPrUrls,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -2816,7 +2872,12 @@ export async function checkWorkflowRules(
       // This happens when Hanzo creates branches externally — Linear's GitHub
       // integration never syncs merge status metadata for externally-created
       // branches (INF-112). Try GitHub API as fallback.
-      if (branchStatus.hasPR && !branchStatus.hasMergedPR) {
+      // Only enter the INF-112 metadata-gap path when no PR attachment has
+      // explicit merge status metadata — meaning Linear's GitHub integration
+      // didn't sync status for this externally-created branch. When metadata
+      // IS available (e.g. status: "open"), the PR is genuinely not merged
+      // and we block immediately (INF-96).
+      if (branchStatus.hasPR && !branchStatus.hasMergedPR && !branchStatus.prMetadataAvailable) {
         const prUrls = branchStatus.prUrls ?? [];
         let verifiedMerged = false;
         for (const prUrl of prUrls) {
@@ -3854,6 +3915,17 @@ export async function applyStateTransition(
         `No state change was made and no children were created. Fix the spec and re-run \`${intent}\`.`,
         authToken,
       );
+      // INF-115 AC2: loud alert — a refused spawn must not rely on the
+      // steward noticing a ticket comment. The alert bus pushes to the
+      // OpenClaw gateway so the refusal surfaces outside Linear.
+      notify({
+        severity: "warning",
+        source: "fanout-spec",
+        title: `fan-out refused on ${issueId}: empty or unparseable '${fanoutConfig.spec_source}' spec at '${currentStateName}'`,
+        detail: validation.reason,
+        ticket: issueId,
+        dedupKey: `fanout-spec-refused|${issueId}|${currentStateName}`,
+      });
       return {
         status: "failed",
         code: "fanout-spec-invalid",
@@ -4453,6 +4525,54 @@ export async function applyStateTransition(
   // Clean up implementer record on terminal states
   if (isTerminal) {
     await removeImplementer(issueId);
+  }
+
+  // ── INF-115: on-entry spec auto-derivation ────────────────────────────
+  // When the DESTINATION state declares fanout.auto_derive_from, populate the
+  // spec section from completed prior-phase children immediately on entry, so
+  // the steward has a review window before running the spawn command. A
+  // human-authored (non-empty) spec section is never touched. Fail-open:
+  // derivation errors never block the transition — when no section exists the
+  // spawn refuses later exactly as it did before INF-115.
+  if (applied && !pendingFanout) {
+    const destFanout = def?.states?.find((s) => s.id === toStateName)?.fanout;
+    if (destFanout?.auto_derive_from) {
+      try {
+        const desc = await fetchFanoutSpecDescription(issueId, authToken);
+        if (extractSpecFindings(desc, destFanout.spec_source).length === 0) {
+          const derived = await deriveSpecFromPriorChildren(issue.internalId, authToken, {
+            fromChildWorkflow: destFanout.auto_derive_from,
+          });
+          if (derived) {
+            const newDesc = upsertDerivedSpecSection(desc, destFanout.spec_source, derived);
+            if (newDesc !== null && (await updateIssueDescription(issue.internalId, newDesc, authToken))) {
+              await postComment(
+                issue.internalId,
+                `🤖 **Spawn spec auto-derived** (INF-115): the \`## ${destFanout.spec_source}\` section was missing, ` +
+                `so the engine populated it with ${derived.length} entr${derived.length === 1 ? "y" : "ies"} from completed ` +
+                `prior-phase children (\`${destFanout.auto_derive_from}\`). ` +
+                `**Review and edit it before running the spawn command** — the fan-out reads this section verbatim.`,
+                authToken,
+              );
+              log.info(
+                `workflow-gate: INF-115: auto-derived ${derived.length} spec entr${derived.length === 1 ? "y" : "ies"} ` +
+                `for ${issueId} on entry to '${toStateName}'`,
+              );
+            }
+          } else {
+            log.info(
+              `workflow-gate: INF-115: no derivable prior-phase children for ${issueId} on entry to '${toStateName}' ` +
+              `— spawn will refuse until the spec is authored`,
+            );
+          }
+        }
+      } catch (err) {
+        log.warn(
+          `workflow-gate: INF-115: auto-derivation failed for ${issueId} on entry to '${toStateName}': ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   }
 
   // ── Phase 5 / B-2 + AI-1992: Fan-out edge (spawning 1→N) ────────────
