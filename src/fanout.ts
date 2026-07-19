@@ -53,6 +53,21 @@ const SPEC_ENTRY_MARKER_RE = /<!--\s*ai-1994:spec-entry-id:\s*(\S+?)\s*-->/;
 const CHILD_WORKFLOW_MARKER_PREFIX = "<!-- inf-32:child-workflow: ";
 const CHILD_WORKFLOW_MARKER_RE = /<!--\s*inf-32:child-workflow:\s*(\S+?)\s*-->/;
 
+/**
+ * INF-131: section-level content hash marker, stored on the PARENT ticket's
+ * description. Guards against re-fanout on an unchanged spec section -- the
+ * existing per-child markers (AI-1994) are NOT sufficient because children
+ * created outside executeFanout (manual agent sessions, `linear subtask`,
+ * pre-AI-1994 code paths) carry no marker and are invisible to the dedup.
+ *
+ * Full form: `<!-- inf-131:spec-hash:<hash> for <spec_source> -->`
+ *
+ * Written at fan-out exit; checked at fan-out entry. A matching hash means
+ * the section has not changed since the last fan-out execution -- skip.
+ */
+const SECTION_HASH_MARKER_PREFIX = "<!-- inf-131:spec-hash:";
+const SECTION_HASH_MARKER_RE = /<!--\s*inf-131:spec-hash:(\S+?)\s+for\s+(\S+?)\s*-->/;
+
 // ── Types ─────────────────────────────────────────────────────────────────
 
 /** A single finding to fan out into its own child issue. */
@@ -221,15 +236,24 @@ export function sanitizeTitle(title: string): string {
  * and prefixed with a readable title slug. The slug aids human debugging; the
  * hash guarantees uniqueness even when two titles slugify identically.
  */
-function deriveFindingId(title: string, description?: string): string {
-  const material = `${title}\n${description ?? ""}`;
-  // FNV-1a 32-bit.
+/**
+ * FNV-1a 32-bit hash.
+ * Shared by deriveFindingId, computeSectionHash, and any other content-addressed
+ * hashing in the fan-out module. Deterministic, fast, no collision guarantee
+ * beyond the 32-bit space (adequate for spec-entry/section identification).
+ */
+function fnv1a32(input: string): string {
   let h = 0x811c9dc5;
-  for (let i = 0; i < material.length; i++) {
-    h ^= material.charCodeAt(i);
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
     h = Math.imul(h, 0x01000193);
   }
-  const hex = (h >>> 0).toString(16).padStart(8, "0");
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+function deriveFindingId(title: string, description?: string): string {
+  const material = `${title}\n${description ?? ""}`;
+  const hex = fnv1a32(material);
   const slug = title
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
@@ -241,6 +265,120 @@ function deriveFindingId(title: string, description?: string): string {
 /** Attach a stable, engine-derived id to each finding (AI-1994). */
 function withStableIds(findings: Finding[]): Finding[] {
   return findings.map((f) => ({ ...f, id: deriveFindingId(f.title, f.description) }));
+}
+
+// ── Section-level content hash guard (INF-131) ───────────────────────────
+
+/**
+ * INF-131: extract the raw text of a named spec section from the ticket
+ * description, for content-hashing. Matches `## <name>`, `### <name>`, etc.
+ * Returns the entire section body (between the header and the next header or
+ * end-of-string). Returns null when the section cannot be found.
+ */
+export function extractSpecSectionRaw(
+  description: string | null | undefined,
+  specSource: string,
+): string | null {
+  if (!description || !specSource) return null;
+  const safeName = specSource.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const sectionRegex = new RegExp(
+    `(?:#{1,4}\\s+${safeName})\\s*\\n([\\s\\S]*?)(?=\\n#{1,4}\\s|\\n*$)`,
+    "i",
+  );
+  const m = sectionRegex.exec(description);
+  return m ? m[1] : null;
+}
+
+/**
+ * INF-131: compute a deterministic hash of the spec section content.
+ * Uses FNV-1a over the raw section body text. Returns null when the section
+ * cannot be found (empty/unparseable spec).
+ */
+export function computeSectionHash(
+  description: string | null | undefined,
+  specSource: string,
+): string | null {
+  const body = extractSpecSectionRaw(description, specSource);
+  if (!body) return null;
+  return fnv1a32(body);
+}
+
+/**
+ * INF-131: read the stored section hash marker from the parent description.
+ * Returns the hash value for the named spec_source, or null if no marker exists.
+ */
+export function extractStoredSectionHash(
+  description: string | null | undefined,
+  specSource: string,
+): string | null {
+  if (!description) return null;
+  const m = SECTION_HASH_MARKER_RE.exec(description);
+  if (m && m[2] === specSource) {
+    return m[1];
+  }
+  return null;
+}
+
+/**
+ * INF-131: build the section hash marker string to embed in the parent description.
+ */
+function buildSectionHashMarker(hash: string, specSource: string): string {
+  return `${SECTION_HASH_MARKER_PREFIX}${hash} for ${specSource} -->`;
+}
+
+/**
+ * INF-131: persist the section hash marker on the parent issue's description.
+ * Appends the marker to the end of the description as an HTML comment.
+ */
+async function persistSectionHashMarker(
+  issueInternalId: string,
+  hash: string,
+  specSource: string,
+  authToken: string,
+): Promise<void> {
+  try {
+    // First, fetch current description
+    const query = `
+      query IssueDesc($id: String!) {
+        issue(id: $id) { description }
+      }
+    `;
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueInternalId } }),
+    });
+    type DescResp = { data?: { issue?: { description?: string | null } | null } };
+    const descData = (await res.json()) as DescResp;
+    const currentDesc = descData.data?.issue?.description ?? "";
+
+    // Check if a marker already exists for this spec_source; replace in place
+    // rather than appending duplicate markers.
+    const markerPattern = new RegExp(
+      `${SECTION_HASH_MARKER_PREFIX}\\S+? for ${specSource.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} -->`,
+    );
+    const newMarker = buildSectionHashMarker(hash, specSource);
+    const updatedDesc = markerPattern.test(currentDesc)
+      ? currentDesc.replace(markerPattern, newMarker)
+      : currentDesc + (currentDesc.endsWith("\n") ? "" : "\n") + newMarker + "\n";
+
+    // Update the description
+    const mutation = `
+      mutation UpdateDesc($id: String!, $desc: String!) {
+        issueUpdate(id: $id, input: { description: $desc }) { success }
+      }
+    `;
+    await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { id: issueInternalId, desc: updatedDesc } }),
+    });
+    log.info(`fanout: section hash marker persisted on ${issueInternalId} (${specSource}: ${hash})`);
+  } catch (err) {
+    // Fail-open: an unwritable hash marker means the next re-entry may re-mint,
+    // but this is identical to the pre-INF-131 behaviour, not a regression.
+    log.warn(`fanout: failed to persist section hash marker for ${issueInternalId} (${specSource}): ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 // ── Finding extraction ────────────────────────────────────────────────────
@@ -1083,6 +1221,40 @@ export async function executeFanout(
     return result;
   }
 
+  // ── INF-131: section-level content hash guard ─────────────────────
+  // Before entering the per-child dedup (which depends on AI-1994 spec-entry
+  // markers that may not exist on children created outside executeFanout),
+  // check whether the spec section content has changed since the last fan-out.
+  // If the hash matches, the section is unchanged -- skip the entire fan-out.
+  // This is a SUPERSET guard that catches the case the per-child dedup misses:
+  // children created by an agent session, `linear subtask`, or pre-AI-1994 code
+  // paths carry no spec-entry markers and are invisible to fetchExistingSpawnChildren.
+  //
+  // The hash is computed over the raw section body (between the header and the
+  // next header or end-of-string), excluding the header itself. This matches
+  // what extractSpecFindings parses, so any content edit to the section changes
+  // the hash, while white-space-only or non-section edits are transparent.
+  const currentHash = computeSectionHash(parentCtx.description, config.spec_source);
+  const storedHash = currentHash !== null
+    ? extractStoredSectionHash(parentCtx.description, config.spec_source)
+    : null;
+
+  if (currentHash !== null && storedHash !== null && currentHash === storedHash) {
+    // Section unchanged since last fan-out -- no-op.
+    log.info(
+      `fanout: section hash guard -- spec section '${config.spec_source}' unchanged on ${parentIssueId} ` +
+      `(hash: ${currentHash}). Skipping fan-out entirely.`,
+    );
+    return result;
+  }
+
+  if (currentHash !== null && storedHash === null) {
+    log.info(
+      `fanout: no stored section hash for ${parentIssueId} (spec_source='${config.spec_source}') -- ` +
+      `proceeding with full fan-out (first-run or pre-INF-131 parent)`,
+    );
+  }
+
   // ── AI-1994: incremental re-spawn dedup ────────────────────────────
   // The rework loop re-enters this fan-out state. Partition the spec against
   // already-spawned children: mint only entries with no child yet; leave every
@@ -1138,6 +1310,14 @@ export async function executeFanout(
       `fanout: incremental dedup — nothing new to spawn for ${parentIssueId} ` +
       `(${findings.length} spec entr${findings.length === 1 ? "y" : "ies"}, all already spawned)`,
     );
+    // INF-131: persist the hash even on a dedup-based no-op, so the next
+    // re-entry skips via the lightweight hash guard instead of re-running
+    // the expensive children fetch and dedup.
+    if (currentHash !== null && storedHash === null) {
+      await persistSectionHashMarker(
+        parentCtx.internalId, currentHash, config.spec_source, authToken,
+      ).catch(() => {});
+    }
     return result;
   }
 
@@ -1384,6 +1564,19 @@ export async function executeFanout(
       await createBlockingRelation(createdInternalIds[i], createdInternalIds[i + 1], authToken);
     }
     log.info(`fanout: created ${createdInternalIds.length - 1} sibling blocking relation(s) for ${parentIssueId}`);
+  }
+
+  // INF-131: persist section hash marker on the parent after a successful
+  // fan-out so the next re-entry skips via the hash guard instead of re-running
+  // the expensive children fetch and dedup.
+  // Fail-open: an unwritable marker degrades to per-child dedup only (pre-INF-131).
+  if (result.created > 0 && currentHash !== null) {
+    await persistSectionHashMarker(
+      parentCtx.internalId,
+      currentHash,
+      config.spec_source,
+      authToken,
+    );
   }
 
   log.info(

@@ -11,7 +11,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { extractFindings, executeFanout, shouldTriggerFanout, sanitizeTitle, type Finding } from "./fanout.js";
+import { extractFindings, executeFanout, shouldTriggerFanout, sanitizeTitle, extractSpecSectionRaw, computeSectionHash, extractStoredSectionHash, type Finding } from "./fanout.js";
 import { applyStateTransition, resetWorkflowCache, type WorkflowDef, type FanoutConfig } from "./workflow-gate.js";
 import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
@@ -241,6 +241,80 @@ describe("sanitizeTitle", () => {
   it("handles two-letter prefix like UI-1", () => {
     const result = sanitizeTitle("[UI-1] Minor layout bug");
     expect(result).toBe("UI-1 · Minor layout bug");
+  });
+});
+
+// ── INF-131: section-level content hash guard ──────────────────────────────
+
+describe("extractSpecSectionRaw (INF-131)", () => {
+  it("returns null for null description", () => {
+    expect(extractSpecSectionRaw(null, "findings")).toBeNull();
+  });
+
+  it("extracts raw section body for ## Findings", () => {
+    const desc = `# Audit\n\n## Findings\n* UX-15 needs provisioning\n* UX-22 needs onboarding\n\n## Next steps\nClose out.`;
+    const body = extractSpecSectionRaw(desc, "findings");
+    expect(body).toContain("UX-15 needs provisioning");
+    expect(body).toContain("UX-22 needs onboarding");
+    expect(body).not.toContain("Close out.");
+  });
+
+  it("extracts raw section body for ### structured", () => {
+    const desc = `## structured\n* Arm 1: scope\n* Arm 2: spike\n\n## Findings\n* Finding 1`;
+    const body = extractSpecSectionRaw(desc, "structured");
+    expect(body).toContain("Arm 1: scope");
+    expect(body).toContain("Arm 2: spike");
+    expect(body).not.toContain("Finding 1");
+  });
+
+  it("returns null when section is not found", () => {
+    expect(extractSpecSectionRaw("Just some text", "findings")).toBeNull();
+  });
+});
+
+describe("computeSectionHash (INF-131)", () => {
+  it("returns deterministic hash for same content", () => {
+    const desc = `## Findings\n* Item A\n* Item B`;
+    const h1 = computeSectionHash(desc, "findings");
+    const h2 = computeSectionHash(desc, "findings");
+    expect(h1).toBe(h2);
+    expect(h1).toBeTruthy();
+  });
+
+  it("returns different hash for different content", () => {
+    const desc1 = `## Findings\n* Item A`;
+    const desc2 = `## Findings\n* Item B`;
+    const h1 = computeSectionHash(desc1, "findings");
+    const h2 = computeSectionHash(desc2, "findings");
+    expect(h1).not.toBe(h2);
+  });
+
+  it("is stable across changes outside the section", () => {
+    const desc1 = `# Ticket\n\n## Findings\n* Item A\n* Item B\n\n## Other`;
+    const desc2 = `# Ticket (updated)\n\n## Findings\n* Item A\n* Item B\n\n## Extra\nSome other content`;
+    expect(computeSectionHash(desc1, "findings")).toBe(computeSectionHash(desc2, "findings"));
+  });
+
+  it("returns null for missing section", () => {
+    expect(computeSectionHash("No section here", "findings")).toBeNull();
+  });
+});
+
+describe("extractStoredSectionHash (INF-131)", () => {
+  it("reads a stored hash marker", () => {
+    const hash = computeSectionHash("## findings\n* Item", "findings")!;
+    const desc = `## findings\n* Item\n<!-- inf-131:spec-hash:${hash} for findings -->`;
+    expect(extractStoredSectionHash(desc, "findings")).toBe(hash);
+  });
+
+  it("returns null when no marker exists", () => {
+    expect(extractStoredSectionHash("## findings\n* Item", "findings")).toBeNull();
+  });
+
+  it("returns null for a different spec_source", () => {
+    const hash = computeSectionHash("## findings\n* Item", "findings")!;
+    const desc = `## findings\n* Item\n<!-- inf-131:spec-hash:${hash} for findings -->`;
+    expect(extractStoredSectionHash(desc, "structured")).toBeNull();
   });
 });
 
