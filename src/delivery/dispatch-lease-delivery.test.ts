@@ -210,6 +210,107 @@ describe("dispatch-lease-delivery (AI-2564)", () => {
     expect(result).toBeDefined();
     expect(typeof result.dispatched).toBe("boolean");
   });
+
+  /**
+   * INF-109 AC5 (defense-in-depth): A dispatch triggered by a human actor
+   * (not an agent) must force-supersede the lease and proceed, even when an
+   * unexpired lease exists for the same (agentId, ticketKey) with an older
+   * updatedAt. A human follow-up (comment, re-delegation) is always fresh
+   * intent and must not be silently dropped by a stale lease.
+   *
+   * We use a deterministic fake actor ID that cannot appear in the real agent
+   * map (all agent linearUserId values are real Linear user UUIDs, not a
+   * string like "human-test-actor").
+   */
+  it("force-supersedes lease for human-authored event", async () => {
+    const dbPath = makeTempDbPath();
+    const leaseStore = new DispatchLeaseStore(dbPath);
+
+    // Pre-establish a lease with old updatedAt
+    leaseStore.acquire(AGENT_ID, TICKET_KEY, {
+      nowMs: Date.now(),
+      updatedAt: UPDATED_AT_OLD,
+    });
+
+    // Route with a human actor (fake ID not in any agent map)
+    const route = makeRoute();
+    (route.event as any).actor = { id: "human-test-actor-inf-109", name: "Test Human" };
+
+    // Spy on console.error for the force-supersede log message
+    const logSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await deliverToAgent(route, makeConfig(), leaseStore);
+
+    // Must proceed past the lease check (not silently refused). The
+    // first acquire() inside deliverToAgent sees the existing lease and
+    // returns refused (count=1), triggering the human-actor check. Then
+    // the force-acquire with force:true supersedes the lease and proceeds.
+    // The key assertion is that deliverToAgent DOES NOT return early with
+    // { dispatched: false } — it continues to the actual delivery path.
+    expect(result).toBeDefined();
+
+    // Lease counters: refused=1 (first acquire hit the guard but was saved
+    // by the human-actor defense), superseded=1 (force-acquire replaced the
+    // lease). The dispatch was NOT silently dropped.
+    expect(leaseStore.counters.refused).toBe(1);
+    expect(leaseStore.counters.superseded).toBe(1);
+
+    // The force-supersede log message must have been emitted
+    const forceLog = logSpy.mock.calls.some(
+      (call) =>
+        typeof call[0] === "string" &&
+        call[0].includes("dispatch force-superseded: human actor"),
+    );
+    expect(forceLog).toBe(true);
+
+    logSpy.mockRestore();
+    leaseStore.close();
+    cleanupDbDir(dbPath);
+  });
+
+  /**
+   * INF-109 AC6 (negative): A dispatch triggered by an agent actor (whose
+   * Linear user ID IS in the agent map) must still be refused when an
+   * unexpired lease exists. This ensures the agent-to-agent workflow is
+   * unaffected by the defense-in-depth fix.
+   */
+  it("continues to refuse dispatch for agent-authored event", async () => {
+    const dbPath = makeTempDbPath();
+    const leaseStore = new DispatchLeaseStore(dbPath);
+
+    // Pre-establish a lease with old updatedAt
+    leaseStore.acquire(AGENT_ID, TICKET_KEY, {
+      nowMs: Date.now(),
+      updatedAt: UPDATED_AT_OLD,
+    });
+
+    // Route with no actor — same as AC1, agent-authored events carry no
+    // actor when the connector processes them internally (no explicit actor
+    // in the route). This verifies the default case is unaffected.
+    const route = makeRoute();
+
+    const logSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await deliverToAgent(route, makeConfig(), leaseStore);
+
+    // Must be refused (same as AC1)
+    expect(result.dispatched).toBe(false);
+
+    // Lease counters: refused must be 1
+    expect(leaseStore.counters.refused).toBe(1);
+
+    // The dedup log message must have been emitted
+    const dedupLog = logSpy.mock.calls.some(
+      (call) =>
+        typeof call[0] === "string" &&
+        call[0].includes("dispatch deduped: live session exists"),
+    );
+    expect(dedupLog).toBe(true);
+
+    logSpy.mockRestore();
+    leaseStore.close();
+    cleanupDbDir(dbPath);
+  });
 });
 
 function cleanupDbDir(dbPath: string): void {
