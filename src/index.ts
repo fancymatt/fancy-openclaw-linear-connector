@@ -41,6 +41,7 @@ import { registerDelegationReconciliationCron, runDelegationReconciliationSweep 
 import { registerRegistryIntegrityCron } from "./registry-integrity-cron.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
+import { registerValidationWatchdogCron } from "./validation-sla-watchdog.js";
 import { registerLabelSyncAuditCron } from "./cron/label-sync-audit.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
@@ -1603,6 +1604,64 @@ if (isEntryPoint) {
     log.info(`AI-1773: SLA sweep cron registered (cadence=${slaCadenceMs ?? 300_000}ms, store=${slaBreachStorePath}, defs=${slaWorkflowDefPath})`);
   } else {
     log.warn("AI-1773: SLA sweep cron NOT registered — no Linear auth token available");
+  }
+
+  // INF-105: validation SLA watchdog — check validation-state tickets for >15 min stalls
+  // and post an automated nudge + re-dispatch to the validator.
+  const validationAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const validationDataDir = process.env.DATA_DIR ?? resolveStatePath("data");
+  const validationNudgeStorePath = process.env.VALIDATION_NUDGE_STORE_PATH ?? path.join(validationDataDir, "validation-nudges.db");
+  const validationCadenceMs = process.env.VALIDATION_WATCHDOG_CADENCE_MS ? parseInt(process.env.VALIDATION_WATCHDOG_CADENCE_MS, 10) : undefined;
+  const validationThresholdMs = process.env.VALIDATION_WATCHDOG_THRESHOLD_MS ? parseInt(process.env.VALIDATION_WATCHDOG_THRESHOLD_MS, 10) : undefined;
+  const validationCooldownMs = process.env.VALIDATION_WATCHDOG_COOLDOWN_MS ? parseInt(process.env.VALIDATION_WATCHDOG_COOLDOWN_MS, 10) : undefined;
+  const validationWatchedStates = process.env.VALIDATION_WATCHDOG_STATES ?? undefined;
+  const validationValidatorUserId =
+    getLinearUserIdForAgent("ai") ??
+    process.env.VALIDATION_VALIDATOR_LINEAR_USER_ID ??
+    "";
+
+  if (validationAuthToken && validationValidatorUserId) {
+    const validationWakeAgent = async (identifier: string) => {
+      const sessionKey = normalizeSessionKey(identifier);
+      const agentCfg = getAgent("ai");
+      const deliveryConfig: DeliveryConfig = {
+        nodeBin: process.execPath,
+        hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
+        hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
+        hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+        hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+        gatewayUrl: agentCfg?.gatewayUrl,
+        gatewayToken: agentCfg?.gatewayToken,
+      };
+      const actionText = `Validation SLA nudge for ${identifier}`;
+      const message =
+        (await buildWorkflowAwareDeliveryMessage(identifier, validationAuthToken, actionText)) ??
+        actionText;
+      await deliverMessageToAgent("ai", sessionKey, message, deliveryConfig);
+    };
+
+    const validationTimer = registerValidationWatchdogCron({
+      authToken: validationAuthToken,
+      validatorLinearUserId: validationValidatorUserId,
+      wakeValidator: validationWakeAgent,
+      nudgeStorePath: validationNudgeStorePath,
+      cadenceMs: validationCadenceMs,
+      thresholdMs: validationThresholdMs,
+      cooldownMs: validationCooldownMs,
+      watchedStates: validationWatchedStates,
+    });
+    log.info(
+      `INF-105: Validation watchdog cron registered ` +
+      `(cadence=${validationCadenceMs ?? 300_000}ms, ` +
+      `threshold=${validationThresholdMs ?? 900_000}ms, ` +
+      `cooldown=${validationCooldownMs ?? 600_000}ms, ` +
+      `store=${validationNudgeStorePath})`,
+    );
+  } else {
+    const missing = [];
+    if (!validationAuthToken) missing.push("auth token");
+    if (!validationValidatorUserId) missing.push("validator Linear user ID");
+    log.warn(`INF-105: Validation watchdog NOT registered — missing: ${missing.join(", ")}`);
   }
 
   // AI-2554: label-sync audit cron — periodic check for proxy-store vs Linear state divergence.

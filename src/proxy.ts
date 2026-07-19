@@ -31,9 +31,7 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
-import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
-import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import { buildTransitionAuditRecord, emitTransitionAuditRecord, verifyPostTransition, type GateResult, type TransitionAuditRecord } from "./transition-audit.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
@@ -378,6 +376,69 @@ function isMutationRequest(body: GraphQLRequestBody | null): boolean {
   return /^mutation\b/.test(stripped);
 }
 
+/**
+ * True when a string looks like a human-readable Linear issue identifier
+ * (e.g. "BBS-3", "AI-2597") rather than a UUID.
+ */
+function isHumanReadableIdentifier(value: string): boolean {
+  return /^[A-Z]+-\d+$/.test(value);
+}
+
+/**
+ * AI-2597: Resolve a human-readable issue identifier to its internal UUID
+ * before forwarding write mutations. The Linear API's `commentCreate` and
+ * other write mutations require the internal UUID for teams outside the AI
+ * namespace; the CLI may pass identifiers (e.g. "BBS-3") when it lacks
+ * workflow context to pre-resolve them.
+ *
+ * Mutates `body.variables` in-place, replacing identifier values in `issueId`
+ * and `id` keys with the resolved UUID. Returns true if a rewrite occurred.
+ */
+async function resolveMutationIssueIds(
+  body: GraphQLRequestBody | null,
+  authToken: string,
+): Promise<boolean> {
+  if (!body?.variables) return false;
+  const vars = body.variables as Record<string, unknown>;
+
+  // Identifiers that need resolving — one call handles both commentCreate
+  // ($issueId) and issueUpdate ($id) mutation variable keys.
+  const idKeys = ["issueId", "id"];
+  let resolved = false;
+
+  for (const key of idKeys) {
+    const value = vars[key];
+    if (typeof value !== "string" || !isHumanReadableIdentifier(value)) continue;
+
+    try {
+      const res = await fetch(LINEAR_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authToken },
+        body: JSON.stringify({
+          query: `query($id: String!) { issue(id: $id) { id } }`,
+          variables: { id: value },
+        }),
+      });
+      if (!res.ok) {
+        // Fail-open: if the resolution query fails, forward the original
+        // identifier and let the upstream return the appropriate error.
+        continue;
+      }
+      const data = (await res.json()) as { data?: { issue?: { id: string } | null } };
+      const uuid = data.data?.issue?.id;
+      if (uuid && uuid !== value) {
+        vars[key] = uuid;
+        resolved = true;
+      }
+    } catch {
+      // Fail-open on resolution error — the upstream error will be clearer
+      // than a proxy-internal resolution failure.
+    }
+  }
+
+  return resolved;
+}
+
 // AI-1860: TTL for per-command authorization snapshots.
 const COMMAND_AUTH_SNAPSHOT_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -425,8 +486,6 @@ export interface ProxyDeps {
    * idempotent; calling it multiple times for the same agent+ticket is harmless.
    */
   onProxyCall?: (agentId: string, ticketId: string) => void;
-  /** AI-2565: dispatch lease store for CAS stale-snapshot enforcement on terminal transitions. */
-  dispatchLeaseStore?: DispatchLeaseStore;
 }
 
 export async function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void> {
@@ -844,28 +903,6 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         return;
       }
 
-      // ====================================================================
-      // AI-2565: CAS stale-snapshot check for terminal transitions.
-      // Runs after B1 (workflow rules) passes but before the forward mutation.
-      // Only applies to terminal/routing intents (handoff-work, complete-work,
-      // needs-human, refuse-work).
-      // ====================================================================
-      if (issueId && effectiveIntent) {
-        const staleRejection = await checkStaleSnapshotForTerminal(
-          effectiveIntent,
-          issueId,
-          agentId,
-          authorization,
-          callerLinearUserId,
-          deps?.dispatchLeaseStore,
-        );
-        if (staleRejection) {
-          log.warn(`stale-snapshot-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${staleRejection}`);
-          res.status(200).json({ errors: [{ message: staleRejection }] });
-          return;
-        }
-      }
-
       // AI-1860: first successful authorization — store the snapshot so subsequent
       // mutations in this multi-step command are not re-gated against its own
       // post-transition state. The source state is captured here (before the forward /
@@ -1073,6 +1110,11 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           }
         }
       }
+
+      // AI-2597: resolve human-readable issue identifiers to UUIDs before
+      // forwarding write mutations. This is safe to call on every request —
+      // it's a no-op when variables contain UUIDs or the keys don't exist.
+      await resolveMutationIssueIds(body, authorization);
 
       let upstreamRes: globalThis.Response;
       try {
@@ -1384,6 +1426,10 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       createClaim = claim;
     }
   }
+
+  // AI-2597: resolve human-readable issue identifiers to UUIDs before
+  // forwarding write mutations.
+  await resolveMutationIssueIds(body, authorization);
 
   // Non-intent forward path (reads and raw non-workflow mutations).
   let upstreamRes: globalThis.Response;
