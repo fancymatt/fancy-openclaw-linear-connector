@@ -15,28 +15,10 @@
 #   it. Two gates, not redundant: department-head `review` = "is this good work?"
 #   (domain quality); requester `sign-off` = "is this what I asked for?" (fit).
 #
-# Completion path (all forward edges are `generic: continue`, so a single agent
-#   verb — `linear continue-workflow` — carries a ticket the whole way):
-#     intake --request--> routing --assign--> doing --submit--> review
-#            --approve--> sign-off --accept--> done
-#   `request-revision` walks the two revision edges (review→doing, sign-off→doing).
-#
-# Break-glass (AI-2095): escape RE-ENTERS the workflow at `intake`, it does NOT
-#   land in a terminal state. Before AI-2095, break_glass.to pointed at a
-#   terminal `escape` state (native Invalid) whose only legal move was `escape`
-#   again — a roach motel: an escaped ticket could never reach a clean terminal
-#   by agent verbs (GEN-103 wedged there; AI-1755 stalled). This is the exact
-#   trap dev-impl already removed in AI-1710; task.yaml now matches that proven
-#   model. From `intake` an escaped ticket has a full forward path to `done`
-#   (via continue-workflow) AND a `demote` exit to ad-hoc — so it is always
-#   dispositionable without human DB surgery. A ticket already carrying a stale
-#   `state:escape` label (created before this fix) recovers by running `escape`
-#   once more: break-glass short-circuits state validation and lands it at
-#   intake.
-#
 # Role-binding modes (design.md §16.1):
-#   - requester        → instance   (pinned at creation; ∈ {matt, ai}; Ai is the
-#                                     de-facto sign-off authority)
+#   - requester        → instance   (pinned at creation; ∈ {ai, astrid}; Ai is the
+#                                     de-facto sign-off authority for general tasks;
+#                                     Astrid is requester for sprint-spawner scan children)
 #   - department-head  → domain-routed (resolved from the department the requester
 #                                     picked at intake, via department-roster.yaml
 #                                     §16.5; pinned for the ticket, so `routing`
@@ -48,6 +30,23 @@
 #
 # Single-domain only: a request spanning domains decomposes into a mini-sprint
 #   (Archetype C, §14b), it is not a `task`.
+#
+# STATUS (2026-07-03, Astrid — rebuild WS2, ACTIVE):
+#   LIVE since 2026-07-03 (dir-mode cutover): loaded and enforced alongside
+#   dev-impl. Roles are staffed in capability-policy: requester=ai (singleton),
+#   department-head=astrid (singleton catch-all until the §16.5 department
+#   roster exists), worker=all delegatable person agents (multi-body → every
+#   assignment demands an explicit, list-validated target).
+#
+#   Everything in this file is ENFORCED: the state machine, generic-verb
+#   resolution (`generic:` tags → continue-workflow / request-revision),
+#   destination-role target legality, singleton auto-assign,
+#   `assign.mode: required`, `assign.default: prior-implementer` (def-driven
+#   return-to-worker routing + implementer recording), and the constraints
+#   `not-self` / `not-implementer`. Removed as unimplemented (2026-07-03
+#   honesty pass): `owner_binding:` (instance/domain-routed pinning) and
+#   `assign.from:` (roster-driven selection — rides on AI-1376 + roster).
+#   Step guidance: workflows/task/<state>.md (injected into wake briefs).
 
 id: task
 version: 2                      # AI-2095: break_glass.to intake + terminal escape state removed
@@ -72,7 +71,7 @@ migrations:
 states:
 
   - id: intake
-    owner_role: requester      # instance-bound at creation (∈ {matt, ai}) — pinning unimplemented
+    owner_role: requester      # instance-bound at creation (∈ {ai, astrid}) — pinning unimplemented; Astrid added 2026-07-10 for sprint-spawner child tickets
     kind: normal
     native_state: todo
     transitions:
@@ -80,7 +79,7 @@ states:
         to: routing
         generic: continue      # `linear continue-workflow` — routing auto-assigns the head (singleton)
       - command: demote
-        to: __ad_hoc__         # leaves the workflow entirely (design.md §4.5) — also the escape exit
+        to: __ad_hoc__         # leaves the workflow entirely (design.md §4.5)
 
   - id: routing
     owner_role: department-head    # resolved from chosen department; pinning unimplemented

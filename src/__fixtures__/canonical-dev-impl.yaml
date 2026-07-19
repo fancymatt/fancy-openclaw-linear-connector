@@ -4,11 +4,6 @@
 # version history: bump `version` on any state/edge change; in-flight tickets
 #   use the version stamped at their creation time (design.md §12).
 #
-# This fixture is kept in sync with the deployed workflow definition so CI
-# can exercise the canonical schema without depending on the vault being
-# present. The canonical source is the deployed def under WORKFLOW_DEFS_DIR;
-# fixture drift is detected at /health.fixtureDrift. Keep in sync.
-#
 # Shape principle (design decision 2026-06-06): a STATE is a work-phase — one
 #   kind of work, one owner role; "awaiting X" and "doing X" are the same state.
 #   A TRANSITION is a decision/event (may carry payload) — never a resting place.
@@ -27,31 +22,45 @@
 #   before implementation), host-deploy (Grover, host-side, the bare-metal half
 #   of deployment Hanzo's container can't reach), ac-validate (the intake steward
 #   re-verifies the deployed artifact against the captured AC before done).
-#   Also reconciled H-7 (AI-1482, Done) stakes/capture_ac/human-signoff config —
-#   it was implemented in code + tests but missing from the production def.
+#   Also reconciled H-7 (AI-1482, Done) stakes/capture_ac/human-signoff config.
 #
-# v9 (2026-06-27, AI-1710): escape re-enters at intake instead of terminating.
-#   break_glass.to changed from escape → intake; escape state removed entirely.
-#   done remains the only terminal state. unescape verb retired (no escape state to exit).
+# v9 (2026-06-23): added generic transition tags (continue / revision) so
+#   agents can use `linear continue-workflow` and `linear request-revision`
+#   instead of workflow-specific command names. Also synced missing fields
+#   from canonical fixture (unescape, SLAs, assign mode fixes).
 #
-# v10 (2026-07-06, AI-1872 — Matt directive): split deployment into merge + deploy
-#   states; generic verbs only. The old `deployment` state conflated two distinct
-#   operations (merging the PR vs deploying the artifact) behind state-specific
-#   custom verbs. Replaced with two explicit states using generic `continue`:
-#     - `merge` (owner: deployment/Hanzo): merges the PR → continue → deploy
-#     - `deploy` (owner: host-deploy/Grover for the connector fleet): deploys the
-#       artifact, or decides "no deploy needed" → continue → ac-validate
-#   Custom verbs `deploy`, `handoff-host-deploy`, `host-deployed` removed entirely;
-#   the full spine is now:
-#     write-tests → implementation → code-review → merge → deploy → ac-validate
-#   In-flight tickets at the old `state:deployment` / `state:host-deploy` labels
-#   are migrated via escape → re-intake (the state labels no longer exist in the
-#   def, so the gate rejects any command from them — operators must escape).
+# v10 (2026-06-28, AI-1710): escape is no longer a terminal state. escape now
+#   re-enters the workflow at intake (break_glass.to: intake). The escape
+#   terminal state and unescape transition are removed. Escape becomes a
+#   clean restart: state/delegate/assignee cleared, ticket re-enters at intake.
 #
-# v15 (INF-98 reconciliation, 2026-07-18): reconciled with deployed def.
-#   recovery_actor: ai added (AI-1579). Version bumped to match deployed (15).
-#   Stakes keys confirmed as stakes:* (canonical; deployed risk:* migrated).
-#   State spine unchanged from v10+ (merge/deploy).
+# v11–v12 (2026-07-06, AI-1884): added the `merge` state + `merge` role — the
+#   post-approve PR-merge phase split out from `deployment`; Hanzo fills both
+#   `deployment` and `merge`. (Prior to this the def shipped with owner_role
+#   `merge` and no declared role, failing every `approve` closed.)
+#
+# v13 (2026-07-07, AI-1872 — Matt directive): split the post-merge stage into
+#   generic-verb states. The old `deployment` + `host-deploy` states (custom
+#   verbs `deployed` / `handoff-host-deploy` / `host-deployed`) are collapsed
+#   into a single `deploy` state exited by the generic `continue-workflow`.
+#   Full spine: write-tests → implementation → code-review → merge → deploy →
+#   ac-validate. This is a RECONCILIATION of the merged AI-1872 canonical
+#   fixture (repo v10) onto live: the fixture had drifted from prod and would
+#   have regressed three live-only settings had it been shipped verbatim, so
+#   those are PRESERVED here — `recovery_actor: ai` (AI-1579), the `stakes:*`
+#   label namespace (fixture reconciliation resolved stakes:* as canonical), and the `merge`
+#   role owner (fixture reverted it to `deployment`). Deployed by Grover
+#   (host-deploy role). Repo test fixture should be refreshed to match — tracked
+#   as a follow-up; the connector loads THIS instance file, not the fixture.
+#
+# v15 (2026-07-16, AI-2463): added `ac-mismatch` command from `ac-validate` to
+#   `deploy` — a redeploy edge for stale-artifact scenarios. Previously the only
+#   legal exit from ac-validate was `validated` → done or `ac-fail` →
+#   implementation (dev role), which assumes a code fault. ac-mismatch routes
+#   back to the deployer (host-deploy / Grover) without passing through a dev
+#   body, since the code is correct. Also updated ac-validate step guidance to
+#   reference the `deploy` state (v13 name) instead of the deleted `deployment`
+#   and `host-deploy` states (pre-v13 names).
 
 id: dev-impl
 version: 15
@@ -68,7 +77,7 @@ recovery_actor: ai
 # When a ticket's stakes level meets or exceeds the threshold, the release
 # transition requires a human sign-off (Matt), not an AI agent.
 # Stakes levels: 0 = low (internal only), 1 = medium, 2 = high (external/irreversible).
-# Labels on the ticket: stakes:low, stakes:medium, stakes:high (canonical namespace).
+# Labels on the ticket: stakes:low, stakes:medium, stakes:high.
 stakes:
   threshold: 2                # release from stakes ≥ this level requires human sign-off
   levels:                     # label name → numeric level mapping
@@ -78,7 +87,7 @@ stakes:
 
 break_glass:
   command: escape               # x-openclaw-linear-intent value that triggers break-glass (§4.4)
-  to: intake   # AI-1710: escape re-enters at intake, not a terminal
+  to: intake                   # AI-1710: escape re-enters at intake, not a terminal
   owner_role: steward           # implicit escape edge from EVERY state (design.md §4.4)
 
 states:
@@ -91,6 +100,7 @@ states:
       - command: accept
         to: write-tests
         assign: { mode: auto }     # test-author is singleton (TestDrivenDevelopmentAgent) — auto-assign
+        generic: continue
         # Phase 6.5 / H-7 (AI-1482): capture verbatim AC from the issue description
         # as the AC of record. ac-validate judges the outcome against this snapshot.
         capture_ac: true
@@ -109,50 +119,45 @@ states:
     transitions:
       - command: tests-ready
         to: implementation
-        assign: { mode: required }     # dev is multi-body (felix/noah/sage/igor) — target required, validated vs dev role
+        assign: { mode: required }     # dev is multi-body (felix/noah/sage/igor) — target required
+        generic: continue
 
   - id: implementation
     owner_role: dev
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
-    sla: 72h                    # G-5: per-state SLA; longer than code-review (days of work vs 24h review cap)
+    sla: 72h                    # G-5: per-state SLA; longer than code-review
     # entered from write-tests/tests-ready, code-review/request-changes,
-    # merge/reject, deploy/reject, ac-validate/ac-fail — one dev work-phase,
-    # no awaiting-vs-doing split. Dev makes the failing tests pass.
+    # merge/reject, deploy/reject, ac-validate/ac-fail — one dev
+    # work-phase, no awaiting-vs-doing split. Dev makes the failing tests pass.
     transitions:
       - command: submit
         to: code-review
-        generic: continue
-        requires_comment: true
         assign:
           mode: required          # reviewer must be explicitly specified (§4.3)
           constraint: not-implementer  # reviewer must differ from implementer (AI-1475 D2)
-      # INF-93 rescue: handoff-work self-loop — write a delegate on a stranded
-      # implementation-state ticket without changing state. The connector's
-      # applyStateTransition self-loop handling (AI-2595 AC2) writes the delegate
-      # atomically; the CLI sets proxyIntent("handoff") to trigger this path.
-      - command: handoff
-        to: implementation
-        assign:
-          mode: required          # caller must specify the delegate target
+        generic: continue
+        requires_comment: true
 
   - id: code-review
     owner_role: code-review
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
-    sla: 24h                    # time-in-state; breach → stall escalation (design.md §5.5)
-    # Review contract (v8): Hanzo runs the FULL test suite. Any red ⇒
-    # request-changes with the failing tests named in feedback. `approve` is
+    sla: 24h                    # G-5: per-state SLA; breach → stall escalation (design.md §5.5)
+    # Review contract (v8): reviewer runs the FULL test suite. Any red ⇒
+    # request-changes with the failing tests named. `approve` is
     # legal only when the suite is green AND code quality satisfies the reviewer.
-    # AI-1872: approve now routes to `merge` (not the old `deployment`).
     transitions:
       - command: approve
         to: merge
         assign: { mode: auto }     # merge is singleton (Hanzo) — auto-assign
+        generic: continue
       - command: request-changes
         to: implementation
-        generic: revision
-        requires_comment: true
+        assign:
+          mode: required
+          constraint: not-implementer
+          default: prior-implementer
         feedback:
           required: true
           category_enum:
@@ -161,30 +166,29 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+        generic: revision
 
   - id: merge
-    owner_role: deployment      # filled by Hanzo; the deployment container (§16.2)
+    owner_role: merge           # filled by Hanzo; the merge container (§16.2)
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
-    sla: 4h                     # G-5: per-state SLA; merge is automated/quick
-    # AI-1872: Hanzo MERGES the PR (deploy:execute, exclusive). This state is
-    # purely about merging — it no longer conflates merging with deploy routing.
-    # `continue-workflow [deployer]` advances to the deploy state where the
-    # deployer decides whether a deploy is needed or not.
+    sla: 2h                     # G-5: per-state SLA; merge is quick — gate-cleared PR → rebase + merge
+    # AI-1872: merge is purely the PR-merge phase. Once merged, `continue-workflow`
+    # advances to `deploy` (generic verb), where the deployer decides whether a
+    # deploy action is needed. Custom verbs removed — the exit is generic continue.
     transitions:
       - command: continue
         to: deploy
-        generic: continue
-        requires_capability: deploy:execute   # Layer A enforcement (design.md §16.2)
-        # Phase 6.5 / H-7 (AI-1482): stakes-threshold gate. If the ticket's stakes
-        # level ≥ workflow.stakes.threshold, the merge must come from a human
-        # sign-off (not an AI agent). Enforced by the connector proxy.
+        requires_capability: deploy:execute   # Layer A: only the deploy:execute holder (Hanzo) merges
         requires_human_signoff_above_stakes: true
-        assign: { mode: auto }     # deploy is singleton (Grover for connector fleet) — auto-assign
+        assign: { mode: auto }     # deploy is singleton (Grover for the connector fleet) — auto-assign
+        generic: continue
       - command: reject
         to: implementation
-        requires_comment: true
-        assign: { default: prior-implementer }
+        assign:
+          mode: required
+          constraint: not-implementer
+          default: prior-implementer
         feedback:
           required: true
           category_enum:
@@ -193,29 +197,34 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+        generic: revision
 
   - id: deploy
-    owner_role: host-deploy     # filled by Grover for the connector fleet; configurable per project (§16.2)
+    owner_role: host-deploy     # Grover for the connector fleet; configurable per project (§16.2)
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
     sla: 8h                     # G-5: per-state SLA; deploy may need host access
-    # AI-1872: Deploys the artifact (restart connector + roll CLI, run migrations,
-    # push TestFlight, etc.) — or decides "no deploy needed" (library release,
-    # CI auto-deploys) and continues forward. Either way the exit verb is the
-    # generic `continue-workflow`, identical to every other forward edge.
-    # Host-side operations require infra:ssh, NOT deploy:execute — the merge
-    # already happened in `merge`; this is the artifact-push half.
+    # AI-1872: single post-merge deploy phase (replaces deployment + host-deploy).
+    # The deployer deploys the artifact — restart connector + roll CLI, run
+    # migrations, push builds — OR decides "no deploy needed" (library release,
+    # CI auto-deploy, docs/config-only) and continues forward. Either way the exit
+    # is the generic `continue-workflow`. Host-side ops require infra:ssh (NOT
+    # deploy:execute — the merge already happened in `merge`).
+    # ci_auto_deploy policy (config/deploy-policy.yaml, AI-1795) still informs the
+    # deployer whether a host deploy is expected vs. CI-handled.
     transitions:
       - command: continue
         to: ac-validate
-        generic: continue
         requires_capability: infra:ssh
-        requires_human_signoff_above_stakes: true   # H-7 (AI-1482): high-stakes release needs human sign-off
+        requires_human_signoff_above_stakes: true
         assign: { mode: auto }     # ac-validate steward is singleton (Astrid) — auto-assign
+        generic: continue
       - command: reject
         to: implementation
-        requires_comment: true
-        assign: { default: prior-implementer }
+        assign:
+          mode: required
+          constraint: not-implementer
+          default: prior-implementer
         feedback:
           required: true
           category_enum:
@@ -224,22 +233,31 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+        generic: revision
 
   - id: ac-validate
     owner_role: steward         # the SAME steward (Astrid) who validated AC at intake
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
-    sla: 24h                    # G-5: per-state SLA; final gate validation should complete within a day
-    # Final gate (design note, 2026-06-10): re-verify the DEPLOYED artifact
-    # satisfies the captured acceptance criteria in real conditions before `done`.
-    # Closes the "every step verified the artifact, none verified the outcome" gap.
+    sla: 24h                    # G-5: per-state SLA; final gate validation
+    # Final gate (v8): re-verify the DEPLOYED artifact
+    # satisfies the acceptance criteria in real conditions before `done`.
+    # AI-2463 (2026-07-16): added ac-mismatch → deploy edge so a validator who
+    # finds a stale artifact can route back to the deployer instead of only
+    # having ac-fail → implementation (which assumes a code fault).
+    # The intended target for ac-mismatch is a host-deploy body (Grover for the
+    # connector fleet) — not a dev body, since the code is correct.
     transitions:
       - command: validated
         to: done
         # terminal → no assignment
+        generic: continue
       - command: ac-fail
         to: implementation
-        requires_comment: true
+        assign:
+          mode: required
+          constraint: not-implementer
+          default: prior-implementer
         feedback:
           required: true
           category_enum:
@@ -248,8 +266,24 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+        generic: revision
+      - command: ac-mismatch
+        to: deploy
+        requires_comment: true
+        feedback:
+          required: true
+          category_enum:
+            - ac-mismatch
+            - stale-artifact
+        assign:
+          mode: auto           # host-deploy is singleton (Grover) — auto-assign
+        # ac-mismatch does NOT reassign to role 'dev' — the code is correct;
+        # the artifact is stale. Routes back to the deploy state where the same
+        # deployer (host-deploy / Grover) can redeploy with full context.
+        generic: continue
 
   - id: done
     kind: terminal
     native_state: done           # targetState: "done" → Done
     satisfies_parent_barrier: true   # uniform terminal contract (design.md §5.4)
+
