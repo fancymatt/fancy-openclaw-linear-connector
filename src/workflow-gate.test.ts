@@ -1835,6 +1835,160 @@ describe("checkWorkflowRules — AI-2476: merged-PR release gate (branch/PR veri
     expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 
+  // INF-132: when Linear's attachment metadata is stale (shows "open"), the gate
+  // falls through to the GitHub API to verify the PR's merge state.
+  describe("INF-132: GitHub API fallback for stale Linear metadata", () => {
+    afterEach(() => { delete process.env.GITHUB_TOKEN; });
+
+    it("allows 'continue' from merge state when Linear says open but GitHub confirms merged", async () => {
+      // Linear returns "open" (hasMergedPR: false), but GitHub says merged.
+      globalThis.fetch = async (_url, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+          return new Response(JSON.stringify({
+            data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:merge" }] }, delegate: null } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("IssueBranchAndPR")) {
+          // Linear attachment metadata shows "open" (stale)
+          return new Response(JSON.stringify({
+            data: { issue: { attachments: { nodes: [{ url: "https://github.com/fancymatt/fancy-openclaw-linear-connector/pull/999", sourceType: "github", metadata: { status: "open" } }] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("TeamStates")) {
+          return new Response(JSON.stringify({
+            data: { team: { states: { nodes: [] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        // GitHub API fallback: PR 999 is merged
+        if ((_url as string).includes("api.github.com")) {
+          return new Response(JSON.stringify({ merged: true, merged_at: "2026-07-19T18:51:23Z" }), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+        // Workflow def query
+        if (bodyText.includes("WorkflowDefs")) {
+          return new Response(JSON.stringify({ data: { workflowDefs: [] } }), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+        throw new Error(`INF-132 test: unexpected fetch: ${bodyText.slice(0, 100)}`);
+      };
+      const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+      expect(result).toBeNull();
+    });
+
+    it("blocks 'continue' from merge state when Linear says open and GitHub also says not merged", async () => {
+      globalThis.fetch = async (_url, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+          return new Response(JSON.stringify({
+            data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:merge" }] }, delegate: null } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("IssueBranchAndPR")) {
+          return new Response(JSON.stringify({
+            data: { issue: { attachments: { nodes: [{ url: "https://github.com/fancymatt/fancy-openclaw-linear-connector/pull/999", sourceType: "github", metadata: { status: "open" } }] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("TeamStates")) {
+          return new Response(JSON.stringify({
+            data: { team: { states: { nodes: [] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        // GitHub API fallback: PR 999 is NOT merged
+        if ((_url as string).includes("api.github.com")) {
+          return new Response(JSON.stringify({ merged: false, state: "open" }), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (bodyText.includes("WorkflowDefs")) {
+          return new Response(JSON.stringify({ data: { workflowDefs: [] } }), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+        throw new Error(`INF-132 test: unexpected fetch: ${bodyText.slice(0, 100)}`);
+      };
+      const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+      expect(result).not.toBeNull();
+      expect(result).toContain("blocked");
+    });
+
+    it("allows 'continue' from merge state when Linear shows merged (fast path, no GitHub call)", async () => {
+      // When Linear already says merged, we should NOT hit the GitHub API.
+      // This test verifies the fast path still works.
+      globalThis.fetch = async (_url, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+          return new Response(JSON.stringify({
+            data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:merge" }] }, delegate: null } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("IssueBranchAndPR")) {
+          // Linear attachment shows "merged" — fast path, no GitHub call needed
+          return new Response(JSON.stringify({
+            data: { issue: { attachments: { nodes: [{ url: "https://github.com/fancymatt/fancy-openclaw-linear-connector/pull/999", sourceType: "github", metadata: { status: "merged" } }] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("TeamStates")) {
+          return new Response(JSON.stringify({
+            data: { team: { states: { nodes: [] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("WorkflowDefs")) {
+          return new Response(JSON.stringify({ data: { workflowDefs: [] } }), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+        // If we hit GitHub API here, something is wrong — throw
+        if ((_url as string).includes("api.github.com")) {
+          throw new Error("INF-132: unexpected GitHub API call when Linear already confirmed merged");
+        }
+        throw new Error(`INF-132 test: unexpected fetch: ${bodyText.slice(0, 100)}`);
+      };
+      const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+      expect(result).toBeNull();
+    });
+
+    it("allows 'continue' when GitHub API returns 404 (PR deleted, fail-open)", async () => {
+      globalThis.fetch = async (_url, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+          return new Response(JSON.stringify({
+            data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:merge" }] }, delegate: null } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("IssueBranchAndPR")) {
+          return new Response(JSON.stringify({
+            data: { issue: { attachments: { nodes: [{ url: "https://github.com/fancymatt/fancy-openclaw-linear-connector/pull/888", sourceType: "github", metadata: { status: "open" } }] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("TeamStates")) {
+          return new Response(JSON.stringify({
+            data: { team: { states: { nodes: [] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        // GitHub returns 404 — PR was deleted, fail-open (fall back to Linear)
+        if ((_url as string).includes("api.github.com")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), {
+            status: 404, headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (bodyText.includes("WorkflowDefs")) {
+          return new Response(JSON.stringify({ data: { workflowDefs: [] } }), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+        throw new Error(`INF-132 test: unexpected fetch: ${bodyText.slice(0, 100)}`);
+      };
+      const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+      // With a 404, GitHub verification fails and we fall back to Linear's
+      // "open" status — the gate blocks since no merged evidence exists.
+      expect(result).not.toBeNull();
+      expect(result).toContain("blocked");
+    });
+  });
+
 });
 
 // ── INF-112 AC4: Regression test — non-Linear-generated branch ──────────────
