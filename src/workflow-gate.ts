@@ -4395,12 +4395,20 @@ export async function applyStateTransition(
   // already validated pre-transition (AC5) and the findings stashed in
   // `pendingFanout`, so this never re-guesses the spec.
   // Fail-open: fan-out errors are logged and never block the transition.
+  // INF-37: set when a spawn_if predicate could not be *evaluated* (as opposed
+  // to evaluating false). Zero children then means "we never found out", not
+  // "none were needed" — so the barrier below must not read it as vacuous
+  // satisfaction. Scoped deliberately to the spawn_if failure: the surrounding
+  // fan-out fail-open (above) is a separate, deliberate contract.
+  let spawnIfEvaluationFailed = false;
+
   if (applied && pendingFanout) {
     try {
       log.info(`workflow-gate: AI-1992 fan-out: triggering fan-out for ${issueId} (${currentStateName} → ${toStateName}, child=${pendingFanout.config.child_workflow})`);
       const fanoutResult = await executeFanout(issueId, authToken, pendingFanout.config, {
         findingsOverride: pendingFanout.findings,
       });
+      spawnIfEvaluationFailed = fanoutResult.spawnIfResult?.outcome === "failed";
       if (fanoutResult.created > 0) {
         log.info(
           `workflow-gate: B-2 fan-out: ${fanoutResult.created} child(ren) created for ${issueId}: ${fanoutResult.childIdentifiers.join(", ")}`,
@@ -4423,7 +4431,20 @@ export async function applyStateTransition(
   // barrier is already satisfied. This is a no-op when children are in-progress
   // — it only fires when all children are terminal or none exist. Barrier-ness
   // is config-driven (any state declaring `barrier: true`), not just "managing".
-  if (applied && destStateNode?.barrier === true) {
+  // INF-37: `!spawnIfEvaluationFailed` is fail-closed. A spawn_if that could not
+  // be evaluated spawned zero children, and zero children is exactly what the
+  // AI-1730 vacuous-satisfaction contract advances on — so the parent would sail
+  // past a sprint that never started, on a transient API error, and log it as
+  // healthy. AI-1730 is not at fault: it is being handed an *unknown* dressed up
+  // as a *zero*. The parent stays in the barrier state, which is recoverable; the
+  // error comment was already posted on the parent by executeFanout.
+  if (applied && destStateNode?.barrier === true && spawnIfEvaluationFailed) {
+    log.error(
+      `workflow-gate: INF-37: skipping barrier auto-advance for ${issueId} — ` +
+      `spawn_if predicate could not be evaluated, so the zero-child set is unverified, not empty. ` +
+      `${issueId} stays in '${toStateName}' pending steward retry.`,
+    );
+  } else if (applied && destStateNode?.barrier === true) {
     try {
       const barrierResult = await onManagingEntry(issueId, authToken);
       if (barrierResult) {

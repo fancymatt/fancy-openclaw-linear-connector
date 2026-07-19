@@ -31,6 +31,7 @@ import { checkLinearIssueRouting } from "./linear-actionable.js";
 import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
 import { getCircuitBreakerHealth } from "./dispatch-circuit-breaker.js";
+import { getPreFlightLiveness, registerSpawnerPreflight } from "./spawner-preflight.js";
 import { registerDistillationCron, createProdGenerationContext } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
@@ -391,6 +392,10 @@ export function createApp(options?: CreateAppOptions) {
       // are in sync; entries list per-def details. Observable at ac-validate
       // without waiting for a dispatch trigger.
       fixtureDrift: getFixtureDriftLiveness(),
+      // INF-97: sprint-spawner pre-flight readiness gate — registered at bootstrap.
+      // scheduled=true only if registerSpawnerPreflight() was called; proves the
+      // component is wired at the production entry point (AI-1808 dead-code-in-prod guard).
+      spawnerPreflight: getPreFlightLiveness(),
       // AI-2582: transcript redaction sweep — periodic .trajectory.jsonl
       // credential redaction. status is "idle"/"running"/"error"; lastRun
       // is null before the first sweep fires.
@@ -1301,6 +1306,13 @@ if (isEntryPoint) {
   runFixtureDriftCheck().catch((err: unknown) => {
     log.error(`fixture-drift bootstrap check failed: ${err instanceof Error ? err.message : String(err)}`);
   });
+
+  // INF-97: register the sprint-spawner pre-flight readiness gate.
+  // The component is now observable at /health.spawnerPreflight with
+  // { scheduled: true } without waiting for a sprint-spawner trigger (AC6).
+  // Registration here at the production entry point is proven by the
+  // bootstrap integration test (inf-97-spawner-preflight-bootstrap.test.ts).
+  registerSpawnerPreflight();
 
   // Phase 2 (rebuild): assert agents.json ⇄ capability-policy agreement at
   // startup and on every registry hot-reload. Drift alerts, never crashes.
