@@ -2,7 +2,7 @@ import { spawn } from "child_process";
 import type { RouteResult } from "../types.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { buildDeliveryMessage } from "./build-message.js";
-import { getAccessToken } from "../agents.js";
+import { getAccessToken, buildAgentMap } from "../agents.js";
 import { getActiveCanonVersion } from "../policy/universal-canon.js";
 import { resolveCanonicalIdentifierFromEvent } from "../canonical-identifier.js";
 import { normalizeSessionKey } from "../session-key.js";
@@ -139,10 +139,31 @@ export async function deliverToAgent(
       { updatedAt },
     );
     if (!leaseResult.acquired && leaseResult.refused) {
-      log.info(
-        `dispatch deduped: live session exists for ${route.agentId} [${route.sessionKey}]`,
-      );
-      return { dispatched: false };
+      // INF-109: Defense-in-depth — if the event is authored by a human (not
+      // an agent), force-supersede the lease and admit the dispatch. A human
+      // follow-up (comment, re-delegation, reassignment) is always fresh intent
+      // and should never be silently dropped by a stale lease.
+      const actorId = route.event.actor?.id;
+      const agentMap = buildAgentMap();
+      const isHumanActor = Boolean(actorId) && !agentMap[actorId];
+      if (isHumanActor) {
+        log.info(
+          `dispatch force-superseded: human actor [${actorId}] for ${route.agentId} [${route.sessionKey}]`,
+        );
+        // Force-acquire: supersede the existing lease unconditionally,
+        // bypassing the updatedAt comparison (the human-authored event is
+        // always fresh intent regardless of Linear's state version).
+        dispatchLeaseStore.acquire(
+          route.agentId,
+          route.sessionKey,
+          { updatedAt, nowMs: Date.now(), force: true },
+        );
+      } else {
+        log.info(
+          `dispatch deduped: live session exists for ${route.agentId} [${route.sessionKey}]`,
+        );
+        return { dispatched: false };
+      }
     }
   }
 

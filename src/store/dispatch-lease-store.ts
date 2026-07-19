@@ -150,6 +150,8 @@ export class DispatchLeaseStore {
    * If no active lease exists, creates one and returns { acquired: true }.
    *
    * If an unexpired lease exists:
+   *   - If `force` is true, the old lease is always superseded (INF-109
+   *     human-actor defense-in-depth). Bypasses the updatedAt comparison.
    *   - If `updatedAt` is provided and is strictly newer than the existing
    *     lease's `ticket_updated_at`, the old lease is superseded (deleted and
    *     re-acquired). This allows legitimate re-dispatches when a ticket's
@@ -169,7 +171,7 @@ export class DispatchLeaseStore {
   acquire(
     agentId: string,
     ticketKey: string,
-    options?: { nowMs?: number; ttlOverrideMs?: number; updatedAt?: string },
+    options?: { nowMs?: number; ttlOverrideMs?: number; updatedAt?: string; force?: boolean },
   ): AcquireResult {
     const now = this.now(options);
     const expiresAt = new Date(now.getTime() + (options?.ttlOverrideMs ?? this.leaseTtlMs));
@@ -188,10 +190,13 @@ export class DispatchLeaseStore {
           // Unexpired lease exists — check if this is a legitimate re-dispatch
           // for a newer state of the ticket.
           if (
-            options?.updatedAt &&
-            options.updatedAt > row.ticket_updated_at
+            options?.force ||
+            (options?.updatedAt &&
+              options.updatedAt > row.ticket_updated_at)
           ) {
-            // Legitimate re-dispatch for a newer state — supersede old lease
+            // Legitimate re-dispatch for a newer state — supersede old lease.
+            // INF-109: `force` bypasses the updatedAt comparison for
+            // human-authored events that always represent fresh intent.
             this.db.prepare(
               `DELETE FROM dispatch_lease WHERE agent_id = ? AND ticket_key = ?`,
             ).run(agentId, ticketKey);

@@ -1113,7 +1113,16 @@ export function createWebhookRouter(
               await throttle.wait(route.agentId);
               throttle.record(route.agentId);
             }
-            const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle, dispatchLeaseStore);
+            // AI-2564 / INF-109: Do NOT pass dispatchLeaseStore on the active-same-ticket
+            // path. The lease's purpose is to prevent double-SPAWN (a second parallel
+            // session for the same ticket). Delivering into an already-live session
+            // carries no spawn risk — the session already exists. Passing the lease
+            // self-defeats the intent of this branch, which is to NOT strand same-ticket
+            // conversational follow-ups (AI-2564 lease guard at deliver.ts:130 checks the
+            // lease and silently drops the dispatch when an unexpired lease exists and
+            // the incoming updatedAt is not strictly newer — which is exactly the shape
+            // of a human follow-up: same ticket, same state, new intent).
+            const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle, /* dispatchLeaseStore= */ undefined);
             bag.removeTicket(agentName, normalizedTicketId);
             appendOperationalEvent(operationalEventStore, {
               outcome: sameTicketResult.runId ? "dispatch-accepted" : "delivered",
