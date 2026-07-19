@@ -39,6 +39,7 @@ import {
   type LadderHistoryEntry,
 } from "./first-action-watchdog-state.js";
 import type { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
+import { StallReasonCode, type StallReason } from "./wake-observability/index.js";
 
 const CRON_NAME = "first-action-watchdog";
 const MINUTE = 60_000;
@@ -78,6 +79,9 @@ export interface WatchdogTicket {
   isReentry?: boolean;
   /** Rungs already fired in prior sweeps (the persisted ladder accumulator). */
   rungsFired?: number;
+  /** Reason-code from the stall resolver — lets the watchdog escalate based on
+   *  the actual cause instead of treating every stall identically. */
+  stallReason?: StallReason;
 }
 
 /** Minimal shape of a capability policy for re-route resolution. */
@@ -269,6 +273,33 @@ export function resolveRerouteTarget(
   return fallback ?? null;
 }
 
+/**
+ * Resolve the role for a MODEL_DEGRADED stall. Prefers the explicit owner_role
+ * from the workflow state def, but falls back to the first role the delegate
+ * fills in the capability policy that has an alternate body — allowing
+ * reroute even when the workflow def doesn't declare an owner_role.
+ */
+function resolveModelDegradedRole(
+  explicitRole: string | undefined,
+  delegate: string,
+  policy: WatchdogCapabilityPolicy | undefined,
+): string | null {
+  if (explicitRole) return explicitRole;
+  if (!policy || !Array.isArray(policy.bodies)) return null;
+  const bodyDef = policy.bodies.find((b) => b.id === delegate);
+  if (!bodyDef || !Array.isArray(bodyDef.fills_roles)) return null;
+  // Find the first role the delegate fills that has an alternate body
+  for (const role of bodyDef.fills_roles) {
+    const roleDef = policy.roles?.find((r) => r.id === role);
+    if (roleDef?.exclusive) continue; // Can't reroute exclusive roles
+    const alternate = policy.bodies.find(
+      (b) => b.id !== delegate && Array.isArray(b.fills_roles) && b.fills_roles.includes(role),
+    );
+    if (alternate) return role;
+  }
+  return null;
+}
+
 // ── Re-dispatch bypassing idempotency (rung 1, AI-1969 admit semantics) ────────
 
 /**
@@ -410,8 +441,25 @@ export async function runFirstActionWatchdogSweep(
         t.firstOwnerActionAtMs != null && t.firstOwnerActionAtMs <= deadlineAtMs;
       const breached = !actedInTime && now >= deadlineAtMs;
 
+      // ── Reason-code-aware escalation (INF-84) ──────────────────────────
+      // Check the stallReason before acting. This lets the watchdog escalate
+      // differently based on the *actual cause* of the stall instead of treating
+      // every breach identically.
+      const stallReason = t.stallReason?.reason;
+
+      // ACTIVELY_PROCESSING — the agent IS working on this ticket, just slowly.
+      // Never escalate: the resolver already confirmed the agent is active.
+      // This eliminates false-alarm "stalls" (AC5).
+      const isActivelyProcessing = stallReason === StallReasonCode.ACTIVELY_PROCESSING;
+
       if (breached) {
         result.breached += 1;
+
+        // If the resolver says the agent is actively working, skip entirely
+        // even if the deadline technically breached.
+        if (isActivelyProcessing) {
+          continue;
+        }
 
         // A breach on a stale mirror row (ticket already done / deleted /
         // demoted in Linear) is not a stall — heal-and-drop, never alert.
@@ -484,12 +532,78 @@ export async function runFirstActionWatchdogSweep(
           }
         } else {
           // Rung 1 — automatic re-dispatch (genuine fresh wake).
-          history.push({ rung: "redispatch", at: new Date(now).toISOString() });
-          if (opts.redispatch) {
-            await opts.redispatch({ ticket: t.ticket, state: t.state, agent: t.delegate });
+          // Reason-code-aware escalation: some stall reasons should skip rung-1
+          // redispatch (re-waking a dead session is pointless) and go directly
+          // to the appropriate higher rung.
+          if (stallReason === StallReasonCode.SESSION_DEAD) {
+            // SESSION_DEAD: skip redispatch → go directly to unreachable (rung 2).
+            unreachable = true;
+            history.push({ rung: "unreachable", at: new Date(now).toISOString() });
+            result.unreachable += 1;
+
+            opts.notify?.({
+              severity: "critical",
+              source: "first-action-watchdog",
+              title: `Delegate ${t.delegate} unreachable (SESSION_DEAD) on ${t.ticket} (${t.state})`,
+              ticket: t.ticket,
+              state: t.state,
+              delegate: t.delegate,
+              rungsFired: priorRungs,
+              history: history.map((h) => ({ ...h })),
+            });
+
+            if (opts.escalateUnreachable) {
+              await opts.escalateUnreachable({
+                ticket: t.ticket,
+                state: t.state,
+                agent: t.delegate,
+                history: history.map((h) => ({ ...h })),
+              });
+            }
+
+            // Set rungsFired = maxRungs so the ladders marks exhausted.
+            rungsFired = maxRungs;
+          } else if (stallReason === StallReasonCode.MODEL_DEGRADED) {
+            // MODEL_DEGRADED: skip redispatch → go directly to reroute (rung 3).
+            // Resolve the role: prefer explicit owner_role from workflow def,
+            // then fall back to any role the delegate fills that has an
+            // alternate body in the capability policy.
+            const role = resolveModelDegradedRole(stateDef?.owner_role, t.delegate, opts.capabilityPolicy);
+            const target = role
+              ? resolveRerouteTarget(opts.capabilityPolicy, role, t.delegate)
+              : null;
+            if (target && role && opts.reroute) {
+              history.push({
+                rung: "reroute",
+                at: new Date(now).toISOString(),
+                detail: `${t.delegate}→${target} (MODEL_DEGRADED)`,
+              });
+              await opts.reroute({
+                ticket: t.ticket,
+                fromAgent: t.delegate,
+                toAgent: target,
+                role,
+              });
+              result.reroutes += 1;
+              rungsFired = maxRungs;
+            } else {
+              // No reroute target available — fall through to normal redispatch
+              history.push({ rung: "redispatch", at: new Date(now).toISOString() });
+              if (opts.redispatch) {
+                await opts.redispatch({ ticket: t.ticket, state: t.state, agent: t.delegate });
+              }
+              rungsFired = priorRungs + 1;
+              result.redispatched += 1;
+            }
+          } else {
+            // Normal escalation: rung 1 — automatic re-dispatch.
+            history.push({ rung: "redispatch", at: new Date(now).toISOString() });
+            if (opts.redispatch) {
+              await opts.redispatch({ ticket: t.ticket, state: t.state, agent: t.delegate });
+            }
+            rungsFired = priorRungs + 1;
+            result.redispatched += 1;
           }
-          rungsFired = priorRungs + 1;
-          result.redispatched += 1;
         }
       }
 

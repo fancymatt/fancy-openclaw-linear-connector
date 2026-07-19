@@ -1,15 +1,12 @@
 /**
- * AI-2178: Dispatch circuit breaker — stop re-waking a delegate on a ticket
- * whose workflow state hasn't moved after N wakes.
+ * AI-2178 / INF-94: Dispatch circuit breaker.
  *
- * Two features:
- *
- * Feature 1: Per-ticket dispatch circuit breaker
+ * Feature 1: Per-ticket dispatch circuit breaker (AI-2178)
  *   After N (3) consecutive wakes where the ticket's workflow state hasn't
  *   changed, stop re-dispatching, emit one loud alert, and park dispatch until
  *   the state advances or a steward resets the breaker.
  *
- * Feature 2: Comment-fed re-wake suppression (pre-wake heuristic)
+ * Feature 2: Comment-fed re-wake suppression (pre-wake heuristic) (AI-2178)
  *   Cheaper guard that runs BEFORE the circuit breaker counter increments.
  *   Suppress the wake when all of:
  *     (a) The triggering event is a comment
@@ -17,6 +14,13 @@
  *     (c) The state:* workflow label is identical to what it was at the
  *         delegate's last dispatch
  *   If suppressed, don't increment the breaker counter.
+ *
+ * INF-94 fix: Ad-hoc tickets (no wf:* label) never trip the transition-stuck
+ *   alert — they have no workflow transitions to measure progress against.
+ *   The DispatchCircuitBreaker class accepts raw label arrays and extracts the
+ *   wf:* label internally, exempting label-less tickets. The legacy functional
+ *   API (recordDispatch etc.) treats null stateLabel as ad-hoc and skips
+ *   trip accounting.
  */
 
 import { createLogger, componentLogger } from "./logger.js";
@@ -32,7 +36,7 @@ const log = componentLogger(createLogger(), "dispatch-circuit-breaker");
 const DEFAULT_MAX_WAKES = 3;
 
 // ---------------------------------------------------------------------------
-// State types
+// Legacy state types
 // ---------------------------------------------------------------------------
 
 export interface TicketBreakerState {
@@ -59,24 +63,220 @@ export interface CircuitBreakerHealth {
 }
 
 // ---------------------------------------------------------------------------
-// In-memory state store
+// Class-based API types (INF-94)
+// ---------------------------------------------------------------------------
+
+export interface DispatchCircuitBreakerConfig {
+  /** Number of wakes without progress before alerting. Default: 3. */
+  maxWakesBeforeAlert?: number;
+}
+
+export interface DispatchCircuitBreakerResult {
+  /** Whether a transition-stuck alert should fire. */
+  shouldAlert: boolean;
+  /** Total recorded wakes for this ticket. */
+  wakeCount: number;
+  /** The wf:* label if the ticket has one, otherwise null. */
+  stateLabel: string | null;
+  /** Human-readable reason for the result. */
+  reason: string | null;
+}
+
+interface TicketState {
+  /** The wf:* label (null for ad-hoc tickets). */
+  stateLabel: string | null;
+  /** Accumulated wake count. */
+  wakeCount: number;
+  /** ISO timestamp of the last delegate activity, if any. */
+  lastActivityAt: string | null;
+  /** Whether the breaker is currently alerting. */
+  shouldAlert: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Legacy in-memory state store
 // ---------------------------------------------------------------------------
 
 const breakerState = new Map<string, TicketBreakerState>();
 
 // ---------------------------------------------------------------------------
-// Circuit breaker operations
+// Utility
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the wf:* label from a Linear labels array.
+ * Returns null if no wf:* label is present (ad-hoc ticket).
+ */
+export function extractWorkflowLabel(labels: string[]): string | null {
+  return labels.find((l) => /^wf:/i.test(l)) ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Class-based API (INF-94)
+// ---------------------------------------------------------------------------
+
+/**
+ * DispatchCircuitBreaker — transition-stuck detection with ad-hoc ticket exemption.
+ *
+ * Tracks wake dispatches per ticket and fires a `transition-stuck` signal when
+ * a governed (wf:*) ticket receives multiple wakes without evidence of progress
+ * (delegate activity or state transition). Ad-hoc tickets (no wf: label) are
+ * exempt from transition-stuck firing because they have no workflow transitions
+ * to measure progress against.
+ */
+export class DispatchCircuitBreaker {
+  private readonly state = new Map<string, TicketState>();
+  private readonly maxWakes: number;
+
+  constructor(config?: DispatchCircuitBreakerConfig) {
+    this.maxWakes = config?.maxWakesBeforeAlert ?? DEFAULT_MAX_WAKES;
+  }
+
+  /**
+   * Record a successful wake dispatch to a ticket with its linear labels.
+   * Labels are used to determine if the ticket is workflow-governed (wf:*).
+   */
+  recordWake(ticketId: string, labels: string[]): void {
+    const wfLabel = extractWorkflowLabel(labels);
+    const existing = this.state.get(ticketId);
+
+    if (!existing) {
+      // First wake for this ticket. Count starts at 1 (this IS a wake).
+      const shouldAlert = wfLabel !== null
+        ? 1 >= this.maxWakes
+        : false;
+      this.state.set(ticketId, {
+        stateLabel: wfLabel,
+        wakeCount: 1,
+        lastActivityAt: null,
+        shouldAlert,
+      });
+      return;
+    }
+
+    if (wfLabel === null) {
+      // INF-94: Ad-hoc ticket (no wf:* label). Track the wake count for
+      // observability but never alert. These tickets have no workflow
+      // transitions to measure progress against.
+      this.state.set(ticketId, {
+        ...existing,
+        stateLabel: null,
+        wakeCount: existing.wakeCount + 1,
+        shouldAlert: false,
+      });
+      return;
+    }
+
+    // If delegate already posted activity, reset the counter
+    if (existing.lastActivityAt !== null) {
+      this.state.set(ticketId, {
+        ...existing,
+        wakeCount: 1,
+        shouldAlert: false,
+      });
+      return;
+    }
+
+    // wf:* ticket — accumulate wakes and alert if threshold exceeded without
+    // any delegate activity.
+    const newCount = existing.wakeCount + 1;
+    const shouldAlert = newCount >= this.maxWakes && existing.lastActivityAt === null;
+
+    this.state.set(ticketId, {
+      stateLabel: wfLabel,
+      wakeCount: newCount,
+      lastActivityAt: existing.lastActivityAt,
+      shouldAlert,
+    });
+  }
+
+  /**
+   * Record evidence of delegate activity (comment posted, state changed, ack
+   * received). For ad-hoc tickets this is the only "progress" signal; for wf:*
+   * tickets it clears the stuck timer.
+   */
+  recordDelegateActivity(ticketId: string): void {
+    const existing = this.state.get(ticketId);
+    if (!existing) return;
+
+    this.state.set(ticketId, {
+      ...existing,
+      wakeCount: 0,
+      lastActivityAt: new Date().toISOString(),
+      shouldAlert: false,
+    });
+  }
+
+  /**
+   * Evaluate whether this ticket should fire a transition-stuck alert.
+   */
+  evaluate(ticketId: string): DispatchCircuitBreakerResult {
+    const existing = this.state.get(ticketId);
+    if (!existing) {
+      return { shouldAlert: false, wakeCount: 0, stateLabel: null, reason: null };
+    }
+
+    const { stateLabel, wakeCount, shouldAlert, lastActivityAt } = existing;
+
+    if (stateLabel === null) {
+      // Ad-hoc ticket — never fire transition-stuck.
+      return {
+        shouldAlert: false,
+        wakeCount,
+        stateLabel: null,
+        reason: `ad-hoc: no wf:* label — transition-stuck not applicable`,
+      };
+    }
+
+    if (shouldAlert) {
+      return {
+        shouldAlert: true,
+        wakeCount,
+        stateLabel,
+        reason: `transition-stuck: ${wakeCount} consecutive wakes on ${stateLabel}, no delegate activity`,
+      };
+    }
+
+    if (lastActivityAt !== null) {
+      return {
+        shouldAlert: false,
+        wakeCount,
+        stateLabel,
+        reason: `delegate activity at ${lastActivityAt}`,
+      };
+    }
+
+    return {
+      shouldAlert: false,
+      wakeCount,
+      stateLabel,
+      reason: `${wakeCount}/${this.maxWakes} wakes before alert threshold`,
+    };
+  }
+
+  /**
+   * Reset tracking for a ticket (e.g., when the ticket transitions or is
+   * completed).
+   */
+  reset(ticketId: string): void {
+    this.state.delete(ticketId);
+  }
+
+  /** Access all tracked tickets (for diagnostics/testing). */
+  allStates(): ReadonlyMap<string, TicketState> {
+    return this.state;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy functional API (AI-2178 compatible)
 // ---------------------------------------------------------------------------
 
 /**
  * Record a dispatch attempt and update the circuit breaker state.
  *
- * Logic:
- *   - First dispatch for a ticket: seeds the state, counter=0.
- *   - State changed since last dispatch: the ticket advanced → reset counter
- *     to 0 and update the tracked state label.
- *   - State unchanged from last dispatch: this is a REPEAT (failed) wake on
- *     the same state — increment the counter. If counter >= maxWakes, trip.
+ * INF-94: If stateLabel is null (ad-hoc ticket, no wf:* workflow label), the
+ * ticket has no workflow transitions to stall — never trip the breaker.
  *
  * @returns The updated breaker state.
  */
@@ -85,6 +285,21 @@ export function recordDispatch(
   stateLabel: string | null,
   maxWakes: number = DEFAULT_MAX_WAKES,
 ): TicketBreakerState {
+  // INF-94: Null stateLabel means this ticket has no workflow state to measure
+  // progress against. Ad-hoc tickets (no wf:* label) always have null stateLabel.
+  // Record the dispatch but never trip — there are no transitions to stall on.
+  if (stateLabel === null) {
+    const fresh: TicketBreakerState = {
+      lastStateLabel: null,
+      lastDispatchAt: new Date().toISOString(),
+      wakeCount: 0,
+      tripped: false,
+      trippedAt: null,
+    };
+    breakerState.set(ticketId, fresh);
+    return fresh;
+  }
+
   const existing = breakerState.get(ticketId);
 
   if (!existing) {
@@ -102,7 +317,6 @@ export function recordDispatch(
   }
 
   // If the breaker is tripped, a state advance resets it.
-  // If the state is the same (or null/missing), the breaker stays tripped.
   if (existing.tripped) {
     if (existing.lastStateLabel !== stateLabel && stateLabel !== null) {
       // State advance un-trips the breaker.
@@ -182,19 +396,7 @@ export function recordDispatch(
  * Called by the dispatch path AFTER a successful dispatch returns, when the
  * state was the same as before. This increments the consecutive-wake counter.
  *
- * The dispatch path workflow:
- *   1. recordDispatch() — sets the state snapshot for THIS dispatch, resets
- *      the counter if the state advanced.
- *   2. [dispatch proceeds through guards and delivery]
- *   3. recordWakeOutcome() — called AFTER the session returns, records
- *      whether the state advanced (→ reset) or not (→ increment).
- *
- * For the simpler pattern used in dispatchRoute, the flow is:
- *   - At webhook ingress: compare event stateLabel vs lastStateLabel.
- *     If same AND lastStateLabel existed → recordFailedWake (increment).
- *     If different → recordDispatch resets on next webhook.
- *
- * This function is the increment-and-trip path.
+ * INF-94: If the ticket has no state label (ad-hoc, no wf:*), don't trip.
  */
 export function recordFailedWake(
   ticketId: string,
@@ -208,11 +410,18 @@ export function recordFailedWake(
     return { tripped: existing?.tripped ?? false, wakeCount: existing?.wakeCount ?? 0 };
   }
 
+  // INF-94: If the ticket has no state label (ad-hoc, no wf:*), don't trip —
+  // there are no transitions to stall on.
+  const effectiveLabel = stateLabel ?? existing.lastStateLabel;
+  if (effectiveLabel === null) {
+    return { tripped: false, wakeCount: 0 };
+  }
+
   const newCount = (existing.wakeCount ?? 0) + 1;
   const shouldTrip = newCount >= maxWakes;
 
   breakerState.set(ticketId, {
-    lastStateLabel: stateLabel ?? existing.lastStateLabel,
+    lastStateLabel: effectiveLabel,
     lastDispatchAt: new Date().toISOString(),
     wakeCount: newCount,
     tripped: shouldTrip,
@@ -221,15 +430,15 @@ export function recordFailedWake(
 
   if (shouldTrip) {
     log.warn(
-      `Circuit breaker TRIPPED for ${ticketId}: ${newCount} consecutive wakes, state=${stateLabel ?? "unknown"}`,
+      `Circuit breaker TRIPPED for ${ticketId}: ${newCount} consecutive wakes, state=${effectiveLabel}`,
     );
     notify({
       severity: "warning",
       source: "dispatch-circuit-breaker",
-      title: `transition-stuck: ${ticketId} ${stateLabel ?? "unknown"} — ${newCount} wakes, no progress`,
+      title: `transition-stuck: ${ticketId} ${effectiveLabel} — ${newCount} wakes, no progress`,
       detail: {
         ticketId,
-        stateLabel,
+        stateLabel: effectiveLabel,
         wakeCount: newCount,
         trippedAt: breakerState.get(ticketId)!.trippedAt,
       },
@@ -237,7 +446,7 @@ export function recordFailedWake(
     });
   } else {
     log.info(
-      `Circuit breaker: state unchanged for ${ticketId} (${newCount}/${maxWakes} wakes, state=${stateLabel ?? "unknown"})`,
+      `Circuit breaker: state unchanged for ${ticketId} (${newCount}/${maxWakes} wakes, state=${effectiveLabel})`,
     );
   }
 

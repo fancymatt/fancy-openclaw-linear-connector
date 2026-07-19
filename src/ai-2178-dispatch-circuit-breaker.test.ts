@@ -81,13 +81,19 @@ describe("Feature 1: per-ticket circuit breaker", () => {
     expect(state.lastStateLabel).toBe("approved");
   });
 
-  test("null state labels work correctly", () => {
-    // No state label present
+  test("null state labels (ad-hoc tickets) never accumulate wake count (INF-94)", () => {
+    // No state label → ad-hoc ticket, no workflow transitions to stall.
     recordDispatch(TICKET, null);
     let state = recordDispatch(TICKET, null);
-    expect(state.wakeCount).toBe(1);
+    expect(state.wakeCount).toBe(0);
+    expect(state.tripped).toBe(false);
 
-    // Transition from null to a real label resets
+    // Third wake with null, still not tripped
+    state = recordDispatch(TICKET, null);
+    expect(state.wakeCount).toBe(0);
+    expect(state.tripped).toBe(false);
+
+    // Transition from null to a real label starts tracking normally
     state = recordDispatch(TICKET, "review");
     expect(state.wakeCount).toBe(0);
   });

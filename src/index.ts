@@ -22,6 +22,7 @@ import { sendWakeUpSignal, type WakeUpConfig } from "./bag/wake-up.js";
 import { getAutoEnrollLiveness, getTicketNoActivityTimeoutMs, getWorkflowRegistryLiveness, loadWorkflowRegistry } from "./workflow-gate.js";
 import { getDefStateMigrationLiveness, registerDefStateMigrationRunner } from "./def-state-migration.js";
 import { getFixtureDriftLiveness, runFixtureDriftCheck } from "./fixture-drift-detector.js";
+import { registerTranscriptRedaction, getTranscriptRedactionHealth } from "./transcript-redaction.js";
 import { normalizeSessionKey } from "./session-key.js";
 import { applyEngagementStatus, registerEngagementNativeStateOverlay } from "./engagement-status.js";
 import { createAdminRouter } from "./admin.js";
@@ -30,6 +31,7 @@ import { checkLinearIssueRouting } from "./linear-actionable.js";
 import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
 import { getCircuitBreakerHealth } from "./dispatch-circuit-breaker.js";
+import { getPreFlightLiveness, registerSpawnerPreflight } from "./spawner-preflight.js";
 import { registerDistillationCron, createProdGenerationContext } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
@@ -48,6 +50,7 @@ import { ProposalStore } from "./store/proposal-store.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
 import { getRegisteredCrons } from "./cron/registry.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
+import { getDetectorState } from "./done-ticket-detector-state.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
@@ -342,6 +345,9 @@ export function createApp(options?: CreateAppOptions) {
       // AI-2009 AC7: first-action watchdog liveness — scheduled + armedCount,
       // observable at ac-validate without waiting for a deadline breach.
       firstActionWatchdog: getFirstActionWatchdogState(),
+      // AI-2468 AC2: done-ticket detector liveness — scheduled + last-run
+      // visibility, observable at ac-validate without waiting for a cron tick.
+      doneTicketDetector: getDetectorState(),
       // AI-1848 (Pillar 2 D1): universal policy canon liveness — confirms
       // the canon file loaded and its version, observable at ac-validate
       // without waiting for a dispatch trigger.
@@ -386,6 +392,14 @@ export function createApp(options?: CreateAppOptions) {
       // are in sync; entries list per-def details. Observable at ac-validate
       // without waiting for a dispatch trigger.
       fixtureDrift: getFixtureDriftLiveness(),
+      // INF-97: sprint-spawner pre-flight readiness gate — registered at bootstrap.
+      // scheduled=true only if registerSpawnerPreflight() was called; proves the
+      // component is wired at the production entry point (AI-1808 dead-code-in-prod guard).
+      spawnerPreflight: getPreFlightLiveness(),
+      // AI-2582: transcript redaction sweep — periodic .trajectory.jsonl
+      // credential redaction. status is "idle"/"running"/"error"; lastRun
+      // is null before the first sweep fires.
+      transcriptRedaction: getTranscriptRedactionHealth(),
       // AI-2542: auto-enroll liveness and demote/escape suppression counters.
       autoEnroll: getAutoEnrollLiveness(),
       // AI-1908 AC5: per-agent OAuth token status. Exposes lastRefreshOkAt,
@@ -1200,7 +1214,12 @@ export function createApp(options?: CreateAppOptions) {
   // capability-policy bodies against agents.json entries and alerts on mismatches.
   registerRegistryIntegrityCron();
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore };
+  // AI-2582: transcript redaction sweep — periodic .trajectory.jsonl
+  // credential redaction. Registered here so the cron registry and /health
+  // both prove wiring without waiting for a trigger.
+  registerTranscriptRedaction();
+
+  return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, transcriptRedactionHealth: getTranscriptRedactionHealth() };
 }
 
 /**
@@ -1287,6 +1306,13 @@ if (isEntryPoint) {
   runFixtureDriftCheck().catch((err: unknown) => {
     log.error(`fixture-drift bootstrap check failed: ${err instanceof Error ? err.message : String(err)}`);
   });
+
+  // INF-97: register the sprint-spawner pre-flight readiness gate.
+  // The component is now observable at /health.spawnerPreflight with
+  // { scheduled: true } without waiting for a sprint-spawner trigger (AC6).
+  // Registration here at the production entry point is proven by the
+  // bootstrap integration test (inf-97-spawner-preflight-bootstrap.test.ts).
+  registerSpawnerPreflight();
 
   // Phase 2 (rebuild): assert agents.json ⇄ capability-policy agreement at
   // startup and on every registry hot-reload. Drift alerts, never crashes.
@@ -1595,6 +1621,7 @@ if (isEntryPoint) {
   registerG20CanaryCron();
 
   // AI-2576: periodic done-ticket detector — flag Done tickets missing from main
+  // (uses git log --grep <ticket-id> to check commit messages).
   registerDoneDetectorCron({
     repoPath: process.env.DONE_DETECTOR_REPO_PATH ?? process.env.REPO_BASE_PATH,
     lookbackDays: parseInt(process.env.DONE_DETECTOR_LOOKBACK_DAYS ?? "14", 10),

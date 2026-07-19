@@ -134,9 +134,16 @@ function makeSpawnIfFetch(opts: {
 
     // ── TeamLabels ──────────────────────────────────────────────────
     if (query.includes("TeamLabels")) {
+      // INF-27 AC2 mint guard: fan-out refuses if the target wf:* label is missing
+      // from the team's labels. Provide common wf:* labels by default so tests
+      // that don't specify teamLabels still pass the mint guard check.
+      const defaultLabels = [
+        { id: "lbl-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "lbl-ui-impact", name: "ui-impact" },
+      ];
       return new Response(
         JSON.stringify({
-          data: { team: { labels: { nodes: opts.teamLabels ?? [] } } },
+          data: { team: { labels: { nodes: opts.teamLabels ?? defaultLabels } } },
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );

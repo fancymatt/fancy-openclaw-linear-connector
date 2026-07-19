@@ -470,7 +470,18 @@ describe("INF-32 AC4 — regression: second fanout on one parent mints its child
       }
       if (query.includes("TeamLabels")) {
         return new Response(
-          JSON.stringify({ data: { team: { labels: { nodes: [] } } } }),
+          JSON.stringify({
+            data: {
+              team: {
+                labels: {
+                  nodes: [
+                    { id: "lbl-wf-dev-impl", name: WF_A },
+                    { id: "lbl-wf-sprint-arm-ux", name: WF_B },
+                  ],
+                },
+              },
+            },
+          }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -540,11 +551,20 @@ describe("INF-32 AC4 — regression: second fanout on one parent mints its child
     globalThis.fetch = makeFetch(existing);
     await executeFanout("AI-1439", "Bearer tok", FANOUT_B, { skipPreview: true } as never);
 
-    // The wf:* label for the SECOND fan-out's workflow must have been resolved.
+    // INF-27 AC2 mint guard: wf:* labels are pre-resolved via TeamLabels lookup
+    // and cached. issueLabelCreate is NOT called for them — the cached label ID
+    // is passed directly in issueCreate's labelIds. Only non-wf labels like
+    // state:intake are still created via issueLabelCreate.
     const labelCalls = fetchCalls.filter((c) => String(c.body.query ?? "").includes("issueLabelCreate"));
     const labelNames = labelCalls.map((c) => (c.body.variables as Record<string, unknown>).name);
-    expect(labelNames).toContain(WF_B);
+    // state:intake is still created via findOrCreateLabel (not a wf:* label).
+    expect(labelNames).toContain("state:intake");
+    // wf:* labels are NOT created inline — they're pre-resolved by the mint guard.
+    expect(labelNames).not.toContain(WF_B);
     expect(labelNames).not.toContain(WF_A);
+    // Children were created with pre-resolved label IDs in labelIds.
+    const createCalls = fetchCalls.filter((c) => String(c.body.query ?? "").includes("issueCreate"));
+    expect(createCalls.length).toBeGreaterThanOrEqual(2);
   });
 
   it("re-entering the SAME fanout twice still mints nothing (no duplicate-spawn regression)", async () => {

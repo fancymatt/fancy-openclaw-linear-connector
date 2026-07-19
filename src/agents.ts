@@ -99,6 +99,20 @@ export interface AgentConfig {
    * See AI-2346.
    */
   status?: "active" | "off-linear" | "never-onboarded";
+  /**
+   * Explicit opt-in for the legacy direct-token write path.
+   *
+   * When set to `true`, syncWorkspaceSecrets will write the raw upstream
+   * `accessToken` into the agent's linear.env when no proxyToken is present.
+   * This is the pre-AI-2304 behavior and should only be used for agents that
+   * cannot use the broker proxy model.
+   *
+   * Default (absent/false): syncWorkspaceSecrets writes NOTHING when there is
+   * no proxyToken — preserving any existing file and logging a loud error.
+   *
+   * The proxy-fleet-sweep.py asserts this flag has zero consumers.
+   */
+  allowDirectToken?: boolean;
 }
 
 export interface TokenFailure {
@@ -581,14 +595,32 @@ function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
   // the proxy URL so the CLI routes through the connector (which swaps in the
   // vaulted real token). The real accessToken update lands only in agents.json
   // via save(). This also runs on every token refresh, so we re-emit the proxy
-  // URL line here to keep it from being clobbered. Agents with no proxyToken yet
-  // keep the legacy direct-token behavior for an incremental migration.
+  // URL line here to keep it from being clobbered.
+  //
+  // Agents with no proxyToken AND no explicit `allowDirectToken` opt-in get
+  // NOTHING written — the implicit raw-token else branch is dead (AI-2304).
+  // With minting at creation (AI-2308), every properly-onboarded agent has a
+  // proxyToken from the moment its record exists, so this early-return is a
+  // no-op under normal conditions. It exists as a containment hard-stop.
+  if (!agent.proxyToken && !agent.allowDirectToken) {
+    log.error(
+      `Refusing to write accessToken to ${secretsPath} for "${agentName}" — ` +
+        `no proxyToken and no allowDirectToken opt-in. This is a provisioning ` +
+        `bug; the agent must have a proxyToken minted at creation (AI-2308). ` +
+        `Leaving any existing credential file untouched.`,
+    );
+    return;
+  }
+
   let contents: string;
   if (agent.proxyToken) {
     const lines = [`LINEAR_OAUTH_TOKEN=${agent.proxyToken}`];
     if (agent.proxyUrl) lines.push(`LINEAR_PROXY_URL=${agent.proxyUrl}`);
     contents = lines.join("\n") + "\n";
   } else {
+    // The only way to reach here is allowDirectToken: true (the guard above
+    // prevents the implicit path). This is the legacy direct-token write
+    // (mode 600, atomic — reuses the AI-2289/AI-2288 writer below).
     contents = `LINEAR_OAUTH_TOKEN=${accessToken}\n`;
   }
 
@@ -727,6 +759,23 @@ export function mintProxyToken(): string {
   return "lpx_" + crypto.randomBytes(24).toString("hex");
 }
 
+/**
+ * Derive the default proxy URL for the connector.
+ * Reads `LINEAR_CONNECTOR_PROXY_URL` env var first, then falls back to
+ * `http://localhost:{PORT}/proxy/graphql` where PORT defaults to 3100.
+ * Returns `undefined` only when no reasonable default can be constructed.
+ */
+function getDefaultProxyUrl(): string | undefined {
+  if (process.env.LINEAR_CONNECTOR_PROXY_URL) {
+    return process.env.LINEAR_CONNECTOR_PROXY_URL;
+  }
+  const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
+  if (Number.isFinite(port)) {
+    return `http://localhost:${port}/proxy/graphql`;
+  }
+  return undefined;
+}
+
 export function upsertAgent(config: AgentConfig): { isNew: boolean } {
   // Match by name first (for partial entries that don't have linearUserId yet)
   // then fall back to linearUserId for token refresh updates. The fallback must
@@ -754,6 +803,7 @@ export function upsertAgent(config: AgentConfig): { isNew: boolean } {
       // publishing the raw upstream token, the exact leak AI-2308 closes.
       if (needsProxyToken(merged)) {
         merged.proxyToken = mintProxyToken();
+        if (!merged.proxyUrl) merged.proxyUrl = getDefaultProxyUrl();
       }
       return merged;
     });
@@ -767,6 +817,7 @@ export function upsertAgent(config: AgentConfig): { isNew: boolean } {
   // agents with an existing proxyToken are untouched.
   if (needsProxyToken(config)) {
     config.proxyToken = mintProxyToken();
+    if (!config.proxyUrl) config.proxyUrl = getDefaultProxyUrl();
   }
 
   _agents.push(reconcileStatusWithCredential(config));

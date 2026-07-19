@@ -394,7 +394,12 @@ describe("executeFanout — mocked Linear API", () => {
       { title: "XSS in profile name" },
     ];
 
-    globalThis.fetch = makeFanoutFetch({});
+    globalThis.fetch = makeFanoutFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+    });
 
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true, findingsOverride: findings });
 
@@ -411,8 +416,8 @@ describe("executeFanout — mocked Linear API", () => {
     // Verify each child has wf:dev-impl and state:intake labels
     for (const call of createCalls) {
       const input = ((call.body.variables as Record<string, unknown>).input as Record<string, unknown>);
-      expect(input.labelIds).toContain("label-wf:dev-impl");
-      expect(input.labelIds).toContain("label-state:intake");
+      expect(input.labelIds).toContain("existing-wf-dev-impl");
+      expect(input.labelIds).toContain("existing-state-intake");
       // AC2: each child is linked to the parent (parentId set)
       expect(input.parentId).toBe("parent-internal-uuid");
     }
@@ -420,6 +425,10 @@ describe("executeFanout — mocked Linear API", () => {
 
   it("extracts findings from description when no override provided", async () => {
     globalThis.fetch = makeFanoutFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
       parentContext: {
         teamId: "team-uuid",
         title: "UX Audit",
@@ -428,20 +437,12 @@ describe("executeFanout — mocked Linear API", () => {
       },
     });
 
-      teamLabels: [
-        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
-        { id: "existing-state-intake", name: "state:intake" },
-      ],
     const result = await executeFanout("AI-1439", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, { skipPreview: true });
 
     expect(result.created).toBe(2);
     expect(result.childIdentifiers).toHaveLength(2);
   });
 
-      teamLabels: [
-        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
-        { id: "existing-state-intake", name: "state:intake" },
-      ],
   it("AI-1992 (AC5): refuses — no children — when the description has no parseable spec", async () => {
     globalThis.fetch = makeFanoutFetch({
       parentContext: {
@@ -557,7 +558,7 @@ describe("executeFanout — mocked Linear API", () => {
     // Both children get exactly the same labels — no special-casing
     for (const call of createCalls) {
       const input = ((call.body.variables as Record<string, unknown>).input as Record<string, unknown>);
-      expect(input.labelIds).toEqual(["label-wf:dev-impl", "label-state:intake"]);
+      expect(input.labelIds).toEqual(["existing-wf-dev-impl", "existing-state-intake"]);
     }
   });
 
@@ -581,8 +582,8 @@ describe("executeFanout — mocked Linear API", () => {
     const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
     for (const call of createCalls) {
       const input = ((call.body.variables as Record<string, unknown>).input as Record<string, unknown>);
-      expect(input.labelIds).toContain("label-wf:dev-impl");
-      expect(input.labelIds).toContain("label-state:intake");
+      expect(input.labelIds).toContain("existing-wf-dev-impl");
+      expect(input.labelIds).toContain("existing-state-intake");
       // Exactly 2 labels: wf:dev-impl and state:intake
       expect((input.labelIds as string[]).length).toBe(2);
     }
@@ -619,7 +620,12 @@ describe("executeFanout — mocked Linear API", () => {
     }));
 
     // Mock: parent has no parent (depth 0)
-    const baseFetch = makeFanoutFetch({});
+    const baseFetch = makeFanoutFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+    });
     globalThis.fetch = async (url, init) => {
       const bodyText = typeof init?.body === "string" ? init.body : "{}";
       // Handle depth walk
@@ -655,7 +661,12 @@ describe("executeFanout — mocked Linear API", () => {
       title: `Finding ${i + 1}`,
     }));
 
-    const baseFetch = makeFanoutFetch({});
+    const baseFetch = makeFanoutFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+    });
     globalThis.fetch = async (url, init) => {
       const bodyText = typeof init?.body === "string" ? init.body : "{}";
       if (bodyText.includes("IssueParent")) {
@@ -687,7 +698,12 @@ describe("executeFanout — mocked Linear API", () => {
       { title: "Finding B" },
     ];
 
-    const baseFetch = makeFanoutFetch({});
+    const baseFetch = makeFanoutFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+    });
     globalThis.fetch = async (url, init) => {
       const bodyText = typeof init?.body === "string" ? init.body : "{}";
       if (bodyText.includes("IssueParent")) {
@@ -727,10 +743,12 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
   let uxDir: string;
   let originalWorkflowDefsDir: string | undefined;
   let originalPolicyPath: string | undefined;
+  let originalAgentsFile: string | undefined;
 
   beforeAll(() => {
     originalWorkflowDefsDir = process.env.WORKFLOW_DEFS_DIR;
     originalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+    originalAgentsFile = process.env.AGENTS_FILE;
 
     uxDir = fs.mkdtempSync(path.join(os.tmpdir(), "fanout-integration-"));
     const policyFile = path.join(uxDir, "capability-policy.yaml");
@@ -777,6 +795,12 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
     } else {
       delete process.env.CAPABILITY_POLICY_PATH;
     }
+    if (originalAgentsFile !== undefined) {
+      process.env.AGENTS_FILE = originalAgentsFile;
+    } else {
+      delete process.env.AGENTS_FILE;
+    }
+    reloadAgents();
   });
 
   beforeEach(() => {
@@ -955,7 +979,12 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
 
   // AC3: parent auto-transitions to managing once children are minted
   it("AC3: spawn on ux-audit spawning state triggers fan-out and transitions to managing", async () => {
-    globalThis.fetch = makeIntegrationFetch({});
+    globalThis.fetch = makeIntegrationFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+    });
 
     await applyStateTransition("spawn", "AI-1439", "Bearer tok");
 
@@ -1017,7 +1046,12 @@ describe("applyStateTransition — fan-out integration (ux-audit spawn)", () => 
 
   it("fan-out still completes even if summary comment fails", async () => {
     let commentFailed = false;
-    const baseFetch = makeIntegrationFetch({});
+    const baseFetch = makeIntegrationFetch({
+      teamLabels: [
+        { id: "existing-wf-dev-impl", name: "wf:dev-impl" },
+        { id: "existing-state-intake", name: "state:intake" },
+      ],
+    });
 
     globalThis.fetch = async (url, init) => {
       const bodyText = typeof init?.body === "string" ? init.body : "{}";
