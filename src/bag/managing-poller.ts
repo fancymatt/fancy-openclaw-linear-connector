@@ -63,6 +63,10 @@ export interface LinearManagingIssue {
   identifier: string;
   title: string;
   description: string | null;
+  /** Resolved issue label names (e.g. ["wf:sprint-spawner"]). */
+  labels: string[];
+  /** Current state name (lowercase), e.g. "managing". */
+  stateName: string;
 }
 
 export interface PollerCycleResult {
@@ -127,7 +131,7 @@ export function isDue(
 
 /**
  * Fetch all Managing-state tickets delegated to an agent from Linear.
- * Uses the agent's own OAuth token. Returns identifier + title + body.
+ * Uses the agent's own OAuth token. Returns identifier + title + body + labels + state.
  */
 async function fetchManagingTicketsForAgent(agent: AgentConfig): Promise<LinearManagingIssue[]> {
   const token = getAccessToken(agent.name);
@@ -146,6 +150,14 @@ async function fetchManagingTicketsForAgent(agent: AgentConfig): Promise<LinearM
           identifier
           title
           description
+          labels {
+            nodes {
+              name
+            }
+          }
+          state {
+            name
+          }
         }
       }
     }
@@ -159,13 +171,30 @@ async function fetchManagingTicketsForAgent(agent: AgentConfig): Promise<LinearM
     throw new Error(`Linear API returned ${res.status} for agent ${agent.name}`);
   }
   const body = (await res.json()) as {
-    data?: { issues?: { nodes?: Array<{ identifier: string; title: string; description: string | null }> } };
+    data?: {
+      issues?: {
+        nodes?: Array<{
+          identifier: string;
+          title: string;
+          description: string | null;
+          labels?: { nodes?: Array<{ name: string }> };
+          state?: { name: string } | null;
+        }>;
+      };
+    };
     errors?: unknown;
   };
   if (body.errors) {
     throw new Error(`Linear API errors for agent ${agent.name}: ${JSON.stringify(body.errors)}`);
   }
-  return body.data?.issues?.nodes ?? [];
+  const raw = body.data?.issues?.nodes ?? [];
+  return raw.map((n) => ({
+    identifier: n.identifier,
+    title: n.title,
+    description: n.description,
+    labels: n.labels?.nodes?.map((l) => l.name) ?? [],
+    stateName: n.state?.name?.toLowerCase() ?? "",
+  }));
 }
 
 export class ManagingPoller {
@@ -262,6 +291,8 @@ export class ManagingPoller {
           identifier: issue.identifier,
           title: issue.title,
           lastDispatchedAt,
+          labels: issue.labels,
+          stateName: issue.stateName,
         });
       }
 
