@@ -4270,6 +4270,14 @@ export async function applyStateTransition(
       log.info(`workflow-gate: AI-1992 fan-out: triggering fan-out for ${issueId} (${currentStateName} → ${toStateName}, child=${pendingFanout.config.child_workflow})`);
       const fanoutResult = await executeFanout(issueId, authToken, pendingFanout.config, {
         findingsOverride: pendingFanout.findings,
+        // INF-111: resolve each child workflow's true entry_state from its
+        // registered workflow def, instead of the hardcoded "state:intake"
+        // that caused def-skew between mint and validate paths.
+        lookupEntryState: async (wfLabel: string) => {
+          const defId = wfLabel.startsWith("wf:") ? wfLabel.slice(3) : wfLabel;
+          const def = await loadWorkflowDefById(defId);
+          return def?.entry_state ? `state:${def.entry_state}` : undefined;
+        },
       });
       spawnIfEvaluationFailed = fanoutResult.spawnIfResult?.outcome === "failed";
       if (fanoutResult.created > 0) {

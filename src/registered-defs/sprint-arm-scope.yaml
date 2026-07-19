@@ -1,23 +1,27 @@
-# sprint-arm-scope — Sprint Arm: Backend/Scope child workflow (v0)
-# owner: backend planner (Igor), reviewer (cra)
-# last-updated: 2026-07-16
-# status: v0 — registered-def fixture placeholder
+# sprint-arm-scope — dev-sprint shaping-arm archetype (scope)
+# spec of record: life-os/project-management/dev-sprint-workflow-spec.md (vault,
+#   approved by Matt 2026-07-08). AI-1993.
+# owner: sprint-owner (Astrid) does the scoping; cra reviews the scope artifact.
 #
-# Registered-def copy for CI conformance validation (INF-42 / INF-45). The
-# canonical source is the spec embedded in dev-sprint-workflow-spec.md.
-# Keep in sync with that spec when a full YAML is authored in the vault.
+# One of the four shaping arms fanned out by dev-sprint at spawn-arms. Every arm
+# is a uniform doing → review → done shape whose `done` terminal carries
+# satisfies_parent_barrier: true, so the parent managing-arms barrier
+# auto-advances only when all four arms terminate cleanly (AI-1992 engine).
 #
-# INF-45 (2026-07-16): added to registered-defs as child_workflow target
-# for dev-sprint's spawn-arms fanout.
+# Originally registered as v0 stubs (INF-45, 2026-07-16). Updated to v1
+# (INF-111, 2026-07-19) to match the live workflow defs in linear-connector/workflows/.
+# The v0 defs had entry_state: intake which created a def-skew bug: the fanout
+# mint path created children at "state:intake" while the live proxy validated
+# against the v1 entering state "doing", causing the proxy to auto-migrate
+# all children to escape (terminal stranded).
 #
-# Archetype: linear — simple doing → review → done, no fanout or barrier.
-# Owner: backend planner (Igor), review/complete authority: cra.
-# Content: approach, infra readiness checklist, dependency tickets, spike recommendation.
+# Archetype: single-task — doing → review → done, no fanout or barrier.
+# Authority: code-review (cra) owns review gate.
 
 id: sprint-arm-scope
-version: 0
-archetype: linear
-entry_state: intake
+version: 1
+archetype: single-task
+entry_state: doing
 
 break_glass:
   command: escape
@@ -26,41 +30,35 @@ break_glass:
 
 states:
 
-  - id: intake
-    owner_role: steward
-    kind: normal
-    native_state: todo
-    description: >
-      Receive arm brief from dev-sprint. Confirm scope is well-defined.
-    transitions:
-      - command: begin
-        to: planning
-        generic: continue
-
-  - id: planning
-    owner_role: implementer
+  - id: doing
+    owner_role: sprint-owner
     kind: normal
     native_state: doing
-    description: >
-      Approach, infra readiness checklist, dependency tickets, spike recommendation.
     transitions:
       - command: submit
         to: review
+        assign: { mode: auto }
         generic: continue
 
   - id: review
-    owner_role: reviewer
+    owner_role: code-review
     kind: normal
-    native_state: thinking
-    description: >
-      Substantive pushback required; enumerated approval or revision request.
+    native_state: todo
     transitions:
       - command: approve
         to: done
         generic: continue
       - command: request-changes
-        to: planning
+        to: doing
+        assign: { mode: auto }
         generic: revision
+        feedback:
+          required: true
+          category_enum:
+            - incomplete
+            - off-brief
+            - scope-creep
+            - correctness
 
   - id: done
     kind: terminal
