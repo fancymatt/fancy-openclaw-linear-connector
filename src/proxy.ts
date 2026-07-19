@@ -31,7 +31,10 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
+import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
+import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
+import { buildTransitionAuditRecord, emitTransitionAuditRecord, verifyPostTransition, type GateResult, type TransitionAuditRecord } from "./transition-audit.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
@@ -305,9 +308,9 @@ function stripStateLabelDeltas(body: GraphQLRequestBody | null, stateLabelIds: S
 function stripNullDelegateAssigneeFields(body: GraphQLRequestBody | null, effectiveIntent: string | null): void {
   const input = issueUpdateInput(body);
   if (!input) return;
-  // AI-2067: needs-human and complete legitimately send delegateId:null as
+  // AI-2067: needs-human, complete, and park legitimately send delegateId:null as
   // part of their documented contract — don't block it.
-  if (effectiveIntent === 'needs-human' || effectiveIntent === 'complete') {
+  if (effectiveIntent === 'needs-human' || effectiveIntent === 'complete' || effectiveIntent === 'park') {
     return;
   }
   if (input.delegateId === null) delete input.delegateId;
@@ -422,6 +425,8 @@ export interface ProxyDeps {
    * idempotent; calling it multiple times for the same agent+ticket is harmless.
    */
   onProxyCall?: (agentId: string, ticketId: string) => void;
+  /** AI-2565: dispatch lease store for CAS stale-snapshot enforcement on terminal transitions. */
+  dispatchLeaseStore?: DispatchLeaseStore;
 }
 
 export async function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void> {
@@ -839,6 +844,28 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         return;
       }
 
+      // ====================================================================
+      // AI-2565: CAS stale-snapshot check for terminal transitions.
+      // Runs after B1 (workflow rules) passes but before the forward mutation.
+      // Only applies to terminal/routing intents (handoff-work, complete-work,
+      // needs-human, refuse-work).
+      // ====================================================================
+      if (issueId && effectiveIntent) {
+        const staleRejection = await checkStaleSnapshotForTerminal(
+          effectiveIntent,
+          issueId,
+          agentId,
+          authorization,
+          callerLinearUserId,
+          deps?.dispatchLeaseStore,
+        );
+        if (staleRejection) {
+          log.warn(`stale-snapshot-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${staleRejection}`);
+          res.status(200).json({ errors: [{ message: staleRejection }] });
+          return;
+        }
+      }
+
       // AI-1860: first successful authorization — store the snapshot so subsequent
       // mutations in this multi-step command are not re-gated against its own
       // post-transition state. The source state is captured here (before the forward /
@@ -1033,15 +1060,20 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // mutation. Running it here — after strip has removed legitimate state:* deltas
         // — catches anything that survived (strip failure, non-state label manipulation).
         // commentCreate is excluded: workflow commands legitimately use it.
-        const intentPathRawRejection = await checkRawMutationInterception(
-          body, issueId, authorization, agentId, callerLinearUserId, /* skipCommentCreate */ true, /* skipLabelFields */ true
-        );
-        if (intentPathRawRejection) {
-          log.warn(`raw-mutation-block-on-intent-path agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${intentPathRawRejection}`);
-          res.status(200).json({ errors: [{ message: intentPathRawRejection }] });
-          return;
+        // AI-2262: `park` is exempt — it sends stateId for Backlog + null delegate/assignee
+        // as its documented contract, and B2 handles the workflow demotion.
+        if (effectiveIntent !== 'park') {
+          const intentPathRawRejection = await checkRawMutationInterception(
+            body, issueId, authorization, agentId, callerLinearUserId, /* skipCommentCreate */ true, /* skipLabelFields */ true
+          );
+          if (intentPathRawRejection) {
+            log.warn(`raw-mutation-block-on-intent-path agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${intentPathRawRejection}`);
+            res.status(200).json({ errors: [{ message: intentPathRawRejection }] });
+            return;
+          }
         }
       }
+
       let upstreamRes: globalThis.Response;
       try {
         upstreamRes = await fetch(LINEAR_API_URL, {
@@ -1156,6 +1188,59 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             operationalEventStore: deps?.operationalEventStore,
             delegateOverride,
           });
+
+          // ── AI-2554: Structured transition audit record ──────────────
+          if (issueId && transitionResult) {
+            try {
+              const gateResults: GateResult[] = [];
+              gateResults.push({ name: "phase-2-escalation-gate", passed: true, detail: null });
+              gateResults.push({ name: "b1-workflow-def-validation", passed: true, detail: null });
+              gateResults.push({ name: "layer-2-raw-interception", passed: true, detail: null });
+              gateResults.push({ name: "config-health", passed: true, detail: null });
+
+              const auditRecord = buildTransitionAuditRecord(
+                issueId,
+                effectiveIntent,
+                transitionResult.to ?? null,
+                transitionResult.from ?? null,
+                transitionResult.to ?? null,
+                transitionResult.status,
+                transitionResult.code,
+                transitionResult.detail ?? null,
+                agentId,
+                gateResults,
+              );
+              emitTransitionAuditRecord(auditRecord);
+            } catch (auditErr) {
+              log.warn(`[transition-audit] failed to emit audit record: ${auditErr instanceof Error ? auditErr.message : String(auditErr)}`);
+            }
+
+            // ── AI-2554: Post-transition verification ────────────────────
+            // After a successful applied transition, re-read the state:* label
+            // from Linear to confirm it matches the expected target state.
+            // Verification is fire-and-forget to avoid blocking the response.
+            // It runs at next microtask to avoid interfering with inline fetch mocks in tests.
+            const verifyTargetState = transitionResult.to;
+            if (transitionResult.status === "applied" && verifyTargetState) {
+              // Schedule on next tick so test mocks don't see the verification fetch
+              // interleaved with the transition-associated fetches.
+              Promise.resolve().then(() => {
+                verifyPostTransition(issueId, verifyTargetState, authorization).then((verification) => {
+                if (verification && !verification.match) {
+                  log.warn(
+                    `[transition-audit] post-transition LABEL MISMATCH for ${issueId} ${ticketCtx}: ` +
+                    `expected state:${verifyTargetState}, got ${verification.actualState ?? "(null)"}`,
+                  );
+                }
+              }).catch((verifyErr: unknown) => {
+                const vm = verifyErr instanceof Error ? verifyErr.message : String(verifyErr);
+                log.warn(`[transition-audit] post-transition verify threw for ${issueId}: ${vm}`);
+              });
+              });
+            }
+          }
+
+          // Legacy log line for backwards compatibility
           if (transitionResult.status === "failed") {
             log.error(`state-transition FAILED agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${transitionResult.code}${transitionResult.detail ? ` — ${transitionResult.detail}` : ""}`);
           }

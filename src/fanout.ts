@@ -109,9 +109,30 @@ export interface ExistingChild {
   childWorkflow?: string;
 }
 
+/**
+ * INF-37: The outcome of a spawn_if predicate evaluation.
+ *
+ * `waived` and `failed` both mean "no children spawned" but are NOT
+ * interchangeable: `waived` is an answer, `failed` is the absence of one.
+ * A barrier may vacuously satisfy on `waived`; it must never do so on `failed`.
+ */
+export type SpawnIfOutcome =
+  /** The predicate evaluated true on a successful read — spawn. */
+  | "fire"
+  /** The predicate evaluated false on a successful read — legitimately skip. */
+  | "waived"
+  /** The predicate could not be evaluated (read/transport/GraphQL error). */
+  | "failed";
+
 /** AI-2523: Result of a spawn_if predicate evaluation. */
 export interface SpawnIfResult {
-  /** Whether the predicate passed — children should be spawned. */
+  /**
+   * INF-37: the discriminant. `waived` vs `failed` is a load-bearing
+   * distinction — see SpawnIfOutcome. Prefer this over `reason`, which is
+   * human-readable prose and not a contract.
+   */
+  outcome: SpawnIfOutcome;
+  /** Whether the predicate passed — children should be spawned. Equivalent to `outcome === "fire"`. */
   shouldSpawn: boolean;
   /** Human-readable explanation of the evaluation outcome. */
   reason: string;
@@ -578,6 +599,12 @@ interface ParentChildrenResponse {
  *
  * On query failure, an error is returned (fail-closed: no spawn), and the
  * caller (executeFanout) is expected to post a failure comment.
+ *
+ * INF-37: every failure path yields `outcome: "failed"` — distinct from
+ * `"waived"`, which requires a *successful* read whose predicate was false.
+ * Callers must branch on `outcome`, never on `reason`: "no children spawned"
+ * is the same observable for both, so a caller that cannot tell them apart
+ * will let a transient API error satisfy a barrier that never ran.
  */
 export async function evaluateSpawnIf(
   parentInternalId: string,
@@ -591,18 +618,44 @@ export async function evaluateSpawnIf(
       body: JSON.stringify({ query: PARENT_CHILDREN_QUERY, variables: { id: parentInternalId } }),
     });
 
+    // INF-37: a non-2xx is an unreadable response, not an empty child set. A
+    // body that happens to parse (or a 5xx HTML error page that doesn't) must
+    // never reach the `?? []` waive path below.
+    if (!res.ok) {
+      return {
+        outcome: "failed",
+        shouldSpawn: false,
+        reason: `spawn_if evaluation failed: children query returned HTTP ${res.status}`,
+        matchedChildren: [],
+      };
+    }
+
     const data = (await res.json()) as ParentChildrenResponse;
 
     if (data.errors?.length) {
       const errorMsg = data.errors.map((e) => e.message).join("; ");
       return {
+        outcome: "failed",
         shouldSpawn: false,
         reason: `spawn_if evaluation failed: GraphQL error — ${errorMsg}`,
         matchedChildren: [],
       };
     }
 
-    const children = data.data?.issue?.children?.nodes ?? [];
+    // INF-37: Linear returns 200 + `issue: null` for an unreadable/absent
+    // parent. `?? []` used to launder that into "no children" → waive. A
+    // missing issue means the predicate has no input, which is a failure.
+    const issueNode = data.data?.issue;
+    if (!issueNode?.children) {
+      return {
+        outcome: "failed",
+        shouldSpawn: false,
+        reason: `spawn_if evaluation failed: children query returned no issue/children payload for the parent`,
+        matchedChildren: [],
+      };
+    }
+
+    const children = issueNode.children.nodes ?? [];
     const targetLabel = spawnIf.label_present;
 
     // Filter to closed children (native state type === "completed")
@@ -615,15 +668,18 @@ export async function evaluateSpawnIf(
 
     if (matchedChildren.length > 0) {
       return {
+        outcome: "fire",
         shouldSpawn: true,
         reason: `spawn_if predicate matched: ${matchedChildren.length} closed child(ren) carry the '${targetLabel}' label (${matchedChildren.join(", ")})`,
         matchedChildren,
       };
     }
 
-    // No match found — determine the right diagnostic
+    // No match found — determine the right diagnostic. Every branch below is a
+    // genuine `waived`: the children query succeeded and the predicate is false.
     if (children.length === 0) {
       return {
+        outcome: "waived",
         shouldSpawn: false,
         reason: `spawn_if predicate waived: parent has no children — no '${targetLabel}' label found anywhere`,
         matchedChildren: [],
@@ -634,6 +690,7 @@ export async function evaluateSpawnIf(
     if (closedCount === 0) {
       const openChildren = children.map((c) => c.identifier).join(", ");
       return {
+        outcome: "waived",
         shouldSpawn: false,
         reason: `spawn_if predicate waived: no closed children yet (${children.length} open child(ren) — ${openChildren}) — none carry '${targetLabel}'`,
         matchedChildren: [],
@@ -641,6 +698,7 @@ export async function evaluateSpawnIf(
     }
 
     return {
+      outcome: "waived",
       shouldSpawn: false,
       reason: `spawn_if predicate waived: ${closedCount} closed child(ren) checked, none carry the '${targetLabel}' label`,
       matchedChildren: [],
@@ -648,6 +706,7 @@ export async function evaluateSpawnIf(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return {
+      outcome: "failed",
       shouldSpawn: false,
       reason: `spawn_if evaluation failed: query error — ${msg}`,
       matchedChildren: [],
@@ -708,7 +767,10 @@ async function postSpawnIfErrorComment(
     `The spawn_if predicate could not be evaluated because the children query failed.`,
     `**Error:** ${errorMessage}`,
     ``,  // blank line
-    `The parent ticket transition was refused — no children were spawned. The steward should investigate and retry.`,
+    // INF-37: this used to claim "the parent ticket transition was refused",
+    // which was never true — the transition is applied before fan-out runs, and
+    // the barrier then advanced the parent anyway. Describe what actually happens.
+    `**No children were spawned.** Because the predicate could not be evaluated, the zero-child result is unverified — it is NOT treated as a waive, and the parent's barrier will not auto-advance on it. The parent is holding at this state pending a steward retry.`,
   ].join("\n");
 
   const mutation = `
@@ -1030,7 +1092,10 @@ export async function executeFanout(
     result.spawnIfResult = siResult;
 
     if (!siResult.shouldSpawn) {
-      const isError = siResult.reason.startsWith("spawn_if evaluation failed");
+      // INF-37: keyed on the `outcome` discriminant. This used to prefix-match
+      // the human-readable `reason` string — a silent trap, since reworded prose
+      // would reclassify a failure as a waive.
+      const isError = siResult.outcome === "failed";
 
       if (isError) {
         result.errors.push({

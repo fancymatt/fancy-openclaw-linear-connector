@@ -49,13 +49,24 @@ export function extractAgentTarget(event: LinearEvent): AgentTargetResult {
   const isActorOurAgent = actorId ? !!agentMap[actorId] : false;
 
   // True when this Issue update event represents a genuine workflow state
-  // transition — i.e. the Linear native state (stateId) changed. Used by both
-  // the AI-1573 no-change-delegate guard and the self-trigger filter below to
+  // transition — i.e. the Linear native state (stateId) changed, OR the
+  // state:* labels changed (same-column workflow advance). Used by both the
+  // AI-1573 no-change-delegate guard and the self-trigger filter below to
   // allow re-dispatch when an agent advances its own ticket to a new step.
   const isStateTransition = ((): boolean => {
     if (event.type !== "Issue" || event.action !== "update") return false;
     const upd = (event as { updatedFrom?: Record<string, unknown> }).updatedFrom;
-    return upd !== undefined && "stateId" in upd;
+    if (upd === undefined) return false;
+    // Native stateId change — always a state transition (cross-column advance).
+    if ("stateId" in upd) return true;
+    // Same-column workflow advance: state:* labels changed by one of our
+    // agents (proxy). The workflow engine advances the state:* label without
+    // changing the native Linear column. Without this, the dispatch is
+    // suppressed and the next workflow owner is never woken (GEN-198 class).
+    // Label edits by human users (isActorOurAgent=false) are NOT workflow
+    // advances and must remain suppressed.
+    if ("labelIds" in upd && isActorOurAgent) return true;
+    return false;
   })();
 
   // For AgentSessionEvent, route to the agent that owns the session — the

@@ -27,6 +27,9 @@ export interface LabelNode {
   isGroup?: boolean;
   /** AI-2176: the parent group of this label, when it is a group child. */
   parent?: { id: string; name: string } | null;
+  /** AI-2557: the team that owns this label. Undefined when the query doesn't select it.
+   *  Used to reject inherited parent-team label IDs that Linear rejects on atomic write. */
+  team?: { id: string };
 }
 
 export interface IssueWithLabels {
@@ -46,7 +49,7 @@ async function lookupTeamLabels(
   const lookupQuery = `
     query TeamLabels($teamId: String!) {
       team(id: $teamId) {
-        labels(first: 250) { nodes { id name isGroup parent { id name } } }
+        labels(first: 250) { nodes { id name isGroup team { id } parent { id name } } }
       }
     }
   `;
@@ -68,16 +71,25 @@ async function lookupTeamLabels(
   }
 }
 
-function findLabelInNodes(nodes: LabelNode[], labelName: string): string | null {
+function findLabelInNodes(
+  nodes: LabelNode[],
+  labelName: string,
+  teamId: string,
+): string | null {
   const colonIdx = labelName.indexOf(":");
   const groupName = colonIdx > 0 ? labelName.slice(0, colonIdx) : null;
   const childName = colonIdx > 0 ? labelName.slice(colonIdx + 1) : labelName;
 
-  const flat = nodes.find((n) => n.name === labelName && !n.isGroup);
+  // AI-2557: only return a label ID if it is owned by the requesting team.
+  // Inherited parent-team labels pass the name check but Linear rejects their ID
+  // on atomic issueUpdate(labelIds:). A non-matching team falls through to create
+  // → inherited conflict → replaceTeamLabels promotion (AI-2543).
+  // Labels without a `team` field (compatibility/default) always match.
+  const flat = nodes.find((n) => n.name === labelName && !n.isGroup && (n.team == null || n.team.id === teamId));
   if (flat) return flat.id;
   if (groupName) {
     const child = nodes.find(
-      (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName,
+      (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName && (n.team == null || n.team.id === teamId),
     );
     if (child) return child.id;
   }
@@ -97,7 +109,7 @@ export async function findLabel(
   // INF-27 AC2: lookup-only twin of findOrCreateLabel for guarded wf:* labels.
   const lookup = await lookupTeamLabels(teamId, labelName, authToken);
   if (lookup.error) return null;
-  return findLabelInNodes(lookup.nodes, labelName);
+  return findLabelInNodes(lookup.nodes, labelName, teamId);
 }
 
 /**
@@ -124,7 +136,7 @@ export async function findOrCreateLabel(
     return null;
   }
   const nodes = lookup.nodes;
-  const existing = findLabelInNodes(nodes, labelName);
+  const existing = findLabelInNodes(nodes, labelName, teamId);
   if (existing) return existing;
 
   // Create — as a group child when the namespace is group-owned, else flat.
@@ -194,27 +206,23 @@ export async function findOrCreateLabel(
         typeof e.message === "string" && e.message.includes("conflicting inherited label"),
       );
     if (isInheritedConflict) {
-      log.info(`inherited-label promotion for '${labelName}' on team ${teamId}`);
-      const promoteMutation = group
-        ? `
-        mutation PromoteLabel($teamId: String!, $name: String!, $color: String!, $parentId: String!, $replaceTeamLabels: Boolean!) {
-          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, parentId: $parentId, replaceTeamLabels: $replaceTeamLabels }) {
-            success
-            issueLabel { id }
-          }
-        }
-      `
-        : `
-        mutation PromoteLabel($teamId: String!, $name: String!, $color: String!, $replaceTeamLabels: Boolean!) {
-          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, replaceTeamLabels: $replaceTeamLabels }) {
+      // AI-2543 + AGI-12: Linear's IssueLabelCreateInput does NOT accept
+      // `replaceTeamLabels` — it was removed from the schema. A plain retry
+      // with `teamId` just repeats the same rejected create. Instead, omit
+      // `teamId` to create a WORKSPACE-LEVEL label (visible to all teams),
+      // which cannot have inheritance conflicts and is accepted by every
+      // team's issueUpdate. For workflow state labels (state:*) this is also
+      // semantically correct — they are universal, not team-specific.
+      log.info(`inherited-label promotion for '${labelName}' — retrying as workspace-level label`);
+      const promoteMutation = `
+        mutation PromoteLabel($name: String!, $color: String!) {
+          issueLabelCreate(input: { name: $name, color: $color }) {
             success
             issueLabel { id }
           }
         }
       `;
-      const promoteVars = group
-        ? { teamId, name: createName, color: "#94a3b8", parentId: group.id, replaceTeamLabels: true }
-        : { teamId, name: createName, color: "#94a3b8", replaceTeamLabels: true };
+      const promoteVars = { name: createName, color: "#94a3b8" };
       try {
         const promoteRes = await fetch(LINEAR_API_URL, {
           method: "POST",
@@ -224,7 +232,7 @@ export async function findOrCreateLabel(
         const promoteData = (await promoteRes.json()) as CreateResp;
         const promoteResult = promoteData.data?.issueLabelCreate;
         if (promoteResult?.success && promoteResult.issueLabel) {
-          log.info(`promoted inherited label '${labelName}' to team ${teamId} as id=${promoteResult.issueLabel.id}`);
+          log.info(`promoted inherited label '${labelName}' as workspace-level id=${promoteResult.issueLabel.id}`);
           return promoteResult.issueLabel.id;
         }
         const errBody = promoteData.errors ? JSON.stringify(promoteData.errors) : "none";
@@ -342,6 +350,64 @@ export async function issueUpdateLabels(
  * Fetch an issue's internal ID, team ID, and labels with their IDs.
  *
  * Returns null if the issue is not found or the API call fails.
+ */
+export async function fetchLastCommentByUser(
+  identifier: string,
+  linearUserId: string,
+  authToken: string,
+): Promise<{ body: string; createdAt: string } | null> {
+  const query = `
+    query LastCommentByUser($id: String!) {
+      issue(id: $id) {
+        comments(first: 50, orderBy: createdAt) {
+          nodes {
+            body
+            createdAt
+            user {
+              id
+            }
+          }
+        }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: identifier } }),
+    });
+    type Resp = {
+      data?: {
+        issue?: {
+          comments: {
+            nodes: Array<{ body: string; createdAt: string; user: { id: string } | null }>;
+          };
+        } | null;
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const comments = data.data?.issue?.comments?.nodes ?? [];
+    // Scan newest-to-oldest for the first comment by the specified user
+    // (comments are returned in ascending order by default even with first:50,
+    // so iterate in reverse for newest-first by the target user).
+    for (let i = comments.length - 1; i >= 0; i--) {
+      const node = comments[i];
+      if (node.user?.id === linearUserId && node.body?.trim()) {
+        return { body: node.body, createdAt: node.createdAt };
+      }
+    }
+    return null;
+  } catch (err) {
+    log.warn(`fetchLastCommentByUser failed for ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/**
+ * Fetch issue labels and team id for label manipulation.
+ *
+ * Returns { internalId, teamId, labels } on success, null on any error.
  */
 export async function fetchIssueWithLabels(
   identifier: string,

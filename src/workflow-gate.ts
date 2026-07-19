@@ -47,6 +47,7 @@ import { getAgent, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout, validateFanoutSpec, type Finding } from "./fanout.js";
 import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
+import { fetchLastCommentByUser } from "./linear-helpers.js";
 import { bindArtifact, getBoundArtifact, removeArtifact } from "./artifact-store.js";
 import { recordSuccess, recordFailure, isHealthy as isConfigHealthy } from "./config-health.js";
 import { captureAc, extractAcFromDescription, removeAcRecord } from "./ac-record-store.js";
@@ -1011,6 +1012,9 @@ interface LabelNode {
   isGroup?: boolean;
   /** AI-2176: the parent group of this label, when it is a group child. */
   parent?: { id: string; name: string } | null;
+  /** AI-2557: the team that owns this label. Undefined when the query doesn't select it.
+   *  Used to reject inherited parent-team label IDs that Linear rejects on atomic write. */
+  team?: { id: string };
 }
 
 interface TicketContext {
@@ -1199,7 +1203,7 @@ async function findOrCreateLabel(
   const lookupQuery = `
     query TeamLabels($teamId: String!) {
       team(id: $teamId) {
-        labels(first: 250) { nodes { id name isGroup parent { id name } } }
+        labels(first: 250) { nodes { id name isGroup team { id } parent { id name } } }
       }
     }
   `;
@@ -1217,12 +1221,17 @@ async function findOrCreateLabel(
     }
     nodes = lookupData.data?.team?.labels?.nodes ?? [];
     // (a) Flat exact match — GEN and the flat state:* labels LIF already carries.
-    const flat = nodes.find((n) => n.name === labelName && !n.isGroup);
+    // AI-2557: only return the label ID if it is owned by the requesting team.
+    // Inherited parent-team labels pass the name check but Linear rejects their ID
+    // on atomic issueUpdate(labelIds:). A non-matching team falls through to create
+    // → inherited conflict → replaceTeamLabels promotion (AI-2543).
+    // Labels without a `team` field (compatibility/default) always match.
+    const flat = nodes.find((n) => n.name === labelName && !n.isGroup && (n.team == null || n.team.id === teamId));
     if (flat) return flat.id;
     // (b) Group-child match — the label is modeled as a child of a `groupName` group.
     if (groupName) {
       const child = nodes.find(
-        (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName,
+        (n) => !n.isGroup && n.parent?.name === groupName && n.name === childName && (n.team == null || n.team.id === teamId),
       );
       if (child) return child.id;
     }
@@ -1294,27 +1303,23 @@ async function findOrCreateLabel(
         typeof e.message === "string" && e.message.includes("conflicting inherited label"),
       );
     if (isInheritedConflict) {
-      log.info(`workflow-gate: attempting inherited-label promotion for '${labelName}' on team ${teamId}`);
-      const promoteMutation = group
-        ? `
-        mutation PromoteLabel($teamId: String!, $name: String!, $color: String!, $parentId: String!, $replaceTeamLabels: Boolean!) {
-          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, parentId: $parentId, replaceTeamLabels: $replaceTeamLabels }) {
-            success
-            issueLabel { id }
-          }
-        }
-      `
-        : `
-        mutation PromoteLabel($teamId: String!, $name: String!, $color: String!, $replaceTeamLabels: Boolean!) {
-          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color, replaceTeamLabels: $replaceTeamLabels }) {
+      // AI-2543 + AGI-12: Linear's IssueLabelCreateInput does NOT accept
+      // `replaceTeamLabels` — it was removed from the schema. A plain retry
+      // with `teamId` just repeats the same rejected create. Instead, omit
+      // `teamId` to create a WORKSPACE-LEVEL label (visible to all teams),
+      // which cannot have inheritance conflicts and is accepted by every
+      // team's issueUpdate. For workflow state labels (state:*) this is also
+      // semantically correct — they are universal, not team-specific.
+      log.info(`workflow-gate: attempting inherited-label promotion for '${labelName}' — retrying as workspace-level label`);
+      const promoteMutation = `
+        mutation PromoteLabel($name: String!, $color: String!) {
+          issueLabelCreate(input: { name: $name, color: $color }) {
             success
             issueLabel { id }
           }
         }
       `;
-      const promoteVars = group
-        ? { teamId, name: createName, color: "#94a3b8", parentId: group.id, replaceTeamLabels: true }
-        : { teamId, name: createName, color: "#94a3b8", replaceTeamLabels: true };
+      const promoteVars = { name: createName, color: "#94a3b8" };
       try {
         const promoteRes = await fetch(LINEAR_API_URL, {
           method: "POST",
@@ -1324,7 +1329,7 @@ async function findOrCreateLabel(
         const promoteData = (await promoteRes.json()) as CreateResp;
         const promoteResult = promoteData.data?.issueLabelCreate;
         if (promoteResult?.success && promoteResult.issueLabel) {
-          log.info(`workflow-gate: promoted inherited label '${labelName}' to team ${teamId} as id=${promoteResult.issueLabel.id}`);
+          log.info(`workflow-gate: promoted inherited label '${labelName}' as workspace-level id=${promoteResult.issueLabel.id}`);
           return promoteResult.issueLabel.id;
         }
         const errBody = promoteData.errors ? JSON.stringify(promoteData.errors) : "none";
@@ -1601,6 +1606,10 @@ interface BranchAndPRStatus {
   hasPR: boolean;
   /** True when the issue has at least one merged pull request. */
   hasMergedPR: boolean;
+  /** Merge commit SHA from GitHub, if available (AI-2361 deploy health gate). */
+  mergeSha?: string | null;
+  /** GitHub repo URL (e.g. "fancyfleet/fancy-openclaw-linear-connector"), if available. */
+  repoUrl?: string | null;
 }
 
 /**
@@ -1683,15 +1692,73 @@ async function fetchBranchAndPRStatus(
       const status = (meta as { status?: unknown; state?: unknown }).status ?? (meta as { state?: unknown }).state;
       return typeof status === "string" && status.toLowerCase() === "merged";
     });
+    // Extract merge SHA and repo URL from the first merged PR (AI-2361 deploy health gate).
+    let mergeSha: string | null = null;
+    let repoUrl: string | null = null;
+    for (const pr of prNodes) {
+      const meta = pr.metadata ?? {};
+      const sha = (meta as { mergeCommitSha?: unknown; mergeSha?: unknown }).mergeCommitSha ?? (meta as { mergeSha?: unknown }).mergeSha;
+      if (typeof sha === "string" && sha.length > 0) {
+        mergeSha = sha;
+      }
+      if (typeof pr.url === "string") {
+        const m = pr.url.match(/github\.com\/([^/]+\/[^/]+)\/pull/);
+        if (m) repoUrl = m[1];
+      }
+      // Use the first merged PR with available data
+      if (mergeSha || repoUrl) break;
+    }
     return {
       // Attachments cannot see branches directly; a PR implies a pushed branch.
       hasBranch: hasPR,
       hasPR,
       hasMergedPR,
+      mergeSha,
+      repoUrl,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: branch/PR fetch failed for ${issueId}: ${msg}`);
+    return null;
+  }
+}
+
+// ── Deploy health gate (AI-2361): verify running artifact contains merge SHA ──
+
+/**
+ * Check if a given repo URL matches the connector repo (which has a verifiable
+ * /health endpoint). Uses the CONNECTOR_REPO env var (defaults to the
+ * fancyfleet/fancy-openclaw-linear-connector identifier) to determine the
+ * connector repo identity.
+ */
+function isConnectorRepo(repoUrl: string | null | undefined): boolean {
+  if (!repoUrl) return false;
+  const connectorRepo = process.env.CONNECTOR_REPO ?? "fancyfleet/fancy-openclaw-linear-connector";
+  return repoUrl.toLowerCase() === connectorRepo.toLowerCase();
+}
+
+/**
+ * Fetch the running connector's /health commit hash.
+ * Uses the HEALTH_CHECK_URL env var, defaulting to http://localhost:3100/health.
+ * Returns null on any error (fail-open for non-connector scenarios).
+ */
+async function fetchHealthCommit(): Promise<string | null> {
+  const url = process.env.HEALTH_CHECK_URL ?? "http://localhost:3100/health";
+  try {
+    const res = await fetch(url, { method: "GET", signal: AbortSignal.timeout(5000) });
+    if (!res.ok) {
+      log.warn(`workflow-gate: /health check returned ${res.status} from ${url}`);
+      return null;
+    }
+    const body = (await res.json()) as { commit?: unknown };
+    if (typeof body.commit !== "string") {
+      log.warn(`workflow-gate: /health response missing 'commit' field from ${url}`);
+      return null;
+    }
+    return body.commit;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: /health fetch failed from ${url}: ${msg}`);
     return null;
   }
 }
@@ -2063,15 +2130,16 @@ export async function checkWorkflowRules(
   // (signaling they believe this is a workflow command), fail closed.
   // Break-glass override bypasses this check.
   if (fetchFailed && !breakGlassOverride) {
-    // Safety: begin-work and note pass through even on fetch failure because:
+    // Safety: begin-work, note, complete, and cancel pass through even on fetch failure because:
     //   - begin-work on an ad-hoc ticket is harmless (labels are empty → getWorkflowId
     //     returns null → pass-through below), and it's the only way to add a wf:*
     //     label to start workflowing a ticket.
     //   - note is informational-only and never mutates state, so allowing it through
     //     is safe even if we can't verify workflow membership.
+    //   - complete and cancel on an ad-hoc ticket close it without workflow validation.
     // All other intents are rejected because they would mutate workflow state without
     //     being able to validate the move.
-    const looksLikeWorkflowCommand = intent !== "begin-work" && intent !== "note";
+    const looksLikeWorkflowCommand = intent !== "begin-work" && intent !== "note" && intent !== "complete" && intent !== "cancel";
     if (looksLikeWorkflowCommand) {
       log.error(`workflow-gate: FAIL-CLOSED — context fetch failed for ${issueId}, cannot determine if workflow ticket — rejecting '${intent}'`);
       return (
@@ -2116,14 +2184,17 @@ export async function checkWorkflowRules(
       "rewind",
       "handoff-work",
       "set-state",
+      "complete",
+      "cancel",
     ];
     if (!safeOnUnarmed.includes(intent)) {
       log.warn(`workflow-gate: rejecting '${intent}' on unarmed ticket ${issueId} — no \`wf:*\` label`);
       return (
         `[Proxy] '${intent}' is only valid on workflow tickets ` +
         `(ticket ${issueId} has no \`wf:*\` label). ` +
-        `Use \`linear begin-work ${issueId}\` to enroll the ticket in a workflow, ` +
-        `or \`linear observe-issue ${issueId}\` for read-only inspection.`
+        `Use \`linear complete ${issueId}\` to close this ad-hoc ticket, ` +
+        `\`linear cancel ${issueId}\` to cancel it, ` +
+        `or \`linear begin-work ${issueId}\` to enroll it in a workflow.`
       );
     }
     return null;
@@ -2533,10 +2604,12 @@ export async function checkWorkflowRules(
   // block when partial evidence exists (has branch but no PR = pushed but never
   // reviewed). Also fail-open on null (transient API failure) after one retry.
   //
-  // NOTE(AI-2476): The AI-1795 no-CI-auto-deploy guard (below) keys on
-  // `intent === "deploy"` and is also dead. It needs independent redesign
-  // (separate ticket) — its premise of a choice between two forward exits no
-  // longer exists in v14.
+  // NOTE(INF-62): The AI-1795 no-CI-auto-deploy guard (below) was re-armed.
+  // The old `intent === "deploy"` check was replaced with a destination-state
+  // check: the guard fires when a transition from a non-deploy state goes
+  // directly to ac-validate on a flagged repo. The guard's premise (blocking
+  // merge→ac-validate skip on no-CI-auto-deploy repos) is now enforced on
+  // the resolved transition's destination, not the caller's verb.
   if ((currentState === 'merge' || currentState === 'deploy') && intent === 'continue') {
     let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     // AI-1497: retry once on null — transient Linear API failure during
@@ -2583,32 +2656,88 @@ export async function checkWorkflowRules(
     }
   }
 
-  // AI-1795: no-CI-auto-deploy guard. On repos flagged `ci_auto_deploy: false`
-  // in the instance deploy policy, `deploy` (merge → ac-validate directly) is
-  // rejected: merge alone leaves the running service on the old build, and
-  // ac-validate would verify a stale artifact (recurred twice on AI-1775).
-  // The legal exit for such repos is `handoff-host-deploy` → host-deploy,
-  // which is never blocked here. Repo resolution: `repo:*` labels + GitHub
-  // attachments; unresolvable or unflagged repos pass (guard is opt-in per
-  // repo). Break-glass is exempt (steward recovery path, identity-gated).
-  if (intent === "deploy" && !breakGlassOverride) {
+  // ── AI-2361: Deploy health gate ───────────────────────────────────────
+  // When a ticket transitions forward from a deploy state on a connector repo
+  // ticket, verify the running connector's /health commit includes the merge SHA.
+  // This prevents stale-artifact tickets from reaching ac-validate (see AI-2357).
+  // Non-connector repos, missing merge SHA, and non-forward transitions (reject)
+  // are all pass-through.
+  if ((currentState?.includes('deploy') ?? false) && intent !== 'reject') {
+    const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+    if (branchStatus) {
+      const repo = branchStatus.repoUrl;
+      const mergeSha = branchStatus.mergeSha;
+      if (!mergeSha) {
+        log.info(`workflow-gate: deploy health gate: ${issueId} — no merge SHA available (passing through)`);
+      } else if (!isConnectorRepo(repo)) {
+        log.info(`workflow-gate: deploy health gate: ${issueId} — non-connector repo '${repo}' (passing through)`);
+      } else {
+        const runningCommit = await fetchHealthCommit();
+        if (runningCommit === null) {
+          log.warn(`workflow-gate: deploy health gate: ${issueId} — /health unreachable, blocking deploy`);
+          notify({
+            severity: "warning",
+            source: "deploy-health-gate",
+            title: "Deploy health gate: /health unreachable",
+            detail: `Ticket ${issueId} on connector repo: /health returned no commit — blocking deploy to prevent stale-artifact validation.`,
+            ticket: issueId,
+            dedupKey: `deploy-health|${issueId}`,
+          });
+          return `[Proxy] '${intent}' blocked: the running connector's /health endpoint is unreachable. ` +
+            `Cannot verify the running artifact contains merge SHA ${mergeSha}. Ensure the connector is running and try again.`;
+        }
+        if (!runningCommit.startsWith(mergeSha) && !runningCommit.includes(mergeSha)) {
+          log.warn(`workflow-gate: deploy health gate: ${issueId} — stale artifact (running=${runningCommit}, merge=${mergeSha})`);
+          notify({
+            severity: "warning",
+            source: "deploy-health-gate",
+            title: `Deploy health gate: stale artifact (running=${runningCommit.slice(0,7)}, merge=${mergeSha.slice(0,7)})`,
+            detail: `Ticket ${issueId}: running commit '${runningCommit}' does not contain merge SHA '${mergeSha}'. ` +
+              `The running connector artifact was not built from this merge and would verify a stale build through ac-validate. ` +
+              `Deploy the new artifact (host restart or redeploy) before continuing.`,
+            ticket: issueId,
+          });
+          return `[Proxy] '${intent}' blocked: stale connector artifact. ` +
+            `Running commit: ${runningCommit}, merge SHA: ${mergeSha}. ` +
+            `The running connector was not built from this merge. Deploy the new artifact (restart/redeploy) before continuing.`;
+        }
+        log.info(`workflow-gate: deploy health gate: ${issueId} passed (running ${runningCommit.slice(0,7)} matches merge ${mergeSha.slice(0,7)})`);
+      }
+    }
+  }
+
+  // AI-1795: no-CI-auto-deploy guard (re-armed for v10+ generic continue, INF-62).
+  // On repos flagged `ci_auto_deploy: false` in the instance deploy policy, a
+  // `continue` transition from merge (or any non-deploy state) that goes directly
+  // to ac-validate is rejected: merging alone leaves the running service on the
+  // old build, and ac-validate would verify a stale artifact without the deploy
+  // state ever being traversed (recurred twice on AI-1775, bypassed again on
+  // GEN-198 by dead guard, INF-62).
+  // The old guard keyed on `intent === "deploy"` — the v8 literal command that
+  // AI-1872 (v10) replaced with `generic: continue`. The guard now fires when
+  // the resolved transition's destination is `ac-validate` from a non-deploy
+  // state, detecting the deploy-skip regardless of the intent string.
+  // Repo resolution: `repo:*` labels + GitHub attachments; unresolvable or
+  // unflagged repos pass (guard is opt-in per repo). Break-glass is exempt.
+  if (!breakGlassOverride && (match.to === 'ac-validate' && currentState !== 'deploy' || intent === 'deploy')) {
     const repoRefs = await resolveTicketRepoRefs(labels, issueId, authToken);
     const flagged = reposWithoutCiAutoDeploy(repoRefs);
     if (flagged.length > 0) {
       const repoList = flagged.join("', '");
-      log.warn(`workflow-gate: AI-1795 no-CI-auto-deploy guard blocked 'deploy' on ${issueId} (repo '${repoList}', agent=${bodyId})`);
+      log.warn(`workflow-gate: AI-1795 no-CI-auto-deploy guard blocked '${intent}' on ${issueId} (repo '${repoList}', agent=${bodyId})`);
       notify({
         severity: "warning",
         source: "deploy-policy",
-        title: `no-CI-auto-deploy guard blocked 'deploy' (repo: ${flagged.join(", ")})`,
-        detail: `Ticket ${issueId}: 'deploy' would advance to ac-validate without the merged artifact running. Agent must use 'handoff-host-deploy' → host-deploy instead.`,
+        title: `no-CI-auto-deploy guard blocked (repo: ${flagged.join(", ")})`,
+        detail: `Ticket ${issueId}: '${intent}' would advance to ac-validate (from ${currentState}) without the merged artifact running through the deploy state. Route through host-deploy instead.`,
         agent: bodyId,
         ticket: issueId,
       });
-      const legalMoves = [...transitions.filter((t) => t.command !== "deploy").map((t) => cliVerbFor(t)), breakGlassCommand].join(", ");
+      const legalMoves = [...transitions.filter((t) => t.command !== intent).map((t) => cliVerbFor(t)), breakGlassCommand].join(", ");
       return (
-        `[Proxy] 'deploy' blocked: repo '${repoList}' has no CI auto-deploy — merging alone leaves the running service on the old build, ` +
-        `and AC validation would verify a stale artifact. Use 'handoff-host-deploy' to route through host-deploy instead. ` +
+        `[Proxy] '${intent}' blocked: repo '${repoList}' has no CI auto-deploy — merging alone leaves ` +
+        `the running service on the old build, and AC validation would verify a stale artifact. ` +
+        `Use 'handoff-host-deploy' to route through host-deploy instead. ` +
         `Legal moves: ${legalMoves}.`
       );
     }
@@ -2858,6 +2987,46 @@ export async function checkRawMutationInterception(
       if (isClearingDelegate) {
         log.warn(`workflow-gate: raw delegate null (self-clear) block agent=${bodyId} ticket=${issueId}`);
         return delegateClearRejection();
+      }
+      // AI-2020: verdict-comment gate for feedback-requiring states.
+      // When the current delegate attempts a handoff from a workflow state
+      // whose transitions require feedback, the mutation must be accompanied
+      // by a verdict comment from this caller. The skill CLI posts comments
+      // before the delegate mutation, so the comment already exists on the
+      // ticket. Fail-open on any fetch error.
+      if (def) {
+        const currentStateId = getCurrentState(labels);
+        if (currentStateId) {
+          const stateNode = def.states.find((s) => s.id === currentStateId);
+          const hasFeedbackTransition = stateNode?.transitions?.some(
+            (t) => t.feedback?.required === true,
+          );
+          if (hasFeedbackTransition && callerLinearUserId) {
+            let hasVerdictComment = true;
+            try {
+              const lastComment = await fetchLastCommentByUser(
+                issueId!,
+                callerLinearUserId,
+                authToken,
+              );
+              hasVerdictComment = lastComment !== null;
+            } catch {
+              // Fail-open: transient API failure
+            }
+            if (!hasVerdictComment) {
+              const breakCmd = def.break_glass?.command ?? "escape";
+              log.warn(
+                `workflow-gate: AI-2020 verdict gate — handoff from feedback-requiring state '${currentStateId}' ` +
+                `agent=${bodyId} ticket=${issueId} — no verdict comment found`,
+              );
+              return (
+                `[Proxy] Handoff blocked from state '${currentStateId}' which requires a review verdict. ` +
+                `Post a comment on the ticket explaining your review findings (use --comment on ` +
+                `\`linear handoff-work\`), or use \`linear ${breakCmd} ${issueId}\` to exit the workflow.`
+              );
+            }
+          }
+        }
       }
       return null; // current delegate may re-route (non-null target only)
     }
@@ -3173,6 +3342,22 @@ export interface TransitionFeedback {
   wakeId?: string | null;
 }
 
+/**
+ * INF-92: Payload for the onTransitionWake callback — emitted when a governed
+ * transition stamps a delegate on a work-eligible state so the dispatch layer
+ * can wake the newly-assigned agent.
+ */
+export interface TransitionWakeData {
+  /** Agent name that was stamped as delegate (e.g. "cra"). */
+  agentName: string;
+  /** Human-readable ticket identifier (e.g. "LIF-54"). */
+  ticketIdentifier: string;
+  /** Destination workflow state name (e.g. "code-review"). */
+  workflowState: string;
+  /** Source of this wake trigger — always "transition" for this path. */
+  source: "transition";
+}
+
 export interface ApplyStateTransitionOptions {
   /** Agent/body issuing the transition (the reviewer). */
   bodyId?: string;
@@ -3205,6 +3390,13 @@ export interface ApplyStateTransitionOptions {
   enrolledTicketsStore?: EnrolledTicketsStore;
   /** AI-1762: operational-event sink for transition-write-failed events. */
   operationalEventStore?: OperationalEventStore;
+
+  /**
+   * INF-92: Callback invoked when a transition stamps a delegate on a work-eligible
+   * (non-terminal) state, so the dispatch layer can wake the newly-assigned agent.
+   * The callback is called after the atomic write is confirmed applied.
+   */
+  onTransitionWake?: (data: TransitionWakeData) => void;
 
   /**
    * AI-1977: Pre-computed delegateId to use instead of resolving via role/prior-implementer.
@@ -3411,8 +3603,17 @@ export async function applyStateTransition(
   // AI-1813 fix: break-glass (escape) must be legal when no state:* label is
   // present — that's precisely the corruption escape exists to recover from.
   // The no-source-state guard below applies only to non-break-glass intents.
+  // AI-2262: `park` is not a workflow transition — it demotes the ticket out of
+  // the workflow (removes state:* and wf:* labels) and clears delegate + assignee.
+  // This mirrors the __ad_hoc__ demotion path below, which handles the actual
+  // label removal. The CLI's forwarded issueUpdate carries the native Backlog
+  // stateId, delegateId: null, and assigneeId: null — the proxy now exempts
+  // the nulls (stripNullDelegateAssigneeFields) so they reach Linear directly.
   if (intent === breakGlassCommand) {
     toStateName = def.break_glass?.to ?? "escape";
+  } else if (intent === "park") {
+    toStateName = "__ad_hoc__";
+    log.info(`workflow-gate: B2 apply: ${issueId} parking — demoting to __ad_hoc__`);
   } else {
     if (!currentStateName) {
       log.warn(`workflow-gate: B2 apply: no state:* label on ${issueId} — skipping`);
@@ -3548,6 +3749,83 @@ export async function applyStateTransition(
         );
         return { status: "applied", code: "stale-label-purged", from: currentStateName, to: toStateName };
       }
+      // AI-2595 AC2: same-state (self-loop) delegate resolution.
+      // When source === destination but the transition carries delegate
+      // semantics (assign.default or cliTarget), resolve and write the
+      // delegate before returning from the idempotency check. This allows
+      // handoff-work to re-attach a delegate on a stranded implementation-
+      // state ticket without needing escape.
+      const selfLoopHasDelegateSemantics =
+        matchedTransition?.assign?.default === 'prior-implementer' ||
+        options?.cliTarget !== undefined ||
+        options?.delegateOverride !== undefined;
+
+      if (selfLoopHasDelegateSemantics) {
+        let selfLoopDelegateId: string | null | undefined;
+
+        if (options?.delegateOverride !== undefined) {
+          selfLoopDelegateId = options.delegateOverride;
+          log.info(
+            `workflow-gate: AI-2595 self-loop delegate: using delegateOverride=${selfLoopDelegateId}`,
+          );
+        } else if (options?.cliTarget) {
+          const targetAgent = getAgent(options.cliTarget);
+          if (targetAgent?.linearUserId) {
+            selfLoopDelegateId = targetAgent.linearUserId;
+            log.info(
+              `workflow-gate: AI-2595 self-loop delegate: explicit target '${options.cliTarget}' → ${selfLoopDelegateId}`,
+            );
+          } else {
+            log.error(
+              `workflow-gate: AI-2595 self-loop delegate: CLI target '${options.cliTarget}' has no linearUserId — skipping delegate write`,
+            );
+          }
+        } else if (matchedTransition?.assign?.default === 'prior-implementer') {
+          const priorImplementer = await getImplementer(issueId);
+          if (priorImplementer) {
+            const agent = getAgent(priorImplementer);
+            if (agent?.linearUserId) {
+              selfLoopDelegateId = agent.linearUserId;
+              log.info(
+                `workflow-gate: AI-2595 self-loop delegate: prior implementer '${priorImplementer}' → ${selfLoopDelegateId}`,
+              );
+            } else {
+              log.error(
+                `workflow-gate: AI-2595 self-loop delegate: prior implementer '${priorImplementer}' has no linearUserId — skipping delegate write`,
+              );
+            }
+          } else {
+            log.warn(
+              `workflow-gate: AI-2595 self-loop delegate: no prior implementer recorded for ${issueId} — skipping delegate write`,
+            );
+          }
+        }
+
+        if (selfLoopDelegateId !== undefined) {
+          // Keep the current label set unchanged — only write the delegate.
+          const stableLabelIds = issue.labels.map((l) => l.id);
+          const selfLoopResult = await issueUpdateAtomicVerified(
+            issue.internalId,
+            stableLabelIds,
+            authToken,
+            selfLoopDelegateId,
+            undefined,  // no native state change
+            toStateName,
+          );
+
+          if (selfLoopResult.ok) {
+            log.info(
+              `workflow-gate: AI-2595: ${issueId} wrote delegate=${selfLoopDelegateId} on self-loop (state:${toStateName})`,
+            );
+            return { status: "applied", code: "delegate-written", from: currentStateName, to: toStateName };
+          }
+
+          log.warn(
+            `workflow-gate: AI-2595: self-loop delegate write failed for ${issueId} — falling through to no-op`,
+          );
+        }
+      }
+
       log.info(
         `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' with label present — no-op`,
       );
@@ -3779,7 +4057,16 @@ export async function applyStateTransition(
   // Step 2: Resolve the next delegate.
   // AI-1493: Deterministic owner-routing for ALL transitions.
   const destStateNode = def.states.find((s) => s.id === toStateName);
-  const destOwnerRole = destStateNode?.owner_role;
+  // §4.4 break-glass (escape): the steward who performs the escape owns the
+  // post-escape ticket, not the destination state's owner_role — otherwise
+  // escape routes to a multi-body role (e.g. task.yaml's `requester`) and
+  // fails closed with "multi-body role requires a --target"; the comment
+  // posts but the state label never lands (fixes INF-67). This matches
+  // dev-impl's design where intake.owner_role is steward, so escape works
+  // identically whether the YAML declares intake.owner_role or not.
+  const destOwnerRole = intent === breakGlassCommand
+    ? def.break_glass?.owner_role
+    : destStateNode?.owner_role;
   const isTerminal = destStateNode?.kind === 'terminal' || !destOwnerRole;
   let resolvedDelegateId: string | null | undefined = undefined;
 
@@ -4104,12 +4391,20 @@ export async function applyStateTransition(
   // already validated pre-transition (AC5) and the findings stashed in
   // `pendingFanout`, so this never re-guesses the spec.
   // Fail-open: fan-out errors are logged and never block the transition.
+  // INF-37: set when a spawn_if predicate could not be *evaluated* (as opposed
+  // to evaluating false). Zero children then means "we never found out", not
+  // "none were needed" — so the barrier below must not read it as vacuous
+  // satisfaction. Scoped deliberately to the spawn_if failure: the surrounding
+  // fan-out fail-open (above) is a separate, deliberate contract.
+  let spawnIfEvaluationFailed = false;
+
   if (applied && pendingFanout) {
     try {
       log.info(`workflow-gate: AI-1992 fan-out: triggering fan-out for ${issueId} (${currentStateName} → ${toStateName}, child=${pendingFanout.config.child_workflow})`);
       const fanoutResult = await executeFanout(issueId, authToken, pendingFanout.config, {
         findingsOverride: pendingFanout.findings,
       });
+      spawnIfEvaluationFailed = fanoutResult.spawnIfResult?.outcome === "failed";
       if (fanoutResult.created > 0) {
         log.info(
           `workflow-gate: B-2 fan-out: ${fanoutResult.created} child(ren) created for ${issueId}: ${fanoutResult.childIdentifiers.join(", ")}`,
@@ -4132,7 +4427,20 @@ export async function applyStateTransition(
   // barrier is already satisfied. This is a no-op when children are in-progress
   // — it only fires when all children are terminal or none exist. Barrier-ness
   // is config-driven (any state declaring `barrier: true`), not just "managing".
-  if (applied && destStateNode?.barrier === true) {
+  // INF-37: `!spawnIfEvaluationFailed` is fail-closed. A spawn_if that could not
+  // be evaluated spawned zero children, and zero children is exactly what the
+  // AI-1730 vacuous-satisfaction contract advances on — so the parent would sail
+  // past a sprint that never started, on a transient API error, and log it as
+  // healthy. AI-1730 is not at fault: it is being handed an *unknown* dressed up
+  // as a *zero*. The parent stays in the barrier state, which is recoverable; the
+  // error comment was already posted on the parent by executeFanout.
+  if (applied && destStateNode?.barrier === true && spawnIfEvaluationFailed) {
+    log.error(
+      `workflow-gate: INF-37: skipping barrier auto-advance for ${issueId} — ` +
+      `spawn_if predicate could not be evaluated, so the zero-child set is unverified, not empty. ` +
+      `${issueId} stays in '${toStateName}' pending steward retry.`,
+    );
+  } else if (applied && destStateNode?.barrier === true) {
     try {
       const barrierResult = await onManagingEntry(issueId, authToken);
       if (barrierResult) {
@@ -4214,6 +4522,31 @@ export async function applyStateTransition(
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`workflow-gate: B-3 barrier check failed for ${issueId}: ${msg}`);
     }
+  }
+
+  // ── INF-92: Fire onTransitionWake when transition stamps a delegate on ──
+  // a work-eligible state. This bridges the gap between the governed
+  // transition path (which writes delegate + state atomically but never
+  // dispatched a wake) and the external delegate-mutation path (which
+  // routed through webhook → routeEventAll → dispatchRoute → wake).
+  // The wake is only fired when the destination is non-terminal (work-eligible)
+  // and a delegate was actually stamped.
+  if (applied && !isTerminal && resolvedDelegateId && options?.onTransitionWake) {
+    const allAgents = getAgents();
+    const delegateAgent = allAgents.find(
+      (a) => a.linearUserId === resolvedDelegateId,
+    );
+    const agentName = delegateAgent?.name ?? resolvedDelegateId;
+    options.onTransitionWake({
+      agentName,
+      ticketIdentifier: issue.identifier ?? issueId,
+      workflowState: toStateName,
+      source: "transition",
+    });
+    log.info(
+      `workflow-gate: INF-92: fired onTransitionWake for ${agentName} ` +
+      `on ${issue.identifier ?? ""} (state:${toStateName})`,
+    );
   }
 
   return { status: "applied", code: "transition-applied", from: currentStateName, to: toStateName };
@@ -4844,6 +5177,12 @@ export interface SetStateAtomicResult {
   redispatched?: string;
   /** Linear internal UUID of the issue (set on success). AI-1954 attribution. */
   internalId?: string;
+  /**
+   * INF-104: When dispatch (sendWakeUp) permanently failed after retry exhaustion,
+   * contains a machine-readable reason code so downstream components (stall detection,
+   * admin UI, alerting) can distinguish this from a healthy stamped delegate.
+   */
+  dispatchFailure?: { reasonCode: string };
 }
 
 export interface SetStateAtomicOptions {
@@ -4998,24 +5337,82 @@ export async function setStateAtomic(
 
   // Step 9: Re-dispatch to the new state's owner (AI-1607).
   // Fail-open: errors are logged but never block the set-state result.
+  // INF-104: retry with bounded backoff on transient failure; after exhaustion
+  // reassign delegate to the steward role so the ticket never rests
+  // stamped-but-session-less.
   let redispatched: string | undefined;
+  let dispatchFailure: { reasonCode: string } | undefined;
+
   if (def && options?.sendWakeUp) {
     const destNode = def.states.find((s) => s.id === targetState);
     const ownerRole = destNode?.owner_role;
     const isTerminal = destNode?.kind === "terminal" || !ownerRole;
     if (!isTerminal && ownerRole) {
+      // INF-104: bounded retry for transient dispatch failures
+      const MAX_DISPATCH_RETRIES = 3;
+      let dispatchExhausted = false;
+      let lastDispatchError: string | undefined;
+
+      /**
+       * Try sendWakeUp with bounded exponential backoff.
+       * Returns true if the wake succeeded, false if all retries exhausted.
+       */
+      const tryDispatchWithRetry = async (
+        bodyName: string,
+        ticketId: string,
+      ): Promise<boolean> => {
+        for (let attempt = 1; attempt <= MAX_DISPATCH_RETRIES; attempt++) {
+          try {
+            await options.sendWakeUp!(bodyName, ticketId);
+            redispatched = bodyName;
+            return true;
+          } catch (err) {
+            lastDispatchError = err instanceof Error ? err.message : String(err);
+            if (attempt < MAX_DISPATCH_RETRIES) {
+              // Exponential backoff: 200ms, 500ms, then fail
+              const delay = attempt <= 1 ? 200 : 500;
+              await new Promise((r) => setTimeout(r, delay));
+            }
+          }
+        }
+        dispatchExhausted = true;
+        return false;
+      };
+
       try {
         const roleBodies = await resolveBodiesForRole(ownerRole);
         if (roleBodies.length === 1) {
-          await options.sendWakeUp(roleBodies[0], ticketIdentifier);
-          redispatched = roleBodies[0];
-          log.info(
-            `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${roleBodies[0]}' (role '${ownerRole}') after advancing to '${targetState}'`,
-          );
+          const ok = await tryDispatchWithRetry(roleBodies[0], ticketIdentifier);
+          if (ok) {
+            log.info(
+              `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${roleBodies[0]}' (role '${ownerRole}') after advancing to '${targetState}'`,
+            );
+          }
         } else if (roleBodies.length > 1) {
-          log.warn(
-            `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has multiple bodies (${roleBodies.join(", ")}); delegate manually`,
-          );
+          // INF-58: when delegate is already resolved for a multi-body role,
+          // dispatch directly to the delegate body instead of skipping.
+          if (resolvedDelegateId != null) {
+            const delegateBody = roleBodies.find(b => {
+              const agent = getAgent(b);
+              return agent?.linearUserId === resolvedDelegateId;
+            });
+            if (delegateBody) {
+              const ok = await tryDispatchWithRetry(delegateBody, ticketIdentifier);
+              if (ok) {
+                log.info(
+                  `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${delegateBody}' (role '${ownerRole}') after advancing to '${targetState}' — delegate pre-set for multi-body role`,
+                );
+              }
+            } else {
+              log.warn(
+                `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — delegate (linearUserId=${resolvedDelegateId}) is not a member of role '${ownerRole}'`,
+              );
+            }
+          } else {
+            log.warn(
+              `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has multiple bodies (${roleBodies.join(", ")}); delegate manually`,
+            );
+          }
         } else {
           log.warn(
             `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — role '${ownerRole}' has no bodies`,
@@ -5025,10 +5422,38 @@ export async function setStateAtomic(
         const msg = err instanceof Error ? err.message : String(err);
         log.warn(`workflow-gate: set-state: re-dispatch failed for ${ticketIdentifier}: ${msg} — continuing`);
       }
+
+      // INF-104: if dispatch retries exhausted, reassign delegate to steward
+      // role so the ticket never rests stamped-but-session-less.
+      if (dispatchExhausted && issue.internalId) {
+        log.warn(
+          `workflow-gate: set-state: re-dispatch exhausted for ${ticketIdentifier} after ${MAX_DISPATCH_RETRIES} attempts: ${lastDispatchError ?? "unknown"} — reassigning to steward`,
+        );
+        const stewardBodies = await resolveBodiesForRole("steward");
+        if (stewardBodies.length > 0) {
+          const stewardAgent = getAgent(stewardBodies[0]);
+          if (stewardAgent?.linearUserId) {
+            await issueUpdateDelegateOnly(issue.internalId, stewardAgent.linearUserId, authToken);
+            redispatched = stewardBodies[0];
+            dispatchFailure = { reasonCode: "session-never-spawned" };
+            log.info(
+              `workflow-gate: set-state: reassigned ${ticketIdentifier} delegate to '${stewardBodies[0]}' (steward) after dispatch exhaustion`,
+            );
+          }
+        }
+      }
     }
   }
 
-  return { ok: true, ticketId: ticketIdentifier, from: fromState, to: targetState, internalId: issue.internalId, ...(redispatched ? { redispatched } : {}) };
+  return {
+    ok: true,
+    ticketId: ticketIdentifier,
+    from: fromState,
+    to: targetState,
+    internalId: issue.internalId,
+    ...(redispatched ? { redispatched } : {}),
+    ...(dispatchFailure ? { dispatchFailure } : {}),
+  };
 }
 
 /**

@@ -75,18 +75,18 @@ describe("isLinearIssueActionable", () => {
     );
   });
 
-  it("allows Backlog tickets for wake-up prompts", async () => {
+  it("treats Backlog tickets as parked and thus non-actionable (AI-2246)", async () => {
     const fetchMock = jest.fn<(...args: Parameters<typeof fetch>) => Promise<any>>().mockResolvedValue({
       ok: true,
       json: async () => ({ data: { issue: { state: { name: "Backlog", type: "backlog" } } } }),
     });
     global.fetch = fetchMock as unknown as typeof fetch;
 
-    await expect(isLinearIssueActionable("AI-942", "igor")).resolves.toBe(true);
+    await expect(isLinearIssueActionable("AI-942", "igor")).resolves.toBe(false);
   });
 
-  it("does not treat Backlog as a parked state", () => {
-    expect(isParkedIssueState({ name: "Backlog", type: "backlog" })).toBe(false);
+  it("treats Backlog as a parked state (AI-2246 Defect B fix)", () => {
+    expect(isParkedIssueState({ name: "Backlog", type: "backlog" })).toBe(true);
     expect(isParkedIssueState({ name: "Todo", type: "unstarted" })).toBe(false);
   });
 

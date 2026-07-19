@@ -116,6 +116,14 @@ states:
         assign:
           mode: required          # reviewer must be explicitly specified (§4.3)
           constraint: not-implementer  # reviewer must differ from implementer (AI-1475 D2)
+      # INF-93 rescue: handoff-work self-loop — write a delegate on a stranded
+      # implementation-state ticket without changing state. The connector's
+      # applyStateTransition self-loop handling (AI-2595 AC2) writes the delegate
+      # atomically; the CLI sets proxyIntent("handoff") to trigger this path.
+      - command: handoff
+        to: implementation
+        assign:
+          mode: required          # caller must specify the delegate target
 
   - id: code-review
     owner_role: code-review

@@ -285,6 +285,18 @@ describe("INF-35 AC1: checkWorkflowRules rejects transition verbs on unarmed tic
     expect(result).toBeNull();
   });
 
+  it("allows 'complete' on a ticket with no wf:* label (INF-63 AC — ad-hoc close path)", async () => {
+    globalThis.fetch = makeNoWfLabelsFetch();
+    const result = await checkWorkflowRules("complete", "INF-35", "Bearer tok", "astrid");
+    expect(result).toBeNull();
+  });
+
+  it("allows 'cancel' on a ticket with no wf:* label (INF-63 AC — ad-hoc close path)", async () => {
+    globalThis.fetch = makeNoWfLabelsFetch();
+    const result = await checkWorkflowRules("cancel", "INF-35", "Bearer tok", "astrid");
+    expect(result).toBeNull();
+  });
+
   it("error message names the reason and the legal next move (AC1)", async () => {
     globalThis.fetch = makeNoWfLabelsFetch();
     const result = await checkWorkflowRules("submit", "INF-35", "Bearer tok", "igor");

@@ -51,7 +51,12 @@ set -euo pipefail
 #   connector-reftxn-arm.sh --force      # arm now, bypassing the quiescence gate (human)
 #   connector-reftxn-arm.sh --status     # report armed/disarmed + version + auto-arm
 #   connector-reftxn-arm.sh --check      # drift check: 0 in-sync, 1 drift, 2 not-armed, 3 no-source
-#   connector-reftxn-arm.sh --disarm     # remove the installed hook + auto-arm hooks
+#   connector-reftxn-arm.sh --disarm     # remove the installed hook + auto-arm hooks + deploy guard
+#
+# ALSO installs a post-checkout-deploy-guard hook (INF-55) that prevents the
+# deploy worktree (fancy-openclaw-linear-connector-deploy) from being switched
+# to any branch other than release-1.4.
+# See scripts/git-hooks/post-checkout-deploy-guard.
 
 QUIET_MIN=15
 MODE="arm"
@@ -81,6 +86,10 @@ case "$GIT_COMMON_DIR" in
   *)  GIT_COMMON_DIR="$REPO_ROOT/$GIT_COMMON_DIR" ;;
 esac
 HOOK_DST="$GIT_COMMON_DIR/hooks/reference-transaction"
+
+# Deploy worktree guard hook (INF-55): prevents checkout off release-1.4.
+DEPLOY_GUARD_SRC="$REPO_ROOT/scripts/git-hooks/post-checkout-deploy-guard"
+DEPLOY_GUARD_DST="$GIT_COMMON_DIR/hooks/post-checkout"
 
 # Auto-re-arm hooks (INF-19). Installed alongside the veto hook, out of tree.
 # post-merge fires after `git pull`/merge; post-rewrite after rebase/amend — the
@@ -166,6 +175,26 @@ install_hook() {
   install_autoarm_hooks      # keep the armed copy converged on future pulls (INF-19)
 }
 
+# Install the deploy worktree guard hook (INF-55) alongside the veto hook.
+# This hook only fires in the deploy worktree (gated on GIT_DIR path) and
+# prevents checkout off release-1.4. Ungated — no quiescence check needed.
+install_deploy_guard() {
+  mkdir -p "$GIT_COMMON_DIR/hooks"
+  if [ ! -e "$DEPLOY_GUARD_SRC" ]; then
+    echo "  warning: deploy guard source not found at $DEPLOY_GUARD_SRC — skipping" >&2
+    return
+  fi
+  local tmp="$DEPLOY_GUARD_DST.tmp.$$"
+  cp "$DEPLOY_GUARD_SRC" "$tmp"
+  chmod +x "$tmp"
+  mv -f "$tmp" "$DEPLOY_GUARD_DST"
+  echo "  deploy guard installed at $DEPLOY_GUARD_DST"
+}
+
+remove_deploy_guard() {
+  rm -f "$DEPLOY_GUARD_DST"
+}
+
 # Seconds since the most recent HEAD reflog ENTRY (checkout/commit/reset/detach).
 # Uses the reflog selector time (%gd --date=unix → "HEAD@{<unixts>}"), NOT the
 # commit time (%ct) — %ct is when the tip commit was authored, which says nothing
@@ -190,6 +219,7 @@ case "$MODE" in
     fi
     if [ -e "$HOOK_SRC" ]; then echo "  tracked src version: $(hook_version "$HOOK_SRC")"; else echo "  tracked src: ABSENT ($HOOK_SRC)"; fi
     if autoarm_installed; then echo "  auto-re-arm on pull: ON (post-merge + post-rewrite installed)"; else echo "  auto-re-arm on pull: OFF (run this script to install)"; fi
+    if [ -x "$DEPLOY_GUARD_DST" ]; then echo "  deploy guard: ARMING (post-checkout at $DEPLOY_GUARD_DST)"; else echo "  deploy guard: NOT INSTALLED (run this script to install) — deploy worktree is UNPROTECTED"; fi
     secs="$(last_activity_secs)"
     if [ "$secs" -lt 0 ]; then echo "  last HEAD activity: unknown"; else echo "  last HEAD activity: $((secs/60))m ago (${secs}s)"; fi
     exit 0
@@ -218,8 +248,9 @@ case "$MODE" in
   disarm)
     rm -f "$HOOK_DST"
     remove_autoarm_hooks
+    remove_deploy_guard
     clear_legacy_hookspath
-    echo "disarmed: removed $HOOK_DST + auto-re-arm hooks"
+    echo "disarmed: removed $HOOK_DST + auto-re-arm hooks + deploy guard"
     exit 0
     ;;
 esac
@@ -231,8 +262,9 @@ esac
 # needed (enforcement is already on; re-copying identical bytes changes nothing).
 if is_armed; then
   install_hook
+  install_deploy_guard
   clear_legacy_hookspath
-  echo "already armed — refreshed hook copy + auto-re-arm hooks at $GIT_COMMON_DIR/hooks"
+  echo "already armed — refreshed hooks at $GIT_COMMON_DIR/hooks"
   exit 0
 fi
 
@@ -253,8 +285,10 @@ else
 fi
 
 install_hook
+install_deploy_guard
 clear_legacy_hookspath
 echo "ARMED: hook installed at $HOOK_DST (out of tree; core.hooksPath left unset)."
 echo "  version: $(hook_version "$HOOK_DST")"
 echo "  auto-re-arm on pull/rebase: ON (post-merge + post-rewrite installed) — armed copy self-converges now."
+echo "  deploy guard installed at $DEPLOY_GUARD_DST (INF-55) — deploy worktree locked to release-1.4"
 echo "  primary-tree detach/reset HEAD moves are now vetoed. Disarm: $0 --disarm ; drift check: $0 --check"

@@ -6,6 +6,7 @@ import { getAccessToken } from "../agents.js";
 import { getActiveCanonVersion } from "../policy/universal-canon.js";
 import { resolveCanonicalIdentifierFromEvent } from "../canonical-identifier.js";
 import { normalizeSessionKey } from "../session-key.js";
+import type { DispatchLeaseStore } from "../store/dispatch-lease-store.js";
 
 const log = componentLogger(createLogger(), "delivery");
 
@@ -124,7 +125,27 @@ function classifyFetchError(err: unknown): DeliveryResult {
 export async function deliverToAgent(
   route: RouteResult,
   config: DeliveryConfig,
+  dispatchLeaseStore?: DispatchLeaseStore,
 ): Promise<DeliveryResult> {
+  // AI-2564: Check the dispatch lease before spawning. If an unexpired lease
+  // exists for this (agentId, ticketKey) and the incoming state is not newer,
+  // refuse the dispatch as a duplicate.
+  if (dispatchLeaseStore) {
+    const updatedAt =
+      (route.event.data as Record<string, string> | undefined)?.updatedAt;
+    const leaseResult = dispatchLeaseStore.acquire(
+      route.agentId,
+      route.sessionKey,
+      { updatedAt },
+    );
+    if (!leaseResult.acquired && leaseResult.refused) {
+      log.info(
+        `dispatch deduped: live session exists for ${route.agentId} [${route.sessionKey}]`,
+      );
+      return { dispatched: false };
+    }
+  }
+
   const rawToken =
     getAccessToken(route.agentId) ??
     process.env.LINEAR_OAUTH_TOKEN ??

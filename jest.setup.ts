@@ -16,7 +16,12 @@ import path from "path";
 // directory). Tests that skip explicit db paths were writing session-end,
 // dispatch-ack, and webhook-dedup rows straight into production state.
 // A fresh temp dir per jest worker keeps every defaulted store isolated.
-process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "connector-jest-"));
+const JEST_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "connector-jest-"));
+process.env.DATA_DIR = JEST_STATE_DIR;
+// Also isolate state-dir defaults. Some older tests delete AGENTS_FILE during
+// cleanup; with no state dir, agents.ts falls back to process.cwd()/agents.json
+// (the live encrypted production file).
+process.env.OPENCLAW_LINEAR_CONNECTOR_STATE = JEST_STATE_DIR;
 // jest only sets NODE_ENV=test when it is unset; the deployment container
 // exports NODE_ENV=production, which silently disabled createApp's test-mode
 // delivery config (50ms timeout, 0 retries) and let tests run with the
@@ -45,6 +50,10 @@ process.env.OPENCLAW_HOOKS_TOKEN = "";
 // the fail-closed default; set it to assert the grace path). Production `.env`
 // leaves it unset → fail-closed, which is the shipped posture.
 process.env.PROXY_ALLOW_MISSING_CLI_VERSION = "1";
+// Production .env currently raises this to 0.3.7. Most tests still exercise
+// older synthetic CLI versions and are not about the version floor; dedicated
+// floor tests set/delete this env themselves.
+process.env.PROXY_MIN_CLI_VERSION = "0.3.0";
 
 // A live token in the container/shell env changes linear-actionable behavior
 // (previously worked around with `env -u LINEAR_OAUTH_TOKEN npm test`).
@@ -57,6 +66,12 @@ delete process.env.LINEAR_OAUTH_TOKEN;
 // fails every test that imports any module transitively depending on agents.ts).
 // Point AGENTS_FILE at a non-existent path so agents.ts returns [] on boot;
 // tests set their own AGENTS_FILE (pointing to a temp fixture) in beforeAll.
-delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE;
-delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
-process.env.AGENTS_FILE = path.join(os.tmpdir(), "connector-jest-no-agents.json");
+process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE = "";
+process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = "";
+// This MUST be a non-empty, non-existent path that stays stable across tests.
+// Setting it to the empty string makes getAgentsPath() fall through to the
+// DEFAULT_AGENTS_PATH, which is process.cwd() + '/agents.json' — the LIVE
+// production encrypted agents file — causing every reloadAgents() that runs
+// without AGENTS_FILE set to hit the encryption key path and fail.
+const JEST_AGENTS_FILE = path.join(os.tmpdir(), "connector-jest-no-agents.json");
+process.env.AGENTS_FILE = JEST_AGENTS_FILE;

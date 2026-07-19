@@ -1,7 +1,15 @@
-# dev-sprint — Sprint Execution Workflow (v2)
+# dev-sprint — Sprint Execution Workflow (v3)
 # owner: steward (Astrid), engine (spawn-arms, spawn-impl)
-# last-updated: 2026-07-16
+# last-updated: 2026-07-17
 # status: v2 deployed to production (INF-40, 2026-07-16)
+#
+# AI-2524 (2026-07-17): added the `post-validation` state — a conditional
+# ui-audit gate at milestone close. `validation → approve` now routes to
+# `post-validation` (not directly to `done`); that state fans out into a
+# wf:ui-audit child ONLY when a closed impl child carries the `ui-impact`
+# label (spawn_if, AI-2523). The visual-audit verdict is a gate input to
+# milestone close. See spec §5 (hard rule) and the milestone-close
+# verification template (src/dev-sprint-milestone-close-template.ts).
 #
 # Registered-def copy for CI conformance validation (INF-42). The canonical
 # source is the vault markdown spec at:
@@ -20,7 +28,7 @@
 #   → 5. ac-definition → 6. spawn-impl → 7. managing-impl → 8. validation → done
 
 id: dev-sprint
-version: 2
+version: 3
 archetype: orchestrator
 entry_state: intake
 
@@ -134,18 +142,45 @@ states:
     native_state: thinking
     description: >
       Author Matt-facing sprint validation. cra reviews technical accuracy.
-      requires_human_signoff_above_stakes — closes only on Matt's explicit yes.
+      requires_human_signoff_above_stakes — the human sign-off is captured HERE,
+      on Matt's explicit yes. On approve the sprint advances to post-validation
+      (the mechanical visual-audit gate), not directly to done.
     transitions:
       - command: approve
-        to: done
+        to: post-validation
         generic: continue
         requires_human_signoff_above_stakes: true
       - command: reject
         to: ac-definition
         generic: revision
 
+  - id: post-validation
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    description: >
+      AI-2524: conditional visual-audit gate at milestone close. Fans out into a
+      wf:ui-audit child ONLY when a closed impl child carries the `ui-impact`
+      label (spawn_if, AI-2523); otherwise the gate is a no-op and the sprint
+      continues to done. The human sign-off was already captured at
+      validation→approve, so this transition is mechanical (no signoff). The
+      milestone-close verification comment carries the Visual Audit breakpoint
+      table + sign-off checkbox (see dev-sprint-milestone-close-template.ts).
+    fanout:
+      spec_source: findings
+      child_workflow: wf:ui-audit
+      initial_delegate: astrid
+      spawn_if:
+        label_present: ui-impact
+        scope: closed_children
+    transitions:
+      - command: continue
+        to: done
+        generic: continue
+
   - id: done
     kind: terminal
+    barrier: true
     native_state: done
     satisfies_parent_barrier: true
 

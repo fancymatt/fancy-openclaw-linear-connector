@@ -7,8 +7,8 @@ const log = componentLogger(createLogger(), "linear-actionable");
 
 const TERMINAL_STATE_TYPES = new Set(["completed", "canceled", "cancelled"]);
 const TERMINAL_STATE_NAMES = new Set(["done", "canceled", "cancelled"]);
-const PARKED_STATE_TYPES = new Set<string>();
-const PARKED_STATE_NAMES = new Set<string>();
+const PARKED_STATE_TYPES = new Set(["backlog"]);
+const PARKED_STATE_NAMES = new Set(["backlog"]);
 
 export function isTerminalIssueState(state: unknown): boolean {
   if (!state || typeof state !== "object") return false;
