@@ -5181,6 +5181,12 @@ export interface SetStateAtomicResult {
   redispatched?: string;
   /** Linear internal UUID of the issue (set on success). AI-1954 attribution. */
   internalId?: string;
+  /**
+   * INF-104: When dispatch (sendWakeUp) permanently failed after retry exhaustion,
+   * contains a machine-readable reason code so downstream components (stall detection,
+   * admin UI, alerting) can distinguish this from a healthy stamped delegate.
+   */
+  dispatchFailure?: { reasonCode: string };
 }
 
 export interface SetStateAtomicOptions {
@@ -5335,20 +5341,57 @@ export async function setStateAtomic(
 
   // Step 9: Re-dispatch to the new state's owner (AI-1607).
   // Fail-open: errors are logged but never block the set-state result.
+  // INF-104: retry with bounded backoff on transient failure; after exhaustion
+  // reassign delegate to the steward role so the ticket never rests
+  // stamped-but-session-less.
   let redispatched: string | undefined;
+  let dispatchFailure: { reasonCode: string } | undefined;
+
   if (def && options?.sendWakeUp) {
     const destNode = def.states.find((s) => s.id === targetState);
     const ownerRole = destNode?.owner_role;
     const isTerminal = destNode?.kind === "terminal" || !ownerRole;
     if (!isTerminal && ownerRole) {
+      // INF-104: bounded retry for transient dispatch failures
+      const MAX_DISPATCH_RETRIES = 3;
+      let dispatchExhausted = false;
+      let lastDispatchError: string | undefined;
+
+      /**
+       * Try sendWakeUp with bounded exponential backoff.
+       * Returns true if the wake succeeded, false if all retries exhausted.
+       */
+      const tryDispatchWithRetry = async (
+        bodyName: string,
+        ticketId: string,
+      ): Promise<boolean> => {
+        for (let attempt = 1; attempt <= MAX_DISPATCH_RETRIES; attempt++) {
+          try {
+            await options.sendWakeUp!(bodyName, ticketId);
+            redispatched = bodyName;
+            return true;
+          } catch (err) {
+            lastDispatchError = err instanceof Error ? err.message : String(err);
+            if (attempt < MAX_DISPATCH_RETRIES) {
+              // Exponential backoff: 200ms, 500ms, then fail
+              const delay = attempt <= 1 ? 200 : 500;
+              await new Promise((r) => setTimeout(r, delay));
+            }
+          }
+        }
+        dispatchExhausted = true;
+        return false;
+      };
+
       try {
         const roleBodies = await resolveBodiesForRole(ownerRole);
         if (roleBodies.length === 1) {
-          await options.sendWakeUp(roleBodies[0], ticketIdentifier);
-          redispatched = roleBodies[0];
-          log.info(
-            `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${roleBodies[0]}' (role '${ownerRole}') after advancing to '${targetState}'`,
-          );
+          const ok = await tryDispatchWithRetry(roleBodies[0], ticketIdentifier);
+          if (ok) {
+            log.info(
+              `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${roleBodies[0]}' (role '${ownerRole}') after advancing to '${targetState}'`,
+            );
+          }
         } else if (roleBodies.length > 1) {
           // INF-58: when delegate is already resolved for a multi-body role,
           // dispatch directly to the delegate body instead of skipping.
@@ -5358,11 +5401,12 @@ export async function setStateAtomic(
               return agent?.linearUserId === resolvedDelegateId;
             });
             if (delegateBody) {
-              await options.sendWakeUp(delegateBody, ticketIdentifier);
-              redispatched = delegateBody;
-              log.info(
-                `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${delegateBody}' (role '${ownerRole}') after advancing to '${targetState}' — delegate pre-set for multi-body role`,
-              );
+              const ok = await tryDispatchWithRetry(delegateBody, ticketIdentifier);
+              if (ok) {
+                log.info(
+                  `workflow-gate: set-state: re-dispatched ${ticketIdentifier} to '${delegateBody}' (role '${ownerRole}') after advancing to '${targetState}' — delegate pre-set for multi-body role`,
+                );
+              }
             } else {
               log.warn(
                 `workflow-gate: set-state: skipping re-dispatch for ${ticketIdentifier} — delegate (linearUserId=${resolvedDelegateId}) is not a member of role '${ownerRole}'`,
@@ -5382,10 +5426,38 @@ export async function setStateAtomic(
         const msg = err instanceof Error ? err.message : String(err);
         log.warn(`workflow-gate: set-state: re-dispatch failed for ${ticketIdentifier}: ${msg} — continuing`);
       }
+
+      // INF-104: if dispatch retries exhausted, reassign delegate to steward
+      // role so the ticket never rests stamped-but-session-less.
+      if (dispatchExhausted && issue.internalId) {
+        log.warn(
+          `workflow-gate: set-state: re-dispatch exhausted for ${ticketIdentifier} after ${MAX_DISPATCH_RETRIES} attempts: ${lastDispatchError ?? "unknown"} — reassigning to steward`,
+        );
+        const stewardBodies = await resolveBodiesForRole("steward");
+        if (stewardBodies.length > 0) {
+          const stewardAgent = getAgent(stewardBodies[0]);
+          if (stewardAgent?.linearUserId) {
+            await issueUpdateDelegateOnly(issue.internalId, stewardAgent.linearUserId, authToken);
+            redispatched = stewardBodies[0];
+            dispatchFailure = { reasonCode: "session-never-spawned" };
+            log.info(
+              `workflow-gate: set-state: reassigned ${ticketIdentifier} delegate to '${stewardBodies[0]}' (steward) after dispatch exhaustion`,
+            );
+          }
+        }
+      }
     }
   }
 
-  return { ok: true, ticketId: ticketIdentifier, from: fromState, to: targetState, internalId: issue.internalId, ...(redispatched ? { redispatched } : {}) };
+  return {
+    ok: true,
+    ticketId: ticketIdentifier,
+    from: fromState,
+    to: targetState,
+    internalId: issue.internalId,
+    ...(redispatched ? { redispatched } : {}),
+    ...(dispatchFailure ? { dispatchFailure } : {}),
+  };
 }
 
 /**
