@@ -22,3 +22,8 @@ dist.pre-deploy-*/
 # Never track these; a stray git add -A here re-commits worktrees as gitlinks.
 .worktrees/
 scripts/__pycache__/
+
+# Python
+__pycache__/
+.pytest_cache/
+*.pyc
