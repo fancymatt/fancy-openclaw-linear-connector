@@ -101,8 +101,8 @@ describe("ManagingPoller.runCycle", () => {
       { name: "charles", linearUserId: "u1", openclawAgent: "charles" },
     ];
     const issues: LinearManagingIssue[] = [
-      { identifier: "AI-1", title: "First", description: null },
-      { identifier: "AI-2", title: "Second", description: null },
+      { identifier: "AI-1", title: "First", description: null, labels: [], stateName: "" },
+      { identifier: "AI-2", title: "Second", description: null, labels: [], stateName: "" },
     ];
     const sendWake = jest.fn(async () => undefined) as unknown as (
       agentId: string,
@@ -140,7 +140,7 @@ describe("ManagingPoller.runCycle", () => {
   it("does not wake when interval has not elapsed", async () => {
     const agents: AgentLike[] = [{ name: "charles", linearUserId: "u1", openclawAgent: "charles" }];
     const issues: LinearManagingIssue[] = [
-      { identifier: "AI-1", title: "T1", description: null },
+      { identifier: "AI-1", title: "T1", description: null, labels: [], stateName: "" },
     ];
     const sendWake = jest.fn(async () => undefined) as unknown as (
       agentId: string,
@@ -170,8 +170,8 @@ describe("ManagingPoller.runCycle", () => {
   it("respects per-ticket Managing-interval body marker", async () => {
     const agents: AgentLike[] = [{ name: "charles", linearUserId: "u1", openclawAgent: "charles" }];
     const issues: LinearManagingIssue[] = [
-      { identifier: "AI-1", title: "Fast", description: "Managing-interval: 5m" },
-      { identifier: "AI-2", title: "Slow", description: "Managing-interval: 2h" },
+      { identifier: "AI-1", title: "Fast", description: "Managing-interval: 5m", labels: [], stateName: "" },
+      { identifier: "AI-2", title: "Slow", description: "Managing-interval: 2h", labels: [], stateName: "" },
     ];
     const sendWake = jest.fn(async () => undefined) as unknown as (
       agentId: string,
@@ -208,7 +208,7 @@ describe("ManagingPoller.runCycle", () => {
     // AI-STILL recorded recently — within the default interval, not due.
     stores.store.recordDispatch("charles", "AI-STILL", now - 60 * 1000);
     const issues: LinearManagingIssue[] = [
-      { identifier: "AI-STILL", title: "Still managing", description: null },
+      { identifier: "AI-STILL", title: "Still managing", description: null, labels: [], stateName: "" },
     ];
     const sendWake = jest.fn(async () => undefined) as unknown as (
       agentId: string,
@@ -246,7 +246,7 @@ describe("ManagingPoller.runCycle", () => {
     ) => Promise<void>;
     const fetchTickets = jest.fn<(agent: AgentLike) => Promise<LinearManagingIssue[]>>()
       .mockImplementationOnce(async () => { throw new Error("Linear is down"); })
-      .mockImplementationOnce(async () => [{ identifier: "AI-9", title: "Ok", description: null }]);
+      .mockImplementationOnce(async () => [{ identifier: "AI-9", title: "Ok", description: null, labels: [], stateName: "" }]);
     const poller = new ManagingPoller(
       {
         store: stores.store,
@@ -272,10 +272,10 @@ describe("ManagingPoller.runCycle", () => {
       { name: "charles", linearUserId: "u2", openclawAgent: "charles" },
     ];
     const issuesForAstrid: LinearManagingIssue[] = [
-      { identifier: "AI-10", title: "Astrid task", description: null },
+      { identifier: "AI-10", title: "Astrid task", description: null, labels: [], stateName: "" },
     ];
     const issuesForCharles: LinearManagingIssue[] = [
-      { identifier: "AI-20", title: "Charles task", description: null },
+      { identifier: "AI-20", title: "Charles task", description: null, labels: [], stateName: "" },
     ];
     const sendWake = jest.fn(async () => undefined) as unknown as (
       agentId: string,
@@ -336,7 +336,7 @@ describe("ManagingPoller.runCycle", () => {
       { name: "charles", linearUserId: "u1", openclawAgent: "charles" },
     ];
     const issues: LinearManagingIssue[] = [
-      { identifier: "AI-100", title: "Managing ticket", description: null },
+      { identifier: "AI-100", title: "Managing ticket", description: null, labels: [], stateName: "" },
     ];
     const sendWake = jest.fn(async () => undefined) as unknown as (
       agentId: string,
