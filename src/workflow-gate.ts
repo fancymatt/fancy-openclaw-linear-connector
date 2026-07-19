@@ -2769,6 +2769,7 @@ export async function checkRawMutationInterception(
   callerLinearUserId?: string | null,
   skipCommentCreate?: boolean,
   skipLabelFields?: boolean,
+  skipTransitionFields?: boolean,
 ): Promise<string | null> {
   if (!body) return null;
 
@@ -2822,8 +2823,13 @@ export async function checkRawMutationInterception(
   };
   const touches = (field: string) => queryHasField(field) || varsHaveKey(vars, field);
 
-  const hasStateChange = touches("stateId");
-  const hasAssigneeChange = touches("assigneeId");
+  // INF-108: when skipTransitionFields is true (intent path after workflow validation
+  // has passed), skip stateId, assigneeId, and delegateId checks. These fields are
+  // knowingly changed by governed workflow commands (e.g. `complete` sends stateId
+  // for the native state, delegateId:null, assigneeId:null) and must not be blocked
+  // as "direct status changes."
+  const hasStateChange = !skipTransitionFields && touches("stateId");
+  const hasAssigneeChange = !skipTransitionFields && touches("assigneeId");
   // AI-1658 AC1: also intercept addedLabelIds/removedLabelIds — additive/subtractive
   // label mutations that the old check missed, letting agents bypass Layer 2 via these fields.
   // When skipLabelFields is true (intent path after state-label stripping), label fields
@@ -2834,7 +2840,8 @@ export async function checkRawMutationInterception(
   // written via `delegateId` (assigneeId is omitted for them, AI-1395), so a raw
   // delegate write was invisible to this detector and bypassed the delegate-only
   // guard entirely — a non-delegate could yank the delegate off the rightful owner.
-  const hasDelegateChange = touches("delegateId");
+  // INF-108: skipTransitionFields also exempts delegateId on the intent path.
+  const hasDelegateChange = !skipTransitionFields && touches("delegateId");
 
   if (!hasStateChange && !hasAssigneeChange && !hasLabelChange && !hasDelegateChange) return null;
 
@@ -4754,6 +4761,25 @@ export async function enrollIfMissing(
   if (!def?.entry_state) {
     log.warn(`workflow-gate: enrollIfMissing: no entry_state in def for wf:${workflowId} on ${issueId} — skipping`);
     return { enrolled: false };
+  }
+
+  // INF-108 AC2: Validate that ALL native_state references in the workflow def
+  // exist on this team BEFORE enrolling. A workflow that references a
+  // non-existent native state can never be transitioned through that state, and
+  // the error will surface confusingly at transition time rather than clearly at
+  // enrollment time.
+  for (const state of def.states) {
+    if (state.native_state) {
+      const resolved = await resolveNativeStateId(issue.teamId, state.native_state, authToken);
+      if (!resolved) {
+        log.error(
+          `workflow-gate: enrollIfMissing: REFUSED — workflow '${workflowId}' ` +
+          `state '${state.id}' references native_state '${state.native_state}' ` +
+          `which does not exist on team ${issue.teamId} (${issue.identifier})`,
+        );
+        return { enrolled: false };
+      }
+    }
   }
 
   const entryLabelName = `state:${def.entry_state}`;

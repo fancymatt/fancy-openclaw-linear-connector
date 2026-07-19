@@ -1036,9 +1036,13 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // commentCreate is excluded: workflow commands legitimately use it.
         // AI-2262: `park` is exempt — it sends stateId for Backlog + null delegate/assignee
         // as its documented contract, and B2 handles the workflow demotion.
+        // INF-108: skipTransitionFields=true — the intent path has already validated
+        // the workflow transition through B1; stateId/assigneeId/delegateId changes
+        // are legitimate parts of the governed transition (e.g. `complete` on a
+        // barrier-state managing ticket sends all three) and must not be blocked.
         if (effectiveIntent !== 'park') {
           const intentPathRawRejection = await checkRawMutationInterception(
-            body, issueId, authorization, agentId, callerLinearUserId, /* skipCommentCreate */ true, /* skipLabelFields */ true
+            body, issueId, authorization, agentId, callerLinearUserId, /* skipCommentCreate */ true, /* skipLabelFields */ true, /* skipTransitionFields */ true
           );
           if (intentPathRawRejection) {
             log.warn(`raw-mutation-block-on-intent-path agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${intentPathRawRejection}`);

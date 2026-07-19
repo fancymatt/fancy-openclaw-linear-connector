@@ -94,6 +94,14 @@ export interface ChildState {
   isTerminal: boolean;
   /** The child's workflow state (from state:* label), or null. */
   workflowState: string | null;
+  /**
+   * INF-108: true when the child has no `state:*` label (demoted off its
+   * workflow mid-flight). An orphaned child cannot contribute to the barrier
+   * evaluation — it is neither terminal nor active — and holds the barrier
+   * indefinitely. The parent steward needs to know about this condition to
+   * manually resolve the deadlock.
+   */
+  isOrphaned: boolean;
 }
 
 /** Result of a barrier evaluation. */
@@ -104,6 +112,8 @@ export interface BarrierResult {
   totalChildren: number;
   /** Number of children in terminal states. */
   terminalCount: number;
+  /** Number of orphaned children (demoted off workflow, INF-108). */
+  orphanedCount: number;
   /** Details of each child. */
   children: ChildState[];
   /**
@@ -390,11 +400,18 @@ export async function fetchChildren(
 
     return nodes.map((node) => {
       const labels = (node.labels?.nodes ?? []).map((l) => l.name);
+      const workflowState = getCurrentState(labels);
+      // INF-108: a child is orphaned when it has no state:* label (it was
+      // demoted off its workflow mid-flight). Such children can never reach a
+      // terminal workflow state and hold the barrier indefinitely — the parent
+      // steward needs to know about this to manually resolve the deadlock.
+      const isOrphaned = workflowState === null && labels.length > 0;
       return {
         identifier: node.identifier,
         labels,
         isTerminal: isChildTerminal(labels),
-        workflowState: getCurrentState(labels),
+        workflowState,
+        isOrphaned,
       };
     });
   } catch (err) {
@@ -472,19 +489,24 @@ export async function evaluateBarrier(
   // INF-34: could not read the children ≠ has no children. Must precede the
   // zero-children check below, which would otherwise read this as satisfied.
   if (children === null) {
-    return { allTerminal: false, totalChildren: 0, terminalCount: 0, children: [], readFailed: true };
+    return { allTerminal: false, totalChildren: 0, terminalCount: 0, orphanedCount: 0, children: [], readFailed: true };
   }
 
   // AI-1730: zero children = vacuous satisfaction (barrier is trivially met).
   if (children.length === 0) {
-    return { allTerminal: true, totalChildren: 0, terminalCount: 0, children: [] };
+    return { allTerminal: true, totalChildren: 0, terminalCount: 0, orphanedCount: 0, children: [] };
   }
 
   const terminalCount = children.filter((c) => c.isTerminal).length;
+  const orphanedCount = children.filter((c) => c.isOrphaned).length;
+  // INF-108: orphaned children can never reach terminal and hold the barrier
+  // indefinitely. Treat the barrier as not-all-terminal if any orphan exists.
+  const allTerminal = orphanedCount === 0 && terminalCount === children.length;
   return {
-    allTerminal: terminalCount === children.length,
+    allTerminal,
     totalChildren: children.length,
     terminalCount,
+    orphanedCount,
     children,
   };
 }
@@ -535,6 +557,51 @@ async function alarmUnreadableChildren(
 }
 
 /**
+ * INF-108: alarm when the barrier evaluation finds orphaned children (children
+ * that have been demoted off their workflow mid-flight). Orphaned children
+ * hold the barrier indefinitely because they can never reach a terminal
+ * workflow state. The parent steward needs to know which children are orphaned
+ * and a clear escape path.
+ *
+ * Best-effort: a comment failure must not propagate.
+ */
+async function alarmOrphanedChildren(
+  parentIdentifier: string,
+  orphaned: Array<{ identifier: string; labels: string[] }>,
+  authToken: string,
+): Promise<void> {
+  const orphanList = orphaned.map((c) => `- ${c.identifier}`).join("\n");
+  log.error(
+    `barrier: INF-108 orphaned-children-detected on ${parentIdentifier}: ` +
+    `${orphaned.length} child(ren) demoted off their workflow — barrier held indefinitely. ` +
+    `Orphaned: ${orphaned.map((c) => c.identifier).join(", ")}`,
+  );
+  try {
+    const internalId = await resolveInternalId(parentIdentifier, authToken);
+    if (!internalId) {
+      log.error(`barrier: INF-108 cannot alarm orphaned children — failed to resolve ${parentIdentifier}`);
+      return;
+    }
+    await postComment(
+      internalId,
+      `[Barrier] **Orphaned child(ren) detected — barrier held on ${parentIdentifier} (INF-108).**\n\n` +
+      `The barrier found ${orphaned.length} child(ren) that have been demoted off their workflow:\n\n` +
+      `${orphanList}\n\n` +
+      `These children can never reach a terminal workflow state, so the barrier will NOT ` +
+      `auto-advance. To resolve the deadlock, the steward must manually complete or escape ` +
+      `the parent (\`linear complete ${parentIdentifier}\` or \`linear escape ${parentIdentifier}\`).\n\n` +
+      `After resolving, consider whether the orphaned children need re-enrollment or closure.`,
+      authToken,
+    );
+  } catch (err) {
+    log.error(
+      `barrier: INF-108 failed to post orphaned-children alarm for ${parentIdentifier}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
  * Attempt to auto-advance the parent from `managing → review` when the
  * barrier is satisfied (all children terminal).
  *
@@ -573,6 +640,16 @@ export async function attemptBarrierTransition(
   if (barrier.readFailed) {
     result.error = UNREADABLE_CHILDREN_ERROR;
     await alarmUnreadableChildren(parentIdentifier, authToken);
+    return result;
+  }
+
+  // INF-108: detect orphaned children before the generic not-all-terminal log.
+  // Orphaned children (demoted off their workflow) can never reach a terminal
+  // state and hold the barrier indefinitely. Surface them as a named condition.
+  if (barrier.orphanedCount > 0) {
+    const orphanedChildren = barrier.children.filter((c) => c.isOrphaned);
+    await alarmOrphanedChildren(parentIdentifier, orphanedChildren, authToken);
+    result.error = `INF-108: ${barrier.orphanedCount} orphaned child(ren) detected — barrier held indefinitely`;
     return result;
   }
 
@@ -737,6 +814,21 @@ export async function onManagingEntry(
       terminalCount: 0,
       totalChildren: 0,
       error: UNREADABLE_CHILDREN_ERROR,
+    };
+  }
+
+  // INF-108: orphaned children (demoted off workflow mid-flight) hold the
+  // barrier indefinitely. Surface them as a named condition rather than
+  // returning null (which looks like normal "children still active").
+  if (barrier.orphanedCount > 0) {
+    const orphanedChildren = barrier.children.filter((c) => c.isOrphaned);
+    await alarmOrphanedChildren(parentIdentifier, orphanedChildren, authToken);
+    return {
+      transitioned: false,
+      parentIdentifier,
+      terminalCount: barrier.terminalCount,
+      totalChildren: barrier.totalChildren,
+      error: `INF-108: ${barrier.orphanedCount} orphaned child(ren) detected — barrier held indefinitely`,
     };
   }
 
