@@ -750,7 +750,7 @@ describe("checkWorkflowRules — deploy:execute capability gate (merge state)", 
   afterEach(() => { globalThis.fetch = originalFetch; });
 
   it("allows 'continue' from Hanzo (deployment body) in merge state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"]);
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { hasMergedPR: true });
     expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 
@@ -910,7 +910,7 @@ describe("checkWorkflowRules — canonical vault schema (src/__fixtures__/canoni
   });
 
   it("canonical: continue in merge state is allowed for Hanzo (deployment body)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge", "stakes:low"]);
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge", "stakes:low"], { hasMergedPR: true });
     expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 });
@@ -3474,11 +3474,12 @@ bodies:
 
       // AI-1475 D1: Branch/PR status for done gate
       if (q.includes("IssueBranchAndPR")) {
+        const hasMergeDeployState = childLabels.some((l: { name: string }) => l.name === "state:merge" || l.name === "state:deploy");
         return new Response(
           JSON.stringify({
             data: {
               issue: {
-                attachments: { nodes: [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status: "open" } }] },
+                attachments: { nodes: [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status: hasMergeDeployState ? "merged" : "open" } }] },
               },
             },
           }),
@@ -4903,7 +4904,7 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       process.env.CAPABILITY_POLICY_PATH = devImplPolicyFile;
       resetPolicyCache();
 
-      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge", "stakes:low"], { hasBranch: true, hasPR: true });
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge", "stakes:low"], { hasBranch: true, hasPR: true, hasMergedPR: true });
       expect(await checkWorkflowRules("continue", "AI-3001", "Bearer tok", "hanzo")).toBeNull();
 
       process.env.WORKFLOW_DEF_PATH = CANONICAL_SPRINT_FIXTURE;
@@ -6289,8 +6290,9 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
 
       // Branch/PR for done gate
       if (q.includes("IssueBranchAndPR")) {
+        const status = currentLabels.some((l) => l === "state:merge" || l === "state:deploy") ? "merged" : "open";
         return new Response(
-          JSON.stringify({ data: { issue: { attachments: { nodes: [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status: "open" } }] } } } }),
+          JSON.stringify({ data: { issue: { attachments: { nodes: [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status } }] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
