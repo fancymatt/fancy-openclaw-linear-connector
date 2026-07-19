@@ -280,7 +280,7 @@ class PostgresParityDriver implements TestDbDriver {
         // Find the index of this column in the column list
         const colIdx = columns.indexOf(serialCol.name.toLowerCase());
         if (colIdx < params.length && (params[colIdx] === null || params[colIdx] === undefined)) {
-          const nextId = (self.serialCounters.get(tableName) ?? 1);
+          const nextId = (this.serialCounters.get(tableName) ?? 1);
           params[colIdx] = nextId;
           this.serialCounters.set(tableName, nextId + 1);
         }
