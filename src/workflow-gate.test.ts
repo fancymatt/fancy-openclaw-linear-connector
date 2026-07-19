@@ -6938,15 +6938,15 @@ describe("checkWorkflowRules — AI-1576 AC3: demote blocked when ticket has in-
     expect(result).toContain("demote");
   });
 
-  it("AC3: demote from intake is blocked when ticket has a merged PR", async () => {
+  // AI-2016 AC1: merged PRs are now a release condition, not a block condition.
+  // A shipped ticket (all PRs merged) is safe to demote — the guard permits it.
+  it("AC3: demote from intake is ALLOWED when all PRs are merged (AI-2016 AC1)", async () => {
     globalThis.fetch = makeLabelFetch(
       ["wf:dev-impl", "state:intake"],
       { hasBranch: true, hasPR: true, hasMergedPR: true },
     );
     const result = await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
-    expect(result).toContain("demote");
+    expect(result).toBeNull();
   });
 
   // AI-1797: branch-only evidence (pushed, no PR yet) is invisible via attachments —

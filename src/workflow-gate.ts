@@ -2330,17 +2330,28 @@ export async function checkWorkflowRules(
   // A demote on a dev-impl ticket carrying a pushed branch or open/merged PR silently
   // drops it off-spine while implementation is already underway. Fail-open on fetch
   // error so a transient API outage never permanently strands a genuinely-fresh intake.
+  // AI-2016 AC1: skip the guard when ALL PR evidence is merged — a shipped ticket
+  // with merged PRs is safe to demote (it's done, not in-flight). When the guard
+  // permits demote (no evidence, or evidence is all merged), return null immediately
+  // to short-circuit the transition-legality check — demote is not a normal state
+  // transition but a workflow-exit action handled by applyStateTransition (B2).
   if (intent === "demote" && workflowId === "dev-impl" && !breakGlassOverride) {
     const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     if (branchStatus && (branchStatus.hasBranch || branchStatus.hasPR)) {
-      log.warn(`workflow-gate: AI-1576 demote-guard blocked agent=${bodyId} ticket=${issueId} (hasBranch=${branchStatus.hasBranch} hasPR=${branchStatus.hasPR})`);
-      return (
-        `[Proxy] 'demote' blocked on ${issueId}: this ticket has in-flight or merged implementation work ` +
-        `(branch: ${branchStatus.hasBranch}, PR: ${branchStatus.hasPR}). ` +
-        `Demoting would silently drop it off the dev-impl spine while implementation is underway. ` +
-        `Use break-glass ('escape') to override if intentional.`
-      );
+      if (!branchStatus.hasMergedPR) {
+        log.warn(`workflow-gate: AI-1576 demote-guard blocked agent=${bodyId} ticket=${issueId} (hasBranch=${branchStatus.hasBranch} hasPR=${branchStatus.hasPR} hasMergedPR=${branchStatus.hasMergedPR})`);
+        return (
+          `[Proxy] 'demote' blocked on ${issueId}: this ticket has in-flight implementation work ` +
+          `(branch: ${branchStatus.hasBranch}, PR: ${branchStatus.hasPR}) that is not yet merged. ` +
+          `Demoting would silently drop it off the dev-impl spine while implementation is underway. ` +
+          `Use break-glass ('escape') to override if intentional.`
+        );
+      }
+      // All PRs are merged — shipped ticket, safe to demote
+      log.info(`workflow-gate: AI-1576 demote-guard allowed agent=${bodyId} ticket=${issueId} (merged PR — shipped ticket)`);
+      return null;
     }
+    // No branch/PR evidence at all — fresh intake, not blocking
   }
 
   // AI-1397: delegate-only enforcement at proxy (CLI-version-agnostic).
