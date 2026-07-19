@@ -32,6 +32,7 @@ import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
 import { getCircuitBreakerHealth } from "./dispatch-circuit-breaker.js";
 import { getPreFlightLiveness, registerSpawnerPreflight } from "./spawner-preflight.js";
+import { checkFanoutOutcomeStoreLiveness, getFanoutOutcomeStoreLiveness } from "./fanout-outcome-store.js";
 import { registerDistillationCron, createProdGenerationContext } from "./cron/p4-metrics-distillation.js";
 import { registerRescueSweepCron } from "./cron/rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
@@ -396,6 +397,11 @@ export function createApp(options?: CreateAppOptions) {
       // scheduled=true only if registerSpawnerPreflight() was called; proves the
       // component is wired at the production entry point (AI-1808 dead-code-in-prod guard).
       spawnerPreflight: getPreFlightLiveness(),
+      // INF-28 AC4: fanout-outcome-store liveness — confirms the DATA_DIR
+      // is readable and writable. `healthy` is null before the startup check
+      // completes; false means every fanout outcome is absent → current-behavior
+      // → potential vacuous advance. Observable at ac-validate without log access.
+      fanoutOutcomeStore: getFanoutOutcomeStoreLiveness(),
       // AI-2582: transcript redaction sweep — periodic .trajectory.jsonl
       // credential redaction. status is "idle"/"running"/"error"; lastRun
       // is null before the first sweep fires.
@@ -1218,6 +1224,14 @@ export function createApp(options?: CreateAppOptions) {
   // credential redaction. Registered here so the cron registry and /health
   // both prove wiring without waiting for a trigger.
   registerTranscriptRedaction();
+
+  // INF-28 AC4: fanout-outcome-store liveness check at startup. An
+  // unwritable DATA_DIR would silently produce N `absent` outcomes →
+  // warned-but-advanced parents → LIF-2 fleet-wide. Fatal-logged and
+  // observable at /health.fanoutOutcomeStore.
+  checkFanoutOutcomeStoreLiveness().catch((err) => {
+    log.error(`fanout-outcome-store startup liveness check threw: ${err instanceof Error ? err.message : String(err)}`);
+  });
 
   return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, transcriptRedactionHealth: getTranscriptRedactionHealth() };
 }

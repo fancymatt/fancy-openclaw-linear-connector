@@ -185,6 +185,39 @@ export function clearFanoutOutcomeStore(): void {
   _loadedFromPath = null;
 }
 
+// ── Startup liveness state (INF-28 AC4) ───────────────────────────────────────────────
+
+/** Whether the startup liveness check has been completed. */
+let _livenessCompleted = false;
+
+/** Whether the startup liveness check passed (only meaningful when _livenessCompleted). */
+let _livenessOk = false;
+
+/** ISO timestamp of the last liveness check (startup). */
+let _livenessCheckedAt: string | null = null;
+
+/**
+ * Reset liveness state (for tests).
+ */
+export function resetFanoutOutcomeStoreLiveness(): void {
+  _livenessCompleted = false;
+  _livenessOk = false;
+  _livenessCheckedAt = null;
+}
+
+/**
+ * Return the recorded liveness state — never calls the store; for /health surfacing.
+ */
+export function getFanoutOutcomeStoreLiveness(): {
+  healthy: boolean | null;
+  checkedAt: string | null;
+} {
+  return {
+    healthy: _livenessCompleted ? _livenessOk : null,
+    checkedAt: _livenessCheckedAt,
+  };
+}
+
 /**
  * Startup liveness check: verify the store is readable and writable.
  * An unreadable/unwritable DATA_DIR is a fatal, alarming condition — it would
@@ -199,10 +232,16 @@ export async function checkFanoutOutcomeStoreLiveness(): Promise<boolean> {
     await ensureLoaded();
     // Verify writability by persisting (no new records, just the current state)
     await persist();
+    _livenessCompleted = true;
+    _livenessOk = true;
+    _livenessCheckedAt = new Date().toISOString();
     log.info("fanout-outcome-store: liveness check passed");
     return true;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
+    _livenessCompleted = true;
+    _livenessOk = false;
+    _livenessCheckedAt = new Date().toISOString();
     log.error(
       `fanout-outcome-store: LIVENESS CHECK FAILED — DATA_DIR may be unwritable. ` +
       `Every fanout outcome will be absent → current-behavior → potential vacuous advance. ` +
