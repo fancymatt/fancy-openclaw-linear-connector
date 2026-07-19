@@ -11,7 +11,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { extractFindings, executeFanout, shouldTriggerFanout, type Finding } from "./fanout.js";
+import { extractFindings, executeFanout, shouldTriggerFanout, sanitizeTitle, type Finding } from "./fanout.js";
 import { applyStateTransition, resetWorkflowCache, type WorkflowDef, type FanoutConfig } from "./workflow-gate.js";
 import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
@@ -202,6 +202,205 @@ describe("extractFindings", () => {
 
     const result = extractFindings(description, "Fallback");
     expect(result).toEqual([{ title: "Fallback" }]);
+  });
+});
+
+// ── sanitizeTitle (INF-113) ────────────────────────────────────────────────
+
+describe("sanitizeTitle", () => {
+  it("replaces [PM-7] with PM-7 ·", () => {
+    const result = sanitizeTitle("🛡️ [PM-7] Per-resident namespacing — docs + tests");
+    expect(result).toBe("🛡️ PM-7 · Per-resident namespacing — docs + tests");
+  });
+
+  it("handles multiple bracket refs in one title", () => {
+    const result = sanitizeTitle("[UX-14] [EN-8] Cross-cutting concerns");
+    expect(result).toBe("UX-14 · EN-8 · Cross-cutting concerns");
+  });
+
+  it("leaves titles without brackets unchanged", () => {
+    const result = sanitizeTitle("Clean title with no refs");
+    expect(result).toBe("Clean title with no refs");
+  });
+
+  it("handles ref at end of title (trailing middot expected — edge case acceptable)", () => {
+    const result = sanitizeTitle("Do the thing [AI-999]");
+    expect(result).toBe("Do the thing AI-999 · ");
+  });
+
+  it("handles three-letter prefix (e.g. INF-113, AI-1994)", () => {
+    const result = sanitizeTitle("[INF-113] Fix fanout title rendering");
+    expect(result).toBe("INF-113 · Fix fanout title rendering");
+  });
+
+  it("ignores lowercase prefixes (not a standard Linear ID)", () => {
+    const result = sanitizeTitle("[abc-1] Not a real issue ref");
+    expect(result).toBe("[abc-1] Not a real issue ref");
+  });
+
+  it("handles two-letter prefix like UI-1", () => {
+    const result = sanitizeTitle("[UI-1] Minor layout bug");
+    expect(result).toBe("UI-1 · Minor layout bug");
+  });
+});
+
+// ── INF-113: title sanitization + marker ordering in executeFanout ─────────
+
+describe("executeFanout — INF-113 title sanitization and marker ordering", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let fetchCalls: Array<{ url: string; body: Record<string, unknown> }>;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    fetchCalls = [];
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  /** Minimal mock fetch for INF-113 tests. */
+  function makeFetch(opts: {
+    teamLabels?: Array<{ id: string; name: string }>;
+    parentDescription?: string;
+  }): typeof globalThis.fetch {
+    const teamLabels = opts.teamLabels ?? [
+      { id: "l-wf", name: "wf:dev-impl" },
+      { id: "l-intake", name: "state:intake" },
+    ];
+    const parentDescription = opts.parentDescription ?? "";
+    return async (url, init) => {
+      if (typeof url !== "string" || !url.includes("api.linear.app")) {
+        throw new Error("unexpected fetch");
+      }
+      const parsed = JSON.parse(typeof init?.body === "string" ? init.body : "{}");
+      fetchCalls.push({ url, body: parsed });
+      const q = parsed.query ?? "";
+
+      if (q.includes("IssueTeamParent")) {
+        return new Response(JSON.stringify({
+          data: {
+            issue: {
+              id: "parent-uuid",
+              title: "Parent",
+              description: parentDescription,
+              team: { id: "team-uuid" },
+              parent: null,
+            },
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (q.includes("TeamLabels")) {
+        return new Response(JSON.stringify({
+          data: { team: { labels: { nodes: teamLabels } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (q.includes("issueLabelCreate")) {
+        const name = parsed.variables?.name as string;
+        return new Response(JSON.stringify({
+          data: { issueLabelCreate: { success: true, issueLabel: { id: `label-${name}` } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (q.includes("issueCreate")) {
+        return new Response(JSON.stringify({
+          data: {
+            issueCreate: {
+              success: true,
+              issue: { id: "child-uuid", identifier: "AI-5001" },
+            },
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (q.includes("commentCreate")) {
+        return new Response(JSON.stringify({
+          data: { commentCreate: { success: true, comment: { id: "c-uuid" } } },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      throw new Error(`unexpected query: ${q.slice(0, 80)}`);
+    };
+  }
+
+  it("INF-113: sanitizes [XX-N] brackets in child titles", async () => {
+    const findings: Finding[] = [
+      { title: "🛡️ [PM-7] Per-resident namespacing — docs + tests" },
+    ];
+    globalThis.fetch = makeFetch({});
+
+    await executeFanout("AI-999", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, {
+      skipPreview: true,
+      findingsOverride: findings,
+    });
+
+    const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
+    expect(createCalls).toHaveLength(1);
+    const input = createCalls[0].body.variables?.input as Record<string, unknown>;
+    expect(input.title).toBe("🛡️ PM-7 · Per-resident namespacing — docs + tests");
+  });
+
+  it("INF-113: leaves titles without brackets unchanged", async () => {
+    const findings: Finding[] = [
+      { title: "Clean title with no refs" },
+    ];
+    globalThis.fetch = makeFetch({});
+
+    await executeFanout("AI-999", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, {
+      skipPreview: true,
+      findingsOverride: findings,
+    });
+
+    const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
+    const input = createCalls[0].body.variables?.input as Record<string, unknown>;
+    expect(input.title).toBe("Clean title with no refs");
+  });
+
+  it("INF-113: description has human body before machine markers", async () => {
+    // Findings passed via findingsOverride don't get withStableIds() —
+    // set .id manually to trigger marker insertion.
+    const findings: Finding[] = [
+      { title: "Finding A", description: "This is the real description body.", id: "finding-a-12345678" },
+    ];
+    globalThis.fetch = makeFetch({});
+
+    await executeFanout("AI-999", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, {
+      skipPreview: true,
+      findingsOverride: findings,
+    });
+
+    const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
+    expect(createCalls).toHaveLength(1);
+    const input = createCalls[0].body.variables?.input as Record<string, unknown>;
+    const desc = input.description as string;
+
+    // The human body should appear BEFORE any HTML-comment marker
+    const humanBodyIndex = desc.indexOf("This is the real description body.");
+    const firstMarkerIndex = desc.indexOf("<!--");
+    expect(humanBodyIndex).toBeGreaterThanOrEqual(0);
+    expect(firstMarkerIndex).toBeGreaterThan(humanBodyIndex);
+  });
+
+  it("INF-113: description without human body still has markers at bottom", async () => {
+    const findings: Finding[] = [
+      { title: "Finding B", id: "finding-b-87654321" }, // no description, has id → markers emitted
+    ];
+    globalThis.fetch = makeFetch({});
+
+    await executeFanout("AI-999", "Bearer tok", DEV_IMPL_FANOUT_CONFIG, {
+      skipPreview: true,
+      findingsOverride: findings,
+    });
+
+    const createCalls = fetchCalls.filter((c) => (c.body.query ?? "").includes("issueCreate"));
+    expect(createCalls).toHaveLength(1);
+    const input = createCalls[0].body.variables?.input as Record<string, unknown>;
+    const desc = input.description as string;
+
+    // Should start with "Parent:" (no description body to insert)
+    expect(desc).toMatch(/^Parent:/);
+    // The last non-empty lines should be the two marker comments
+    const lines = desc.split("\n");
+    const lastMarkerLine = [...lines].reverse().find((l) => l.includes("<!--"));
+    expect(lastMarkerLine).toBeDefined();
+    expect(lastMarkerLine!).toContain("<!-- inf-32:child-workflow:");
   });
 });
 

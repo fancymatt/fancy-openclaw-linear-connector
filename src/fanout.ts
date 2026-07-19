@@ -187,6 +187,25 @@ export interface FanoutError {
   message: string;
 }
 
+// ── Title sanitization (INF-113) ───────────────────────────────────────────
+
+/**
+ * INF-113: Sanitize a fanout child title so Linear's auto-linkifier doesn't
+ * mangle or truncate bracketed issue references like [PM-7].
+ *
+ * Transforms:
+ *   "🛡️ [PM-7] Per-resident namespacing — docs + tests"
+ *   → "🛡️ PM-7 · Per-resident namespacing — docs + tests"
+ *
+ * The pattern matches `[XX-N]` where XX is 2-3 uppercase letters and N is
+ * digits (the standard Linear issue-id format). The brackets are stripped
+ * and replaced with a middot separator so the identifier stays readable
+ * without triggering Linear's linkifier on the title.
+ */
+export function sanitizeTitle(title: string): string {
+  return title.replace(/\[([A-Z]{2,3}-\d+)\](?:\s*)/g, "$1 · ");
+}
+
 // ── Stable spec-entry ids (AI-1994) ────────────────────────────────────────
 
 /**
@@ -1259,7 +1278,9 @@ export async function executeFanout(
   // left untouched.
   for (let i = 0; i < toSpawn.length; i++) {
     const finding = toSpawn[i];
-    const childTitle = finding.title;
+    // INF-113: sanitize the title before passing to Linear — strip bracketed
+    // issue-refs ([XX-N]) so the auto-linkifier doesn't mangle or truncate.
+    const childTitle = sanitizeTitle(finding.title);
 
     // AI-2199: per-entry child workflow override. Falls back to config default.
     const findingWorkflow = finding.child_workflow ?? childWorkflowLabel;
@@ -1303,18 +1324,29 @@ export async function executeFanout(
       log.warn(`fanout: per-entry delegate '${finding.delegate}' for finding "${childTitle}" did not resolve — spawning undelegated`);
     }
 
-    // Build child description: parent reference + a machine-readable spec-entry
-    // marker (AI-1994) so a later re-entry can match this child back to its spec
-    // entry and skip re-spawning it. The marker is an HTML comment — invisible
-    // in Linear's rendered markdown.
-    const childDescription = [
-      `Parent: ${parentIssueId}`,
-      finding.id ? `${SPEC_ENTRY_MARKER_PREFIX}${finding.id} -->` : "",
-      // INF-32: record the minting workflow so a later fan-out sharing this
-      // spec_source can tell this child apart from one of its own.
-      finding.id ? `${CHILD_WORKFLOW_MARKER_PREFIX}${findingWorkflow} -->` : "",
-      finding.description ? `\n${finding.description}` : "",
-    ].filter(Boolean).join("\n");
+    // INF-113: Build child description with load-bearing machine markers placed
+    // BELOW the human body. The markers are HTML comments on the assumption
+    // they'd be invisible — but Linear renders them as visible text. Placing
+    // them at the top polluted every minted child with machine noise. Moving
+    // them below the description means a human reader sees the real content
+    // first, and the markers are far less obtrusive. (The durable fix for a
+    // marker-free description is a Linear-native field, tracked separately.
+    // When that lands, the markers can be removed and the dedup/child-workflow
+    // read paths updated in lockstep.)
+    const descriptionFragments: string[] = [`Parent: ${parentIssueId}`];
+    if (finding.description) {
+      descriptionFragments.push("", finding.description);
+    }
+    if (finding.id) {
+      descriptionFragments.push(
+        "",
+        `${SPEC_ENTRY_MARKER_PREFIX}${finding.id} -->`,
+        // INF-32: record the minting workflow so a later fan-out sharing this
+        // spec_source can tell this child apart from one of its own.
+        `${CHILD_WORKFLOW_MARKER_PREFIX}${findingWorkflow} -->`,
+      );
+    }
+    const childDescription = descriptionFragments.join("\n");
 
     const child = await createChildIssue(
       parentCtx.teamId,
