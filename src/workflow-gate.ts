@@ -1715,6 +1715,15 @@ interface BranchAndPRStatus {
   prMetadataAvailable: boolean;
   /** URLs of PR attachments found on the issue (INF-112). */
   prUrls: string[];
+  /**
+   * True when the INF-132 GitHub API verification was attempted but
+   * inconclusive — i.e., all API requests failed (auth error, network
+   * error, 404, etc.) rather than returning a definitive "merged" or
+   * "not merged" answer. When true and no GH_TOKEN is configured, the
+   * stale-metadata else branch applies a defense-in-depth fallback
+   * accepting PR URLs as sufficient evidence (INF-139).
+   */
+  ghVerificationInconclusive?: boolean;
 }
 
 /**
@@ -1836,8 +1845,17 @@ async function fetchBranchAndPRStatus(
     // metadata can be stale — a merged PR may still show "open" in Linear for
     // minutes or longer. The GitHub API is the source of truth. Check both
     // attachment-based and description-scanned URLs for full coverage.
+    let ghVerificationInconclusive = false;
     if (!hasMergedPR && allPrUrls.length > 0) {
-      hasMergedPR = await verifyPrMergeStateViaGitHub(allPrUrls);
+      const ghResult = await verifyPrMergeStateViaGitHub(allPrUrls);
+      if (ghResult === true) {
+        hasMergedPR = true;
+      } else if (ghResult === null) {
+        // All GitHub API requests failed (auth error, network error, 404, etc.)
+        // — verification was inconclusive. Track this so the stale-metadata
+        // gate can apply defense-in-depth when no GH_TOKEN is configured.
+        ghVerificationInconclusive = true;
+      }
     }
     return {
       // Attachments cannot see branches directly; a PR implies a pushed branch.
@@ -1849,6 +1867,7 @@ async function fetchBranchAndPRStatus(
       hasMergedPR,
       prMetadataAvailable,
       prUrls: allPrUrls,
+      ghVerificationInconclusive,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1873,7 +1892,8 @@ async function fetchBranchAndPRStatus(
  * (higher rate limit, private repo access). Falls back to unauthenticated
  * requests when no token is available.
  */
-async function verifyPrMergeStateViaGitHub(prUrls: string[]): Promise<boolean> {
+async function verifyPrMergeStateViaGitHub(prUrls: string[]): Promise<boolean | null> {
+  let anySuccessfulRequest = false;
   for (const prUrl of prUrls) {
     const parsed = parseGitHubPrUrl(prUrl);
     if (!parsed) continue;
@@ -1893,6 +1913,7 @@ async function verifyPrMergeStateViaGitHub(prUrls: string[]): Promise<boolean> {
         log.warn(`INF-132: GitHub API returned ${res.status} for ${owner}/${repo}#${number} — skipping GitHub verification (falling back to Linear metadata)`);
         continue;
       }
+      anySuccessfulRequest = true;
       type GitHubPrResponse = { merged?: boolean };
       const prData = (await res.json()) as GitHubPrResponse;
       if (prData.merged === true) {
@@ -1905,7 +1926,10 @@ async function verifyPrMergeStateViaGitHub(prUrls: string[]): Promise<boolean> {
       continue;
     }
   }
-  return false;
+  // Return null when no API request succeeded (all failed or all returned
+  // non-200) — verification was inconclusive. Return false when at least one
+  // request succeeded and confirmed the PR is not merged.
+  return anySuccessfulRequest ? false : null;
 }
 
 /**
@@ -3022,19 +3046,44 @@ export async function checkWorkflowRules(
           }
         }
       } else {
-        // Has some GitHub evidence but PR is not yet merged (open PR, partial
-        // evidence, etc.). Block: affirmative evidence that code review was not
-        // completed. The only pass through the done gate is a verified merged PR.
-        // (INF-96 / AI-1497 rework: open PR no longer passes.)
-        const missing: string[] = [];
-        if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
-        if (!branchStatus.hasPR) missing.push('no pull request associated');
-        if (missing.length === 0) missing.push('pull request not yet merged');
-        log.warn(`workflow-gate: done gate: ${issueId} blocked — ${missing.join('; ')}`);
-        return (
-          `[Proxy] '${intent}' blocked: cannot release unmerged work. Missing: ${missing.join('; ')}. ` +
-          `Push the branch and open a pull request before deploying.`
-        );
+        // Has some GitHub evidence but Linear metadata shows the PR as not
+        // merged. When metadata exists (prMetadataAvailable=true) but the
+        // INF-132 GitHub API fallback was inconclusive (all requests failed
+        // — 401 on private repo without token, network error, etc.) AND no
+        // GH_TOKEN is configured, apply defense-in-depth: accept PR URLs as
+        // sufficient since the ticket reached merge/deploy state through the
+        // merge gate which already verified (INF-139).
+        //
+        // When verification was conclusive (GitHub confirmed not merged) or
+        // GH_TOKEN IS configured but the API still failed, block — we have
+        // affirmative metadata evidence that the PR is not merged.
+        const ghTokenConfigured = !!(process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN);
+        const ghInconclusive = branchStatus.ghVerificationInconclusive === true;
+        if (ghInconclusive && !ghTokenConfigured) {
+          log.warn(`workflow-gate: done gate: ${issueId} — PR metadata shows "not merged" but INF-132 GitHub check was inconclusive and no GH_TOKEN configured; accepting PR as sufficient (INF-139 defense-in-depth). Set GH_TOKEN to enable direct GitHub verification.`);
+          notify({
+            severity: "info",
+            source: "done-gate",
+            title: "PR evidence accepted (stale Linear metadata, no GH_TOKEN — INF-139)",
+            detail: `Ticket ${issueId}: PR attachment metadata shows "not merged" but may be stale (Linear GitHub integration sync lag). No GH_TOKEN configured for GitHub API verification. Accepting PR URL as sufficient since ticket reached merge/deploy state via merge gate verification.`,
+            ticket: issueId,
+            dedupKey: `done-gate|inf-139-stale-no-token|${issueId}`,
+          });
+        } else {
+          // Affirmative evidence that the PR is genuinely not merged:
+          // either GitHub confirmed it, or GitHub check couldn't run but
+          // Linear metadata clearly shows "open". Block with actionable
+          // message. (INF-96 / AI-1497 rework: open PR no longer passes.)
+          const missing: string[] = [];
+          if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
+          if (!branchStatus.hasPR) missing.push('no pull request associated');
+          if (missing.length === 0) missing.push('pull request not yet merged');
+          log.warn(`workflow-gate: done gate: ${issueId} blocked — ${missing.join('; ')}`);
+          return (
+            `[Proxy] '${intent}' blocked: cannot release unmerged work. Missing: ${missing.join('; ')}. ` +
+            `Push the branch and open a pull request before deploying.`
+          );
+        }
       }
     }
   }

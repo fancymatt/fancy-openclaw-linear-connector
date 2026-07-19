@@ -1950,7 +1950,12 @@ describe("checkWorkflowRules — AI-2476: merged-PR release gate (branch/PR veri
       expect(result).toBeNull();
     });
 
-    it("allows 'continue' when GitHub API returns 404 (PR deleted, fail-open)", async () => {
+    it("allows 'continue' when GitHub API returns 404 with no GH_TOKEN (PR deleted, INF-139 defense-in-depth)", async () => {
+      // No GH_TOKEN is configured (set in INF-132 describe afterEach). GitHub
+      // returns 404 — all API requests fail, so verifyPrMergeStateViaGitHub
+      // returns null (inconclusive). ghVerificationInconclusive=true triggers
+      // the INF-139 defense-in-depth: since the ticket is in merge state
+      // (merge gate already verified), accept the PR URL as sufficient.
       globalThis.fetch = async (_url, init) => {
         const bodyText = typeof init?.body === "string" ? init.body : "";
         if (bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
@@ -1968,7 +1973,7 @@ describe("checkWorkflowRules — AI-2476: merged-PR release gate (branch/PR veri
             data: { team: { states: { nodes: [] } } },
           }), { status: 200, headers: { "Content-Type": "application/json" } });
         }
-        // GitHub returns 404 — PR was deleted, fail-open (fall back to Linear)
+        // GitHub returns 404 — all requests fail, verification inconclusive
         if ((_url as string).includes("api.github.com")) {
           return new Response(JSON.stringify({ message: "Not Found" }), {
             status: 404, headers: { "Content-Type": "application/json" },
@@ -1981,11 +1986,57 @@ describe("checkWorkflowRules — AI-2476: merged-PR release gate (branch/PR veri
         }
         throw new Error(`INF-132 test: unexpected fetch: ${bodyText.slice(0, 100)}`);
       };
+      // With INF-139, a 404 + no GH_TOKEN means ghVerificationInconclusive=true
+      // and the stale-metadata branch applies defense-in-depth. Gate passes.
       const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
-      // With a 404, GitHub verification fails and we fall back to Linear's
-      // "open" status — the gate blocks since no merged evidence exists.
-      expect(result).not.toBeNull();
-      expect(result).toContain("blocked");
+      expect(result).toBeNull();
+    });
+
+    it("allows 'continue' from merge state when Linear metadata is stale and no GH_TOKEN is configured (INF-139 defense-in-depth)", async () => {
+      // Linear returns "open" (stale), GitHub API returns 401 because the
+      // repo is private and no GH_TOKEN is set. The INF-132 fallback logs a
+      // warning and skips, falling back to Linear's stale "open" metadata.
+      // With the INF-139 fix, the stale-metadata else branch detects the
+      // inconclusive GitHub verification and no GH_TOKEN, then accepts PR
+      // URL as sufficient evidence (defense-in-depth — merge gate already
+      // verified the PR was merged).
+      delete process.env.GITHUB_TOKEN;
+      delete process.env.GH_TOKEN;
+      globalThis.fetch = async (_url, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+          return new Response(JSON.stringify({
+            data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:merge" }] }, delegate: null } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("IssueBranchAndPR")) {
+          // Linear attachment metadata shows "open" (stale — actually merged)
+          return new Response(JSON.stringify({
+            data: { issue: { attachments: { nodes: [{ url: "https://github.com/fancymatt/fancy-openclaw-linear-connector/pull/999", sourceType: "github", metadata: { status: "open" } }] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("TeamStates")) {
+          return new Response(JSON.stringify({
+            data: { team: { states: { nodes: [] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        // GitHub API returns 401 (private repo, no token) — INF-132 skips
+        if ((_url as string).includes("api.github.com")) {
+          return new Response(JSON.stringify({ message: "Unauthorized" }), {
+            status: 401, headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (bodyText.includes("WorkflowDefs")) {
+          return new Response(JSON.stringify({ data: { workflowDefs: [] } }), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+        throw new Error(`INF-139 test: unexpected fetch: ${bodyText.slice(0, 100)}`);
+      };
+      const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+      // With INF-139 fix, the stale-metadata else branch detects no GH_TOKEN
+      // and accepts the PR URL as sufficient (defense-in-depth).
+      expect(result).toBeNull();
     });
   });
 
