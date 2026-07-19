@@ -166,7 +166,7 @@ fi
       done
     else
       mkdir -p "$WORKFLOW_DEFS_DIR"
-      rsync -a --delete "$DEPLOY_WT/src/registered-defs/"*.yaml "$WORKFLOW_DEFS_DIR/"
+      rsync -a --ignore-existing "$DEPLOY_WT/src/registered-defs/"*.yaml "$WORKFLOW_DEFS_DIR/"
       echo "        workflow YAML definitions synced"
     fi
   else
