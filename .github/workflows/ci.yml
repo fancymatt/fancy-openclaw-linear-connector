@@ -57,7 +57,7 @@ jobs:
         run: pip install bandit
 
       - name: Run bandit
-        run: bandit --recursive apps/mam-downloader --severity-level medium
+        run: bandit --recursive apps/mam-downloader --severity-level medium --ini .bandit
 
   security-pip-audit:
     name: Security - pip-audit (dependency CVEs)
