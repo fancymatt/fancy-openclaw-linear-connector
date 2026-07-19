@@ -3561,6 +3561,20 @@ export async function applyStateTransition(
   // the nulls (stripNullDelegateAssigneeFields) so they reach Linear directly.
   if (intent === breakGlassCommand) {
     toStateName = def.break_glass?.to ?? "escape";
+    // INF-135: escape-wedge fix — when the ticket is already in the break-glass
+    // target state, escape must restart the workflow rather than no-opping
+    // idempotently. The escape verb is the only legal verb from this state;
+    // an idempotent escape silently strands the ticket with no forward path.
+    // Transition to the workflow's entry_state to resume, or demote to ad-hoc
+    // if no entry_state is defined.
+    const breakGlassTarget = def.break_glass?.to ?? "escape";
+    if (currentStateName && currentStateName === breakGlassTarget) {
+      toStateName = def.entry_state ?? "__ad_hoc__";
+      log.info(
+        `workflow-gate: INF-135 escape-wedge: ${issueId} already at break-glass target '${currentStateName}'; ` +
+        `re-entering at '${toStateName}' instead of no-opping idempotently`,
+      );
+    }
   } else if (intent === "park") {
     toStateName = "__ad_hoc__";
     log.info(`workflow-gate: B2 apply: ${issueId} parking — demoting to __ad_hoc__`);
