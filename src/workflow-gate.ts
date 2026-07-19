@@ -2634,38 +2634,34 @@ export async function checkWorkflowRules(
     } else if (branchStatus.hasMergedPR) {
       log.info(`workflow-gate: done gate: ${issueId} passed (merged PR confirmed)`);
     } else if (!branchStatus.hasBranch && !branchStatus.hasPR) {
-      // AI-1497: Complete absence of evidence — likely lost to auto-delete.
-      // Fail-open: a ticket in merge/deploy state has already passed code review,
-      // so the PR almost certainly existed and was merged.
-      log.info(`workflow-gate: done gate: ${issueId} passed (no branch/PR evidence — treating as merged, data likely lost to auto-delete)`);
-      // AI-1797: with no GitHub integration installed, EVERY ticket takes this
-      // path — an evidence-free gate. Constant dedup key: one folded alert row,
-      // count keeps rising until the integration lands, then it goes quiet.
+      // INF-96: Complete absence of evidence → hard block. This was an AI-1497
+      // fail-open, but with no GitHub integration installed every ticket passed
+      // evidence-free — a silent false-completion failure mode. The warning-only
+      // alert scrolled past. Now treated as a hard block with an actionable alert.
+      log.warn(`workflow-gate: done gate: ${issueId} blocked — no branch/PR evidence`);
       notify({
-        severity: "warning",
+        severity: "error",
         source: "done-gate",
-        title: "done gate passed with no branch/PR evidence (GitHub integration missing?)",
-        detail: `Ticket ${issueId} passed '${intent}' with zero GitHub attachments. If this fires for every forward move, the Linear GitHub integration is not installed and the merged-PR gate is verifying nothing.`,
+        title: "done gate blocked: no branch/PR evidence (GitHub integration missing?)",
+        detail: `Ticket ${issueId} blocked on '${intent}' with zero GitHub attachments. If this fires for every forward move, the Linear GitHub integration is not installed and the merged-PR gate is verifying nothing. Install the integration or use break-glass to bypass.`,
         ticket: issueId,
         dedupKey: "done-gate|no-evidence",
       });
+      return `[Proxy] '${intent}' blocked: cannot release — no branch/PR evidence found.`;
     } else {
-      // Partial evidence exists (has branch but no PR, or similar).
-      // Block: affirmative evidence that review was not completed.
-      // AI-1797: with attachment-derived status hasBranch ≡ hasPR, so this
-      // block is currently unreachable (open PR falls through to the pass
-      // log below). Kept for defense-in-depth if a richer source returns.
+      // Has some GitHub evidence but PR is not yet merged (open PR, partial
+      // evidence, etc.). Block: affirmative evidence that code review was not
+      // completed. The only pass through the done gate is a verified merged PR.
+      // (INF-96 / AI-1497 rework: open PR no longer passes.)
       const missing: string[] = [];
       if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
       if (!branchStatus.hasPR) missing.push('no pull request associated');
-      if (missing.length > 0) {
-        log.warn(`workflow-gate: release gate: ${issueId} blocked — ${missing.join('; ')}`);
-        return (
-          `[Proxy] '${intent}' blocked: cannot release unmerged work. Missing: ${missing.join('; ')}. ` +
-          `Push the branch and open a pull request before deploying.`
-        );
-      }
-      log.info(`workflow-gate: done gate: ${issueId} passed (has branch + PR, not yet merged)`);
+      if (missing.length === 0) missing.push('pull request not yet merged');
+      log.warn(`workflow-gate: done gate: ${issueId} blocked — ${missing.join('; ')}`);
+      return (
+        `[Proxy] '${intent}' blocked: cannot release unmerged work. Missing: ${missing.join('; ')}. ` +
+        `Push the branch and open a pull request before deploying.`
+      );
     }
   }
 
@@ -3741,24 +3737,24 @@ export async function applyStateTransition(
       await new Promise((r) => setTimeout(r, 1000));
       branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
     }
-    const hasMergedPR = branchStatus?.hasMergedPR === true;
-    const hasBranchAndPR = branchStatus?.hasBranch && branchStatus?.hasPR;
-    const noEvidenceAtAll = branchStatus && !branchStatus.hasBranch && !branchStatus.hasPR;
-    if (!hasMergedPR && !hasBranchAndPR && !noEvidenceAtAll) {
-      // Block: either null after retry (branchStatus is null → noEvidenceAtAll is false)
-      // or partial evidence (has branch but no PR).
-      // But AI-1497: if null after retry, fail-open instead of blocking.
-      if (!branchStatus) {
-        log.warn(`workflow-gate: B2 apply: done gate could not verify status for ${issueId} after retry — failing open`);
-      } else {
-        const missing: string[] = [];
-        if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
-        if (!branchStatus.hasPR) missing.push('no pull request associated');
-        log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
-        return { status: "blocked", code: "release-gate", detail: missing.join('; '), from: currentStateName, to: toStateName }; // Block the transition
-      }
-    } else if (noEvidenceAtAll) {
-      log.info(`workflow-gate: B2 apply: done gate for ${issueId} — no branch/PR evidence, treating as merged (AI-1497 fail-open)`);
+    if (!branchStatus) {
+      // Two consecutive nulls — transient API failure. Fail-open to avoid
+      // stranding tickets; merge/deploy state is already past code review.
+      log.warn(`workflow-gate: B2 apply: done gate could not verify status for ${issueId} after retry — failing open`);
+    } else if (branchStatus.hasMergedPR) {
+      // Merged PR confirmed — pass (AI-1492 preserved).
+    } else if (!branchStatus.hasBranch && !branchStatus.hasPR) {
+      // INF-96: no evidence → hard block (was AI-1497 fail-open).
+      log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — no branch/PR evidence`);
+      return { status: "blocked", code: "release-gate", detail: "no branch/PR evidence", from: currentStateName, to: toStateName };
+    } else {
+      // Has some evidence but not merged → block.
+      const missing: string[] = [];
+      if (!branchStatus.hasBranch) missing.push('branch not pushed to origin');
+      if (!branchStatus.hasPR) missing.push('no pull request associated');
+      if (missing.length === 0) missing.push('pull request not yet merged');
+      log.warn(`workflow-gate: B2 apply: done gate blocked for ${issueId} — ${missing.join('; ')}`);
+      return { status: "blocked", code: "release-gate", detail: missing.join('; '), from: currentStateName, to: toStateName };
     }
   }
 
