@@ -3458,6 +3458,7 @@ async function postComment(internalIssueId: string, body: string, authToken: str
  * whose catch is itself a fail-close site.
  */
 async function failDelegateUnresolved(args: {
+  /** Internal Linear UUID (issue.internalId) — commentCreate rejects the human-readable identifier (INF-128). */
   issueId: string;
   authToken: string;
   detail: string;
@@ -3992,7 +3993,7 @@ export async function applyStateTransition(
               `workflow-gate: B2 apply: FAIL-CLOSED — prior implementer '${priorImplementer}' has no linearUserId. Cannot route ${intent} on ${issueId}.`,
             );
             return await failDelegateUnresolved({
-              issueId,
+              issueId: issue.internalId,
               authToken,
               detail: `prior implementer '${priorImplementer}' has no linearUserId`,
               remedy:
@@ -4025,7 +4026,7 @@ export async function applyStateTransition(
               // INF-12: text pinned verbatim — this path was already correct and
               // its wording is asserted exactly by the regression suite.
               return await failDelegateUnresolved({
-                issueId,
+                issueId: issue.internalId,
                 authToken,
                 detail: singletonResult.detail ?? "singleton body has no linearUserId",
                 remedy:
@@ -4040,7 +4041,7 @@ export async function applyStateTransition(
               `workflow-gate: B2 apply: FAIL-CLOSED — multi-body role '${destOwnerRole}' (${roleBodies.join(", ")}) on '${intent}' for ${issueId} requires a CLI --target${wantsPriorImplementer ? " (no prior implementer recorded)" : ""} but none was supplied. Transition aborted.`,
             );
             return await failDelegateUnresolved({
-              issueId,
+              issueId: issue.internalId,
               authToken,
               detail: `multi-body role '${destOwnerRole}' requires a --target`,
               remedy:
@@ -4057,7 +4058,7 @@ export async function applyStateTransition(
                 `workflow-gate: B2 apply: FAIL-CLOSED — no bodies found for role '${destOwnerRole}' on '${intent}'. Transition aborted per AI-1493.`,
               );
               return await failDelegateUnresolved({
-                issueId,
+                issueId: issue.internalId,
                 authToken,
                 detail: `no bodies found for role '${destOwnerRole}'`,
                 remedy:
@@ -4078,7 +4079,7 @@ export async function applyStateTransition(
             `workflow-gate: B2 apply: FAIL-CLOSED — role resolution failed for '${destOwnerRole}': ${msg}. Transition aborted.`,
           );
           return await failDelegateUnresolved({
-            issueId,
+            issueId: issue.internalId,
             authToken,
             detail: `role resolution failed for '${destOwnerRole}': ${msg}`,
             remedy:
