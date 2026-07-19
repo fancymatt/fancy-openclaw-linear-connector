@@ -1940,7 +1940,10 @@ describe("checkWorkflowRules — INF-112: non-Linear-generated branch (metadata-
                     {
                       url: "https://github.com/fancymatt/repo/pull/42",
                       sourceType: "github",
-                      metadata: { status: "open" },  // ← key: NOT "merged"
+                      // metadata deliberately omits `status` — simulates
+                      // externally-created branch where Linear's GitHub
+                      // integration never synced merge status (metadata-gap).
+                      metadata: {},
                     },
                   ],
                 },

@@ -1693,6 +1693,13 @@ interface BranchAndPRStatus {
   hasPR: boolean;
   /** True when the issue has at least one merged pull request. */
   hasMergedPR: boolean;
+  /**
+   * True when any PR attachment carries explicit status/state metadata
+   * (INF-96). When false, PR URLs exist but Linear's GitHub integration
+   * didn't sync merge status — the INF-112 metadata-gap case for
+   * externally-created branches.
+   */
+  prMetadataAvailable: boolean;
   /** URLs of PR attachments found on the issue (INF-112). */
   prUrls: string[];
 }
@@ -1773,11 +1780,23 @@ async function fetchBranchAndPRStatus(
     const nodes = issue.attachments?.nodes ?? [];
     const prNodes = nodes.filter((n) => typeof n.url === "string" && /github\.com\/[^/]+\/[^/]+\/pull\/\d+/i.test(n.url));
     const hasPR = prNodes.length > 0;
-    const hasMergedPR = prNodes.some((n) => {
+    // hasMergedPR: any PR attachment has metadata.status === "merged".
+    // prMetadataAvailable: any PR attachment has explicit status/state metadata
+    // ("merged", "open", etc.), as opposed to the INF-112 metadata-gap case
+    // where the attachment URL exists but Linear's GitHub integration didn't
+    // sync merge status (externally-created branches).
+    let hasMergedPR = false;
+    let prMetadataAvailable = false;
+    for (const n of prNodes) {
       const meta = n.metadata ?? {};
       const status = (meta as { status?: unknown; state?: unknown }).status ?? (meta as { state?: unknown }).state;
-      return typeof status === "string" && status.toLowerCase() === "merged";
-    });
+      if (typeof status === "string") {
+        prMetadataAvailable = true;
+        if (status.toLowerCase() === "merged") {
+          hasMergedPR = true;
+        }
+      }
+    }
     const attachmentPrUrls = prNodes.map((n) => n.url ?? "");
 
     // INF-121: Fall back to scanning the issue description for GitHub PR URLs
@@ -1801,9 +1820,12 @@ async function fetchBranchAndPRStatus(
     return {
       // Attachments cannot see branches directly; a PR implies a pushed branch.
       // INF-121: hasBranch/hasPR also true when only description-based URLs exist.
+      // prMetadataAvailable: true when any PR attachment has explicit status/state metadata.
+      // False for externally-created branches (INF-112 metadata-gap case).
       hasBranch: hasPR || descPrUrls.length > 0,
       hasPR: hasPR || descPrUrls.length > 0,
       hasMergedPR,
+      prMetadataAvailable,
       prUrls: allPrUrls,
     };
   } catch (err) {
@@ -2850,7 +2872,12 @@ export async function checkWorkflowRules(
       // This happens when Hanzo creates branches externally — Linear's GitHub
       // integration never syncs merge status metadata for externally-created
       // branches (INF-112). Try GitHub API as fallback.
-      if (branchStatus.hasPR && !branchStatus.hasMergedPR) {
+      // Only enter the INF-112 metadata-gap path when no PR attachment has
+      // explicit merge status metadata — meaning Linear's GitHub integration
+      // didn't sync status for this externally-created branch. When metadata
+      // IS available (e.g. status: "open"), the PR is genuinely not merged
+      // and we block immediately (INF-96).
+      if (branchStatus.hasPR && !branchStatus.hasMergedPR && !branchStatus.prMetadataAvailable) {
         const prUrls = branchStatus.prUrls ?? [];
         let verifiedMerged = false;
         for (const prUrl of prUrls) {
