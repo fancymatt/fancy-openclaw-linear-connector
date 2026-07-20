@@ -1438,6 +1438,25 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   // inside the TTL is answered with the first create's upstream response, so the
   // caller receives the issue that already exists instead of minting a second one.
   // `linear create` carries no intent header, so this sits on the non-intent path.
+  // INF-152: team-default project injection for issueCreate.
+  // When no projectId is set and the team has a configured default, inject it
+  // before forwarding. This covers ALL agents routing through the proxy.
+  if (body && typeof body === "object" && "variables" in body) {
+    const vars = (body as Record<string, unknown>).variables as Record<string, unknown> | undefined;
+    const input = vars?.input as Record<string, unknown> | undefined;
+    if (input && typeof input === "object" && !input.projectId && input.teamId) {
+      const TEAM_DEFAULT_PROJECTS: Record<string, string> = {
+        // INF: all tickets auto-attach to "Fancy Openclaw Linear Connector"
+        "1519bfb2-fc64-4f4c-883c-0aeba9faf30a": "a6a0fd38-720f-42e8-9791-02682f44d269",
+      };
+      const defaultProjectId = TEAM_DEFAULT_PROJECTS[input.teamId as string];
+      if (defaultProjectId) {
+        input.projectId = defaultProjectId;
+        log.info(`team-default-project teamId=${input.teamId} projectId=${defaultProjectId}`);
+      }
+    }
+  }
+
   let createClaim: Claim | null = null;
   const createInput = issueCreateDedupTtlMs > 0 ? extractIssueCreateInput(body) : null;
   if (createInput) {
