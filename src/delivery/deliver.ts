@@ -2,7 +2,7 @@ import { spawn } from "child_process";
 import type { RouteResult } from "../types.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { buildDeliveryMessage } from "./build-message.js";
-import { getAccessToken } from "../agents.js";
+import { getAccessToken, getOpenclawAgentName } from "../agents.js";
 import { getActiveCanonVersion } from "../policy/universal-canon.js";
 import { resolveCanonicalIdentifierFromEvent } from "../canonical-identifier.js";
 import { normalizeSessionKey } from "../session-key.js";
@@ -332,6 +332,24 @@ async function deliverViaGatewayApi(
     const controller = new AbortController();
     timer = setTimeout(() => controller.abort(), opts.timeoutMs);
 
+    // INF-224: agent-prefix the session-key header. A bare key (e.g.
+    // `linear-INF-216`) is scoped by the gateway to the DEFAULT agent (`main`),
+    // NOT the model-resolved agent — the gateway uses `model: openclaw/<agent>`
+    // only for model-override auth and drops that agentId when namespacing an
+    // explicit bare session key. The result is dispatches landing in
+    // `agent:main:linear-*` sessions (main is a Linear non-actor → dead-end).
+    // The gateway honors an explicit `agent:<agentId>:<key>` namespace (only
+    // `subagent:`/`cron:`/`acp:` are reserved), so bind the session to the
+    // correct agent here. This mirrors the canonical stored form that
+    // stale-session forensics already reads (`agent:<openclawAgent>:<key>`).
+    // Idempotent: leave already-prefixed keys untouched so re-poke/wake callers
+    // that pass a full key don't get double-prefixed. The real fix is upstream
+    // (gateway should thread the model-resolved agentId into a bare key) — this
+    // is the connector-side bleed-stopper.
+    const routedSessionKey = sessionId.startsWith("agent:")
+      ? sessionId
+      : `agent:${getOpenclawAgentName(agentName)}:${sessionId}`;
+
     // Construct the OpenAI-compatible chat completions request body.
     // The model field routes to the specific agent; the message content
     // carries the dispatch message (same as hooks mode).
@@ -355,7 +373,7 @@ async function deliverViaGatewayApi(
       headers: {
         Authorization: `Bearer ${config.gatewayToken!}`,
         "Content-Type": "application/json",
-        "x-openclaw-session-key": sessionId,
+        "x-openclaw-session-key": routedSessionKey,
         ...(config.hooksThinking ? { "x-openclaw-model": config.hooksThinking } : {}),
       },
       body,
@@ -375,7 +393,7 @@ async function deliverViaGatewayApi(
     const runId = typeof json.id === "string" ? json.id : undefined;
 
     log.info(
-      `Gateway API delivery dispatched for ${agentName} [${sessionId}]: id=${runId ?? "ok"}`,
+      `Gateway API delivery dispatched for ${agentName} [${routedSessionKey}]: id=${runId ?? "ok"}`,
     );
     return { dispatched: true, runId, rawResponse: json };
   } catch (err) {
