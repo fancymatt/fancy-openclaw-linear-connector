@@ -19,13 +19,18 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, jest 
 
 import {
   runStalePlainDelegateSweep,
+  runNullDelegateRecoverySweep,
   registerStalePlainDelegateCron,
 } from "./stale-plain-delegate-sweep.js";
+
+
 import { AlertBus } from "./alerts/alert-bus.js";
 import { AlertStore } from "./alerts/alert-store.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
 import { resetCronRegistryForTest, getRegisteredCrons } from "./cron/registry.js";
+
+
 
 const STALE_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 const STALE_TIME = new Date(Date.now() - STALE_TIMEOUT_MS - 60_000).toISOString();
@@ -348,5 +353,173 @@ describe("StalePlainDelegateSweep", () => {
 
     expect(result.escalated).toBe(1);
     expect(result.redispatched).toBe(0);
+  });
+
+  // ── INF-187: Null-delegate recovery ─────────────────────────────────────
+
+  function makeNullDelegateTicket(
+    identifier: string,
+    stateName: string,
+    overrides?: { teamId?: string; updatedAt?: string; labels?: Array<{ name: string }> },
+  ) {
+    return {
+      id: `issue-${identifier.toLowerCase()}`,
+      identifier,
+      updatedAt: overrides?.updatedAt ?? STALE_TIME,
+      state: { name: stateName },
+      labels: { nodes: overrides?.labels ?? [] },
+      team: { id: overrides?.teamId ?? "ai-team-uuid" },
+    };
+  }
+
+  function makeTeamStatesOkResponse(): { data: { team: { states: { nodes: Array<{ id: string; name: string }> } } } } {
+    return {
+      data: {
+        team: {
+          states: {
+            nodes: [
+              { id: "todo-state-uuid", name: "To Do" },
+              { id: "doing-state-uuid", name: "Doing" },
+              { id: "thinking-state-uuid", name: "Thinking" },
+            ],
+          },
+        },
+      },
+    };
+  }
+
+  it("INF-187 AC1: detects null-delegate plain tickets in Thinking/Doing", async () => {
+    const tickets = [
+      makeNullDelegateTicket("AI-1111", "Thinking"),
+      makeNullDelegateTicket("AI-2222", "Doing"),
+    ];
+
+    const fetcher = mockFetch([
+      { query: "ActivePlainNullDelegate", response: { data: { issues: { nodes: tickets } } } },
+      { query: "TeamStatesForNullDelegate", response: makeTeamStatesOkResponse() },
+      { query: "MoveTicketToTodo", response: { data: { issueUpdate: { success: true } } } },
+      { query: "TeamStatesForNullDelegate", response: makeTeamStatesOkResponse() },
+      { query: "MoveTicketToTodo", response: { data: { issueUpdate: { success: true } } } },
+    ]);
+
+    const result = await runNullDelegateRecoverySweep({
+      authToken: "tok",
+      operationalEventStore: eventStore,
+      alertBus,
+      wakeFn: () => Promise.resolve(),
+      fetchFn: fetcher,
+    });
+
+    expect(result.detected).toBe(2);
+    expect(result.recovered).toBe(2);
+    expect(result.failed).toBe(0);
+  });
+
+  it("INF-187 AC2: skips tickets with wf:* labels", async () => {
+    const tickets = [
+      makeNullDelegateTicket("AI-3333", "Thinking", { labels: [{ name: "wf:dev-impl" }] }),
+    ];
+
+    const fetcher = mockFetch([
+      { query: "ActivePlainNullDelegate", response: { data: { issues: { nodes: tickets } } } },
+    ]);
+
+    const result = await runNullDelegateRecoverySweep({
+      authToken: "tok",
+      operationalEventStore: eventStore,
+      alertBus,
+      wakeFn: () => Promise.resolve(),
+      fetchFn: fetcher,
+    });
+
+    // The wf:* ticket should be filtered out
+    expect(result.detected).toBe(0);
+    expect(result.recovered).toBe(0);
+  });
+
+  it("INF-187 AC3: recovers tickets and posts comment", async () => {
+    const tickets = [
+      makeNullDelegateTicket("AI-4444", "Doing"),
+    ];
+
+    const fetcher = mockFetch([
+      { query: "ActivePlainNullDelegate", response: { data: { issues: { nodes: tickets } } } },
+      { query: "TeamStatesForNullDelegate", response: makeTeamStatesOkResponse() },
+      { query: "MoveTicketToTodo", response: { data: { issueUpdate: { success: true } } } },
+    ]);
+
+    const result = await runNullDelegateRecoverySweep({
+      authToken: "tok",
+      operationalEventStore: eventStore,
+      alertBus,
+      wakeFn: () => Promise.resolve(),
+      postLinearComment: (a, t, b) => { commentCalls.push({ agent: a, ticket: t, body: b }); return Promise.resolve(true); },
+      fetchFn: fetcher,
+    });
+
+    expect(result.detected).toBe(1);
+    expect(result.recovered).toBe(1);
+    expect(commentCalls.some((c) => c.ticket === "AI-4444")).toBe(true);
+  });
+
+  it("INF-187 AC4: records nullDelegateDetected in main sweep result", async () => {
+    const fetcher = mockFetch([
+      { query: "StalePlainDelegates", response: { data: { issues: { nodes: [] } } } },
+      { query: "ActivePlainNullDelegate", response: { data: { issues: { nodes: [] } } } },
+    ]);
+
+    const result = await runStalePlainDelegateSweep({
+      authToken: "tok",
+      operationalEventStore: eventStore,
+      alertBus,
+      ackTracker,
+      wakeFn: () => Promise.resolve(),
+      fetchFn: fetcher,
+      staleTimeoutMs: STALE_TIMEOUT_MS,
+    });
+
+    expect(result.nullDelegateDetected).toBe(0);
+    expect(result.nullDelegateRecovered).toBe(0);
+    expect(result.nullDelegateFailed).toBe(0);
+  });
+
+  it("INF-187 AC5: handles query failures gracefully", async () => {
+    const failingFetch: typeof fetch = async () => { throw new Error("Linear unreachable"); };
+
+    const result = await runNullDelegateRecoverySweep({
+      authToken: "tok",
+      operationalEventStore: eventStore,
+      alertBus,
+      wakeFn: () => Promise.resolve(),
+      fetchFn: failingFetch,
+    });
+
+    expect(result.detected).toBe(0);
+    expect(result.recovered).toBe(0);
+    expect(result.failed).toBe(0);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain("Linear unreachable");
+  });
+
+  it("INF-187 AC6: handles tickets with no team gracefully", async () => {
+    const tickets = [
+      makeNullDelegateTicket("AI-5555", "Thinking", { teamId: "" }),
+    ];
+
+    const fetcher = mockFetch([
+      { query: "ActivePlainNullDelegate", response: { data: { issues: { nodes: tickets } } } },
+    ]);
+
+    const result = await runNullDelegateRecoverySweep({
+      authToken: "tok",
+      operationalEventStore: eventStore,
+      alertBus,
+      wakeFn: () => Promise.resolve(),
+      fetchFn: fetcher,
+    });
+
+    expect(result.detected).toBe(1);
+    expect(result.recovered).toBe(0);
+    expect(result.failed).toBe(1);
   });
 });
