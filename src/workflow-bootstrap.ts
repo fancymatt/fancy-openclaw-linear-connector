@@ -158,6 +158,38 @@ export async function issueUpdateAtomic(
   }
 }
 
+/**
+ * INF-203: fetch the wf:* label names on an issue's PARENT, or null when the
+ * issue has no parent (or the fetch fails — treated as "no parent", fail-open
+ * toward normal bootstrap, since the proxy create-strip is the first line of
+ * defense).
+ */
+async function fetchParentWfLabelNames(issueId: string, authToken: string): Promise<string[] | null> {
+  const query = `
+    query IssueParentLabels($id: String!) {
+      issue(id: $id) {
+        parent { id labels { nodes { name } } }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    type Resp = {
+      data?: { issue?: { parent?: { labels?: { nodes: Array<{ name: string }> } } | null } | null };
+    };
+    const data = (await res.json()) as Resp;
+    const parent = data.data?.issue?.parent;
+    if (!parent) return null;
+    return (parent.labels?.nodes ?? []).map((n) => n.name).filter((n) => n.startsWith("wf:"));
+  } catch {
+    return null;
+  }
+}
+
 // ── Main hook ─────────────────────────────────────────────────────────────────
 
 /**
@@ -236,6 +268,30 @@ export async function maybeBootstrapWorkflow(
   if (addedIds.length > 0 && currentWfLabelNode && addedIds.includes(currentWfLabelNode.id)) {
     // Idempotency: if state:* is already present, this ticket is already in-flight.
     if (currentStateLabels.length > 0) return null;
+
+    // INF-203: inherited-label guard. On a CREATE event whose wf:* label
+    // matches the parent's wf:* label, the label was copied by Linear's
+    // sub-issue label inheritance, not applied intentionally — bootstrapping
+    // would enroll a leaf into its PARENT's workflow (LIF-143/144/145: scan
+    // leaves trapped in wf:sprint-spawner). Strip the inherited governance
+    // labels instead of enrolling. Backstop to the proxy create-strip: this
+    // also covers non-proxy creates (Linear UI sub-issues).
+    if (event.action === "create") {
+      const parentWfNames = await fetchParentWfLabelNames(issueEvent.data.id, effectiveToken);
+      if (parentWfNames !== null && parentWfNames.includes(currentWfLabelNode.name)) {
+        const govIds = new Set(
+          issue.labels.filter((n) => n.name.startsWith("wf:") || n.name.startsWith("state:")).map((n) => n.id),
+        );
+        const newLabelIds = currentLabelIds.filter((id) => !govIds.has(id));
+        const stripped = await issueUpdateAtomic(issue.id, newLabelIds, effectiveToken);
+        log.warn(
+          `workflow-bootstrap: inherited-label guard — ${issueEvent.data.id} was created carrying its parent's ` +
+            `'${currentWfLabelNode.name}' label (Linear sub-issue inheritance). ` +
+            `${stripped ? "Stripped governance labels instead of enrolling." : "Label strip FAILED — ticket may still enroll via labels."}`,
+        );
+        return { action: "demoted" };
+      }
+    }
 
     return applyBootstrapToIssue(issue, effectiveToken, undefined, enrolledTicketsStore);
   }

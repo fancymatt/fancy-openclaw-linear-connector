@@ -1516,7 +1516,7 @@ if (isEntryPoint) {
       const labels = issue.labels?.nodes ?? [];
       const stateType = issue.state?.type;
       const stateLabel = labels.find((l) => l.name.startsWith("state:"))?.name.slice("state:".length);
-      if (stateType === "completed" || stateType === "canceled" || stateLabel === "done") {
+      if (stateType === "completed" || stateType === "canceled" || stateType === "duplicate" || stateLabel === "done") {
         enrolledTicketsStore.markTerminal(t.ticket, "watchdog-crosscheck-terminal");
         return "stale";
       }

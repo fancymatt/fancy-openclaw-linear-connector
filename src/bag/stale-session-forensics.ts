@@ -801,7 +801,7 @@ export async function recoverTicket(
     // ticket is already terminal. (Linear state.type: completed | canceled.)
     const liveStateType = issueBody.data?.issue?.state?.type;
     const liveStateName = issueBody.data?.issue?.state?.name ?? "(unknown)";
-    if (liveStateType === "completed" || liveStateType === "canceled") {
+    if (liveStateType === "completed" || liveStateType === "canceled" || liveStateType === "duplicate") {
       log.info(
         `Recovery for ${identifier}: ticket already terminal (state="${liveStateName}", type=${liveStateType}) — skipping recovery to avoid clobbering completed work`,
       );

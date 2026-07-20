@@ -5,8 +5,12 @@ import type { LinearEvent } from "./webhook/schema.js";
 
 const log = componentLogger(createLogger(), "linear-actionable");
 
-const TERMINAL_STATE_TYPES = new Set(["completed", "canceled", "cancelled"]);
-const TERMINAL_STATE_NAMES = new Set(["done", "canceled", "cancelled"]);
+// INF-203: Linear emits a first-class "duplicate" state type (verified live:
+// LIF team "Duplicate" state reports type "duplicate", not "canceled"). A
+// duplicated ticket is closed — treat it as terminal or it keeps being
+// dispatched and stuck-detected.
+const TERMINAL_STATE_TYPES = new Set(["completed", "canceled", "cancelled", "duplicate"]);
+const TERMINAL_STATE_NAMES = new Set(["done", "canceled", "cancelled", "duplicate"]);
 const PARKED_STATE_TYPES = new Set(["backlog"]);
 const PARKED_STATE_NAMES = new Set(["backlog"]);
 

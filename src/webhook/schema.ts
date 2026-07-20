@@ -24,7 +24,7 @@ export interface LinearIssueData {
   state: {
     id: string;
     name: string;
-    type: string; // "triage" | "backlog" | "unstarted" | "started" | "completed" | "cancelled"
+    type: string; // "triage" | "backlog" | "unstarted" | "started" | "completed" | "cancelled" | "duplicate" (INF-203)
   };
   priority: number; // 0 = No priority, 1 = Urgent, 2 = High, 3 = Medium, 4 = Low
   priorityLabel: string;

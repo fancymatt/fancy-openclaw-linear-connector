@@ -182,8 +182,9 @@ function parseEnvInt(name: string, defaultVal: number): number {
 
 /** Terminal workflow `state:*` labels that satisfy a parent's N→1 barrier. */
 const TERMINAL_CHILD_STATES = new Set(["done", "escape"]);
-/** Native Linear state types that count as terminal (issue closed). */
-const TERMINAL_NATIVE_STATE_TYPES = new Set(["completed", "canceled"]);
+/** Native Linear state types that count as terminal (issue closed). INF-203:
+ * "duplicate" is a distinct first-class Linear state type, not "canceled". */
+const TERMINAL_NATIVE_STATE_TYPES = new Set(["completed", "canceled", "duplicate"]);
 
 /**
  * Is a child issue in a terminal state? A child satisfies the parent barrier if

@@ -32,7 +32,7 @@ import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
 import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
-import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
+import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, fetchTeamGovernanceLabelsByTeam, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
 import { buildTransitionAuditRecord, emitTransitionAuditRecord, verifyPostTransition, type GateResult, type TransitionAuditRecord } from "./transition-audit.js";
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import type { ObservationStore } from "./store/observation-store.js";
@@ -1453,6 +1453,54 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       if (defaultProjectId) {
         input.projectId = defaultProjectId;
         log.info(`team-default-project teamId=${input.teamId} projectId=${defaultProjectId}`);
+      }
+    }
+
+    // INF-203: strip governance labels from issueCreate. Linear copies the
+    // parent's labels onto a sub-issue created with parentId, so a leaf minted
+    // under an enrolled parent is born wearing `wf:*` (+ sometimes `state:*`),
+    // which auto-enrolls it into the PARENT's workflow (LIF-143/144/145).
+    //   - `state:*` is stripped unconditionally: the proxy is the sole writer
+    //     of the state projection (AI-1612); no create may carry one.
+    //   - `wf:*` is stripped only for sub-issue creates (parentId present) —
+    //     that is the inheritance vector; a deliberate top-level enroll-at-create
+    //     is preserved.
+    // Fail-open on resolver errors (empty set): creation must not block on a
+    // transient label fetch; the workflow-bootstrap inherited-label guard is the
+    // second line of defense.
+    if (input && typeof input === "object" && Array.isArray(input.labelIds) && input.labelIds.length > 0 && input.teamId) {
+      try {
+        const govLabels = await fetchTeamGovernanceLabelsByTeam(input.teamId as string, authorization);
+        if (govLabels.size > 0) {
+          const isSubIssue = typeof input.parentId === "string" && input.parentId.length > 0;
+          const before = input.labelIds as unknown[];
+          const strippedNames: string[] = [];
+          const kept = before.filter((id) => {
+            if (typeof id !== "string") return true;
+            const name = govLabels.get(id);
+            if (!name) return true;
+            if (/^state:/i.test(name)) {
+              strippedNames.push(name);
+              return false;
+            }
+            if (/^wf:/i.test(name) && isSubIssue) {
+              strippedNames.push(name);
+              return false;
+            }
+            return true;
+          });
+          if (kept.length !== before.length) {
+            log.warn(
+              `issue-create-label-strip agent=${agentId} teamId=${input.teamId}` +
+                `${isSubIssue ? ` parentId=${String(input.parentId)}` : ""}` +
+                ` stripped [${strippedNames.join(", ")}] from create — governance labels are engine-owned`,
+            );
+            input.labelIds = kept;
+          }
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`issue-create-label-strip failed agent=${agentId}: ${msg} — forwarding unmodified (fail-open)`);
       }
     }
   }

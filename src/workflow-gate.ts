@@ -1217,6 +1217,50 @@ export async function fetchTeamStateLabelIds(
 }
 
 /**
+ * INF-203: resolve the governance (`wf:*` / `state:*`) label IDs for a team,
+ * keyed by teamId (for `issueCreate`, where no issue exists yet). Used by the
+ * proxy to strip Linear's parent→sub-issue label inheritance off new creates —
+ * an inherited `wf:` label silently enrolls the child into the parent's
+ * workflow (LIF-143). Fail-open (empty set) on fetch errors; the
+ * workflow-bootstrap inherited-label guard is the second line of defense.
+ */
+export async function fetchTeamGovernanceLabelsByTeam(
+  teamId: string,
+  authToken: string,
+): Promise<Map<string, string>> {
+  // Scoped to the team's labels PLUS workspace-level labels (team null) — the
+  // AI-2543 promotion moved some governance labels to workspace scope, so a
+  // team-only query would miss them.
+  const query = `
+    query TeamGovernanceLabels($teamId: ID) {
+      issueLabels(first: 250, filter: { and: [
+        { or: [{ team: { id: { eq: $teamId } } }, { team: { null: true } }] },
+        { or: [{ name: { startsWith: "wf:" } }, { name: { startsWith: "state:" } }] }
+      ] }) {
+        nodes { id name }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { teamId } }),
+    });
+    type Resp = {
+      data?: { issueLabels?: { nodes: LabelNode[] } };
+    };
+    const data = (await res.json()) as Resp;
+    const nodes = data.data?.issueLabels?.nodes ?? [];
+    return new Map(nodes.filter((n) => /^(wf|state):/i.test(n.name)).map((n) => [n.id, n.name]));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: team governance-label fetch failed for team ${teamId}: ${msg} — failing open`);
+    return new Map();
+  }
+}
+
+/**
  * Find an existing label by name in the team, or create it if absent.
  * Returns the label ID, or null if both lookup and creation fail.
  */
@@ -2825,6 +2869,34 @@ export async function checkWorkflowRules(
         `if you intentionally need to terminate.`
       );
     }
+  }
+
+  // INF-203: `park` is the governed de-enrollment hatch. B2 (applyStateTransition)
+  // demotes the ticket to __ad_hoc__ — strips wf:/state: labels, clears the cached
+  // state, and demote-marks the enrolled mirror (arming the AI-2542 auto-enroll
+  // suppression). Before this gate existed, `park` had no B1 legality on governed
+  // tickets: it is not a def transition in any state, so a mis-enrolled ticket
+  // (e.g. a scan leaf born wearing its parent's wf: label — LIF-143) had NO
+  // governed exit back to a plain ticket. Steward-gated: de-enrollment removes a
+  // ticket from workflow governance entirely, so only workflow:break-glass
+  // holders may fire it.
+  if (intent === "park") {
+    let parkAuthorized = false;
+    try {
+      parkAuthorized = await bodyHasCapability(bodyId, "workflow:break-glass");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`workflow-gate: park capability check failed agent=${bodyId} ticket=${issueId}: ${msg}`);
+    }
+    if (parkAuthorized) {
+      log.warn(`workflow-gate: park (governed de-enroll) allowed agent=${bodyId} ticket=${issueId} — workflow:break-glass`);
+      return null;
+    }
+    return (
+      `[Proxy] 'park' on a governed workflow ticket de-enrolls it from its workflow and requires ` +
+      `the workflow:break-glass capability. Ask a steward to park it, or use '${breakGlassCommand}' ` +
+      `(break-glass) if you are the delegate.`
+    );
   }
 
   // §4.4 / AI-1668: break-glass escape is caller-gated.

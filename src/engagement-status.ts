@@ -73,10 +73,21 @@ interface IssueShape {
   teamId: string;
   stateName: string;
   stateId: string;
+  /** Linear native state type (e.g. "completed", "canceled", "duplicate"). */
+  stateType?: string;
   labels: string[];
   /** Linear user ID of the current delegate, if set. */
   delegateLinearUserId?: string;
 }
+
+/**
+ * INF-203: Linear native state types that are terminal. A ticket someone moved
+ * to Done/Canceled/Duplicate out-of-band must never be re-driven by the
+ * engagement overlay — the label-based TERMINAL_LABELS immunity below misses
+ * this case because a native move does not update the `state:*` label (this is
+ * exactly how LIF-143's Duplicate disposition was reverted to To Do).
+ */
+const TERMINAL_NATIVE_TYPES = new Set(["completed", "canceled", "cancelled", "duplicate"]);
 
 async function fetchIssue(identifier: string, authHeader: string): Promise<IssueShape | null> {
   const query = `
@@ -84,7 +95,7 @@ async function fetchIssue(identifier: string, authHeader: string): Promise<Issue
       issue(id: $id) {
         id
         team { id }
-        state { id name }
+        state { id name type }
         labels { nodes { name } }
         delegate { id }
       }
@@ -99,7 +110,7 @@ async function fetchIssue(identifier: string, authHeader: string): Promise<Issue
       issue?: {
         id: string;
         team?: { id: string } | null;
-        state?: { id: string; name: string } | null;
+        state?: { id: string; name: string; type?: string | null } | null;
         labels?: { nodes: Array<{ name: string }> } | null;
         delegate?: { id?: string } | null;
       } | null;
@@ -113,6 +124,7 @@ async function fetchIssue(identifier: string, authHeader: string): Promise<Issue
     teamId: issue.team.id,
     stateName: issue.state.name,
     stateId: issue.state.id,
+    stateType: issue.state.type ?? undefined,
     labels: (issue.labels?.nodes ?? []).map((l) => l.name),
     delegateLinearUserId: issue.delegate?.id ?? undefined,
   };
@@ -150,6 +162,15 @@ export async function applyEngagementStatus(
     // resting end-state (state:done / state:escape). The gate's native write wins;
     // a late agent-authored-activity webhook must not re-drive it to "doing" (AI-1540).
     if (issue.labels.some((l) => TERMINAL_LABELS.has(l.toLowerCase()))) return;
+
+    // INF-203: native terminal immunity — a ticket whose native state is
+    // completed/canceled/duplicate is closed regardless of its workflow label.
+    if (issue.stateType && TERMINAL_NATIVE_TYPES.has(issue.stateType.toLowerCase())) {
+      log.info(
+        `engagement: ${identifier} skipped — native state "${issue.stateName}" (type=${issue.stateType}) is terminal`,
+      );
+      return;
+    }
 
     // AI-1660: delegate guard — only the current delegate may flip to "doing".
     // A prior-step agent posting a handoff comment must not drive the next agent's
@@ -215,6 +236,8 @@ export async function applyEngagementStatus(
     // does not overwrite the authoritative terminal native write.
     const freshIssue = await fetchIssue(identifier, authHeader);
     if (!freshIssue || freshIssue.labels.some((l) => TERMINAL_LABELS.has(l.toLowerCase()))) return;
+    // INF-203: same native terminal immunity on the pre-write re-check.
+    if (freshIssue.stateType && TERMINAL_NATIVE_TYPES.has(freshIssue.stateType.toLowerCase())) return;
 
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",
