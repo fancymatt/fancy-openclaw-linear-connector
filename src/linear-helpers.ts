@@ -507,3 +507,33 @@ export async function fetchIssueWithLabels(
     return null;
   }
 }
+
+/**
+ * Update an issue's description. Fail-open.
+ */
+export async function issueUpdateDescription(
+  internalId: string,
+  description: string,
+  authToken: string,
+): Promise<boolean> {
+  const mutation = `
+    mutation UpdateDescription($issueId: String!, $description: String!) {
+      issueUpdate(id: $issueId, input: { description: $description }) {
+        success
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query: mutation, variables: { issueId: internalId, description } }),
+    });
+    type Resp = { data?: { issueUpdate?: { success: boolean } } };
+    const data = (await res.json()) as Resp;
+    return data.data?.issueUpdate?.success ?? false;
+  } catch (err) {
+    log.warn(`issueUpdateDescription failed for ${internalId}: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}

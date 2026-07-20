@@ -44,7 +44,7 @@ import type { ObservationStore } from "./store/observation-store.js";
 import { recordObservation } from "./store/observation-write-path.js";
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent, getAgents } from "./agents.js";
-import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, deriveSpecFromPriorChildren, upsertDerivedSpecSection, updateIssueDescription, type Finding } from "./fanout.js";
+import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, upsertDerivedSpecSection, updateIssueDescription, type Finding } from "./fanout.js";
 import { recordFanoutOutcome } from "./fanout-outcome-store.js";
 import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
@@ -2693,6 +2693,25 @@ export async function checkWorkflowRules(
     log.info(`workflow-gate: unknown caller '${bodyId}' on wf:${workflowId} — human sign-off path, allowing through`);
   }
 
+  // INF-148: cycle-roll resilience guard for sprint-spawner.
+  // A `retrospecting → evaluating` cycle-roll must never terminate the
+  // spawner. Escape from `retrospecting` on a sprint-spawner ticket requires
+  // explicit break-glass override even for the delegate/steward — prevents
+  // accidental termination during a cycle-roll (GEN-208 repro: three dead
+  // Gen loops, each terminated at or around a cycle-roll).
+  if (intent === breakGlassCommand && workflowId === "sprint-spawner" && !breakGlassOverride) {
+    const rollState = getCurrentState(labels);
+    if (rollState === "retrospecting") {
+      log.warn(`workflow-gate: INF-148 cycle-roll guard — blocking escape on ${issueId} from state '${rollState}' (wf:sprint-spawner) — requires explicit break-glass override`);
+      return (
+        `[Proxy] 'escape' blocked on wf:sprint-spawner ticket in state 'retrospecting': ` +
+        `a cycle-roll must never terminate the spawner. ` +
+        `Use the explicit break-glass flag (--break-glass or X-Openclaw-Break-Glass header) ` +
+        `if you intentionally need to terminate.`
+      );
+    }
+  }
+
   // §4.4 / AI-1668: break-glass escape is caller-gated.
   // The delegate can always escape their own ticket; the workflow steward
   // (break_glass.owner_role) can escape any ticket. All other known agents
@@ -2901,6 +2920,16 @@ export async function checkWorkflowRules(
       `This state was likely removed in a workflow def update. ` +
       `Use break-glass ('escape') to re-enter the workflow at intake, or contact a steward to migrate the ticket.`
     );
+  }
+
+  // INF-124: `handoff` is a delegate-routing meta-command, not a state transition.
+  // A governed handoff between two agents must never be blocked by a missing def
+  // transition or a branch-evidence gate — it changes delegate only, not workflow
+  // progress. Allow it from any state; applyStateTransition handles the self-loop
+  // delegate-only semantics.
+  if (intent === "handoff") {
+    log.info(`workflow-gate: handoff meta-command allowed from state '${currentState}' on ${issueId}`);
+    return null;
   }
 
   const transitions = stateNode.transitions ?? [];
@@ -3917,6 +3946,9 @@ async function fetchFanoutSpecDescription(issueId: string, authToken: string): P
 /**
  * AI-1992: Post a plain workflow comment on a governed ticket (e.g. the
  * fan-out refusal notice). Fail-open — a failed comment never changes control flow.
+ *
+ * INF-127: Added response validation — checks HTTP status, GraphQL errors, and
+ * commentCreate.success. Exported as _postCommentForTests for testing.
  */
 async function postComment(internalIssueId: string, body: string, authToken: string): Promise<void> {
   const mutation = `
@@ -3925,15 +3957,43 @@ async function postComment(internalIssueId: string, body: string, authToken: str
     }
   `;
   try {
-    await fetch(LINEAR_API_URL, {
+    const res = await fetch(LINEAR_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query: mutation, variables: { issueId: internalIssueId, body } }),
     });
+
+    const bodyText = await res.text();
+
+    if (!res.ok) {
+      log.error(`workflow-gate: postComment HTTP ${res.status} on ${internalIssueId}: ${bodyText.slice(0, 500)}`);
+      return;
+    }
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(bodyText);
+    } catch {
+      log.error(`workflow-gate: postComment unparseable JSON on ${internalIssueId} (HTTP ${res.status}): ${bodyText.slice(0, 500)}`);
+      return;
+    }
+
+    if (parsed.errors && parsed.errors.length > 0) {
+      const errorDetail = parsed.errors.map((e: any) => e.message ?? JSON.stringify(e)).join("; ");
+      log.error(`workflow-gate: postComment GraphQL error on ${internalIssueId}: ${errorDetail}`);
+      return;
+    }
+
+    const commentCreate = parsed?.data?.commentCreate;
+    if (!commentCreate || commentCreate.success !== true) {
+      log.error(`workflow-gate: postComment commentCreate.success !== true on ${internalIssueId}: ${JSON.stringify(commentCreate ?? null)}`);
+      return;
+    }
   } catch (err) {
     log.warn(`workflow-gate: failed to post comment on ${internalIssueId}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
+export const _postCommentForTests = postComment;
 
 /**
  * INF-12: the single exit for every `delegate-unresolved` fail-close.
@@ -4049,7 +4109,7 @@ export async function applyStateTransition(
     }
   }
 
-  let toStateName: string;
+  let toStateName: string = "";
   let matchedTransition: WorkflowTransition | undefined;
 
   // AI-1813 fix: break-glass (escape) must be legal when no state:* label is
@@ -4063,24 +4123,34 @@ export async function applyStateTransition(
   // the nulls (stripNullDelegateAssigneeFields) so they reach Linear directly.
   if (intent === breakGlassCommand) {
     toStateName = def.break_glass?.to ?? "escape";
-    // INF-135: escape-wedge fix — when the ticket is already in the break-glass
-    // target state, escape must restart the workflow rather than no-opping
-    // idempotently. The escape verb is the only legal verb from this state;
-    // an idempotent escape silently strands the ticket with no forward path.
-    // Transition to the workflow's entry_state to resume, or demote to ad-hoc
-    // if no entry_state is defined.
-    const breakGlassTarget = def.break_glass?.to ?? "escape";
-    if (currentStateName && currentStateName === breakGlassTarget) {
-      toStateName = def.entry_state ?? "__ad_hoc__";
+    // INF-146/INF-135: break-glass escape from the break-glass target state
+    // itself (e.g. `intake` for dev-impl) is a self-loop that no-ops through
+    // the idempotency check below. Redirect: if entry_state differs from the
+    // target, restart the workflow via entry_state; otherwise exit entirely.
+    if (currentStateName && currentStateName === toStateName) {
+      toStateName = def.entry_state && def.entry_state !== toStateName
+        ? def.entry_state
+        : "__ad_hoc__";
       log.info(
-        `workflow-gate: INF-135 escape-wedge: ${issueId} already at break-glass target '${currentStateName}'; ` +
-        `re-entering at '${toStateName}' instead of no-opping idempotently`,
+        `workflow-gate: B2 apply: ${issueId} break-glass escape from state '${currentStateName}' ` +
+        `which IS the break-glass target — redirecting to '${toStateName}'`,
       );
     }
   } else if (intent === "park") {
     toStateName = "__ad_hoc__";
     log.info(`workflow-gate: B2 apply: ${issueId} parking — demoting to __ad_hoc__`);
+  } else if (intent === "handoff") {
+    // INF-124: handoff is a delegate-routing meta-command — self-loop, same state.
+    // Skip state label swap; delegate resolution still runs below.
+    if (!currentStateName) {
+      log.warn(`workflow-gate: B2 apply: handoff on ${issueId} has no state:* label — skipping`);
+      return { status: "failed", code: "no-state-label", detail: `handoff on ticket ${issueId} has no state:* label` };
+    }
+    log.info(`workflow-gate: B2 apply: ${issueId} handoff self-loop at state '${currentStateName}'`);
+    matchedTransition = def.states.find((s) => s.id === currentStateName)?.transitions?.find((t) => t.command === intent);
+    toStateName = currentStateName;
   } else {
+    // Normal transition resolution — no special handling needed.
     if (!currentStateName) {
       log.warn(`workflow-gate: B2 apply: no state:* label on ${issueId} — skipping`);
       return { status: "failed", code: "no-state-label", detail: `workflow ticket ${issueId} has no state:* label` };
@@ -4141,18 +4211,54 @@ export async function applyStateTransition(
     ? null
     : shouldTriggerFanout(def, currentStateName ?? "", intent);
   if (fanoutConfig) {
-    const specDescription = await fetchFanoutSpecDescription(issueId, authToken);
-    // AI-2199: load registry to validate per-entry child workflow ids.
-    // Fail-open: if registry load fails, skip per-entry validation (backward compat).
-    let registeredWorkflows: Set<string> | undefined;
-    try {
-      const registry = await loadWorkflowRegistry();
-      registeredWorkflows = new Set(registry.keys());
-    } catch (err) {
-      log.warn(`workflow-gate: AI-2199: failed to load workflow registry for per-entry validation: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    const validation = validateFanoutSpec(specDescription, fanoutConfig, registeredWorkflows);
-    if (!validation.ok) {
+    specDescriptionLoop: for (let attempt = 0; attempt < 2; attempt++) {
+      const specDescription = await fetchFanoutSpecDescription(issueId, authToken);
+      // AI-2199: load registry to validate per-entry child workflow ids.
+      // Fail-open: if registry load fails, skip per-entry validation (backward compat).
+      let registeredWorkflows: Set<string> | undefined;
+      try {
+        const registry = await loadWorkflowRegistry();
+        registeredWorkflows = new Set(registry.keys());
+      } catch (err) {
+        log.warn(`workflow-gate: AI-2199: failed to load workflow registry for per-entry validation: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      const validation = validateFanoutSpec(specDescription, fanoutConfig, registeredWorkflows);
+      if (validation.ok) {
+        pendingFanout = { config: fanoutConfig, findings: validation.findings };
+        break specDescriptionLoop;
+      }
+
+      // INF-123: auto-derive ## Findings from completed arm children before refusing.
+      // When spec_source is "findings" and validation fails, attempt to derive findings
+      // from terminal wf:sprint-arm-* children and write them to the parent description.
+      // If derivation succeeds, loop back and re-validate on the updated description.
+      if (fanoutConfig.spec_source === "findings" && attempt === 0) {
+        log.info(
+          `workflow-gate: INF-123: attempting auto-derive of findings for ${issueId} ` +
+          `(state '${currentStateName}' → '${toStateName}') after validation failure`,
+        );
+        const derivedFindings = await autoDeriveArmFindings(issue.internalId, authToken);
+        if (derivedFindings.length > 0) {
+          const { autoPopulateFindingsSection } = await import("./fanout.js");
+          const updated = await autoPopulateFindingsSection(
+            issue.internalId,
+            derivedFindings,
+            specDescription,
+            authToken,
+          );
+          if (updated) {
+            log.info(
+              `workflow-gate: INF-123: auto-derived ${derivedFindings.length} finding(s) and wrote to description for ${issueId} — re-validating`,
+            );
+            continue; // Re-fetch and re-validate
+          }
+          log.warn(
+            `workflow-gate: INF-123: auto-derived ${derivedFindings.length} finding(s) but failed to write description for ${issueId}`,
+          );
+        }
+      }
+
+      // Refusal: validation failed and auto-derivation did not (or could not) resolve it
       log.warn(
         `workflow-gate: AI-1992: fan-out spec REFUSED for ${issueId} (state '${currentStateName}' → '${toStateName}'): ${validation.reason}`,
       );
@@ -4183,7 +4289,6 @@ export async function applyStateTransition(
         to: toStateName,
       };
     }
-    pendingFanout = { config: fanoutConfig, findings: validation.findings };
   }
 
   // ── Idempotency check (AI-1490 hardened) ────────────────────────────────
@@ -4194,7 +4299,12 @@ export async function applyStateTransition(
   // AI-1534: this branch is state-preserving (source === destination), so it
   // intentionally neither records nor clears the applied-state cache — any
   // existing entry already holds this same state, and its absence is harmless.
-  if (currentStateName === toStateName) {
+  // INF-124: for handoff self-loop, don't short-circuit — the delegate
+  // write (via delegateOverride or the target field in the forwarded mutation
+  // body) must still fire. Skip the idempotency check entirely.
+  if (intent === "handoff" || intent === "handoff-work") {
+    log.info(`workflow-gate: B2 apply: ${issueId} handoff self-loop at state '${toStateName}' — continuing to delegate write`);
+  } else if (currentStateName === toStateName) {
     const targetLabelName = `state:${toStateName}`;
     const hasTargetLabel = issue.labels.some((l) => l.name === targetLabelName);
     if (hasTargetLabel) {
@@ -4226,10 +4336,21 @@ export async function applyStateTransition(
         );
         return { status: "applied", code: "stale-label-purged", from: currentStateName, to: toStateName };
       }
-      log.info(
-        `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' with label present — no-op`,
-      );
-      return { status: "noop", code: "already-in-state", from: currentStateName, to: toStateName };
+      // INF-124: for handoff self-loop, don't short-circuit — the delegate
+      // must be written even though the state label doesn't change.
+      if (intent === "handoff") {
+        log.info(
+          `workflow-gate: B2 apply: ${issueId} handoff self-loop at state '${toStateName}' — continuing to delegate write`,
+        );
+        // Don't return; fall through to the delegate resolution + atomic write below.
+        // The state labels are already correct, so the atomic write will be a
+        // label-preserving no-op that updates delegate + native state.
+      } else {
+        log.info(
+          `workflow-gate: B2 apply: ${issueId} already in state '${toStateName}' with label present — no-op`,
+        );
+        return { status: "noop", code: "already-in-state", from: currentStateName, to: toStateName };
+      }
     }
     // Label is missing despite being in the correct state — re-stamp.
     log.warn(

@@ -48,6 +48,8 @@ export const STEWARD_OWNED_STATES = new Set([
   "scoping",
   "launching",
   "managing",
+  "releasing",
+  "retrospecting",
   "product-definition",
   "ac-definition",
 ]);

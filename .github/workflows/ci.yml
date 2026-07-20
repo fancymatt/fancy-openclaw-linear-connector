@@ -1,3 +1,4 @@
+# Merged by Hanzo — do not merge this file yourself
 name: CI
 
 on:
@@ -38,3 +39,60 @@ jobs:
         env:
           LINEAR_WEBHOOK_SECRET: test-secret-for-ci
           LOG_LEVEL: error
+
+  security-bandit:
+    name: Security - bandit (Python SAST)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install bandit
+        run: pip install bandit
+
+      - name: Run bandit
+        run: bandit --recursive apps/mam-downloader --severity-level medium --ini .bandit
+
+  security-pip-audit:
+    name: Security - pip-audit (dependency CVEs)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install pip-audit and dependencies from pyproject.toml
+        run: |
+          pip install pip-audit
+          pip install -e apps/mam-downloader
+
+      - name: Run pip-audit against pinned deps
+        run: pip-audit
+
+  security-trufflehog:
+    name: Security - trufflehog (secrets scanning)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: TruffleHog Secrets Scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          only_verified: true

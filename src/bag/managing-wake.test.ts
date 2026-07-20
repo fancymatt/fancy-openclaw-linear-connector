@@ -22,6 +22,9 @@ describe("STEWARD_OWNED_STATES", () => {
     expect(STEWARD_OWNED_STATES.has("scoping")).toBe(true);
     expect(STEWARD_OWNED_STATES.has("launching")).toBe(true);
     expect(STEWARD_OWNED_STATES.has("managing")).toBe(true);
+    expect(STEWARD_OWNED_STATES.has("releasing")).toBe(true);
+    expect(STEWARD_OWNED_STATES.has("retrospecting")).toBe(true);
+>>>>>> origin/main
   });
 
   it("includes dev-sprint steward states", () => {

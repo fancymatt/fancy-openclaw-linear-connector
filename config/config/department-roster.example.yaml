@@ -1,0 +1,28 @@
+# department-roster.example.yaml — AI-1479 (Phase 6.5 / H-4) routing functionary.
+#
+# Copy this to the instance-config path the connector reads at bootstrap:
+#   $DEPARTMENT_ROSTER_PATH, else
+#   {LINEAR_CONNECTOR_CONFIG_DIR|~/.openclaw/linear-connector}/config/department-roster.yaml
+#
+# The routing functionary matches a department-prefixed ticket (e.g. AI-1234)
+# to that department's default worker — a deterministic, checkable route with no
+# person in the loop. It is a FALLBACK only: an explicit mechanical route
+# (delegate / assignee / mention) always wins (mechanical-first ordering). A
+# request whose prefix matches no department escalates to the steward — a
+# judgment act that puts a person back in the loop.
+#
+# No per-event-type override ships (the stale `Comment: charles` override was
+# dropped at intake — Charles is conversation-only, AI-1946; cra owns review).
+
+version: 1
+
+# Steward an unroutable request escalates to (person tier).
+steward: astrid
+
+departments:
+  AI:
+    name: AI Team
+    defaultTarget: igor
+  ILL:
+    name: ILL Team
+    defaultTarget: sage

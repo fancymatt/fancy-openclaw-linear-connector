@@ -566,6 +566,159 @@ export function extractSpecFindings(
   return withStableIds(findings);
 }
 
+// ── INF-123: Auto-derive Findings from completed arm children ──────────────
+
+/**
+ * INF-123: Query a parent issue's children and auto-derive `## Findings` entries
+ * from the terminal descriptions of completed `wf:sprint-arm-*` children.
+ *
+ * The sprint workflow spawns arm children via `spawn-arms`. When those arms
+ * complete, their terminal descriptions contain the findings they produced.
+ * `spawn-impl` traditionally required the steward to hand-transcribe these into
+ * a `## Findings` section on the parent. This function fills that gap by reading
+ * the completed arms and synthesizing Finding entries.
+ *
+ * Returns the derived findings (with stable IDs) or an empty array if no
+ * completed arm children with findings are found. Fail-open: errors (network,
+ * parse) are logged and return [].
+ */
+export async function autoDeriveArmFindings(
+  parentInternalId: string,
+  authToken: string,
+): Promise<Finding[]> {
+  const query = `
+    query ParentChildrenForArmFindings($id: String!) {
+      issue(id: $id) {
+        children {
+          nodes {
+            identifier
+            description
+            state { name type }
+            labels { nodes { name } }
+          }
+        }
+      }
+    }
+  `;
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: parentInternalId } }),
+    });
+    type ArmChild = {
+      identifier: string;
+      description?: string | null;
+      state?: { name: string; type: string } | null;
+      labels?: { nodes?: Array<{ name?: string }> } | null;
+    };
+    type Resp = {
+      data?: {
+        issue?: {
+          children?: {
+            nodes?: ArmChild[];
+          } | null;
+        } | null;
+      };
+    };
+    const data = (await res.json()) as Resp;
+    const nodes = data.data?.issue?.children?.nodes ?? [];
+
+    // Filter to terminal children with wf:sprint-arm-* labels
+    const armChildren = nodes.filter((n) => {
+      const isTerminal = n.state?.type === "completed";
+      const hasArmLabel = (n.labels?.nodes ?? []).some(
+        (l) => typeof l.name === "string" && /^wf:sprint-arm-/.test(l.name),
+      );
+      return isTerminal && hasArmLabel && n.description;
+    });
+
+    if (armChildren.length === 0) {
+      log.info(`autoDeriveArmFindings: no terminal wf:sprint-arm-* children found for ${parentInternalId}`);
+      return [];
+    }
+
+    // Extract findings from each arm's description
+    const allFindings: Finding[] = [];
+    const seenTitles = new Set<string>();
+
+    for (const child of armChildren) {
+      // Each arm's terminal description should contain a `## Findings` section
+      const armFindings = extractSpecFindings(child.description, "findings");
+      for (const f of armFindings) {
+        // Deduplicate by title across arms
+        if (!seenTitles.has(f.title)) {
+          seenTitles.add(f.title);
+          allFindings.push(f);
+        }
+      }
+    }
+
+    log.info(
+      `autoDeriveArmFindings: derived ${allFindings.length} finding(s) from ${armChildren.length} completed arm child(ren) for ${parentInternalId}: ${allFindings.map((f) => f.title).join(", ")}`,
+    );
+    return withStableIds(allFindings);
+  } catch (err) {
+    log.warn(
+      `autoDeriveArmFindings: failed for ${parentInternalId}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return [];
+  }
+}
+
+/**
+ * INF-123: Auto-populate (or replace) a `## Findings` section on an issue's
+ * description from an array of findings. Uses the Linear API to update the
+ * description.
+ *
+ * When the description already has a `## Findings` section, it is replaced.
+ * Otherwise the section is prepended to the existing content (or becomes the
+ * full description). Returns true if the update succeeded.
+ */
+export async function autoPopulateFindingsSection(
+  parentInternalId: string,
+  findings: Finding[],
+  existingDescription: string | null | undefined,
+  authToken: string,
+): Promise<boolean> {
+  // Format the findings as a markdown section
+  const lines: string[] = ["## Findings\n"];
+  for (const f of findings) {
+    if (f.description) {
+      lines.push(`- **${f.title}**: ${f.description}`);
+    } else {
+      lines.push(`- **${f.title}**`);
+    }
+  }
+  const findingsSection = lines.join("\n");
+
+  // Build the new description
+  let newDescription: string;
+  const existingDesc = existingDescription ?? "";
+  const findingsRegex = /^##\s+Findings[\s\S]*?(?=\n##\s|\n*$)/im;
+
+  if (findingsRegex.test(existingDesc)) {
+    // Replace existing ## Findings section
+    newDescription = existingDesc.replace(findingsRegex, findingsSection);
+  } else if (existingDesc.trim()) {
+    // Prepend to existing content
+    newDescription = `${findingsSection}\n\n${existingDesc}`;
+  } else {
+    // Empty description — just the findings section
+    newDescription = findingsSection;
+  }
+
+  // Import here to avoid circular dependency at module level
+  const { issueUpdateDescription } = await import("./linear-helpers.js");
+  const ok = await issueUpdateDescription(parentInternalId, newDescription, authToken);
+  if (ok) {
+    log.info(`autoPopulateFindingsSection: wrote ${findings.length} finding(s) to description of ${parentInternalId}`);
+  } else {
+    log.warn(`autoPopulateFindingsSection: failed to update description for ${parentInternalId}`);
+  }
+  return ok;
+}
+
 // ── Incremental re-spawn dedup (AI-1994) ────────────────────────────────────
 
 /**

@@ -8635,3 +8635,79 @@ bodies:
   });
 });
 
+// INF-148: cycle-roll resilience — escape from retrospecting on sprint-spawner requires explicit break-glass override
+describe("checkWorkflowRules — sprint-spawner cycle-roll guard (INF-148)", () => {
+  let originalWorkflowPath: string | undefined;
+  let originalPolicyPath: string | undefined;
+  let inf148Dir: string;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeAll(() => {
+    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    originalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+
+    inf148Dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf148-test-"));
+    const policyFile = path.join(inf148Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, SPRINT_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    process.env.WORKFLOW_DEF_PATH = path.resolve(process.cwd(), "src/registered-defs/sprint-spawner.yaml");
+
+    const agentsFile = path.join(inf148Dir, "agents.json");
+    fs.writeFileSync(
+      agentsFile,
+      JSON.stringify({ agents: [
+        { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-client", clientSecret: "h-secret", accessToken: "h-token", refreshToken: "h-refresh" },
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+      ] }),
+      "utf8",
+    );
+    process.env.AGENTS_FILE = agentsFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+  });
+
+  afterAll(() => {
+    if (originalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    if (originalPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
+    delete process.env.AGENTS_FILE;
+    resetPolicyCache();
+    resetWorkflowCache();
+  });
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("INF-148: blocks escape from retrospecting without break-glass override", async () => {
+    resetWorkflowCache();
+    globalThis.fetch = makeLabelFetch(["wf:sprint-spawner", "state:retrospecting"]);
+    const blocked = await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "astrid");
+    expect(blocked).not.toBeNull();
+    expect(blocked).toContain("cycle-roll");
+    expect(blocked).toContain("break-glass");
+  });
+
+  it("INF-148: allows escape with explicit break-glass override", async () => {
+    resetWorkflowCache();
+    globalThis.fetch = makeLabelFetch(["wf:sprint-spawner", "state:retrospecting"]);
+    const allowed = await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "astrid", null, null, null, true);
+    expect(allowed).toBeNull();
+  });
+
+  it("INF-148: does not block escape from non-retrospecting states", async () => {
+    const safeStates = ["evaluating", "scanning", "determining-scope", "spawning-scope", "scoping", "launching", "managing", "releasing"];
+    for (const state of safeStates) {
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:sprint-spawner", `state:${state}`]);
+      const result = await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "astrid");
+      expect(result).toBeNull(); // state: ${state}
+    }
+  });
+});
+
