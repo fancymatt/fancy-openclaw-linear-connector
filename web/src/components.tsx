@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { Heading, Nav as SharedNav, Text } from "@fancyfleet/components";
 import { NavLink } from "react-router-dom";
 import type { Severity } from "./types";
 
@@ -10,19 +11,19 @@ export function Chip({ tone, children }: { tone: Severity | "blue" | string; chi
 export function Card({ span = 12, title, children }: { span?: 4 | 6 | 8 | 12; title?: ReactNode; children: ReactNode }) {
   return (
     <section className={`card span-${span}`}>
-      {title !== undefined && <h2>{title}</h2>}
+      {title !== undefined && <Heading level={2} size="sm" className="card-heading">{title}</Heading>}
       {children}
     </section>
   );
 }
 
 export function Empty({ children }: { children: ReactNode }) {
-  return <div className="empty">{children}</div>;
+  return <Text as="div" tone="muted" className="empty">{children}</Text>;
 }
 
 export function ErrorBanner({ message }: { message: string | null }) {
   if (!message) return null;
-  return <div className="error-banner">API error: {message}</div>;
+  return <Text as="div" tone="danger" className="error-banner">API error: {message}</Text>;
 }
 
 export function Diagnostics({ value, label = "Raw diagnostics" }: { value: unknown; label?: string }) {
@@ -49,27 +50,37 @@ const TABS: Array<[string, string]> = [
 ];
 
 export function Tabs({ pendingProposals = 0 }: { pendingProposals?: number } = {}) {
+  const items = TABS.map(([to, label]) => ({
+    to,
+    label,
+    badge: to === "/proposals" && pendingProposals > 0 ? pendingProposals : undefined,
+    badgeTestId: to === "/proposals" ? "nav-pending-badge" : undefined,
+  }));
+
   return (
-    <nav className="tabs">
-      {TABS.map(([to, label]) => (
-        <NavLink key={to} to={to} end={to === "/"} className={({ isActive }) => (isActive ? "active" : "")}>
-          {label}
-          {to === "/proposals" && pendingProposals > 0 && (
-            <span className="nav-pending-badge" data-testid="nav-pending-badge">
-              {pendingProposals}
-            </span>
-          )}
+    <SharedNav
+      ariaLabel="Connector console"
+      className="tabs"
+      items={items}
+      renderLink={(item, className, children) => (
+        <NavLink
+          key={item.to}
+          to={item.to}
+          end={item.to === "/"}
+          className={({ isActive }) => [className, isActive ? "active" : ""].filter(Boolean).join(" ")}
+        >
+          {children}
         </NavLink>
-      ))}
-    </nav>
+      )}
+    />
   );
 }
 
 export function Stat({ value, label, tone }: { value: ReactNode; label: string; tone?: "red" | "yellow" | "green" }) {
   return (
     <div className="stat">
-      <div className="value" style={tone ? { color: `var(--${tone})` } : undefined}>{value}</div>
-      <div className="label">{label}</div>
+      <Text as="div" size="lg" className="value" style={tone ? { color: `var(--${tone})` } : undefined}>{value}</Text>
+      <Text as="div" tone="muted" size="sm" className="label">{label}</Text>
     </div>
   );
 }
