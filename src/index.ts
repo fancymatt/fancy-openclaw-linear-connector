@@ -39,6 +39,7 @@ import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerDoneDetectorCron } from "./cron/done-ticket-detector-cron.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { registerDelegationReconciliationCron, runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
+import { registerStalePlainDelegateCron } from "./stale-plain-delegate-sweep.js";
 import { registerRegistryIntegrityCron } from "./registry-integrity-cron.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
@@ -1403,6 +1404,16 @@ if (isEntryPoint) {
     operationalEventStore,
     wakeFn: reconciliationWakeFn,
     dispatchLeaseStore,
+  });
+
+  // INF-168: stale-plain-delegate sweep — detect and re-dispatch plain
+  // (non-wf) tickets with a delegate set that have been sitting in Thinking/
+  // Doing/To Do with zero progress beyond the staleness threshold.
+  registerStalePlainDelegateCron({
+    authToken: reconciliationAuthToken,
+    operationalEventStore,
+    alertBus: getAlertBus(),
+    wakeFn: reconciliationWakeFn,
   });
 
   // AI-2009: first-action watchdog — arm a per-state deadline at dispatch
