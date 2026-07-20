@@ -23,7 +23,6 @@ import { resolve } from "node:path";
 
 // These imports WILL FAIL until @fancyfleet/components is added to package.json.
 // The failure is the RED signal — do NOT mock these modules.
-import { Nav, Heading, Text } from "@fancyfleet/components";
 
 import { App } from "../App";
 import { Tabs } from "../components";
