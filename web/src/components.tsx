@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Heading, Nav as SharedNav, Text } from "@fancyfleet/components";
+import { Heading, Nav, Text } from "@fancyfleet/components";
 import { NavLink } from "react-router-dom";
 import type { Severity } from "./types";
 
@@ -50,29 +50,19 @@ const TABS: Array<[string, string]> = [
 ];
 
 export function Tabs({ pendingProposals = 0 }: { pendingProposals?: number } = {}) {
-  const items = TABS.map(([to, label]) => ({
-    to,
-    label,
-    badge: to === "/proposals" && pendingProposals > 0 ? pendingProposals : undefined,
-    badgeTestId: to === "/proposals" ? "nav-pending-badge" : undefined,
-  }));
-
   return (
-    <SharedNav
-      ariaLabel="Connector console"
-      className="tabs"
-      items={items}
-      renderLink={(item, className, children) => (
-        <NavLink
-          key={item.to}
-          to={item.to}
-          end={item.to === "/"}
-          className={({ isActive }) => [className, isActive ? "active" : ""].filter(Boolean).join(" ")}
-        >
-          {children}
+    <Nav>
+      {TABS.map(([to, label]) => (
+        <NavLink key={to} to={to} end={to === "/"} className={({ isActive }) => (isActive ? "active" : "")}>
+          {label}
+          {to === "/proposals" && pendingProposals > 0 && (
+            <span className="nav-pending-badge" data-testid="nav-pending-badge">
+              {pendingProposals}
+            </span>
+          )}
         </NavLink>
-      )}
-    />
+      ))}
+    </Nav>
   );
 }
 

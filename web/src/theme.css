@@ -1,15 +1,12 @@
-@import "@fancyfleet/tokens";
+@import "@fancyfleet/components/tokens";
 
-/* GEN-285: Token Centralization & Pilot Consumption
- * — Import centralized @fancyfleet/tokens and adapt surface tokens for a
- *   lighter Connector UI appearance per Laren's direction.
- * — The centralized tokens provide the foundation scale (brand colors, type,
- *   spacing, shadow). Surface/border/text overrides below give the connector
- *   a dark-but-not-black look that is lighter than Gen's "Editorial Dark". */
+/* GEN-288: Connector surface overrides — import centralized @fancyfleet/components/tokens
+ * (which re-exports @fancyfleet/tokens) and apply the connector's lighter dark palette.
+ * Surface overrides are declared AFTER the import so they win the cascade. */
 :root {
   /* ── Connector semantic aliases (map old names to centralized tokens) ── */
-  --bg: var(--ff-surface-primary);
-  --panel: var(--ff-surface-secondary);
+  --bg: #0b0f14;
+  --panel: #111821;
   --panel-glass: var(--ff-surface-elevated);
   --line: var(--ff-border-default);
   --text: var(--ff-text-primary);
