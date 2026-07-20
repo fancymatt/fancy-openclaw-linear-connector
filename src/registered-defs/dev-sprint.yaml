@@ -34,11 +34,12 @@
 #   → 5. ac-definition → 6. spawn-impl → 7. managing-impl → 8. validation → done
 
 id: dev-sprint
-version: 4
+version: 5
 archetype: orchestrator
 entry_state: intake
 
 # v4: escape → intake migration for in-flight tickets
+# v5: parent_label_present added to spawn_if — no schema change required
 migrations:
   escape: intake
 
@@ -169,10 +170,9 @@ states:
     kind: normal
     native_state: doing
     description: >
-      AI-2524: conditional visual-audit gate at milestone close. Fans out into a
-      wf:ui-audit child ONLY when a closed impl child carries the `ui-impact`
-      label (spawn_if, AI-2523); otherwise the gate is a no-op and the sprint
-      continues to done. The human sign-off was already captured at
+      v5 (INF-176): visual-audit gate with design-provenance awareness. Spawns
+      a wf:ui-audit child when the sprint itself carries `wf:design-provenance`
+      OR when a closed child carries `ui-impact`. The human sign-off was already captured at
       validation→approve, so this transition is mechanical (no signoff). The
       milestone-close verification comment carries the Visual Audit breakpoint
       table + sign-off checkbox (see dev-sprint-milestone-close-template.ts).
@@ -183,6 +183,7 @@ states:
       spawn_if:
         label_present: ui-impact
         scope: closed_children
+        parent_label_present: wf:design-provenance
     transitions:
       - command: continue
         to: done
@@ -195,3 +196,4 @@ states:
     satisfies_parent_barrier: true
 
   # v4: escape terminal state removed — break_glass now re-enters at intake
+  # v5: parent_label_present added to spawn_if (INF-176)

@@ -25,6 +25,7 @@
  * evaluation result is recorded on FanoutResult for inspection.
  */
 
+import { notify } from "./alerts/alert-bus.js";
 import { componentLogger, createLogger } from "./logger.js";
 import { findLabel, findOrCreateLabel } from "./linear-helpers.js";
 import { generateSpawnPreview, checkCaps, formatPreviewComment, formatCapRefusalComment, parseSpawnCaps, type SpawnPreview, type CapCheckResult, type SpawnCaps } from "./spawn-preview.js";
@@ -882,12 +883,15 @@ export function validateFanoutSpec(
 
 /**
  * AI-2523: GraphQL query to fetch a parent issue's children with their
- * identifiers, labels, and native workflow state (type). This lets us
- * determine which children are closed (terminal) and what labels they carry.
+ * identifiers, labels, and native workflow state (type), PLUS the parent
+ * issue's own labels (INF-176: for parent_label_present check). This lets us
+ * determine which children are closed (terminal), what labels they carry,
+ * and whether the parent itself carries a label that mandates spawning.
  */
 const PARENT_CHILDREN_QUERY = `
   query ParentChildrenLabels($id: String!) {
     issue(id: $id) {
+      labels { nodes { id name } }
       children {
         nodes {
           identifier
@@ -908,6 +912,7 @@ interface ChildNode {
 interface ParentChildrenResponse {
   data?: {
     issue?: {
+      labels: { nodes: Array<{ id: string; name: string }> } | null;
       children: {
         nodes: ChildNode[];
       };
@@ -995,6 +1000,20 @@ export async function evaluateSpawnIf(
       .filter((c) => c.labels.nodes.some((l) => l.name === targetLabel))
       .map((c) => c.identifier);
 
+    // INF-176: OR with parent_label_present — if the parent itself carries
+    // the configured label, spawn regardless of children.
+    const parentHasLabel = spawnIf.parent_label_present &&
+      issueNode.labels?.nodes?.some((l) => l.name === spawnIf.parent_label_present);
+
+    if (parentHasLabel) {
+      return {
+        outcome: "fire",
+        shouldSpawn: true,
+        reason: `spawn_if predicate matched: parent carries the '${spawnIf.parent_label_present}' label`,
+        matchedChildren,
+      };
+    }
+
     if (matchedChildren.length > 0) {
       return {
         outcome: "fire",
@@ -1053,13 +1072,18 @@ async function postSpawnIfComment(
   authToken: string,
 ): Promise<void> {
   const emoji = spawnIfResult.shouldSpawn ? "✅" : "⏭️";
+  const labelMatch = spawnIfResult.reason.match(/'([^']+)'/);
+  const matchedLabel = labelMatch?.[1] ?? "—";
   const body = [
-    `${emoji} **spawn_if Evaluation** (label_present: "${spawnIfResult.matchedChildren.length > 0 ? spawnIfResult.reason.match(/'([^']+)'/)?.[1] ?? "—" : "—"}")`,
+    `${emoji} **spawn_if Evaluation**`,
     ``,  // "ui-impact" not stable — just explain clearly
     `**Outcome:** ${spawnIfResult.shouldSpawn ? "FIRE — spawning children" : "WAIVE — skipping spawn"}`,
     `**Reason:** ${spawnIfResult.reason}`,
     spawnIfResult.matchedChildren.length > 0
       ? `**Matched children:** ${spawnIfResult.matchedChildren.join(", ")}`
+      : null,
+    matchedLabel !== "—"
+      ? `**Matched label:** \`${matchedLabel}\``
       : null,
   ]
     .filter(Boolean)
@@ -1117,6 +1141,123 @@ async function postSpawnIfErrorComment(
   } catch (err) {
     log.warn(`fanout: failed to post spawn_if error comment: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+// ── INF-176: design-provenance missed-label check ──────────────────────
+
+/**
+ * INF-176 Part 2: Check whether a sprint appears to be a design-provenance
+ * sprint based on its completed arm children, despite missing the
+ * `wf:design-provenance` label. When detected (completed sprint-arm-design or
+ * sprint-arm-ux children exist), emits a warning alert suggesting the label
+ * may have been forgotten at sprint-creation time.
+ *
+ * Designed to fire from the spawn_if waived path in executeFanout, where
+ * `parent_label_present` is configured but neither that label nor any child
+ * `ui-impact` label was found.
+ *
+ * Fail-open: errors are logged and swallowed — the alert is advisory, and a
+ * transient fetch failure must not block the parent's state transition.
+ */
+async function checkSprintDesignProvenance(
+  parentInternalId: string,
+  authToken: string,
+  parentIssueId: string,
+): Promise<void> {
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({
+        query: PARENT_ARM_CHILDREN_QUERY,
+        variables: { id: parentInternalId },
+      }),
+    });
+
+    if (!res.ok) {
+      log.warn(`fanout: INF-176 design check: arm children query returned HTTP ${res.status} for ${parentIssueId}`);
+      return;
+    }
+
+    const data = (await res.json()) as ParentArmChildrenResponse;
+    if (data.errors?.length) {
+      log.warn(`fanout: INF-176 design check: GraphQL error for ${parentIssueId}: ${data.errors.map((e) => e.message).join("; ")}`);
+      return;
+    }
+
+    const issueNode = data.data?.issue;
+    const children = issueNode?.children?.nodes ?? [];
+
+    // Design-provenance arm workflow labels. A completed child with any of
+    // these indicates the sprint involved design work and should carry the
+    // `wf:design-provenance` label.
+    const DESIGN_ARM_LABELS = new Set([
+      "wf:sprint-arm-design",
+      "wf:sprint-arm-ux",
+      "wf:sprint-arm-ui",
+    ]);
+
+    const designArms = children.filter(
+      (c) =>
+        c.state?.type === "completed" &&
+        c.labels.nodes.some((l) => DESIGN_ARM_LABELS.has(l.name)),
+    );
+
+    if (designArms.length === 0) return; // not a design-provenance sprint
+
+    const designArmIds = designArms.map((c) => c.identifier).join(", ");
+    log.warn(
+      `fanout: INF-176 design-provenance warning for ${parentIssueId}: ` +
+      `design arm children found (${designArmIds}) but sprint lacks 'wf:design-provenance' label. ` +
+      `Visual audit gate was waived.`,
+    );
+
+    notify({
+      severity: "warning",
+      source: "visual-audit-gate",
+      title: `Design-provenance sprint ${parentIssueId} reached Done without visual audit`,
+      detail: {
+        sprint: parentIssueId,
+        designArms: designArmIds,
+        finding: "Sprint appears to be design-provenance but lacks the wf:design-provenance label. Visual audit gate was waived.",
+      },
+      ticket: "INF-176",
+    });
+  } catch (err) {
+    log.warn(`fanout: INF-176 design-provenance check failed for ${parentIssueId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** INF-176: GraphQL query to fetch a parent's children with their labels and state — used to detect design-provenance arm children. */
+const PARENT_ARM_CHILDREN_QUERY = `
+  query ParentArmChildren($id: String!) {
+    issue(id: $id) {
+      children {
+        nodes {
+          identifier
+          state { name type }
+          labels { nodes { id name } }
+        }
+      }
+    }
+  }
+`;
+
+interface ParentArmChildNode {
+  identifier: string;
+  state: { name: string; type: string } | null;
+  labels: { nodes: Array<{ id: string; name: string }> };
+}
+
+interface ParentArmChildrenResponse {
+  data?: {
+    issue?: {
+      children: {
+        nodes: ParentArmChildNode[];
+      };
+    } | null;
+  };
+  errors?: Array<{ message: string }>;
 }
 
 // ── Linear API helpers ────────────────────────────────────────────────────
@@ -1498,6 +1639,15 @@ export async function executeFanout(
         await postSpawnIfErrorComment(parentCtx.internalId, siResult.reason, authToken);
       } else {
         await postSpawnIfComment(parentCtx.internalId, siResult, authToken);
+
+        // INF-176 Part 2: missed-label detection. When spawn_if is waived on a
+        // sprint that appears design-provenance (has completed design/ux arm
+        // children), emit a warning suggesting the wf:design-provenance label
+        // may have been forgotten at sprint-creation time.
+        if (config.spawn_if?.parent_label_present) {
+          checkSprintDesignProvenance(parentCtx.internalId, authToken, parentIssueId)
+            .catch((err) => log.warn(`fanout: design check failed: ${err instanceof Error ? err.message : String(err)}`));
+        }
       }
 
       log.info(

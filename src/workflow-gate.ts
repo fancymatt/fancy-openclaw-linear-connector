@@ -166,6 +166,12 @@ export interface SpawnIfConfig {
    * Only children in a terminal Linear native state (type: "completed") are examined.
    */
   scope?: "closed_children";
+  /**
+   * INF-176: Optional parent label that ORs with the child label check.
+   * When set, the spawn_if predicate also fires if the parent ticket itself
+   * carries this label, regardless of children.
+   */
+  parent_label_present?: string;
 }
 
 export interface FanoutConfig {
@@ -899,8 +905,17 @@ export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
               );
             }
 
+            // INF-176: parent_label_present checks the parent ticket's own labels
+            if (sif.parent_label_present !== undefined) {
+              if (typeof sif.parent_label_present !== "string" || (sif.parent_label_present as string).trim() === "") {
+                errors.push(
+                  `Workflow state '${state.id}' fanout spawn_if parent_label_present must be a non-empty string when present.`,
+                );
+              }
+            }
+
             // No unknown fields
-            const knownFields = new Set(["label_present", "scope"]);
+            const knownFields = new Set(["label_present", "scope", "parent_label_present"]);
             for (const key of Object.keys(sif)) {
               if (!knownFields.has(key)) {
                 errors.push(
