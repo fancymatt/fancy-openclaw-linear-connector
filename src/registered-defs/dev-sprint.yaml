@@ -1,6 +1,6 @@
-# dev-sprint — Sprint Execution Workflow (v3)
+# dev-sprint — Sprint Execution Workflow (v4)
 # owner: steward (Astrid), engine (spawn-arms, spawn-impl)
-# last-updated: 2026-07-17
+# last-updated: 2026-07-20
 # status: v2 deployed to production (INF-40, 2026-07-16)
 #
 # AI-2524 (2026-07-17): added the `post-validation` state — a conditional
@@ -16,6 +16,12 @@
 #   life-os/project-management/workflows/dev-sprint/dev-sprint-workflow-spec.md
 # Keep in sync with that spec.
 #
+# v3 (2026-07-17, AI-2524): added `post-validation` state — conditional
+#   visual-audit gate (see REGISTERED_DEFS_CHANGELOG).
+# v4 (2026-07-20, P2(d) AGI-16): escape now re-enters at intake instead of
+#   terminating. A wedged sprint can be recovered by breaking glass, following
+#   the same pattern as dev-impl v9 (AI-1710).
+#
 # INF-45 (2026-07-16): added to registered-defs as child_workflow target
 # for sprint-spawner's launching state (fanout: wf:dev-sprint).
 #
@@ -28,13 +34,17 @@
 #   → 5. ac-definition → 6. spawn-impl → 7. managing-impl → 8. validation → done
 
 id: dev-sprint
-version: 3
+version: 4
 archetype: orchestrator
 entry_state: intake
 
+# v4: escape → intake migration for in-flight tickets
+migrations:
+  escape: intake
+
 break_glass:
   command: escape
-  to: escape
+  to: intake            # v4: re-enter at intake instead of terminating
   owner_role: steward
 
 states:
@@ -184,6 +194,4 @@ states:
     native_state: done
     satisfies_parent_barrier: true
 
-  - id: escape
-    kind: terminal
-    native_state: invalid
+  # v4: escape terminal state removed — break_glass now re-enters at intake

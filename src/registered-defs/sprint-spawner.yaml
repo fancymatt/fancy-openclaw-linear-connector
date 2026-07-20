@@ -75,10 +75,11 @@ entry_state: evaluating
 migrations:
   evaluate: evaluating
   dormant: evaluating
+  escape: evaluating         # P2(d) AGI-16: escape → loop entry for recovery
 
 break_glass:
   command: escape
-  to: escape
+  to: evaluating              # P2(d) AGI-16: re-enter the loop instead of terminating
   owner_role: steward
 
 states:
@@ -256,9 +257,7 @@ states:
     native_state: done
     satisfies_parent_barrier: true
 
-  - id: escape
-    kind: terminal
-    native_state: invalid
+  # escape terminal state removed in P2(d) AGI-16 — break_glass now re-enters at evaluating
 
   - id: __terminal_hold__
     kind: terminal
