@@ -29,6 +29,11 @@ import {
   type WatchdogFinding,
   type WatchdogOutput,
 } from "./config-sanity-alert.js";
+import {
+  _resetAlertBusForTests,
+  initAlertBus,
+} from "./alerts/alert-bus.js";
+import { AlertStore } from "./alerts/alert-store.js";
 import { createApp } from "./index.js";
 import { reloadAgents } from "./agents.js";
 import { resetPolicyCache } from "./escalation-gate.js";
@@ -266,5 +271,238 @@ describe("AC4: config-sanity-alert is wired in index.ts", () => {
 
   it("calls registerConfigSanityAlertCron from the entry point", () => {
     expect(INDEX_TS.includes("registerConfigSanityAlertCron(")).toBe(true);
+  });
+});
+
+// ── AI-2620: suppression window override for git-remote-liveness critical ──
+
+describe("AI-2620: git-remote-liveness critical suppression window override", () => {
+  /**
+   * AC3: Unit test — two processWatchdogOutput calls 30 minutes apart with
+   * an identical git-remote-liveness critical finding produce only one push.
+   *
+   * The per-dedupKey suppression window override (6h) must absorb the 30min
+   * cycle gap that would otherwise escape the 15min severity-based window.
+   */
+  it("AC3: two identical git-remote-liveness critical findings 30min apart produce one push", async () => {
+    // Setup a controlled AlertBus with push tracking
+    _resetAlertBusForTests();
+    _resetConfigSanityAlertForTests();
+
+    const store = new AlertStore(":memory:");
+    const pushes: string[] = [];
+    const pushFn = jest.fn(async (message: string) => {
+      pushes.push(message);
+    });
+
+    // Base time
+    const t0 = new Date("2026-07-20T00:00:00.000Z");
+    let nowMs = t0.getTime();
+
+    initAlertBus({
+      store,
+      pushFn,
+      pushEnabled: true,
+      pushMinSeverity: "critical",
+      now: () => new Date(nowMs),
+    });
+
+    // First cycle at T+0
+    const findings: WatchdogFinding[] = [
+      {
+        check: "git-remote-liveness",
+        severity: "critical",
+        message: "PUSH-DEAD: 12 repos with no push access (git-remote-liveness)",
+      },
+    ];
+    processWatchdogOutput({ ok: false, findings }, new Date(nowMs));
+
+    // Advance 30 minutes (= one cron cycle, well within a 6h window)
+    nowMs += 30 * 60_000;
+    processWatchdogOutput({ ok: false, findings }, new Date(nowMs));
+
+    // Flush pending push promises
+    await new Promise((r) => setImmediate(r));
+
+    // Only one push — the second call folded into the existing burst
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain("[git-remote-liveness] PUSH-DEAD: 12 repos");
+
+    // Also verify store reflects a single burst with count=2 (folded)
+    const stored = store.query();
+    expect(stored).toHaveLength(1);
+    expect(stored[0].count).toBe(2);
+
+    _resetAlertBusForTests();
+    _resetConfigSanityAlertForTests();
+  });
+
+  /**
+   * AC4: Regression test — a non-git-remote-liveness critical finding
+   * still fires separate pushes when called 30 minutes apart because its
+   * severity-based suppression window (15min for critical) is narrower than
+   * the cron cadence.
+   *
+   * This is the exact failure mode this ticket fixes for git-remote-liveness,
+   * but other dedup keys must remain on severity-based windows.
+   */
+  it("AC4: non-git-remote-liveness critical findings 30min apart produce two pushes (regression)", async () => {
+    _resetAlertBusForTests();
+    _resetConfigSanityAlertForTests();
+
+    const store = new AlertStore(":memory:");
+    const pushes: string[] = [];
+    const pushFn = jest.fn(async (message: string) => {
+      pushes.push(message);
+    });
+
+    const t0 = new Date("2026-07-20T00:00:00.000Z");
+    let nowMs = t0.getTime();
+
+    initAlertBus({
+      store,
+      pushFn,
+      pushEnabled: true,
+      pushMinSeverity: "critical",
+      now: () => new Date(nowMs),
+    });
+
+    // Use a non-git-remote-liveness critical finding
+    const findings: WatchdogFinding[] = [
+      {
+        check: "config-json",
+        severity: "critical",
+        message: "Host openclaw.json won't parse",
+      },
+    ];
+
+    // First cycle at T+0
+    processWatchdogOutput({ ok: false, findings }, new Date(nowMs));
+
+    // Advance 30 minutes (= one cron cycle, well beyond the 15min critical window)
+    nowMs += 30 * 60_000;
+    processWatchdogOutput({ ok: false, findings }, new Date(nowMs));
+
+    await new Promise((r) => setImmediate(r));
+
+    // Two pushes — the second call creates a new burst because 15min < 30min
+    expect(pushes).toHaveLength(2);
+
+    // Also verify store reflects two separate bursts
+    const stored = store.query({ severity: "critical" });
+    expect(stored).toHaveLength(2);
+
+    _resetAlertBusForTests();
+    _resetConfigSanityAlertForTests();
+  });
+
+  /**
+   * AC1—AC2 cross-check: a git-remote-liveness warning finding (non-critical)
+   * still uses severity-based suppression. Two warning findings 30min apart
+   * fold into one burst (1h window), but a second burst after 90min fires
+   * a new push.
+   */
+  it("AC2: non-critical git-remote-liveness findings still use severity-based suppress window", async () => {
+    _resetAlertBusForTests();
+    _resetConfigSanityAlertForTests();
+
+    const store = new AlertStore(":memory:");
+    const pushes: string[] = [];
+    const pushFn = jest.fn(async (message: string) => {
+      pushes.push(message);
+    });
+
+    const t0 = new Date("2026-07-20T00:00:00.000Z");
+    let nowMs = t0.getTime();
+
+    initAlertBus({
+      store,
+      pushFn,
+      pushEnabled: true,
+      pushMinSeverity: "warning",
+      now: () => new Date(nowMs),
+    });
+
+    const findings: WatchdogFinding[] = [
+      {
+        check: "git-remote-liveness",
+        severity: "warning",
+        message: "SSH-AUTH: 3 repos with SSH auth failures",
+      },
+    ];
+
+    // First cycle at T+0
+    processWatchdogOutput({ ok: false, findings }, new Date(nowMs));
+
+    // Advance 30 minutes — still within the 1h warning window → fold
+    nowMs += 30 * 60_000;
+    processWatchdogOutput({ ok: false, findings }, new Date(nowMs));
+
+    await new Promise((r) => setImmediate(r));
+
+    // Only one push — folded within warning's 1h window
+    expect(pushes).toHaveLength(1);
+
+    // Advance another 61 minutes — beyond 1h window → new burst
+    nowMs += 61 * 60_000;
+    processWatchdogOutput({ ok: false, findings }, new Date(nowMs));
+
+    await new Promise((r) => setImmediate(r));
+
+    expect(pushes).toHaveLength(2);
+
+    _resetAlertBusForTests();
+    _resetConfigSanityAlertForTests();
+  });
+
+  /**
+   * AC1 edge case: after a very long window (e.g. 7h), a git-remote-liveness
+   * critical finding should start a new burst.
+   */
+  it("AC1: git-remote-liveness critical findings beyond the 6h window start a new burst", async () => {
+    _resetAlertBusForTests();
+    _resetConfigSanityAlertForTests();
+
+    const store = new AlertStore(":memory:");
+    const pushes: string[] = [];
+    const pushFn = jest.fn(async (message: string) => {
+      pushes.push(message);
+    });
+
+    const t0 = new Date("2026-07-20T00:00:00.000Z");
+    let nowMs = t0.getTime();
+
+    initAlertBus({
+      store,
+      pushFn,
+      pushEnabled: true,
+      pushMinSeverity: "critical",
+      now: () => new Date(nowMs),
+    });
+
+    const findings: WatchdogFinding[] = [
+      {
+        check: "git-remote-liveness",
+        severity: "critical",
+        message: "PUSH-DEAD: 12 repos",
+      },
+    ];
+
+    processWatchdogOutput({ ok: false, findings }, new Date(nowMs));
+
+    // Beyond the 6h override window (7 hours)
+    nowMs += 7 * 60 * 60_000;
+    processWatchdogOutput({ ok: false, findings }, new Date(nowMs));
+
+    await new Promise((r) => setImmediate(r));
+
+    // Two pushes — second call is beyond the 6h window
+    expect(pushes).toHaveLength(2);
+
+    const stored = store.query();
+    expect(stored).toHaveLength(2);
+
+    _resetAlertBusForTests();
+    _resetConfigSanityAlertForTests();
   });
 });
