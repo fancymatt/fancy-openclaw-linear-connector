@@ -1,0 +1,20 @@
+{
+  "name": "@fancyfleet/components",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./styles.css": "./styles.css"
+  },
+  "peerDependencies": {
+    "react": "^18.3.1 || ^19.0.0"
+  },
+  "sideEffects": [
+    "./styles.css"
+  ]
+}

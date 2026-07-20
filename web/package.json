@@ -11,6 +11,8 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@fancyfleet/components": "file:packages/components",
+    "@fancyfleet/tokens": "file:packages/tokens",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.30.0"

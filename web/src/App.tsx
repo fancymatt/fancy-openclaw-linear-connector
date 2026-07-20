@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { Button, Heading, Text } from "@fancyfleet/components";
 import { BrowserRouter, Routes, Route, Navigate, useParams } from "react-router-dom";
 import { fetchMe, logout, setUnauthorizedHandler } from "./api";
 import { Tabs } from "./components";
@@ -181,7 +182,11 @@ export function App() {
   }, [check]);
 
   if (auth === "checking") {
-    return <div className="login-screen"><div className="muted">Connecting…</div></div>;
+    return (
+      <div className="login-screen">
+        <Text as="div" tone="muted" className="muted">Connecting…</Text>
+      </div>
+    );
   }
 
   if (auth === "anonymous") {
@@ -193,16 +198,20 @@ export function App() {
       <div className="wrap">
         <div className="topbar">
           <div>
-            <h1>Linear Connector Console</h1>
-            <div className="sub">Workflow engine · fleet routing · operational health</div>
+            <Heading level={1} size="lg">Linear Connector Console</Heading>
+            <Text as="div" tone="muted" size="sm" className="sub">
+              Workflow engine · fleet routing · operational health
+            </Text>
           </div>
-          <button
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={() => {
               void logout().finally(() => setAuth("anonymous"));
             }}
           >
             Sign out
-          </button>
+          </Button>
         </div>
         <Tabs pendingProposals={proposals.filter((p) => isPendingQueue(p, Date.now())).length} />
         <Routes>

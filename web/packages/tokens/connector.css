@@ -1,0 +1,29 @@
+@import "./tokens.css";
+
+:root {
+  color-scheme: dark;
+
+  --ff-color-bg: #0b0f14;
+  --ff-color-bg-end: #111820;
+  --ff-color-surface: #16202a;
+  --ff-color-surface-subtle: #101821;
+  --ff-color-surface-glass: rgba(22, 32, 42, 0.92);
+  --ff-color-border: #2b3a49;
+  --ff-color-border-strong: #43607b;
+  --ff-color-text: #eef4f8;
+  --ff-color-text-secondary: #a7b7c5;
+  --ff-color-text-tertiary: #8d9eae;
+
+  --ff-color-accent: #8fc7ff;
+  --ff-color-accent-subtle: #18283a;
+  --ff-color-focus: #8fc7ff;
+
+  --ff-color-success: #74d99f;
+  --ff-color-success-subtle: #102019;
+  --ff-color-warning: #f2c96d;
+  --ff-color-warning-subtle: #241d0f;
+  --ff-color-warning-text: #241d0f;
+  --ff-color-error: #ff837d;
+  --ff-color-error-subtle: #271514;
+  --ff-color-info: #8fc7ff;
+}

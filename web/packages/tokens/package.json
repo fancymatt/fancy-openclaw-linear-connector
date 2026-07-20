@@ -1,0 +1,13 @@
+{
+  "name": "@fancyfleet/tokens",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    "./tokens.css": "./tokens.css",
+    "./connector.css": "./connector.css"
+  },
+  "sideEffects": [
+    "./tokens.css",
+    "./connector.css"
+  ]
+}
