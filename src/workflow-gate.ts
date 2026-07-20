@@ -725,7 +725,7 @@ export function _resetNoActivityTimeoutCache(): void {
  * the first match found in the team's actual states wins.
  * Keep in sync with the CLI's SEMANTIC_STATE_MAP when new semantic names are added.
  */
-const SEMANTIC_STATE_MAP: Record<string, string[]> = {
+export const SEMANTIC_STATE_MAP: Record<string, string[]> = {
   backlog: ["Backlog"],
   todo: ["Todo", "To Do", "To Develop"],
   thinking: ["Thinking", "In Progress"],
