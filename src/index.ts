@@ -45,6 +45,7 @@ import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerLabelSyncAuditCron } from "./cron/label-sync-audit.js";
 import { registerAntiEntropyCron } from "./cron/anti-entropy.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
+import { registerConfigSanityAlertCron, getConfigSanityAlertLiveness } from "./config-sanity-alert.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
 import { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
@@ -368,6 +369,10 @@ export function createApp(options?: CreateAppOptions) {
       // a hardcoded literal — so the wiring is observable at /health without
       // waiting for a live misroute. Closes the AI-1808 dead-code-in-prod risk.
       dispatchIntegrity: getDispatchIntegrityState(),
+      // AI-2619: config-sanity alert consumer liveness — confirms the
+      // component is armed and last read the watchdog JSON, observable at
+      // ac-validate without waiting for the next cron tick.
+      configSanityAlert: getConfigSanityAlertLiveness(),
       // AI-1918: dispatch idempotency liveness — confirms the dedup/stale-guard
       // layer is active, observable at ac-validate without waiting for a real
       // duplicate event.
@@ -1665,6 +1670,11 @@ if (isEntryPoint) {
   // AI-1838: out-of-band mutation reconcile sweep. Detects state/label/delegate
   // changes that bypassed the proxy gate (raw token → api.linear.app direct).
   registerOobReconcileCron(mutationAuditStore, operationalEventStore);
+
+  // AI-2619: config-sanity watchdog alert consumer — reads the watchdog JSON
+  // output and routes findings through the AlertBus with stable dedup keys
+  // (git-remote-liveness PUSH-DEAD keyed on AI-2189 root-cause ticket).
+  registerConfigSanityAlertCron();
 
   // Config-health healthy→unhealthy is the loudest structural signal we have
   // (bad policy/workflow/agents.json = engine fail-closed for workflow tickets).

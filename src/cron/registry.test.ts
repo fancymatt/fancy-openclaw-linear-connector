@@ -20,6 +20,7 @@ import {
 import { registerRescueSweepCron } from "./rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./g20-canary-runner.js";
 import { registerSlaSweepCron } from "../sla-sweep.js";
+import { registerConfigSanityAlertCron, _resetConfigSanityAlertForTests } from "../config-sanity-alert.js";
 
 describe("cron registry (AI-1810)", () => {
   beforeEach(() => resetCronRegistryForTest());
@@ -96,5 +97,13 @@ describe("driver registrars self-register (AI-1810)", () => {
     const entry = getRegisteredCrons().find((e) => e.name === "sla-sweep");
     expect(entry).toBeDefined();
     expect(entry?.schedule).toBe("every 1m");
+  });
+
+  test("registerConfigSanityAlertCron registers 'config-sanity-alert'", () => {
+    _resetConfigSanityAlertForTests();
+    registerConfigSanityAlertCron();
+    const names = getRegisteredCrons().map((e) => e.name);
+    expect(names).toContain("config-sanity-alert");
+    _resetConfigSanityAlertForTests();
   });
 });
