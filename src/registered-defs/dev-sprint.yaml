@@ -1,4 +1,4 @@
-# dev-sprint — Sprint Execution Workflow (v4)
+# dev-sprint — Sprint Execution Workflow (v5)
 # owner: steward (Astrid), engine (spawn-arms, spawn-impl)
 # last-updated: 2026-07-20
 # status: v2 deployed to production (INF-40, 2026-07-16)
@@ -21,6 +21,10 @@
 # v4 (2026-07-20, P2(d) AGI-16): escape now re-enters at intake instead of
 #   terminating. A wedged sprint can be recovered by breaking glass, following
 #   the same pattern as dev-impl v9 (AI-1710).
+# v5 (2026-07-20, INF-176): post-validation spawn_if now supports
+#   parent_label_present: wf:design-provenance — a sprint-level declarative
+#   marker that forces the visual-audit gate even when no closed child carries
+#   ui-impact. Design-provenance sprints always get a visual audit.
 #
 # INF-45 (2026-07-16): added to registered-defs as child_workflow target
 # for sprint-spawner's launching state (fanout: wf:dev-sprint).
@@ -34,11 +38,12 @@
 #   → 5. ac-definition → 6. spawn-impl → 7. managing-impl → 8. validation → done
 
 id: dev-sprint
-version: 4
+version: 5
 archetype: orchestrator
 entry_state: intake
 
 # v4: escape → intake migration for in-flight tickets
+# v5: no migration needed — parent_label_present is additive, no state change
 migrations:
   escape: intake
 
@@ -169,10 +174,11 @@ states:
     kind: normal
     native_state: doing
     description: >
-      AI-2524: conditional visual-audit gate at milestone close. Fans out into a
-      wf:ui-audit child ONLY when a closed impl child carries the `ui-impact`
-      label (spawn_if, AI-2523); otherwise the gate is a no-op and the sprint
-      continues to done. The human sign-off was already captured at
+      AI-2524 / INF-176: visual-audit gate at milestone close. Fans out into a
+      wf:ui-audit child when a closed impl child carries `ui-impact` label OR
+      when the sprint itself carries the `wf:design-provenance` declarative
+      marker (parent_label_present). This ensures design-provenance sprints
+      always get a visual review. The human sign-off was already captured at
       validation→approve, so this transition is mechanical (no signoff). The
       milestone-close verification comment carries the Visual Audit breakpoint
       table + sign-off checkbox (see dev-sprint-milestone-close-template.ts).
@@ -182,6 +188,7 @@ states:
       initial_delegate: astrid
       spawn_if:
         label_present: ui-impact
+        parent_label_present: wf:design-provenance
         scope: closed_children
     transitions:
       - command: continue

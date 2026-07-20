@@ -155,8 +155,17 @@ export interface WorkflowTransition {
  * AI-2523: Configuration for the spawn_if predicate — conditional child spawning.
  *
  * A state declaring `spawn_if` will only spawn its child_workflow when the
- * predicate evaluates to true. In v1, the only predicate type is `label_present`
- * which checks whether any closed child ticket carries the specified label.
+ * predicate evaluates to true. The predicate supports two checks that are OR'd:
+ *
+ *   FIRE if (any closed child carries `label_present`)
+ *      OR (the parent ticket carries `parent_label_present`)
+ *
+ * This means the fanout fires when EITHER condition is met. Typical use:
+ *   label_present: "ui-impact"           # check closed impl children
+ *   parent_label_present: "wf:design-provenance"  # OR check parent declarative marker
+ *
+ * v1: only `label_present` against closed children.
+ * v2 (INF-176): added `parent_label_present` — check the parent ticket's own labels.
  */
 export interface SpawnIfConfig {
   /** Label name to check for on closed children. */
@@ -166,6 +175,14 @@ export interface SpawnIfConfig {
    * Only children in a terminal Linear native state (type: "completed") are examined.
    */
   scope?: "closed_children";
+  /**
+   * INF-176: Optional parent label to check. When present, the spawn fires if
+   * EITHER a closed child carries `label_present` OR the parent issue itself
+   * carries `parent_label_present`. This enables declarative sprint-level
+   * markers (e.g. `wf:design-provenance`) to force an audit gate regardless of
+   * per-child labels.
+   */
+  parent_label_present?: string;
 }
 
 export interface FanoutConfig {
@@ -899,8 +916,17 @@ export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
               );
             }
 
+            // INF-176: parent_label_present is optional; validate type when present
+            if (sif.parent_label_present !== undefined) {
+              if (typeof sif.parent_label_present !== "string" || (sif.parent_label_present as string).trim() === "") {
+                errors.push(
+                  `Workflow state '${state.id}' fanout spawn_if parent_label_present must be a non-empty string when present.`,
+                );
+              }
+            }
+
             // No unknown fields
-            const knownFields = new Set(["label_present", "scope"]);
+            const knownFields = new Set(["label_present", "scope", "parent_label_present"]);
             for (const key of Object.keys(sif)) {
               if (!knownFields.has(key)) {
                 errors.push(

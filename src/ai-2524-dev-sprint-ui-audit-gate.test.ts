@@ -135,6 +135,13 @@ describe("AC1: dev-sprint.yaml post-validation state", () => {
     expect(fanout.spawn_if!.label_present).toBe("ui-impact");
   });
 
+  it("INF-176: post-validation fanout includes parent_label_present: 'wf:design-provenance'", () => {
+    const pvState = devSprint.states.find((s) => s.id === "post-validation");
+    const fanout = pvState!.fanout as FanoutConfig;
+    expect(fanout.spawn_if).toBeDefined();
+    expect(fanout.spawn_if!.parent_label_present).toBe("wf:design-provenance");
+  });
+
   it("post-validation fanout spawn_if scope is closed_children (default, ok if absent)", () => {
     const pvState = devSprint.states.find((s) => s.id === "post-validation");
     const fanout = pvState!.fanout as FanoutConfig;

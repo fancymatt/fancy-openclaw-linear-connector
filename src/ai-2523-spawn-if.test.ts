@@ -11,6 +11,13 @@
  *   - AC4: A state with NO `spawn_if` keeps unconditional spawn (no regression).
  *   - AC5: Malformed `spawn_if` fails validation at def load, fails closed,
  *         and leaves the prior registry intact.
+ *
+ * INF-176 extension (v2): `parent_label_present` — check the parent ticket's
+ *   own labels as an OR condition.
+ *   - AC6: `parent_label_present` fires when the parent carries the label.
+ *   - AC7: `parent_label_present` works even when no children exist.
+ *   - AC8: Child label and parent label are OR'd — either triggers a fire.
+ *   - AC9: Validation rejects invalid `parent_label_present` config.
  */
 
 import { shouldTriggerFanout, executeFanout, type Finding, type FanoutResult } from "./fanout.js";
@@ -963,5 +970,386 @@ describe("AI-2523 AC5: spawn_if config validation", () => {
     } as unknown as WorkflowDef;
     const errors = validateFanoutBarrierConfig(def);
     expect(errors).toHaveLength(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INF-176: parent_label_present — check parent ticket labels as OR condition
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("INF-176: parent_label_present — parent-level declarative marker", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  // ── AC6: parent_label_present fires when the parent carries the label ──
+
+  it("AC6: spawns when the parent ticket carries the parent_label_present label, even with no children", async () => {
+    // Parent carries wf:design-provenance but has no children
+    // → shouldSpawn: true (parent match)
+    const childLabels: Record<string, string[]> = {};
+
+    globalThis.fetch = makeSpawnIfFetch({
+      childLabels,
+      parentContext: {
+        teamId: "team-uuid",
+        title: "Design Sprint",
+        description: "## Findings\n- **Audit Item**: Do the visual audit\n",
+        parentIssueId: null,
+      },
+    });
+
+    const findings: Finding[] = [
+      { title: "Visual Audit item", description: "Run the UI audit" },
+    ];
+
+    const config: FanoutConfig & { spawn_if: SpawnIfConfig } = {
+      spec_source: "findings",
+      child_workflow: "wf:dev-impl",
+      spawn_if: {
+        label_present: "ui-impact",
+        parent_label_present: "wf:design-provenance",
+        scope: "closed_children",
+      },
+    };
+
+    // Override the mock to add wf:design-provenance to parent labels
+    // The mock fetcher doesn't know about parent labels, so we need to
+    // patch it for the ParentChildrenLabels query.
+    const baseFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      if (typeof url !== "string") return baseFetch(url, init);
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string };
+      if (parsed.query?.includes("ParentChildrenLabels")) {
+        // Return parent with the design-provenance label
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                labels: { nodes: [{ id: "label-design", name: "wf:design-provenance" }] },
+                children: { nodes: [] },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return baseFetch(url, init);
+    };
+
+    const result = await executeFanout("AI-2000", "Bearer tok", config, {
+      skipPreview: true,
+      findingsOverride: findings,
+    });
+
+    // Should have created the child (parent_label_present matches)
+    expect(result.created).toBe(1);
+    expect(result.childIdentifiers).toHaveLength(1);
+    expect(result.refused).toBe(false);
+  });
+
+  // ── AC7: parent_label_present works with no children at all ────────────
+
+  it("AC7: fires when parent carries label even with zero children (no regression for child-only check)", async () => {
+    globalThis.fetch = async (url, init) => {
+      if (typeof url !== "string") throw new Error("unexpected");
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string };
+      if (parsed.query?.includes("ParentChildrenLabels")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                labels: { nodes: [{ id: "label-design", name: "wf:design-provenance" }] },
+                children: { nodes: [] },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return makeSpawnIfFetch({})(url, init);
+    };
+
+    const findings: Finding[] = [{ title: "Audit" }];
+    const config: FanoutConfig & { spawn_if: SpawnIfConfig } = {
+      spec_source: "findings",
+      child_workflow: "wf:dev-impl",
+      spawn_if: {
+        label_present: "ui-impact",
+        parent_label_present: "wf:design-provenance",
+        scope: "closed_children",
+      },
+    };
+
+    const result = await executeFanout("AI-2000", "Bearer tok", config, {
+      skipPreview: true,
+      findingsOverride: findings,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.refused).toBe(false);
+  });
+
+  // ── AC8: Child label and parent label are OR'd ─────────────────────────
+
+  it("AC8: fires when only a closed child carries ui-impact, even without the parent label", async () => {
+    // Child has ui-impact, parent does NOT have wf:design-provenance
+    globalThis.fetch = async (url, init) => {
+      if (typeof url !== "string") throw new Error("unexpected");
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string };
+      if (parsed.query?.includes("ParentChildrenLabels")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                labels: { nodes: [] },
+                children: {
+                  nodes: [{
+                    identifier: "AI-3001",
+                    state: { name: "Done", type: "completed" },
+                    labels: { nodes: [{ id: "label-ui", name: "ui-impact" }] },
+                  }],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return makeSpawnIfFetch({})(url, init);
+    };
+
+    const findings: Finding[] = [{ title: "Audit" }];
+    const config: FanoutConfig & { spawn_if: SpawnIfConfig } = {
+      spec_source: "findings",
+      child_workflow: "wf:dev-impl",
+      spawn_if: {
+        label_present: "ui-impact",
+        parent_label_present: "wf:design-provenance",
+        scope: "closed_children",
+      },
+    };
+
+    const result = await executeFanout("AI-2000", "Bearer tok", config, {
+      skipPreview: true,
+      findingsOverride: findings,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.refused).toBe(false);
+  });
+
+  it("AC8: fires when only parent carries wf:design-provenance (no ui-impact on children)", async () => {
+    globalThis.fetch = async (url, init) => {
+      if (typeof url !== "string") throw new Error("unexpected");
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string };
+      if (parsed.query?.includes("ParentChildrenLabels")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                labels: { nodes: [{ id: "label-design", name: "wf:design-provenance" }] },
+                children: {
+                  nodes: [{
+                    identifier: "AI-3001",
+                    state: { name: "Done", type: "completed" },
+                    labels: { nodes: [{ id: "label-nope", name: "backend-only" }] },
+                  }],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return makeSpawnIfFetch({})(url, init);
+    };
+
+    const findings: Finding[] = [{ title: "Audit" }];
+    const config: FanoutConfig & { spawn_if: SpawnIfConfig } = {
+      spec_source: "findings",
+      child_workflow: "wf:dev-impl",
+      spawn_if: {
+        label_present: "ui-impact",
+        parent_label_present: "wf:design-provenance",
+        scope: "closed_children",
+      },
+    };
+
+    const result = await executeFanout("AI-2000", "Bearer tok", config, {
+      skipPreview: true,
+      findingsOverride: findings,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.refused).toBe(false);
+  });
+
+  it("AC8: waives when NEITHER parent label NOR child label matches", async () => {
+    globalThis.fetch = async (url, init) => {
+      if (typeof url !== "string") throw new Error("unexpected");
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      const parsed = JSON.parse(bodyText) as { query?: string };
+      if (parsed.query?.includes("ParentChildrenLabels")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                labels: { nodes: [{ id: "label-other", name: "some-other-label" }] },
+                children: {
+                  nodes: [{
+                    identifier: "AI-3001",
+                    state: { name: "Done", type: "completed" },
+                    labels: { nodes: [{ id: "label-nope", name: "backend-only" }] },
+                  }],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return makeSpawnIfFetch({})(url, init);
+    };
+
+    const findings: Finding[] = [{ title: "Audit" }];
+    const config: FanoutConfig & { spawn_if: SpawnIfConfig } = {
+      spec_source: "findings",
+      child_workflow: "wf:dev-impl",
+      spawn_if: {
+        label_present: "ui-impact",
+        parent_label_present: "wf:design-provenance",
+        scope: "closed_children",
+      },
+    };
+
+    const result = await executeFanout("AI-2000", "Bearer tok", config, {
+      skipPreview: true,
+      findingsOverride: findings,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.refused).toBe(false);
+  });
+
+  // ── AC9: Validation for parent_label_present ───────────────────────────
+
+  it("AC9: valid parent_label_present passes validation", () => {
+    const def: WorkflowDef = {
+      id: "sprint",
+      version: 1,
+      entry_state: "intake",
+      states: [
+        { id: "intake", transitions: [{ command: "accept", to: "spawning" }] },
+        {
+          id: "spawning",
+          fanout: {
+            spec_source: "findings",
+            child_workflow: "wf:dev-impl",
+            spawn_if: {
+              label_present: "ui-impact",
+              parent_label_present: "wf:design-provenance",
+              scope: "closed_children",
+            },
+          } as FanoutConfig & { spawn_if: SpawnIfConfig },
+          transitions: [{ command: "spawn", to: "done" }],
+        },
+        { id: "done", kind: "terminal", native_state: "done" },
+      ],
+    } as unknown as WorkflowDef;
+    const errors = validateFanoutBarrierConfig(def);
+    expect(errors).toHaveLength(0);
+  });
+
+  it("AC9: rejects parent_label_present when it's an empty string", () => {
+    const def: WorkflowDef = {
+      id: "sprint",
+      version: 1,
+      entry_state: "intake",
+      states: [
+        { id: "intake", transitions: [{ command: "accept", to: "spawning" }] },
+        {
+          id: "spawning",
+          fanout: {
+            spec_source: "findings",
+            child_workflow: "wf:dev-impl",
+            spawn_if: {
+              label_present: "ui-impact",
+              parent_label_present: "",
+            },
+          } as FanoutConfig & { spawn_if: SpawnIfConfig },
+          transitions: [{ command: "spawn", to: "done" }],
+        },
+        { id: "done", kind: "terminal", native_state: "done" },
+      ],
+    } as unknown as WorkflowDef;
+    const errors = validateFanoutBarrierConfig(def);
+    expect(errors.length).toBeGreaterThanOrEqual(1);
+    expect(errors[0]).toMatch(/parent_label_present/i);
+  });
+
+  it("AC9: rejects parent_label_present as non-string type", () => {
+    const def: WorkflowDef = {
+      id: "sprint",
+      version: 1,
+      entry_state: "intake",
+      states: [
+        { id: "intake", transitions: [{ command: "accept", to: "spawning" }] },
+        {
+          id: "spawning",
+          fanout: {
+            spec_source: "findings",
+            child_workflow: "wf:dev-impl",
+            spawn_if: {
+              label_present: "ui-impact",
+              parent_label_present: 42,
+            },
+          } as unknown as FanoutConfig & { spawn_if: SpawnIfConfig },
+          transitions: [{ command: "spawn", to: "done" }],
+        },
+        { id: "done", kind: "terminal", native_state: "done" },
+      ],
+    } as unknown as WorkflowDef;
+    const errors = validateFanoutBarrierConfig(def);
+    expect(errors.length).toBeGreaterThanOrEqual(1);
+    expect(errors[0]).toMatch(/parent_label_present/i);
+  });
+
+  it("AC5: parent_label_present is accepted as a known field (no unknown-field error)", () => {
+    const def: WorkflowDef = {
+      id: "sprint",
+      version: 1,
+      entry_state: "intake",
+      states: [
+        { id: "intake", transitions: [{ command: "accept", to: "spawning" }] },
+        {
+          id: "spawning",
+          fanout: {
+            spec_source: "findings",
+            child_workflow: "wf:dev-impl",
+            spawn_if: {
+              label_present: "ui-impact",
+              parent_label_present: "wf:design-provenance",
+            },
+          } as FanoutConfig & { spawn_if: SpawnIfConfig },
+          transitions: [{ command: "spawn", to: "done" }],
+        },
+        { id: "done", kind: "terminal", native_state: "done" },
+      ],
+    } as unknown as WorkflowDef;
+    const errors = validateFanoutBarrierConfig(def);
+    // Should have no errors about unknown field
+    const unknownFieldErrors = errors.filter((e) => /unknown|unexpected/i.test(e));
+    expect(unknownFieldErrors).toHaveLength(0);
   });
 });

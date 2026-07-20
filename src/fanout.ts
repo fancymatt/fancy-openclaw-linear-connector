@@ -730,6 +730,7 @@ export function validateFanoutSpec(
 const PARENT_CHILDREN_QUERY = `
   query ParentChildrenLabels($id: String!) {
     issue(id: $id) {
+      labels { nodes { id name } }
       children {
         nodes {
           identifier
@@ -750,6 +751,7 @@ interface ChildNode {
 interface ParentChildrenResponse {
   data?: {
     issue?: {
+      labels: { nodes: Array<{ id: string; name: string }> };
       children: {
         nodes: ChildNode[];
       };
@@ -761,9 +763,15 @@ interface ParentChildrenResponse {
 /**
  * AI-2523: Evaluate a spawn_if predicate for a parent issue.
  *
- * Queries the parent's children (via ParentChildrenLabels), filters to closed
- * children (native state type === "completed"), then checks if any closed child
- * carries the configured label.
+ * Queries the parent issue and its children (via ParentChildrenLabels), then
+ * evaluates two conditions that are OR'd:
+ *
+ *   FIRE if (any closed child carries `spawnIf.label_present`)
+ *      OR (the parent issue carries `spawnIf.parent_label_present`)
+ *
+ * The child check filters to closed children (native state type === "completed")
+ * and looks for the `label_present` label. The parent check looks for the
+ * `parent_label_present` label on the parent ticket.
  *
  * The result is a SpawnIfResult indicating whether the spawn should proceed,
  * a human-readable reason, and the list of matched child identifiers.
@@ -776,6 +784,9 @@ interface ParentChildrenResponse {
  * Callers must branch on `outcome`, never on `reason`: "no children spawned"
  * is the same observable for both, so a caller that cannot tell them apart
  * will let a transient API error satisfy a barrier that never ran.
+ *
+ * INF-176 (v2): added `parent_label_present` — check the parent ticket's own
+ * labels as an OR condition alongside the child-label check.
  */
 export async function evaluateSpawnIf(
   parentInternalId: string,
@@ -828,6 +839,16 @@ export async function evaluateSpawnIf(
 
     const children = issueNode.children.nodes ?? [];
     const targetLabel = spawnIf.label_present;
+    const parentLabel = spawnIf.parent_label_present;
+
+    // ── Check parent labels (INF-176) ───────────────────────────────
+    // When `parent_label_present` is configured, check if the parent ticket
+    // itself carries that label. If so, the predicate fires regardless of
+    // what children look like.
+    const parentLabels = issueNode.labels?.nodes ?? [];
+    const parentHasLabel = parentLabel
+      ? parentLabels.some((l) => l.name === parentLabel)
+      : false;
 
     // Filter to closed children (native state type === "completed")
     const closedChildren = children.filter((c) => c.state?.type === "completed");
@@ -837,22 +858,45 @@ export async function evaluateSpawnIf(
       .filter((c) => c.labels.nodes.some((l) => l.name === targetLabel))
       .map((c) => c.identifier);
 
-    if (matchedChildren.length > 0) {
+    // INF-176: OR the conditions — fire if EITHER the parent carries the
+    // declarative marker OR a closed child carries the ui-impact label.
+    if (matchedChildren.length > 0 || parentHasLabel) {
+      const childPart = matchedChildren.length > 0
+        ? `${matchedChildren.length} closed child(ren) carry the '${targetLabel}' label (${matchedChildren.join(", ")})`
+        : "";
+      const parentPart = parentHasLabel
+        ? `the parent ticket carries the '${parentLabel}' declarative marker`
+        : "";
+      const reasonParts = [childPart, parentPart].filter(Boolean);
       return {
         outcome: "fire",
         shouldSpawn: true,
-        reason: `spawn_if predicate matched: ${matchedChildren.length} closed child(ren) carry the '${targetLabel}' label (${matchedChildren.join(", ")})`,
+        reason: `spawn_if predicate matched: ${reasonParts.join(", and ")}`,
         matchedChildren,
+      };
+    }
+
+    // INF-176: gate-skipped alert — when the parent carries the declarative
+    // marker but somehow the predicate didn't fire (shouldn't happen with the
+    // OR logic above, but catches data races / manual state changes), flag it.
+    if (parentLabel && parentHasLabel) {
+      return {
+        outcome: "waived",
+        shouldSpawn: false,
+        reason: `spawn_if predicate ANOMALY: parent carries '${parentLabel}' but no child matched '${targetLabel}' — this should not happen with the OR logic`,
+        matchedChildren: [],
       };
     }
 
     // No match found — determine the right diagnostic. Every branch below is a
     // genuine `waived`: the children query succeeded and the predicate is false.
+    // Note: the parent_label_present check above already covered parent-only matches,
+    // so by this point we know neither condition is met.
     if (children.length === 0) {
       return {
         outcome: "waived",
         shouldSpawn: false,
-        reason: `spawn_if predicate waived: parent has no children — no '${targetLabel}' label found anywhere`,
+        reason: `spawn_if predicate waived: parent has no children and no '${parentLabel || targetLabel}' label found`,
         matchedChildren: [],
       };
     }
@@ -863,7 +907,7 @@ export async function evaluateSpawnIf(
       return {
         outcome: "waived",
         shouldSpawn: false,
-        reason: `spawn_if predicate waived: no closed children yet (${children.length} open child(ren) — ${openChildren}) — none carry '${targetLabel}'`,
+        reason: `spawn_if predicate waived: no closed children yet (${children.length} open child(ren) — ${openChildren}) — none carry '${targetLabel}', and parent lacks '${parentLabel || "—"}'`,
         matchedChildren: [],
       };
     }
@@ -893,11 +937,16 @@ async function postSpawnIfComment(
   issueInternalId: string,
   spawnIfResult: SpawnIfResult,
   authToken: string,
+  spawnIfConfig?: SpawnIfConfig,
 ): Promise<void> {
   const emoji = spawnIfResult.shouldSpawn ? "✅" : "⏭️";
+  const labelInfoParts: string[] = [];
+  if (spawnIfConfig?.label_present) labelInfoParts.push(`children: "${spawnIfConfig.label_present}"`);
+  if (spawnIfConfig?.parent_label_present) labelInfoParts.push(`parent: "${spawnIfConfig.parent_label_present}"`);
+  const labelInfo = labelInfoParts.length > 0 ? ` (${labelInfoParts.join(", ")})` : "";
   const body = [
-    `${emoji} **spawn_if Evaluation** (label_present: "${spawnIfResult.matchedChildren.length > 0 ? spawnIfResult.reason.match(/'([^']+)'/)?.[1] ?? "—" : "—"}")`,
-    ``,  // "ui-impact" not stable — just explain clearly
+    `${emoji} **spawn_if Evaluation**${labelInfo}`,
+    ``,  // blank line
     `**Outcome:** ${spawnIfResult.shouldSpawn ? "FIRE — spawning children" : "WAIVE — skipping spawn"}`,
     `**Reason:** ${spawnIfResult.reason}`,
     spawnIfResult.matchedChildren.length > 0
@@ -1297,7 +1346,7 @@ export async function executeFanout(
         });
         await postSpawnIfErrorComment(parentCtx.internalId, siResult.reason, authToken);
       } else {
-        await postSpawnIfComment(parentCtx.internalId, siResult, authToken);
+        await postSpawnIfComment(parentCtx.internalId, siResult, authToken, config.spawn_if);
       }
 
       log.info(
@@ -1306,7 +1355,7 @@ export async function executeFanout(
       return result;
     }
 
-    await postSpawnIfComment(parentCtx.internalId, siResult, authToken);
+    await postSpawnIfComment(parentCtx.internalId, siResult, authToken, config.spawn_if);
 
     log.info(
       `fanout: spawn_if fired for ${parentIssueId} — ${siResult.reason}`,
