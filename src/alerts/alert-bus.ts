@@ -110,7 +110,8 @@ export class AlertBus {
     let rowId: number | null = null;
     if (this.store) {
       try {
-        const result = this.store.record(alert, SUPPRESS_WINDOW_MS[alert.severity], this.now());
+        const windowMs = alert.suppressWindowMs ?? SUPPRESS_WINDOW_MS[alert.severity];
+        const result = this.store.record(alert, windowMs, this.now());
         suppressed = result.suppressed;
         burstCount = result.row.count;
         priorBurstCount = result.priorBurstCount;

@@ -1,13 +1,14 @@
 {
   "name": "@fancyfleet/tokens",
-  "version": "0.1.0",
+  "version": "0.0.0",
+  "description": "Design tokens — CSS custom properties for color, typography, spacing",
+  "license": "UNLICENSED",
   "type": "module",
-  "exports": {
-    "./tokens.css": "./tokens.css",
-    "./connector.css": "./connector.css"
-  },
+  "main": "index.css",
+  "files": [
+    "*.css"
+  ],
   "sideEffects": [
-    "./tokens.css",
-    "./connector.css"
+    "*.css"
   ]
 }

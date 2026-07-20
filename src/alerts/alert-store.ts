@@ -17,6 +17,13 @@ export interface AlertInput {
   ticket?: string | null;
   /** Dedup identity. Defaults to source|title|agent|ticket. */
   dedupKey?: string;
+  /**
+   * Override the suppression window for this dedup identity.
+   * When set, AlertBus uses this value instead of the severity-based
+   * SUPPRESS_WINDOW_MS for the record() call, allowing specific checks
+   * (e.g. git-remote-liveness critical) to use a longer window.
+   */
+  suppressWindowMs?: number;
 }
 
 export interface AlertRow {

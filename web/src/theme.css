@@ -1,24 +1,50 @@
+@import "@fancyfleet/tokens";
+
+/* GEN-285: Token Centralization & Pilot Consumption
+ * — Import centralized @fancyfleet/tokens and adapt surface tokens for a
+ *   lighter Connector UI appearance per Laren's direction.
+ * — The centralized tokens provide the foundation scale (brand colors, type,
+ *   spacing, shadow). Surface/border/text overrides below give the connector
+ *   a dark-but-not-black look that is lighter than Gen's "Editorial Dark". */
 :root {
-  --bg: var(--ff-color-bg);
-  --panel: var(--ff-color-surface);
-  --panel-glass: var(--ff-color-surface-glass);
-  --line: var(--ff-color-border);
-  --text: var(--ff-color-text);
-  --muted: var(--ff-color-text-secondary);
+  /* ── Connector semantic aliases (map old names to centralized tokens) ── */
+  --bg: var(--ff-surface-primary);
+  --panel: var(--ff-surface-secondary);
+  --panel-glass: var(--ff-surface-elevated);
+  --line: var(--ff-border-default);
+  --text: var(--ff-text-primary);
+  --muted: var(--ff-text-secondary);
   --green: var(--ff-color-success);
   --yellow: var(--ff-color-warning);
   --red: var(--ff-color-error);
-  --gray: var(--ff-color-text-tertiary);
+  --gray: var(--ff-color-neutral-400);
   --blue: var(--ff-color-accent);
+  --brand: var(--ff-color-brand-primary);
+  --space-4: var(--ff-space-4);
+
+  /* ── GEN-285: Lighter surface adaptation (Connector UI overrides) ──
+   * The centralized tokens default to light-mode values. The Connector UI
+   * is a dark-themed app, so we redeclare surface tokens with a dark-but-not-
+   * black palette — lighter than Gen's "Editorial Dark" — per Laren's direction.
+   * We use the centralized neutral scale to stay on-token. */
+  color-scheme: dark;
+
+  --ff-surface-primary: var(--ff-color-neutral-800);
+  --ff-surface-secondary: var(--ff-color-neutral-900);
+  --ff-surface-elevated:  var(--ff-color-neutral-700);
+  --ff-text-primary:      var(--ff-color-neutral-50);
+  --ff-text-secondary:    var(--ff-color-neutral-400);
+  --ff-border-default:    var(--ff-color-neutral-600);
+  --ff-border-subtle:     var(--ff-color-neutral-700);
 }
 
 * { box-sizing: border-box; }
 
 body {
   margin: 0;
-  background: linear-gradient(180deg, var(--ff-color-bg), var(--ff-color-bg-end));
+  background: var(--ff-surface-secondary);
   color: var(--text);
-  font: var(--ff-font-size-md)/var(--ff-line-height-body) var(--ff-font-family-body);
+  font: var(--ff-font-size-base)/var(--ff-line-height-normal) var(--ff-font-sans);
   min-height: 100vh;
 }
 
@@ -55,7 +81,7 @@ nav.tabs:not(.ff-nav) a.active { background: #203044; border-color: #3d5570; }
 .card {
   background: var(--panel-glass);
   border: 1px solid var(--line);
-  border-radius: var(--ff-radius-panel);
+  border-radius: var(--ff-radius-lg);
   padding: 16px;
   box-shadow: 0 14px 40px rgba(0, 0, 0, 0.25);
 }
@@ -140,7 +166,7 @@ button, input[type="password"], input[type="text"], select {
 button { cursor: pointer; font-weight: 650; }
 button.primary { background: #203044; border-color: #3d5570; }
 button:disabled { opacity: 0.55; cursor: not-allowed; }
-button.ff-button { color: var(--ff-color-text); }
+button.ff-button { color: var(--text); }
 
 .filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; align-items: center; }
 .filters label { color: var(--muted); font-size: 12px; }

@@ -171,6 +171,11 @@ export function processWatchdogOutput(output: WatchdogOutput, now = new Date()):
       detail: finding.detail ?? undefined,
       ticket: finding.ticket ?? undefined,
       dedupKey,
+      // git-remote-liveness critical uses a 6h suppression window (AI-2620)
+      // so the 30-min cron cadence doesn't create fresh pushes every cycle.
+      suppressWindowMs: finding.check === "git-remote-liveness" && severity === "critical"
+        ? 6 * 60 * 60_000
+        : undefined,
     });
 
     if (severity === "critical" || severity === "warning") {
