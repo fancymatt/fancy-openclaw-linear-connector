@@ -17,4 +17,7 @@ export default defineConfig({
       "/admin/api": "http://localhost:3199",
     },
   },
+  optimizeDeps: {
+    exclude: ["@fancyfleet/components", "@fancyfleet/tokens"],
+  },
 });

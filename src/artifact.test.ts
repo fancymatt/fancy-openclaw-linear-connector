@@ -71,7 +71,7 @@ describe("artifact helpers", () => {
     expect(shasMatch("1234567", "abc1234567")).toBe(false);
   });
 
-  it("compares artifacts by exact branch and sha prefix", () => {
+  it("compares artifacts by case-insensitive branch and sha prefix", () => {
     expect(sameArtifact(
       { branch: "feature/x", sha: "abc1234" },
       { branch: "feature/x", sha: "abc1234567890" },
@@ -80,6 +80,15 @@ describe("artifact helpers", () => {
       { branch: "feature/x", sha: "abc1234" },
       { branch: "feature/y", sha: "abc1234567890" },
     )).toBe(false);
+    // Case-insensitive branch comparison (INF-169)
+    expect(sameArtifact(
+      { branch: "feature/GEN-288", sha: "def5678" },
+      { branch: "feature/gen-288", sha: "def5678901234" },
+    )).toBe(true);
+    expect(sameArtifact(
+      { branch: "FEATURE/X", sha: "abc1234" },
+      { branch: "feature/x", sha: "abc1234567890" },
+    )).toBe(true);
   });
 
   it("formats code artifacts as branch@sha", () => {

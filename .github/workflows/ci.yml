@@ -17,10 +17,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: 'npm'
@@ -79,6 +79,24 @@ jobs:
 
       - name: Run pip-audit against pinned deps
         run: pip-audit
+
+  lint-linear-cli-version:
+    name: Lint - linear-cli version consistency (checks Dockerfiles for hardcoded versions)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint linear-cli version — verify config/linear-cli-version and scan Dockerfiles
+        run: |
+          bash scripts/lint-linear-cli-version.sh
+          # Fail on mismatch: the lint script exits non-zero if any Dockerfile has a
+          # hardcoded linear-cli version that doesn't match the canonical source.
+          lint_result=$?
+          if [ $lint_result -ne 0 ]; then
+            echo "::error title=linear-cli-version::Dockerfile version mismatch detected — update config/linear-cli-version instead of hardcoding tarball URLs"
+            exit 1
+          fi
 
   security-trufflehog:
     name: Security - trufflehog (secrets scanning)

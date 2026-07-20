@@ -1,0 +1,40 @@
+.link {
+  color: var(--color-primary);
+  text-decoration: none;
+  transition:
+    color var(--transition-fast),
+    text-decoration-color var(--transition-fast);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.link:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.link:focus-visible {
+  outline: 2px solid var(--color-border-strong);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* ── Muted variant ── */
+
+.muted {
+  color: var(--color-text-secondary);
+}
+
+.muted:hover {
+  color: var(--color-text);
+}
+
+/* ── External icon ── */
+
+.externalIcon {
+  width: 0.8em;
+  height: 0.8em;
+  flex-shrink: 0;
+}

@@ -1,14 +1,25 @@
 {
   "name": "@fancyfleet/tokens",
-  "version": "0.0.0",
-  "description": "Design tokens — CSS custom properties for color, typography, spacing",
-  "license": "UNLICENSED",
-  "type": "module",
-  "main": "index.css",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CSS custom property token layer for the Warm Precision Design System",
   "files": [
-    "*.css"
+    "tokens.css",
+    "index.css"
   ],
-  "sideEffects": [
-    "*.css"
-  ]
+  "style": "index.css",
+  "main": "index.css",
+  "exports": {
+    ".": {
+      "style": "./index.css"
+    },
+    "./tokens.css": "./tokens.css"
+  },
+  "keywords": [
+    "design-system",
+    "tokens",
+    "css",
+    "fancyfleet"
+  ],
+  "license": "UNLICENSED"
 }

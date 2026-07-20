@@ -1,3 +1,5 @@
+ARG LINEAR_CLI_VERSION
+
 # --- Backend build stage ---
 FROM node:22-alpine AS builder
 
@@ -32,6 +34,8 @@ COPY src/ src/
 RUN npm run build
 
 # --- Web SPA build stage ---
+ARG LINEAR_CLI_VERSION
+
 FROM node:22-alpine AS web-builder
 
 WORKDIR /app
@@ -47,6 +51,9 @@ RUN npm run build --prefix web
 
 # --- Runtime stage ---
 FROM node:22-alpine
+
+ARG LINEAR_CLI_VERSION
+LABEL linear-cli-version="${LINEAR_CLI_VERSION}"
 
 # better-sqlite3 runtime native deps (libc++, etc.)
 RUN apk add --no-cache python3 make g++ libstdc++

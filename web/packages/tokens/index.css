@@ -1,5 +1,2 @@
-/* ❇️ @fancyfleet/tokens — Design token entry point */
-
-@import "./colors.css";
-@import "./typography.css";
-@import "./spacing.css";
+/* @fancyfleet/tokens — entry point */
+@import "./tokens.css";

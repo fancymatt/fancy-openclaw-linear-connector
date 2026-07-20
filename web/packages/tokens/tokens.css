@@ -1,0 +1,119 @@
+/* ============================================================
+   Warm Precision Design System — Token Layer
+   ============================================================
+   "Instruments, not decorations."
+   Design direction: Laren (CDO) — Reviewed: Astrid (CPO)
+   ============================================================ */
+
+:root {
+  /* ── Primary ── */
+  --color-primary: #6B4F3C;
+  --color-primary-strong: #4F3828;
+  --color-primary-subtle: #F0E8DE;
+  --color-primary-muted: #D9CBBE;
+
+  /* ── Neutral ── */
+  --color-bg: #F7F5F1;
+  --color-surface: #FFFFFF;
+  --color-surface-subtle: #F0EDE8;
+  --color-border: #E2DDD6;
+  --color-border-strong: #C4BEB4;
+  --color-text: #1C1A17;
+  --color-text-secondary: #6B655C;
+  --color-text-tertiary: #9C958A;
+  --color-text-inverse: #F0EDE8;
+
+  /* ── Semantic ── */
+  --color-success: #4A7C59;
+  --color-warning: #B8863A;
+  --color-error: #A0443A;
+  --color-info: #4F6F8F;
+
+  /* ── Accent ── */
+  --color-accent: #8B6F47;
+  --color-accent-warm: #A0714E;
+
+  /* ── Typography ── */
+  --font-family-heading: Georgia, "Times New Roman", serif;
+  --font-family-body: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-family-mono: "JetBrains Mono", "Fira Code", monospace;
+
+  --font-size-xs: 0.75rem;
+  --font-size-sm: 0.875rem;
+  --font-size-base: 1rem;
+  --font-size-lg: 1.125rem;
+  --font-size-xl: 1.25rem;
+  --font-size-2xl: 1.5rem;
+  --font-size-3xl: 1.875rem;
+  --font-size-4xl: 2.25rem;
+  --font-size-5xl: 3rem;
+
+  --line-height-body: 1.6;
+  --line-height-heading: 1.2;
+  --line-height-compact: 1;
+
+  --letter-spacing-heading-large: -0.01em;
+  --letter-spacing-heading-small: 0;
+  --letter-spacing-body: 0;
+  --letter-spacing-label: 0.04em;
+
+  /* ── Spacing (4px base) ── */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-8: 3rem;
+  --space-10: 4rem;
+  --space-12: 6rem;
+
+  /* ── Border Radius ── */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
+
+  /* ── Elevation / Shadow (warm-tinted, using text color + opacity) ── */
+  --elevation-1: 0 1px 2px rgba(28, 26, 23, 0.06), 0 1px 3px rgba(28, 26, 23, 0.1);
+  --elevation-2: 0 2px 4px rgba(28, 26, 23, 0.06), 0 4px 8px rgba(28, 26, 23, 0.1);
+  --elevation-3: 0 4px 8px rgba(28, 26, 23, 0.08), 0 8px 16px rgba(28, 26, 23, 0.12);
+  --elevation-4: 0 8px 16px rgba(28, 26, 23, 0.1), 0 16px 32px rgba(28, 26, 23, 0.14);
+
+  /* ── Transition Durations ── */
+  --transition-fast: 150ms ease;
+  --transition-base: 200ms ease;
+}
+
+/* ============================================================
+   DARK THEME — Same room, different lighting
+   ============================================================ */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-primary: #C4A882;
+    --color-primary-strong: #DEC49C;
+    --color-primary-subtle: #3D2C1E;
+    --color-primary-muted: #5E4833;
+
+    --color-bg: #1A1816;
+    --color-surface: #242220;
+    --color-surface-subtle: #2C2A26;
+    --color-border: #3B3833;
+    --color-border-strong: #5C5850;
+    --color-text: #E6E2DA;
+    --color-text-secondary: #A39D92;
+    --color-text-tertiary: #736D62;
+    --color-text-inverse: #1C1A17;
+
+    --color-success: #6DB07E;
+    --color-warning: #DBA45A;
+    --color-error: #CF685C;
+    --color-info: #7FA3C7;
+
+    --elevation-1: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 3px rgba(0, 0, 0, 0.4);
+    --elevation-2: 0 2px 4px rgba(0, 0, 0, 0.3), 0 4px 8px rgba(0, 0, 0, 0.4);
+    --elevation-3: 0 4px 8px rgba(0, 0, 0, 0.35), 0 8px 16px rgba(0, 0, 0, 0.45);
+    --elevation-4: 0 8px 16px rgba(0, 0, 0, 0.4), 0 16px 32px rgba(0, 0, 0, 0.5);
+  }
+}

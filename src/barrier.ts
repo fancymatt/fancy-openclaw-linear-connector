@@ -370,6 +370,7 @@ export async function fetchChildren(
           children?: {
             nodes?: Array<{
               identifier: string;
+              state?: { name: string; type: string } | null;
               labels?: { nodes?: Array<{ name: string }> };
             }>;
           };

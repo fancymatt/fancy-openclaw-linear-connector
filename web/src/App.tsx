@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { Button, Heading, Text } from "@fancyfleet/components";
 import { BrowserRouter, Routes, Route, Navigate, useParams } from "react-router-dom";
+import { Button, Heading, Text } from "@fancyfleet/components";
 import { fetchMe, logout, setUnauthorizedHandler } from "./api";
 import { Tabs } from "./components";
 import { LoginPage } from "./pages/LoginPage";
@@ -198,14 +198,11 @@ export function App() {
       <div className="wrap">
         <div className="topbar">
           <div>
-            <Heading level={1} size="lg">Linear Connector Console</Heading>
-            <Text as="div" tone="muted" size="sm" className="sub">
-              Workflow engine · fleet routing · operational health
-            </Text>
+            <Heading as="h1">Linear Connector Console</Heading>
+            <Text variant="small" style={{ marginTop: 2 }}>Workflow engine · fleet routing · operational health</Text>
           </div>
           <Button
-            variant="secondary"
-            size="sm"
+            variant="ghost"
             onClick={() => {
               void logout().finally(() => setAuth("anonymous"));
             }}
