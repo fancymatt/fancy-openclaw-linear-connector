@@ -1,0 +1,61 @@
+/* ❇️ Color tokens — Warm Precision foundation
+ *
+ * "Instruments, not decorations."
+ * Design direction: Laren (CDO)
+ *
+ * Neutral scale carries a warm tilt (60° hue) so surfaces feel natural
+ * rather than clinical. Brand and semantic colors use OKLCH for perceptual
+ * uniformity — same chroma at any lightness = same perceived intensity.
+ *
+ * These are light-mode-default foundation tokens. Dark-theme consumers
+ * are expected to override `--ff-surface-*` and `--ff-text-*` aliases.
+ */
+
+:root {
+  /* ── Brand ── */
+  --ff-color-brand-primary:   oklch(48% 0.05 60);   /* warm brown */
+  --ff-color-brand-secondary: oklch(55% 0.08 75);   /* warmer amber */
+
+  /* ── Neutrals (warm-tinted gray scale) ── */
+  --ff-color-neutral-50:  oklch(98%  0.004 60);
+  --ff-color-neutral-100: oklch(95%  0.006 60);
+  --ff-color-neutral-200: oklch(90%  0.008 60);
+  --ff-color-neutral-300: oklch(80%  0.01  60);
+  --ff-color-neutral-400: oklch(70%  0.012 60);
+  --ff-color-neutral-500: oklch(55%  0.015 60);
+  --ff-color-neutral-600: oklch(40%  0.012 60);
+  --ff-color-neutral-700: oklch(30%  0.01  60);
+  --ff-color-neutral-800: oklch(20%  0.008 60);
+  --ff-color-neutral-900: oklch(12%  0.005 60);
+
+  /* ── Semantic ── */
+  --ff-color-success: oklch(60% 0.12 145);
+  --ff-color-warning: oklch(72% 0.14 85);
+  --ff-color-error:   oklch(55% 0.14 25);
+  --ff-color-info:    oklch(60% 0.08 240);
+
+  /* ── Accent ── */
+  --ff-color-accent:       oklch(58% 0.08 65);    /* warm amber-cognac */
+  --ff-color-accent-hover: oklch(62% 0.09 65);
+  --ff-color-accent-dim:   oklch(58% 0.08 65 / 0.15);  /* subtle fill */
+
+  /* ── Surface aliases (light-mode default) ── */
+  --ff-surface-primary:   var(--ff-color-neutral-50);
+  --ff-surface-secondary: var(--ff-color-neutral-100);
+  --ff-surface-elevated:  var(--ff-color-neutral-200);
+  --ff-surface-inverse:   var(--ff-color-neutral-900);
+
+  /* ── Border aliases ── */
+  --ff-border-subtle:  var(--ff-color-neutral-200);
+  --ff-border-default: var(--ff-color-neutral-300);
+  --ff-border-strong:  var(--ff-color-neutral-400);
+
+  /* ── Text aliases (light-mode default) ── */
+  --ff-text-primary:   var(--ff-color-neutral-900);
+  --ff-text-secondary: var(--ff-color-neutral-500);
+  --ff-text-tertiary:  var(--ff-color-neutral-400);
+  --ff-text-disabled:  var(--ff-color-neutral-300);
+  --ff-text-inverse:   var(--ff-color-neutral-50);
+  --ff-link:           var(--ff-color-brand-primary);
+  --ff-link-hover:     oklch(45% 0.055 60);
+}
