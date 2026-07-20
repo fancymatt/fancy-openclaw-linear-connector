@@ -184,7 +184,7 @@ export function App() {
   if (auth === "checking") {
     return (
       <div className="login-screen">
-        <Text as="div" tone="muted" className="muted">Connecting…</Text>
+        <Text className="muted">Connecting…</Text>
       </div>
     );
   }

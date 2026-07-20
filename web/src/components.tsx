@@ -11,19 +11,19 @@ export function Chip({ tone, children }: { tone: Severity | "blue" | string; chi
 export function Card({ span = 12, title, children }: { span?: 4 | 6 | 8 | 12; title?: ReactNode; children: ReactNode }) {
   return (
     <section className={`card span-${span}`}>
-      {title !== undefined && <Heading level={2} size="sm" className="card-heading">{title}</Heading>}
+      {title !== undefined && <Heading as="h2" className="card-heading">{title}</Heading>}
       {children}
     </section>
   );
 }
 
 export function Empty({ children }: { children: ReactNode }) {
-  return <Text as="div" tone="muted" className="empty">{children}</Text>;
+  return <Text className="empty">{children}</Text>;
 }
 
 export function ErrorBanner({ message }: { message: string | null }) {
   if (!message) return null;
-  return <Text as="div" tone="danger" className="error-banner">API error: {message}</Text>;
+  return <Text className="error-banner">API error: {message}</Text>;
 }
 
 export function Diagnostics({ value, label = "Raw diagnostics" }: { value: unknown; label?: string }) {
@@ -69,8 +69,8 @@ export function Tabs({ pendingProposals = 0 }: { pendingProposals?: number } = {
 export function Stat({ value, label, tone }: { value: ReactNode; label: string; tone?: "red" | "yellow" | "green" }) {
   return (
     <div className="stat">
-      <Text as="div" size="lg" className="value" style={tone ? { color: `var(--${tone})` } : undefined}>{value}</Text>
-      <Text as="div" tone="muted" size="sm" className="label">{label}</Text>
+      <Text className="value" style={tone ? { color: `var(--${tone})` } : undefined}>{value}</Text>
+      <Text className="label">{label}</Text>
     </div>
   );
 }

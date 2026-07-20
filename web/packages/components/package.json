@@ -9,6 +9,8 @@
       "import": "./src/index.ts",
       "types": "./src/index.ts"
     },
+    "./styles.css": "./styles.css",
+    "./tokens": "./tokens.css",
     "./tokens.css": "./tokens.css",
     "./package.json": "./package.json"
   },
