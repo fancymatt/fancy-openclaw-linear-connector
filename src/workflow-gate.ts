@@ -1739,6 +1739,7 @@ interface BranchAndPRStatus {
 async function fetchBranchAndPRStatus(
   issueId: string,
   authToken: string,
+  issueIdentifier?: string | null,
 ): Promise<BranchAndPRStatus | null> {
   const query = `
     query IssueBranchAndPR($id: String!) {
@@ -1839,13 +1840,38 @@ async function fetchBranchAndPRStatus(
     if (!hasMergedPR && allPrUrls.length > 0) {
       hasMergedPR = await verifyPrMergeStateViaGitHub(allPrUrls);
     }
+
+    // INF-144: When no PR evidence found via attachments or description,
+    // search GitHub for merged PRs that reference the ticket identifier in
+    // their title or body. This handles agent-created branches where
+    // Linear's GitHub integration didn't correlate the PR (branch name
+    // mismatch between agent's manual branch and Linear's auto-generated name).
+    // Requires GH_TOKEN for GitHub API search access.
+    const searchedPrUrls: string[] = [];
+    if (!hasMergedPR && allPrUrls.length === 0 && issueIdentifier) {
+      const found = await searchGitHubPRsByTicketRef(issueIdentifier);
+      for (const prUrl of found) {
+        searchedPrUrls.push(prUrl);
+        allPrUrls.push(prUrl);
+      }
+      if (searchedPrUrls.length > 0) {
+        log.info(`workflow-gate: found ${searchedPrUrls.length} PR(s) via GitHub search for ticket ${issueIdentifier} (INF-144 ticket-ref search)`);
+        // Verify merge status via GitHub API for the newly found PRs
+        const verified = await verifyPrMergeStateViaGitHub(searchedPrUrls);
+        if (verified) {
+          hasMergedPR = true;
+        }
+      }
+    }
+
     return {
       // Attachments cannot see branches directly; a PR implies a pushed branch.
       // INF-121: hasBranch/hasPR also true when only description-based URLs exist.
+      // INF-144: also true when GitHub search found PRs by ticket reference.
       // prMetadataAvailable: true when any PR attachment has explicit status/state metadata.
       // False for externally-created branches (INF-112 metadata-gap case).
-      hasBranch: hasPR || descPrUrls.length > 0,
-      hasPR: hasPR || descPrUrls.length > 0,
+      hasBranch: hasPR || descPrUrls.length > 0 || searchedPrUrls.length > 0,
+      hasPR: hasPR || descPrUrls.length > 0 || searchedPrUrls.length > 0,
       hasMergedPR,
       prMetadataAvailable,
       prUrls: allPrUrls,
@@ -1854,6 +1880,130 @@ async function fetchBranchAndPRStatus(
     const msg = err instanceof Error ? err.message : String(err);
     log.warn(`workflow-gate: branch/PR fetch failed for ${issueId}: ${msg}`);
     return null;
+  }
+}
+
+/**
+ * Search GitHub for merged pull requests that reference a Linear ticket
+ * identifier (e.g. "GEN-231") in their title or body (INF-144).
+ *
+ * This handles the case where an implementer creates a branch manually
+ * instead of using `linear branch <ID>`, so Linear's GitHub integration
+ * never correlates the PR with the Linear ticket. By searching GitHub
+ * for PRs mentioning the ticket ID, we can find the PR evidence that
+ * the merge gate requires.
+ *
+ * Uses the GitHub issue/PR search API (which indexes PRs by title,
+ * body, and comments). Returns an array of PR URLs that mention the
+ * ticket identifier. Returns empty array when:
+ *   - No GH_TOKEN / GITHUB_TOKEN is configured
+ *   - The GitHub API returns an error
+ *   - No PRs match the search
+ *
+ * @param identifier - Linear ticket identifier (e.g. "GEN-231")
+ * @returns Array of GitHub PR URLs mentioning the ticket identifier
+ */
+async function searchGitHubPRsByTicketRef(identifier: string): Promise<string[]> {
+  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? null;
+  if (!token) {
+    log.info(`workflow-gate: INF-144 GitHub search skipped for ${identifier} — no GH_TOKEN configured`);
+    return [];
+  }
+  try {
+    // Search for merged PRs that explicitly mention the ticket identifier.
+    // The 'type:pr' filter restricts to pull requests; 'in:title' ensures
+    // the identifier appears in the PR title (most reliable signal).
+    // Fall back to in:body if title search finds nothing (handles edge
+    // cases where the ID is only in the PR body/description).
+    let query = encodeURIComponent(`type:pr ${identifier} in:title is:merged`);
+    const res = await fetch(`https://api.github.com/search/issues?q=${query}&per_page=5&sort=updated`, {
+      headers: {
+        Accept: "application/vnd.github.v3+json",
+        Authorization: `Bearer ${token}`,
+        "User-Agent": "fancy-openclaw-linear-connector",
+      },
+    });
+    if (!res.ok) {
+      if (res.status === 422) {
+        // 422 means invalid search query — try body-only search
+        log.info(`workflow-gate: INF-144 GitHub title search returned 422 for ${identifier} — falling back to body search`);
+        query = encodeURIComponent(`type:pr ${identifier} is:merged`);
+      } else {
+        log.warn(`workflow-gate: INF-144 GitHub search returned ${res.status} for ${identifier}`);
+        return [];
+      }
+    }
+    if (res.status === 422) {
+      // Second attempt with body search
+      const res2 = await fetch(`https://api.github.com/search/issues?q=${query}&per_page=5&sort=updated`, {
+        headers: {
+          Accept: "application/vnd.github.v3+json",
+          Authorization: `Bearer ${token}`,
+          "User-Agent": "fancy-openclaw-linear-connector",
+        },
+      });
+      if (!res2.ok) {
+        log.warn(`workflow-gate: INF-144 GitHub body search also returned ${res2.status} for ${identifier}`);
+        return [];
+      }
+      type GitHubSearchResp = { items?: Array<{ pull_request?: Record<string, unknown> | null; html_url?: string | null; title?: string | null; repository_url?: string | null; number?: number | null }> };
+      const data = (await res2.json()) as GitHubSearchResp;
+      if (!data.items?.length) {
+        log.info(`workflow-gate: INF-144 GitHub search found no PRs for ${identifier}`);
+        return [];
+      }
+      const prUrls: string[] = [];
+      for (const item of data.items) {
+        if (item.html_url && item.pull_request) {
+          prUrls.push(item.html_url);
+        }
+      }
+      log.info(`workflow-gate: INF-144 GitHub search found ${prUrls.length} PR(s) for ${identifier} (body search)`);
+      return prUrls;
+    }
+    type GitHubSearchResp = { items?: Array<{ pull_request?: Record<string, unknown> | null; html_url?: string | null; title?: string | null; repository_url?: string | null; number?: number | null }> };
+    const data = (await res.json()) as GitHubSearchResp;
+    if (!data.items?.length) {
+      log.info(`workflow-gate: INF-144 GitHub title search found no PRs for ${identifier} — trying body search`);
+      // Fall back to broader body search
+      const query2 = encodeURIComponent(`type:pr ${identifier} is:merged`);
+      const res2 = await fetch(`https://api.github.com/search/issues?q=${query2}&per_page=5&sort=updated`, {
+        headers: {
+          Accept: "application/vnd.github.v3+json",
+          Authorization: `Bearer ${token}`,
+          "User-Agent": "fancy-openclaw-linear-connector",
+        },
+      });
+      if (!res2.ok) {
+        log.warn(`workflow-gate: INF-144 GitHub body search returned ${res2.status} for ${identifier}`);
+        return [];
+      }
+      const data2 = (await res2.json()) as GitHubSearchResp;
+      if (!data2.items?.length) {
+        log.info(`workflow-gate: INF-144 GitHub search found no PRs for ${identifier} in any field`);
+        return [];
+      }
+      const prUrls: string[] = [];
+      for (const item of data2.items) {
+        if (item.html_url && item.pull_request) {
+          prUrls.push(item.html_url);
+        }
+      }
+      log.info(`workflow-gate: INF-144 GitHub search found ${prUrls.length} PR(s) for ${identifier} (body search)`);
+      return prUrls;
+    }
+    const prUrls: string[] = [];
+    for (const item of data.items) {
+      if (item.html_url && item.pull_request) {
+        prUrls.push(item.html_url);
+      }
+    }
+    log.info(`workflow-gate: INF-144 GitHub search found ${prUrls.length} PR(s) for ${identifier} (title search)`);
+    return prUrls;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`workflow-gate: INF-144 GitHub search failed for ${identifier}: ${msg}`);
+    return [];
   }
 }
 
@@ -2599,7 +2749,7 @@ export async function checkWorkflowRules(
   // to short-circuit the transition-legality check — demote is not a normal state
   // transition but a workflow-exit action handled by applyStateTransition (B2).
   if (intent === "demote" && workflowId === "dev-impl" && !breakGlassOverride) {
-    const branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+    const branchStatus = await fetchBranchAndPRStatus(issueId, authToken, fetchedIdentifier);
     if (branchStatus && (branchStatus.hasBranch || branchStatus.hasPR)) {
       if (!branchStatus.hasMergedPR) {
         log.warn(`workflow-gate: AI-1576 demote-guard blocked agent=${bodyId} ticket=${issueId} (hasBranch=${branchStatus.hasBranch} hasPR=${branchStatus.hasPR} hasMergedPR=${branchStatus.hasMergedPR})`);
@@ -2933,12 +3083,12 @@ export async function checkWorkflowRules(
         dedupKey: `done-gate|force-deploy|${issueId}`,
       });
     }
-    let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+    let branchStatus = await fetchBranchAndPRStatus(issueId, authToken, fetchedIdentifier);
     // AI-1497: retry once on null — transient Linear API failure during
     // Hanzo merge+deploy quick succession.
     if (!branchStatus) {
       await new Promise((r) => setTimeout(r, 1000));
-      branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+      branchStatus = await fetchBranchAndPRStatus(issueId, authToken, fetchedIdentifier);
     }
     if (!branchStatus) {
       // Two consecutive nulls — transient API failure. Fail-open to avoid
@@ -4224,10 +4374,10 @@ export async function applyStateTransition(
   // AI-1497: Fail-open on null (after retry) and on complete absence of evidence
   // (no branch + no PR). Only block on partial evidence (branch exists but no PR).
   if ((currentStateName === 'merge' || currentStateName === 'deploy') && intent === 'continue') {
-    let branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+    let branchStatus = await fetchBranchAndPRStatus(issueId, authToken, issue.identifier ?? undefined);
     if (!branchStatus) {
       await new Promise((r) => setTimeout(r, 1000));
-      branchStatus = await fetchBranchAndPRStatus(issueId, authToken);
+      branchStatus = await fetchBranchAndPRStatus(issueId, authToken, issue.identifier ?? undefined);
     }
     if (!branchStatus) {
       // Two consecutive nulls — transient API failure. Fail-open to avoid
