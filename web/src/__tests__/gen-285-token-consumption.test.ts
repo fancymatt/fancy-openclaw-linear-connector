@@ -22,8 +22,6 @@ import { resolve } from "path";
 
 const WEB_ROOT = resolve(__dirname, "..");
 const THEME_CSS = resolve(WEB_ROOT, "theme.css");
-const MAIN_TSX = resolve(WEB_ROOT, "main.tsx");
-
 function read(rel: string): string {
   const p = resolve(WEB_ROOT, rel);
   if (!existsSync(p)) return "";
@@ -118,18 +116,6 @@ describe("GEN-285 AC4: connector UI adapts surface tokens (lighter)", () => {
     // a dark theme. The Connector UI inherits tokens but overrides surface
     // values to be lighter. Expect the surface-primary override to use
     // a lighter neutral (neutral-50, neutral-100) or a custom light value.
-    const hasLightSurface = (
-      css.includes("--ff-surface-primary") &&
-      // Should reference a light color — either a light neutral or a light oklch value
-      (
-        css.includes("neutral-50") ||
-        css.includes("neutral-100") ||
-        css.includes("oklch") ||
-        css.includes("#") ||
-        css.includes("rgb")
-      )
-    );
-
     // At minimum, the surface-primary should be redeclared with SOME value.
     // The implementer may use var(--ff-color-neutral-*) or a raw OKLCH value.
     const surfaceMatch = css.match(/--ff-surface-primary\s*:\s*([^;]+)/);
