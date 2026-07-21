@@ -66,7 +66,7 @@ function makeLinearFetchMock(fixture: {
             issue: {
               id: fixture.issueId,
               team: { id: fixture.teamId },
-              state: { id: fixture.stateId, name: fixture.stateName },
+              state: { id: fixture.stateId, name: fixture.stateName, type: fixture.stateName === "Done" ? "completed" : fixture.stateName === "Invalid" ? "canceled" : "started" },
               labels: { nodes: fixture.labels.map((name) => ({ name })) },
             },
           },
@@ -437,7 +437,7 @@ describe("AC4: pull-pickup + handoff lifecycle regression (AI-1560)", () => {
               issue: {
                 id: "issue-uuid",
                 team: { id: "team-uuid" },
-                state: { id: SEMANTIC_TO_UUID["To Do"], name: "To Do" },
+                state: { id: SEMANTIC_TO_UUID["To Do"], name: "To Do", type: "started" },
                 labels: { nodes: WF_LABELS.map((name) => ({ name })) },
               },
             },

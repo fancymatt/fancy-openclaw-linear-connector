@@ -60,6 +60,22 @@ const DOING_NAMES = new Set(["doing", "developing"]);
  */
 const TERMINAL_LABELS = new Set(["state:done", "state:escape"]);
 
+/**
+ * Terminal native Linear state types. A ticket in one of these states (e.g.
+ * completed, canceled, duplicate) has been driven to a resting end-state at
+ * the Linear layer. The engagement overlay must never move it — even if the
+ * ticket's `state:*` label is stale or absent, the native state type tells us
+ * the ticket is finished (INF-205 follow-up, INF-244).
+ */
+const TERMINAL_NATIVE_STATE_TYPES = new Set(["completed", "canceled", "duplicate"]);
+
+function isTerminalIssue(issue: IssueShape): boolean {
+  return (
+    issue.labels.some((l) => TERMINAL_LABELS.has(l.toLowerCase())) ||
+    (issue.stateType ? TERMINAL_NATIVE_STATE_TYPES.has(issue.stateType.toLowerCase()) : false)
+  );
+}
+
 function normalizeName(s: string): string {
   return s.toLowerCase().replace(/\s+/g, "");
 }
@@ -73,6 +89,7 @@ interface IssueShape {
   teamId: string;
   stateName: string;
   stateId: string;
+  stateType?: string;
   labels: string[];
   /** Linear user ID of the current delegate, if set. */
   delegateLinearUserId?: string;
@@ -84,7 +101,7 @@ async function fetchIssue(identifier: string, authHeader: string): Promise<Issue
       issue(id: $id) {
         id
         team { id }
-        state { id name }
+        state { id name type }
         labels { nodes { name } }
         delegate { id }
       }
@@ -99,7 +116,7 @@ async function fetchIssue(identifier: string, authHeader: string): Promise<Issue
       issue?: {
         id: string;
         team?: { id: string } | null;
-        state?: { id: string; name: string } | null;
+        state?: { id: string; name: string; type?: string } | null;
         labels?: { nodes: Array<{ name: string }> } | null;
         delegate?: { id?: string } | null;
       } | null;
@@ -113,6 +130,7 @@ async function fetchIssue(identifier: string, authHeader: string): Promise<Issue
     teamId: issue.team.id,
     stateName: issue.state.name,
     stateId: issue.state.id,
+    stateType: issue.state.type ?? undefined,
     labels: (issue.labels?.nodes ?? []).map((l) => l.name),
     delegateLinearUserId: issue.delegate?.id ?? undefined,
   };
@@ -149,7 +167,9 @@ export async function applyEngagementStatus(
     // Terminal-state immunity: never overlay a ticket the workflow has driven to a
     // resting end-state (state:done / state:escape). The gate's native write wins;
     // a late agent-authored-activity webhook must not re-drive it to "doing" (AI-1540).
-    if (issue.labels.some((l) => TERMINAL_LABELS.has(l.toLowerCase()))) return;
+    // Also guard against natively-terminal states (completed, canceled, duplicate)
+    // where the state:* label is stale or absent (INF-244).
+    if (isTerminalIssue(issue)) return;
 
     // AI-1660: delegate guard — only the current delegate may flip to "doing".
     // A prior-step agent posting a handoff comment must not drive the next agent's
@@ -214,7 +234,7 @@ export async function applyEngagementStatus(
     // initial fetch (above) and this issueUpdate. Re-read to ensure the overlay
     // does not overwrite the authoritative terminal native write.
     const freshIssue = await fetchIssue(identifier, authHeader);
-    if (!freshIssue || freshIssue.labels.some((l) => TERMINAL_LABELS.has(l.toLowerCase()))) return;
+    if (!freshIssue || isTerminalIssue(freshIssue)) return;
 
     const res = await fetch(LINEAR_API_URL, {
       method: "POST",

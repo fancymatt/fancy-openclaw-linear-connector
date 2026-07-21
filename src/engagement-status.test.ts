@@ -20,6 +20,7 @@ interface IssueFixture {
   teamId: string;
   stateName: string;
   stateId: string;
+  stateType?: string;
   labels: string[];
   /** Linear user ID of the current delegate (AI-1660) */
   delegateLinearUserId?: string;
@@ -32,6 +33,13 @@ const SEMANTIC_TO_UUID: Record<string, string> = {
   Done: "state-done-uuid",
   Invalid: "state-invalid-uuid",
 };
+
+function nativeStateTypeFor(issue: IssueFixture): string {
+  if (issue.stateType) return issue.stateType;
+  if (issue.stateName === "Done") return "completed";
+  if (issue.stateName === "Invalid") return "canceled";
+  return "started";
+}
 
 /**
  * Build a fetch mock for one issue. Tracks the variables of every issueUpdate
@@ -60,7 +68,11 @@ function makeEngagementFetch(issue: IssueFixture): {
             issue: {
               id: issue.id,
               team: { id: issue.teamId },
-              state: { id: issue.stateId, name: issue.stateName },
+              state: {
+                id: issue.stateId,
+                name: issue.stateName,
+                type: nativeStateTypeFor(issue),
+              },
               labels: { nodes: issue.labels.map((name) => ({ name })) },
               delegate: issue.delegateLinearUserId ? { id: issue.delegateLinearUserId } : null,
             },
@@ -237,6 +249,54 @@ describe("applyEngagementStatus (AI-1510)", () => {
       stateName: "Doing",
       stateId: SEMANTIC_TO_UUID["Doing"],
       labels: ["wf:dev-impl", "state:escape"],
+    });
+    globalThis.fetch = fetch;
+
+    await applyEngagementStatus("AI-1", "todo", "tok");
+
+    expect(updates).toHaveLength(0);
+  });
+
+  it("INF-244: never overlays a natively completed ticket with stale workflow labels", async () => {
+    const { fetch, updates } = makeEngagementFetch({
+      id: "issue-uuid",
+      teamId: "team-uuid",
+      stateName: "Done",
+      stateId: "state-completed-uuid",
+      stateType: "completed",
+      labels: WF_LABELS,
+    });
+    globalThis.fetch = fetch;
+
+    await applyEngagementStatus("AI-1", "doing", "tok");
+
+    expect(updates).toHaveLength(0);
+  });
+
+  it("INF-244: never overlays a natively canceled ticket with stale workflow labels", async () => {
+    const { fetch, updates } = makeEngagementFetch({
+      id: "issue-uuid",
+      teamId: "team-uuid",
+      stateName: "Canceled",
+      stateId: "state-canceled-uuid",
+      stateType: "canceled",
+      labels: WF_LABELS,
+    });
+    globalThis.fetch = fetch;
+
+    await applyEngagementStatus("AI-1", "doing", "tok");
+
+    expect(updates).toHaveLength(0);
+  });
+
+  it("INF-244: never overlays a duplicated ticket with stale workflow labels", async () => {
+    const { fetch, updates } = makeEngagementFetch({
+      id: "issue-uuid",
+      teamId: "team-uuid",
+      stateName: "Duplicate",
+      stateId: "state-duplicate-uuid",
+      stateType: "duplicate",
+      labels: WF_LABELS,
     });
     globalThis.fetch = fetch;
 

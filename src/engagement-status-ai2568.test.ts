@@ -84,7 +84,7 @@ function makeEngagementFetch(issue: IssueFixture, preWrites?: {
             issue: {
               id: active.id,
               team: { id: active.teamId },
-              state: { id: active.stateId, name: active.stateName },
+              state: { id: active.stateId, name: active.stateName, type: active.stateName === "Done" ? "completed" : active.stateName === "Invalid" ? "canceled" : "started" },
               labels: { nodes: active.labels.map((name) => ({ name })) },
               delegate: active.delegateLinearUserId ? { id: active.delegateLinearUserId } : null,
             },
