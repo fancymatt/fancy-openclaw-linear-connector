@@ -123,9 +123,11 @@ export class EnrolledTicketsStore {
       );
       CREATE INDEX IF NOT EXISTS idx_enrolled_terminal ON enrolled_tickets(terminal);
       CREATE INDEX IF NOT EXISTS idx_enrolled_workflow ON enrolled_tickets(workflow);
-      CREATE INDEX IF NOT EXISTS idx_enrolled_suspended ON enrolled_tickets(suspended);
     `);
     // Migration: add suspended columns if missing (existing databases).
+    // Run BEFORE idx_enrolled_suspended — on existing databases the column
+    // does not exist yet, and SQLite would fail at CREATE INDEX on a
+    // nonexistent column. The ALTER TABLE must happen first.
     const colInfo = this.db.pragma("table_info(enrolled_tickets)") as Array<{ name: string }>;
     const colNames = new Set(colInfo.map((c) => c.name));
     if (!colNames.has("suspended")) {
@@ -137,6 +139,10 @@ export class EnrolledTicketsStore {
     if (!colNames.has("suspended_by")) {
       this.db.exec(`ALTER TABLE enrolled_tickets ADD COLUMN suspended_by TEXT`);
     }
+    // INF-231: suspended index — separated from the CREATE TABLE block above
+    // so on existing databases it runs after the ALTER TABLE migration adds
+    // the column, avoiding "no such column: suspended" startup failures.
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_enrolled_suspended ON enrolled_tickets(suspended);`);
   }
 
   /** AC1: Enroll a ticket into the mirror (idempotent). */
