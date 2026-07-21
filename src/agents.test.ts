@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   getAccessToken,
   getAgentByProxyToken,
+  getEncryptionKeyValidation,
   getAgents,
   getTokenStatus,
   isAgentLocal,
@@ -15,6 +16,7 @@ import {
   updateAgentMetadata,
   updateTokens,
   upsertAgent,
+  validateEncryptionKeyMatch,
   type AgentConfig,
 } from "./agents.js";
 
@@ -171,6 +173,83 @@ describe("agents credential file encryption", () => {
 
     reloadAgents();
     expect(getAccessToken("charles")).toBe("access-token-1");
+  });
+
+  test("INF-272: save() refuses to re-encrypt with a wrong encryption key (prevents token-store corruption)", () => {
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = key;
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+
+    // Confirm the file is encrypted with the original key
+    const raw = fs.readFileSync(agentsFile, "utf8");
+    expect(raw).toContain('"version": 2');
+
+    // Now set a DIFFERENT key — simulate a stale .env with wrong key reference
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = Buffer.alloc(32, 42).toString("base64");
+
+    // updateTokens calls save() which must throw because the new key doesn't
+    // match the encrypted data on disk
+    expect(() => {
+      updateTokens("charles", "access-token-wrong", "refresh-token-wrong");
+    }).toThrow(/Encryption key mismatch/);
+
+    // After the rejected save, the file must still contain the ORIGINAL data
+    // encrypted with the original key — nothing was corrupted
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = key;
+    reloadAgents();
+    expect(getAccessToken("charles")).toBe("access-token-1");
+    expect(getAgents()).toHaveLength(1);
+  });
+
+  test("INF-272: validateEncryptionKeyMatch reports valid=true for matching key", () => {
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = key;
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+
+    const result = validateEncryptionKeyMatch();
+    expect(result.valid).toBe(true);
+    expect(result.agentsEncrypted).toBe(true);
+    expect(result.lastValidationAt).toBeTruthy();
+  });
+
+  test("INF-272: validateEncryptionKeyMatch reports valid=false for wrong key", () => {
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = key;
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+
+    // Switch to wrong key
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = Buffer.alloc(32, 42).toString("base64");
+
+    const result = validateEncryptionKeyMatch();
+    expect(result.valid).toBe(false);
+    expect(result.agentsEncrypted).toBe(true);
+    expect(result.error).toMatch(/Encryption key mismatch/);
+  });
+
+  test("INF-272: validateEncryptionKeyMatch reports valid=true for unencrypted file", () => {
+    delete process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY;
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+
+    const result = validateEncryptionKeyMatch();
+    expect(result.valid).toBe(true);
+    expect(result.agentsEncrypted).toBe(false);
+  });
+
+  test("INF-272: getEncryptionKeyValidation returns cached result from latest validation", () => {
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = key;
+    upsertAgent(makeAgent(path.join(dir, "linear.env")));
+    validateEncryptionKeyMatch();
+
+    const after = getEncryptionKeyValidation();
+    expect(after.valid).toBe(true);
+    expect(after.agentsEncrypted).toBe(true);
+    expect(after.lastValidationAt).toBeTruthy();
+
+    // Switch to wrong key and re-validate — cache should now show the failure
+    process.env.LINEAR_CONNECTOR_ENCRYPTION_KEY = Buffer.alloc(32, 42).toString("base64");
+    const failed = validateEncryptionKeyMatch();
+    expect(failed.valid).toBe(false);
+
+    const cached = getEncryptionKeyValidation();
+    expect(cached.valid).toBe(false);
+    expect(cached.error).toMatch(/Encryption key mismatch/);
   });
 });
 
