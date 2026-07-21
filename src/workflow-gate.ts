@@ -1956,6 +1956,7 @@ const KNOWN_SCAN_REPOS: Array<{ owner: string; repo: string }> = [
   { owner: "fancymatt", repo: "fancy-openclaw-linear-connector" },
   { owner: "fancymatt", repo: "fancy-openclaw-linear-skill-cli" },
   { owner: "fancymatt", repo: "fancy-openclaw-workflow-skill" },
+  { owner: "fancyfleet", repo: "fancy-openclaw-linear-connector" },
   { owner: "fancyfleet", repo: "gen" },
 ];
 
