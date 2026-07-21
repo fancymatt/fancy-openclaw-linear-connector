@@ -625,4 +625,81 @@ describe("Background-component integration — bootstrap wiring", () => {
       closeCreatedResources(created as Record<string, unknown>);
     }
   });
+
+  // INF-247 AC3: proxy for cron dispatch path integration.
+  // The backlogController exposed on createApp must be a live CronBacklogController
+  // instance — not a stub or placeholder — so the cron dispatch pipeline can actually
+  // submit jobs through it. Verifying the full API shape (submit, getStats, shutdown,
+  // recordActivity, detectRecoveryGap, isRecovering, drain) ensures that the wired
+  // instance is the real production controller, not an empty object.
+  it("exposes a live CronBacklogController instance on the createApp return", () => {
+    const created = createApp(prepareBootstrapEnv());
+
+    try {
+      const controller = created.backlogController as Record<string, unknown>;
+      expect(controller).toBeDefined();
+      expect(typeof controller.submit).toBe("function");
+      expect(typeof controller.getStats).toBe("function");
+      expect(typeof controller.shutdown).toBe("function");
+      expect(typeof controller.recordActivity).toBe("function");
+      expect(typeof controller.detectRecoveryGap).toBe("function");
+      expect(typeof controller.isRecovering).toBe("function");
+      expect(typeof controller.drain).toBe("function");
+
+      // The getStats shape confirms it's a real backlog controller
+      const stats = (controller as { getStats(): unknown }).getStats() as Record<string, unknown>;
+      expect(stats).toHaveProperty("maxConcurrency");
+      expect(stats).toHaveProperty("running");
+      expect(stats).toHaveProperty("queued");
+      expect(stats).toHaveProperty("completed");
+      expect(stats).toHaveProperty("dedup");
+      expect(stats).toHaveProperty("rate");
+      expect(stats).toHaveProperty("recovery");
+    } finally {
+      closeCreatedResources(created as Record<string, unknown>);
+    }
+  });
+
+  // INF-247 AC6: liveness observable at ac-validate without waiting for trigger condition.
+  // The controller's state (running, queued, dedup, recovery) must be reachable via /health
+  // so a reviewer can confirm wiring without waiting for a cron tick.
+  it("surfaces backlog-controller state at the /health endpoint", async () => {
+    const created = createApp(prepareBootstrapEnv());
+
+    try {
+      const { app } = created;
+
+      // Simulate a request to /health and inspect the response
+      const response = await new Promise<{ statusCode: number; body: Record<string, unknown> }>(
+        (resolve, reject) => {
+          const server = app.listen(0, () => {
+            const addr = server.address() as { port: number };
+            fetch(`http://127.0.0.1:${addr.port}/health`)
+              .then(async (res) => {
+                const body = (await res.json()) as Record<string, unknown>;
+                resolve({ statusCode: res.status, body });
+                server.close();
+              })
+              .catch((err) => {
+                server.close();
+                reject(err);
+              });
+          });
+        },
+      );
+
+      // The /health response must include the backlog controller's live state
+      // so ac-validate can confirm bootstrap wiring without a trigger event.
+      expect(response.body).toHaveProperty("backlogController");
+      const bc = response.body.backlogController as Record<string, unknown>;
+      expect(bc).toHaveProperty("running");
+      expect(bc).toHaveProperty("queued");
+      expect(bc).toHaveProperty("completed");
+      expect(bc).toHaveProperty("dedup");
+      expect(bc).toHaveProperty("rate");
+      expect(bc).toHaveProperty("recovery");
+    } finally {
+      closeCreatedResources(created as Record<string, unknown>);
+    }
+  });
 });
