@@ -67,6 +67,7 @@ import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses,
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
 import { loadRoster, getRoutingFunctionaryLiveness } from "./department-roster.js";
 import { createGuidanceRouter, getDocsLiveness } from "./docs/guidance-router.js";
+import { TtlCache, buildFullCacheLiveness, markCacheFlushRouteMounted, registerTtlInvalidationCron } from "./cache/ttl-cache.js";
 import type { StaleSessionDetail } from "./bag/session-tracker.js";
 import crypto from "crypto";
 import path from "path";
@@ -225,6 +226,11 @@ export function createApp(options?: CreateAppOptions) {
   // Create stores early — needed before route registration.
   const observationStore = new ObservationStore(options?.observationsDbPath);
 
+  // INF-193: TTL-backed in-memory cache for workflow-critical data (labels,
+  // states, workflow defs). Used via module-level liveness helpers so /health
+  // can report cache state without threading this reference through every layer.
+  const ttlCache = new TtlCache<unknown>({ defaultTtlMs: 300_000 });
+
   // AI-2036 AC1.5/AC1.6: register the observation write path here, on the same
   // code path that hands the store to the proxy's transition options below.
   // The registry entry — surfaced at /health.observations — therefore exists if
@@ -363,6 +369,10 @@ export function createApp(options?: CreateAppOptions) {
       // the live dispatch path (routeEventAll), observable at ac-validate without
       // waiting for a webhook to arrive.
       routingFunctionary: getRoutingFunctionaryLiveness(),
+      // INF-193 AC4: TTL cache liveness — confirms the TTL invalidation
+      // scheduler timer is armed and the cache-flush route is mounted, both
+      // observable at /health without waiting for a stale-resolution event.
+      cache: buildFullCacheLiveness(ttlCache),
       // AI-2091 §9 (AI-1808 addendum): dispatch-integrity gate liveness. Each of
       // the four gates (delivery-time recipient resolution, phantom fetchability,
       // wake→session dedup, pre-mutation compare-and-swap) reports `active: true`
@@ -1099,6 +1109,16 @@ export function createApp(options?: CreateAppOptions) {
   // Management console (Phase 3): React SPA + JSON API, session or secret auth.
   app.use("/admin", createAdminRouter({ agentQueue, bag, sessionTracker, operationalEventStore, observationStore, ackTracker, deploymentName: DEPLOYMENT_NAME, enrolledTicketsStore, forensicsDiagnosticsDir: options?.forensicsDiagnosticsDir, mutationAuditStore, wakeConfigForAgent, proposalStore }));
 
+  // INF-193 AC3: cache-flush endpoint for emergency invalidation. ADMIN_SECRET-gated.
+  app.post("/admin/api/cache/flush", (req: express.Request, res: express.Response) => {
+    if (!requireAdminSecret(req, res)) return;
+    ttlCache.flushAll();
+    log.info("INF-193: cache flushed via /admin/api/cache/flush");
+    res.json({ success: true });
+  });
+  // Mark the flush route as mounted for /health.cache liveness proof (AC4).
+  markCacheFlushRouteMounted();
+
   app.use("/", createWebhookRouter(
     eventStore,
     nudgeStore,
@@ -1392,6 +1412,11 @@ export function createApp(options?: CreateAppOptions) {
   checkFanoutOutcomeStoreLiveness().catch((err) => {
     log.error(`fanout-outcome-store startup liveness check threw: ${err instanceof Error ? err.message : String(err)}`);
   });
+
+  // INF-193 AC4: TTL cache invalidation scheduler — periodic purge of expired
+  // entries to prevent stale resolution and memory accumulation of unread keys.
+  registerTtlInvalidationCron(ttlCache, 60_000);
+  log.info("INF-193: TTL cache invalidation cron registered (every 60s)");
 
   return { app, agentQueue, bag, sessionTracker, operationalEventStore, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, transcriptRedactionHealth: getTranscriptRedactionHealth() };
 }

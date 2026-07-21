@@ -13,6 +13,7 @@
  *   AC3 — flushAll() clears the entire cache
  */
 
+import { jest } from "@jest/globals";
 import { TtlCache, getCacheLiveness } from "../cache/ttl-cache.js";
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -21,13 +22,11 @@ import { TtlCache, getCacheLiveness } from "../cache/ttl-cache.js";
 
 describe("AC1 — TTL-based cache invalidation", () => {
   beforeEach(() => {
-    vi.useFakeTimers?.();
-    jest.useFakeTimers?.();
+    jest.useFakeTimers();
   });
 
   afterEach(() => {
-    vi.useRealTimers?.();
-    jest.useRealTimers?.();
+    jest.useRealTimers();
   });
 
   test("returns cached value before TTL expiry", () => {
