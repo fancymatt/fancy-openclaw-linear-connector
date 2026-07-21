@@ -6,6 +6,7 @@ import type { LinearEvent } from "./schema.js";
 import { EventStore } from "../store/event-store.js";
 import { NudgeStore } from "../store/nudge-store.js";
 import type { OperationalEventInput, OperationalEventStore } from "../store/operational-event-store.js";
+import type { DeadLetterQueueStore } from "../dead-letter-queue.js";
 import type { EnrolledTicketsStore } from "../store/enrolled-tickets-store.js";
 import type { MutationAuditStore } from "../store/mutation-audit-store.js";
 import type { DispatchIdempotencyStore } from "../store/dispatch-idempotency-store.js";
@@ -197,6 +198,7 @@ export function createWebhookRouter(
   sessionTracker?: SessionTracker,
   throttle?: DeliveryThrottle,
   operationalEventStore?: OperationalEventStore,
+  deadLetterQueue?: DeadLetterQueueStore,
   onDispatched?: (agentId: string, ticketId: string) => void,
   onAgentActivity?: (agentId: string, ticketId: string) => void,
   onDeliveryCommitted?: (agentId: string, ticketId: string) => void,
@@ -620,14 +622,39 @@ export function createWebhookRouter(
         const humans = unresolved.filter((id) => knownHumans.has(id));
         const unknown = unresolved.filter((id) => !knownHumans.has(id));
         const humanOnly = humans.length > 0 && unknown.length === 0;
-        appendOperationalEvent(operationalEventStore, {
-          outcome: humanOnly ? "no-route-human" : "no-route",
-          type: event.type,
-          key: noRouteTicket ? `linear-${noRouteTicket}` : noRouteRawId ? `linear-${noRouteRawId}` : null,
-          errorSummary:
-            `No agent target for ${event.type}${attribution}` +
-            (humans.length > 0 ? ` — known human: ${humans.map((id) => knownHumans.get(id)).join(", ")}` : ""),
-        });
+        const hasDeadLetterTarget = unknown.length > 0 && deadLetterQueue && noRouteTicket;
+
+        if (hasDeadLetterTarget) {
+          // ── INF-217: Dead-letter queue for genuinely unknown agents ──
+          const intendedAgent = unknown[0];
+          deadLetterQueue.append({
+            ticketId: noRouteTicket,
+            intendedAgent,
+            reason: "not in roster",
+            eventPayload: { eventType: event.type, eventAction: "action" in event ? event.action : undefined, unresolved, humans: humans.map((id) => knownHumans.get(id)) },
+          });
+          log.warn(
+            `dead-letter: ${noRouteTicket} targeted agent ${intendedAgent} not in roster - ` +
+            `wrote to DLQ (type=${event.type})`,
+          );
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "dead-letter",
+            type: event.type,
+            key: `linear-${noRouteTicket}`,
+            sessionKey: `linear-${noRouteTicket}`,
+            errorSummary: `Non-roster dispatch for ${noRouteTicket} - ${intendedAgent}`,
+            detail: { ticketId: noRouteTicket, intendedAgent, reason: "not in roster" },
+          });
+        } else {
+          appendOperationalEvent(operationalEventStore, {
+            outcome: humanOnly ? "no-route-human" : "no-route",
+            type: event.type,
+            key: noRouteTicket ? `linear-${noRouteTicket}` : noRouteRawId ? `linear-${noRouteRawId}` : null,
+            errorSummary:
+              `No agent target for ${event.type}${attribution}` +
+              (humans.length > 0 ? ` — known human: ${humans.map((id) => knownHumans.get(id)).join(", ")}` : ""),
+          });
+        }
         if (humans.length > 0) {
           log.info(
             `no-route candidates resolved to known human(s): ${humans.map((id) => `${knownHumans.get(id)} (${id})`).join(", ")}` +
