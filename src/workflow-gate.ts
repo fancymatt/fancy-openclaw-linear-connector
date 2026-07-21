@@ -5666,6 +5666,7 @@ export async function enrollIfMissing(
   issueId: string,
   authToken: string,
   onHeal?: (info: EnrollHealInfo) => void,
+  enrolledTicketsStore?: EnrolledTicketsStore,
 ): Promise<{ enrolled: boolean; entryState?: string }> {
   const issue = await fetchIssueWithLabels(issueId, authToken);
   if (!issue) {
@@ -5681,6 +5682,15 @@ export async function enrollIfMissing(
   if (currentState) return { enrolled: false }; // already enrolled
 
   // Gap: wf:* present, state:* missing.
+
+  // AI-2631 defense-in-depth: don't re-stamp state:* on a demoted ticket even
+  // when wf:* is present — a demote should be terminal unless a human
+  // explicitly re-enrolls.
+  if (enrolledTicketsStore?.wasDemoted(issue.identifier)) {
+    log.info(`workflow-gate: enrollIfMissing: skipping ${issue.identifier} — last enrolled-ticket event is demoted`);
+    return { enrolled: false };
+  }
+
   let def: WorkflowDef | undefined;
   try {
     const registry = await loadWorkflowRegistry();
@@ -5910,6 +5920,17 @@ export async function autoEnrollByTeam(
     enrolledCount: autoEnrollLiveness.enrolledCount + 1,
     lastEnrolledAt: new Date().toISOString(),
   };
+
+  // AI-2631: Write an enrolment mirror row AFTER successful label stamping so
+  // that a subsequent demote finds a row to UPDATE into a demoted tombstone.
+  // Without this, `wasDemoted()` has nothing to query and the next webhook
+  // re-enrolls the ticket, defeating the demote entirely.
+  enrolledTicketsStore?.enroll({
+    ticketId: issue.identifier ?? issueId,
+    workflow: workflowId,
+    state: def.entry_state,
+    delegate: null,
+  });
 
   try {
     onEnroll?.({
