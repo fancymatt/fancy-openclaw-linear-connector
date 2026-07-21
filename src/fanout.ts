@@ -668,6 +668,80 @@ export async function autoDeriveArmFindings(
 }
 
 /**
+ * INF-258: Derive structured spec entries from children of the parent ticket.
+ *
+ * When a parent ticket enters a fan-out state with `spec_source: structured`
+ * but has no `## Structured` section in its description (e.g. pre-existing
+ * children created by sprint-spawner), this function examines the parent's
+ * existing children with workflow labels matching wf:sprint-arm-* patterns
+ * and creates structured entries from their titles.
+ *
+ * Returns an array of Finding objects (title + optional description) that can
+ * be formatted into a `## Structured` section. Returns empty array when no
+ * suitable children are found.
+ */
+export async function deriveStructuredFromChildren(
+  parentInternalId: string,
+  authToken: string,
+): Promise<Pick<Finding, "title" | "description">[]> {
+  const query = `
+    query Inf258StructuredChildren($id: String!) {
+      issue(id: $id) {
+        children {
+          nodes {
+            identifier
+            title
+            labels { nodes { name } }
+          }
+        }
+      }
+    }
+  `;
+  type ChildNode = {
+    identifier: string;
+    title?: string | null;
+    labels?: { nodes?: Array<{ name?: string }> } | null;
+  };
+  let nodes: ChildNode[] = [];
+  try {
+    const res = await fetch(LINEAR_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authToken },
+      body: JSON.stringify({ query, variables: { id: parentInternalId } }),
+    });
+    const data = (await res.json()) as {
+      data?: { issue?: { children?: { nodes?: ChildNode[] } | null } | null };
+    };
+    nodes = data.data?.issue?.children?.nodes ?? [];
+  } catch (err) {
+    log.warn(
+      `fanout: INF-258: failed to fetch children for ${parentInternalId}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return [];
+  }
+
+  const derived: Pick<Finding, "title" | "description">[] = [];
+  for (const child of nodes) {
+    const wfLabel = (child.labels?.nodes ?? [])
+      .map((l) => l.name)
+      .find((name): name is string => typeof name === "string" && name.startsWith("wf:sprint-arm-"));
+    if (!wfLabel) continue;
+
+    const title = (child.title ?? child.identifier).trim();
+    const description = `spawned from ${child.identifier}`;
+    derived.push({ title, description });
+  }
+
+  if (derived.length > 0) {
+    log.info(
+      `fanout: INF-258: derived ${derived.length} structured entry(ies) from children of ${parentInternalId}`,
+    );
+  }
+  return derived;
+}
+
+/**
  * INF-123: Auto-populate (or replace) a `## Findings` section on an issue's
  * description from an array of findings. Uses the Linear API to update the
  * description.

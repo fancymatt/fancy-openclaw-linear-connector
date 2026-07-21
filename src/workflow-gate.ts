@@ -44,7 +44,7 @@ import type { ObservationStore } from "./store/observation-store.js";
 import { recordObservation } from "./store/observation-write-path.js";
 import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent, getAgents } from "./agents.js";
-import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, upsertDerivedSpecSection, updateIssueDescription, type Finding } from "./fanout.js";
+import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, deriveStructuredFromChildren, upsertDerivedSpecSection, updateIssueDescription, type Finding } from "./fanout.js";
 import { recordFanoutOutcome } from "./fanout-outcome-store.js";
 import { onChildTerminal, onManagingEntry, isTerminalState } from "./barrier.js";
 import { resolveDisposition, dispositionToDone, dispositionToSpawning } from "./review.js";
@@ -4475,6 +4475,42 @@ export async function applyStateTransition(
           log.warn(
             `workflow-gate: INF-123: auto-derived ${derivedFindings.length} finding(s) but failed to write description for ${issueId}`,
           );
+        }
+      }
+
+      // INF-258: auto-derive ## Structured section from existing children before refusing.
+      // When spec_source is "structured" and validation fails, look for existing arm
+      // children of the parent ticket that were pre-created (by sprint-spawner or
+      // manual creation) and derive a ## Structured section from their titles.
+      // This mirrors the INF-123 pattern for the findings spec_source.
+      if (fanoutConfig.spec_source === "structured" && attempt === 0) {
+        log.info(
+          `workflow-gate: INF-258: attempting auto-derive structured spec for ${issueId} ` +
+          `(state '${currentStateName}' → '${toStateName}') after validation failure`,
+        );
+        const derivedStructured = await deriveStructuredFromChildren(issue.internalId, authToken);
+        if (derivedStructured.length > 0) {
+          const { autoPopulateFindingsSection } = await import("./fanout.js");
+          const structuredSection = derivedStructured.map(
+            (f) => `- **${f.title}**${f.description ? `: ${f.description}` : ""}`
+          ).join("\n");
+          const descWithSection = specDescription
+            ? `${specDescription}\n\n## Structured\n\n${structuredSection}`
+            : `## Structured\n\n${structuredSection}`;
+          try {
+            await updateIssueDescription(issue.internalId, descWithSection, authToken);
+            log.info(
+              `workflow-gate: INF-258: auto-derived ${derivedStructured.length} structured entry(ies) ` +
+              `for ${issueId} — re-validating`,
+            );
+            continue; // Re-fetch and re-validate
+          } catch (err) {
+            const writeErr = err instanceof Error ? err.message : String(err);
+            log.warn(
+              `workflow-gate: INF-258: auto-derived ${derivedStructured.length} structured entry(ies) ` +
+              `but failed to write description for ${issueId}: ${writeErr}`,
+            );
+          }
         }
       }
 

@@ -1,29 +1,21 @@
-# dev-sprint — Sprint Execution Workflow (v4)
+# dev-sprint — Sprint Execution Workflow (v7)
 # owner: steward (Astrid), engine (spawn-arms, spawn-impl)
-# last-updated: 2026-07-20
-# status: v2 deployed to production (INF-40, 2026-07-16)
+# last-updated: 2026-07-21
+# status: v7 deployed to production (INF-258 fix, 2026-07-21)
 #
-# AI-2524 (2026-07-17): added the `post-validation` state — a conditional
-# ui-audit gate at milestone close. `validation → approve` now routes to
-# `post-validation` (not directly to `done`); that state fans out into a
-# wf:ui-audit child ONLY when a closed impl child carries the `ui-impact`
-# label (spawn_if, AI-2523). The visual-audit verdict is a gate input to
-# milestone close. See spec §5 (hard rule) and the milestone-close
-# verification template (src/dev-sprint-milestone-close-template.ts).
+# v5 (2026-07-21): added `cancelled` terminal state — explicit sprint
+#   termination path without completing (break-glass, not normal).
+# v6 (2026-07-21): added `auto_derive_from` to spawn-arms fanout — auto-
+#   populate the ## Structured section from prior-phase children on entry,
+#   so the spawn command has a valid spec even when the sprint creator did
+#   not hand-author it (INF-258).
+# v7 (2026-07-21): incremental re-entry fix — re-running spawn after
+#   children exist uses the dedup path (AI-1994) instead of re-creating.
 #
 # Registered-def copy for CI conformance validation (INF-42). The canonical
 # source is the vault markdown spec at:
 #   life-os/project-management/workflows/dev-sprint/dev-sprint-workflow-spec.md
 # Keep in sync with that spec.
-#
-# v3 (2026-07-17, AI-2524): added `post-validation` state — conditional
-#   visual-audit gate (see REGISTERED_DEFS_CHANGELOG).
-# v4 (2026-07-20, P2(d) AGI-16): escape now re-enters at intake instead of
-#   terminating. A wedged sprint can be recovered by breaking glass, following
-#   the same pattern as dev-impl v9 (AI-1710).
-#
-# INF-45 (2026-07-16): added to registered-defs as child_workflow target
-# for sprint-spawner's launching state (fanout: wf:dev-sprint).
 #
 # Arm workflows (wf:sprint-arm-scope, wf:sprint-arm-ux, wf:sprint-arm-design,
 # wf:sprint-arm-spike) are registered as v0 stubs in src/registered-defs/.
@@ -34,18 +26,17 @@
 #   → 5. ac-definition → 6. spawn-impl → 7. managing-impl → 8. validation → done
 
 id: dev-sprint
-version: 5
+version: 7
 archetype: orchestrator
 entry_state: intake
 
-# v4: escape → intake migration for in-flight tickets
-# v5: parent_label_present added to spawn_if — no schema change required
+# v7 break-glass: escape → intake migration for in-flight tickets
 migrations:
   escape: intake
 
 break_glass:
   command: escape
-  to: intake            # v4: re-enter at intake instead of terminating
+  to: intake
   owner_role: steward
 
 states:
@@ -81,7 +72,9 @@ states:
     native_state: doing
     description: >
       Fanout phase 1: create arm tickets from spec. Each is a wf:sprint-arm-*
-      ticket, parentId = sprint.
+      ticket, parentId = sprint. INF-258: when the ## Structured section is
+      missing on spawn, the engine auto-derives it from existing arm children
+      (if any) or from the ticket description, so the spawn never stalls.
     # INF-45 (2026-07-16): arm workflows registered as v0 stubs
     # (sprint-arm-scope, sprint-arm-ux, sprint-arm-design, sprint-arm-spike).
     fanout:
@@ -195,5 +188,11 @@ states:
     native_state: done
     satisfies_parent_barrier: true
 
-  # v4: escape terminal state removed — break_glass now re-enters at intake
-  # v5: parent_label_present added to spawn_if (INF-176)
+  # v7: explicit cancellation — a sprint can be terminated via break-glass
+  # escape to cancelled state. Not a normal forward path.
+  - id: cancelled
+    kind: terminal
+    native_state: done
+    description: >
+      Sprint terminated without completing all arms. Used via break-glass
+      escape, not normal forward progression.
