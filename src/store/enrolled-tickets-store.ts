@@ -360,7 +360,7 @@ export class EnrolledTicketsStore {
  */
 function normalizeRow(row: EnrolledTicketRow): EnrolledTicketRow {
   if (row.designated_approver === null) {
-    (row as Record<string, unknown>).designated_approver = undefined;
+    (row as unknown as Record<string, unknown>).designated_approver = undefined;
   }
   return row;
 }
