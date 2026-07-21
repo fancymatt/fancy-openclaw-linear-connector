@@ -141,6 +141,61 @@ describe("AI-1799 AC1: EnrolledTicketsStore — mirror lifecycle", () => {
     expect(store.wasDemoted("AI-1009")).toBe(true);
   });
 
+  // ── INF-271: retire() ───────────────────────────────────────────────
+
+  it("retire() marks an active ticket as retired (terminal=1, delegate cleared)", () => {
+    store.enroll({ ticketId: "INF-271-1", workflow: "sprint-spawner", state: "scanning", delegate: "astrid" });
+
+    let row = store.getByTicketId("INF-271-1");
+    expect(row).not.toBeNull();
+    expect(row!.terminal).toBe(0);
+    expect(row!.delegate).toBe("astrid");
+
+    store.retire("INF-271-1");
+
+    row = store.getByTicketId("INF-271-1");
+    expect(row).not.toBeNull();
+    expect(row!.terminal).toBe(1);
+    expect(row!.last_event_kind).toBe("retired");
+    expect(row!.delegate).toBeNull();
+  });
+
+  it("retire() is idempotent — calling it twice does not error", () => {
+    store.enroll({ ticketId: "INF-271-2", workflow: "dev-impl", state: "intake", delegate: "ai" });
+    store.retire("INF-271-2");
+
+    // Second call should not throw
+    expect(() => store.retire("INF-271-2")).not.toThrow();
+
+    const row = store.getByTicketId("INF-271-2");
+    expect(row!.terminal).toBe(1);
+    expect(row!.last_event_kind).toBe("retired");
+  });
+
+  it("retire() creates a tombstone for a ticket with no prior mirror row", () => {
+    store.retire("INF-271-3");
+
+    const row = store.getByTicketId("INF-271-3");
+    expect(row).not.toBeNull();
+    expect(row!.terminal).toBe(1);
+    expect(row!.last_event_kind).toBe("retired");
+    expect(row!.workflow).toBe("unknown");
+    expect(row!.state).toBe("__retired__");
+  });
+
+  it("retire() is a no-op on an already-terminal ticket (idempotent)", () => {
+    store.enroll({ ticketId: "INF-271-4", workflow: "dev-impl", state: "done", delegate: "ai" });
+    store.markTerminal("INF-271-4", "complete");
+
+    // Should not throw
+    expect(() => store.retire("INF-271-4")).not.toThrow();
+
+    const row = store.getByTicketId("INF-271-4");
+    expect(row!.terminal).toBe(1);
+    // last_event_kind should remain "complete", not overwritten by retire
+    expect(row!.last_event_kind).toBe("complete");
+  });
+
   it("persisted rows survive store reopen (durable sqlite, not in-memory)", () => {
     store.enroll({ ticketId: "AI-1008", workflow: "dev-impl", state: "intake", delegate: "ai" });
     store.recordTransition({ ticketId: "AI-1008", toState: "write-tests", delegate: "tdd", eventKind: "accept" });

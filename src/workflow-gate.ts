@@ -40,6 +40,7 @@ import yaml from "js-yaml";
 import { componentLogger, createLogger, type Logger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
 import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability } from "./escalation-gate.js";
+import { isTerminalIssueState } from "./linear-actionable.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import { recordObservation } from "./store/observation-write-path.js";
 import { isBodyKnown } from "./escalation-gate.js";
@@ -2886,6 +2887,33 @@ export async function checkWorkflowRules(
     // No branch/PR evidence at all — fresh intake, not blocking
   }
 
+  // INF-271: `retire` — steward-only verb that strips wf:* and state:* labels
+  // from a workflow ticket whose native Linear state is already terminal
+  // (Duplicate/Canceled/Done). This is a governed jailbreak: it exits the
+  // workflow without reactivating it. Guard: caller must be a workflow steward
+  // (workflow:steward capability). The native-state terminal check happens in
+  // applyStateTransition (B2) so we don't double-fetch here.
+  if (intent === "retire") {
+    const hasStewardCap = await bodyHasCapability(bodyId, "workflow:steward");
+    if (!hasStewardCap) {
+      log.warn(`workflow-gate: retire blocked — '${bodyId}' lacks workflow:steward on ${issueId}`);
+      return (
+        `[Proxy] 'retire' blocked: caller '${bodyId}' is not a workflow steward. ` +
+        `Only a workflow steward (workflow:steward capability) may retire a ticket from workflow governance.`
+      );
+    }
+    // Must be a workflow ticket
+    if (!workflowId) {
+      log.warn(`workflow-gate: retire blocked — ${issueId} has no wf:* label (not a workflow ticket)`);
+      return (
+        `[Proxy] 'retire' blocked: ticket ${issueId} is not a workflow ticket ` +
+        `(no wf:* label found). Retire only applies to tickets enrolled in a governed workflow.`
+      );
+    }
+    log.info(`workflow-gate: retire allowed — steward '${bodyId}' retiring ${issueId} from wf:${workflowId}`);
+    return null;
+  }
+
   // AI-1397: delegate-only enforcement at proxy (CLI-version-agnostic).
   // If both the caller's Linear user ID and the ticket's delegate ID are known,
   // block any agent that is not the current delegate. Fails open when either is
@@ -4265,6 +4293,12 @@ export async function applyStateTransition(
   } else if (intent === "park") {
     toStateName = "__ad_hoc__";
     log.info(`workflow-gate: B2 apply: ${issueId} parking — demoting to __ad_hoc__`);
+  } else if (intent === "retire") {
+    // INF-271: retire exits the workflow entirely (like park) but is a steward-only
+    // verb for terminal native-state tickets. The native-state terminal check runs
+    // inside the __retired__ handler below. Go straight to the retire target.
+    toStateName = "__retired__";
+    log.info(`workflow-gate: B2 apply: ${issueId} retiring — exiting workflow governance`);
   } else if (intent === "handoff") {
     // INF-124: handoff is a delegate-routing meta-command — self-loop, same state.
     // Skip state label swap; delegate resolution still runs below.
@@ -4324,6 +4358,72 @@ export async function applyStateTransition(
       `workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels`,
     );
     return { status: "applied", code: "demoted-ad-hoc", from: currentStateName, to: "__ad_hoc__" };
+  }
+
+  // ── Special target: __retired__ (INF-271) ──────────────────────────────
+  // Ticket is retired from workflow governance — same label stripping as
+  // __ad_hoc__ but additionally validates that the native Linear state is
+  // already terminal, and calls retire() on the enrollment store so the mirror
+  // reflects the terminal disposition.
+  if (toStateName === "__retired__") {
+    // Fetch native state to verify it's terminal before stripping labels
+    const stateQuery = `query($id: String!) { issue(id: $id) { id state { type name } } }`;
+    let nativeStateTerminal = false;
+    try {
+      const res = await fetch(LINEAR_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authToken },
+        body: JSON.stringify({ query: stateQuery, variables: { id: issueId } }),
+      });
+      const data = (await res.json()) as {
+        data?: { issue?: { state?: { type?: string; name?: string } | null } | null };
+      };
+      const state = data.data?.issue?.state;
+      if (state) {
+        nativeStateTerminal = isTerminalIssueState(state);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(`workflow-gate: B2 apply: retire native-state fetch failed for ${issueId}: ${msg} — proceeding anyway (fail-open)`);
+      nativeStateTerminal = true; // fail-open: allow retire even if we can't check
+    }
+
+    if (!nativeStateTerminal) {
+      log.warn(`workflow-gate: B2 apply: retire blocked — ${issueId} native state is not terminal`);
+      return {
+        status: "blocked",
+        code: "native-state-not-terminal",
+        detail: `'retire' refused: ${issueId} native Linear state is not terminal. Retire is only valid for tickets already in a terminal native state (Done/Canceled/Duplicate).`,
+        from: currentStateName,
+        to: "__retired__",
+      };
+    }
+
+    // Strip all wf:* and state:* labels
+    const keepIds = issue.labels
+      .filter((l) => !l.name.startsWith("state:") && !l.name.startsWith("wf:"))
+      .map((l) => l.id);
+    const labelsApplied = await issueUpdateLabels(issue.internalId, keepIds, authToken);
+    if (!labelsApplied) {
+      log.error(`workflow-gate: B2 apply: FAILED — ${issueId} retired but label mutation returned false`);
+      emitTransitionWriteFailure({
+        identifier: issue.identifier ?? issueId,
+        from: currentStateName,
+        to: "__retired__",
+        intent,
+        agent: options?.bodyId ?? null,
+        outcome: { ok: false, attempts: 1, failureKind: "mutation", divergent: [], unverified: false },
+        operationalEventStore: options?.operationalEventStore,
+      });
+      return { status: "failed", code: "atomic-mutation-failed", detail: `__retired__ label mutation did not apply`, from: currentStateName, to: "__retired__" };
+    }
+    clearAppliedState(issue.identifier);
+    // INF-271: mirror — mark the ticket as retired.
+    options?.enrolledTicketsStore?.retire(issue.identifier ?? issueId);
+    log.info(
+      `workflow-gate: B2 apply: ${issueId} retired — removed state:* and wf:* labels, cleared delegate`,
+    );
+    return { status: "applied", code: "retired", from: currentStateName, to: "__retired__" };
   }
 
   // ── AI-1992: Pre-transition fan-out spec gate (AC5) ──────────────────────

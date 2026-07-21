@@ -5,8 +5,8 @@ import type { LinearEvent } from "./webhook/schema.js";
 
 const log = componentLogger(createLogger(), "linear-actionable");
 
-const TERMINAL_STATE_TYPES = new Set(["completed", "canceled", "cancelled"]);
-const TERMINAL_STATE_NAMES = new Set(["done", "canceled", "cancelled"]);
+const TERMINAL_STATE_TYPES = new Set(["completed", "canceled", "cancelled", "duplicate"]);
+const TERMINAL_STATE_NAMES = new Set(["done", "canceled", "cancelled", "duplicate"]);
 const PARKED_STATE_TYPES = new Set(["backlog"]);
 const PARKED_STATE_NAMES = new Set(["backlog"]);
 

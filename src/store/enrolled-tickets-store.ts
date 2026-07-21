@@ -252,6 +252,41 @@ export class EnrolledTicketsStore {
   }
 
   /**
+   * INF-271: Retire a ticket from workflow governance when its native Linear state
+   * is already terminal (Duplicate/Canceled/Done). Unlike demoteEnrolled (which also
+   * marks terminal and expects label-stripping), retire is called when the workflow
+   * engine actively strips wf:* and state:* labels and clears the delegate. The mirror
+   * row is marked terminal so it never surfaces in active-enrollment queries.
+   *
+   * Idempotent: calling retire on an already-terminal row is a no-op.
+   */
+  retire(ticketId: string): void {
+    const now = preciseTimestamp();
+    const existing = this.getByTicketId(ticketId);
+    if (existing && existing.terminal === 1) return; // Already retired
+
+    if (existing) {
+      this.db
+        .prepare(
+          `UPDATE enrolled_tickets
+           SET terminal = 1, delegate = NULL, last_event_kind = 'retired', last_event_at = ?
+           WHERE ticket_id = ?`,
+        )
+        .run(now, ticketId);
+    } else {
+      // Ticket not in the mirror at all — create a minimal retired row
+      // so the absence is explicit rather than a silent gap.
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO enrolled_tickets
+           (ticket_id, workflow, state, delegate, entered_state_at, enrolled_at, last_event_kind, last_event_at, terminal)
+           VALUES (?, 'unknown', '__retired__', NULL, ?, ?, 'retired', ?, 1)`,
+        )
+        .run(ticketId, now, now, now);
+    }
+  }
+
+  /**
    * AC3: Reconcile the mirror against authoritative Linear label state.
    *
    * - No wf:* label → ticket left the workflow → mark terminal (demoted).

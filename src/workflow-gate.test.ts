@@ -61,6 +61,7 @@ capabilities:
   - id: linear:transition
   - id: human:escalate
   - id: workflow:break-glass
+  - id: workflow:steward
   - id: deploy:execute
   - id: infra:ssh
 
@@ -70,7 +71,7 @@ containers:
   - id: deployment
     grants: [linear:transition, deploy:execute, infra:ssh]
   - id: steward
-    grants: [linear:transition, human:escalate, workflow:break-glass]
+    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:steward]
   - id: code-review
     grants: [linear:transition]
 
@@ -114,6 +115,7 @@ capabilities:
   - id: linear:transition
   - id: human:escalate
   - id: workflow:break-glass
+  - id: workflow:steward
   - id: deploy:execute
 
 containers:
@@ -122,7 +124,7 @@ containers:
   - id: deployment
     grants: [linear:transition, deploy:execute]
   - id: steward
-    grants: [linear:transition, human:escalate, workflow:break-glass]
+    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:steward]
   - id: ux-researcher
     grants: [linear:transition]
   - id: engine
@@ -167,6 +169,7 @@ capabilities:
   - id: linear:transition
   - id: human:escalate
   - id: workflow:break-glass
+  - id: workflow:steward
   - id: deploy:execute
 
 containers:
@@ -175,7 +178,7 @@ containers:
   - id: deployment
     grants: [linear:transition, deploy:execute]
   - id: steward
-    grants: [linear:transition, human:escalate, workflow:break-glass]
+    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:steward]
   - id: ux-researcher
     grants: [linear:transition]
   - id: engine
@@ -593,6 +596,42 @@ describe("checkWorkflowRules — AI-1574: refuse-work caller-gating", () => {
   it("INF-35 AC3: refuse-work on an ungoverned ticket (no wf:* label) is now rejected", async () => {
     globalThis.fetch = makeDelegateFetch(["bug", "priority:high"], "real-delegate-uid");
     const result = await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "charles-uid");
+    expect(result).not.toBeNull();
+    expect(result).toContain("no `wf:*` label");
+  });
+});
+
+// ── INF-271: retire steward verb ──────────────────────────────────────────
+
+describe("checkWorkflowRules — INF-271: retire verb", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("allows retire for a workflow steward (astrid) on a workflow ticket", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:done"]);
+    const result = await checkWorkflowRules("retire", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).toBeNull();
+  });
+
+  it("blocks retire for a non-steward agent (charles) on a workflow ticket", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:done"]);
+    const result = await checkWorkflowRules("retire", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("not a workflow steward");
+  });
+
+  it("blocks retire on an ad-hoc ticket (no wf:* label) even for a steward", async () => {
+    globalThis.fetch = makeLabelFetch([]);
+    const result = await checkWorkflowRules("retire", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).not.toBeNull();
+    // The ad-hoc guard catches it first — retire is not a safe-on-unarmed verb
+    expect(result).toContain("no `wf:*` label");
+  });
+
+  it("rejects retire for a non-workflow steward when the ticket has no wf:* label", async () => {
+    globalThis.fetch = makeLabelFetch([]);
+    const result = await checkWorkflowRules("retire", "issue-uuid", "Bearer tok", "charles");
     expect(result).not.toBeNull();
     expect(result).toContain("no `wf:*` label");
   });
@@ -3230,6 +3269,7 @@ capabilities:
   - id: linear:transition
   - id: human:escalate
   - id: workflow:break-glass
+  - id: workflow:steward
   - id: deploy:execute
 
 containers:
@@ -3238,7 +3278,7 @@ containers:
   - id: deployment
     grants: [linear:transition, deploy:execute]
   - id: steward
-    grants: [linear:transition, human:escalate, workflow:break-glass]
+    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:steward]
   - id: code-review
     grants: [linear:transition]
   - id: orchestrator
@@ -6226,6 +6266,7 @@ capabilities:
   - id: linear:transition
   - id: human:escalate
   - id: workflow:break-glass
+  - id: workflow:steward
 
 containers:
   - id: dev
@@ -6233,7 +6274,7 @@ containers:
   - id: test-author-container
     grants: [linear:transition]
   - id: steward
-    grants: [linear:transition, human:escalate, workflow:break-glass]
+    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:steward]
 
 roles:
   - id: dev
@@ -8377,6 +8418,7 @@ capabilities:
   - id: linear:transition
   - id: human:escalate
   - id: workflow:break-glass
+  - id: workflow:steward
   - id: deploy:execute
   - id: infra:ssh
 
@@ -8388,7 +8430,7 @@ containers:
   - id: host-deploy
     grants: [linear:transition, infra:ssh]
   - id: steward
-    grants: [linear:transition, human:escalate, workflow:break-glass]
+    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:steward]
   - id: test-author-container
     grants: [linear:transition]
 
