@@ -891,7 +891,7 @@ export function createApp(options?: CreateAppOptions) {
           for (const [, def_] of registry) {
             for (const stateDef_ of (def_.states ?? [])) {
               if (stateLabels.includes(`state:${stateDef_.id}`)) {
-                const forwardVerb = stateDef_.transitions?.[0] ?? null;
+                const forwardVerb = stateDef_.transitions?.[0]?.command ?? null;
                 return { inWorkflow: true, resolvableVerb: forwardVerb };
               }
             }
