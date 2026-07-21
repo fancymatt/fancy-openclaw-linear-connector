@@ -1323,7 +1323,8 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             }
           }
 
-          // Legacy log line for backwards compatibility
+          // INF-229: B2 failure is now ALSO surfaced via response `errors[]` below,
+          // not just logged server-side. The log remains as a fallback diagnostic.
           if (transitionResult.status === "failed") {
             log.error(`state-transition FAILED agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${transitionResult.code}${transitionResult.detail ? ` — ${transitionResult.detail}` : ""}`);
           }
@@ -1390,6 +1391,24 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           try {
             const parsedResponse = JSON.parse(responseText);
             if (attachTransition) parsedResponse._workflowTransition = transitionResult;
+            // INF-229: surface B2 apply-failure code to caller via the standard
+            // GraphQL `errors[]` channel, so the CLI can see why the transition
+            // declined instead of silently logging server-side and relying on the
+            // CLI's expensive post-hoc state-label re-poll to detect the failure.
+            if (attachTransition && transitionResult?.status === "failed") {
+              if (!Array.isArray(parsedResponse.errors)) {
+                parsedResponse.errors = [];
+              }
+              parsedResponse.errors.push({
+                message: `[Connector] Workflow transition failed: ${transitionResult.code}${transitionResult.detail ? ` — ${transitionResult.detail}` : ""}`,
+                extensions: {
+                  workflowTransitionCode: transitionResult.code,
+                  workflowTransitionDetail: transitionResult.detail ?? null,
+                  agentId,
+                  intent: effectiveIntent,
+                },
+              });
+            }
             if (workflowReminder) parsedResponse._workflowReminder = workflowReminder;
             res.status(upstreamRes.status).set("Content-Type", "application/json").send(JSON.stringify(parsedResponse));
             return;
