@@ -31,6 +31,23 @@ import { notify } from "../alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(), "managing-poller");
 
+// Singleton guard (AI-2624 AC5): prevents a second ManagingPoller from being
+// instantiated while one is already active. If two pollers run independently,
+// neither can see the other's persisted dispatch state during the same cycle
+// (they don't share an in-memory buffer), but more importantly they each
+// maintain their own setInterval — producing double ~1min wakes from the same
+// process. The active-instance count lives on the module so require/import
+// deduplication is the only guard; createApp() calls the constructor at most
+// once per app instance.
+//
+// The guard is only enforced in production (NODE_ENV !== 'test') because
+// test suites call createApp() many times, each creating a fresh ManagingPoller.
+// Construction in test resets the guard automatically via _resetSingletonGuard().
+let activeInstanceCount = 0;
+export function _resetSingletonGuard(): void {
+  activeInstanceCount = 0;
+}
+
 const DEFAULT_CYCLE_MS = 60 * 1000;
 const DEFAULT_INTERVAL_MS = 30 * 60 * 1000;
 
@@ -208,6 +225,22 @@ export class ManagingPoller {
   };
 
   constructor(deps: ManagingPollerDeps, config?: Partial<ManagingPollerConfig>) {
+    // Singleton guard: prevent double instantiation within the same process
+    // (the leading hypothesis for the duplicate ~1min wakes observed on AI-2573).
+    // app.create() is called once in production, but defensive code here catches
+    // a test/packaging/import mistake that creates two active pollers.
+    // Enforced only in production (NODE_ENV !== 'test'); test suites call
+    // createApp() many times and auto-reset via _resetSingletonGuard().
+    if (process.env.NODE_ENV !== "test") {
+      if (activeInstanceCount > 0) {
+        throw new Error(
+          "ManagingPoller already instantiated — a second instance would create " +
+          "an independent timer and lose visibility into the first instance's " +
+          "dispatch state. This is likely a packaging/import bug. See AI-2624.",
+        );
+      }
+    }
+    activeInstanceCount++;
     this.config = {
       cycleMs: config?.cycleMs ?? parseEnvInt("MANAGING_POLLER_CYCLE_MS", DEFAULT_CYCLE_MS),
       defaultIntervalMs:
@@ -242,6 +275,21 @@ export class ManagingPoller {
       clearInterval(this.timer);
       this.timer = undefined;
     }
+  }
+
+  /**
+   * Expose live poller state for /health and ac-validate (AI-2624 AC7).
+   * Without waiting for a wake to fire, an operator or test can confirm
+   * the scheduler is running, the cycle cadence, and the default interval
+   * — and detect at a glance whether the poller was wired at bootstrap
+   * (running=true) or never started (running=false).
+   */
+  liveness(): { running: boolean; cycleMs: number; defaultIntervalMs: number } {
+    return {
+      running: this.timer !== undefined,
+      cycleMs: this.config.cycleMs,
+      defaultIntervalMs: this.config.defaultIntervalMs,
+    };
   }
 
   /**

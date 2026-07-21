@@ -308,6 +308,12 @@ export function createApp(options?: CreateAppOptions) {
   // resolves the real token from the proxy token and fetches the asset.
   app.get("/proxy/upload", (req, res) => handleProxyUploadRequest(req, res));
 
+  // Forward ref for managingPoller (created later in createApp but before
+  // the health handler is registered). The health handler reads this at
+  // request time — if the poller was never wired, it reports running=false.
+  // See AI-2624 AC7.
+  const managingPollerRef: { current: ManagingPoller | null } = { current: null };
+
   // Health check — returns 503 when the agent roster is empty so the
   // Docker healthcheck (and any load balancer) pulls the container out of
   // rotation instead of silently serving an empty-roster instance. This was
@@ -454,6 +460,15 @@ export function createApp(options?: CreateAppOptions) {
       matrixApprovalGate: getMatrixApprovalGateLiveness(),
       // AI-2542: auto-enroll liveness and demote/escape suppression counters.
       autoEnroll: getAutoEnrollLiveness(),
+      // AI-2624 AC7: ManagingPoller liveness — reports running state and
+      // effective cycle/interval at /health without waiting for a wake.
+      // Uses a forward ref because the poller is constructed later in
+      // createApp (after `wakeConfigForAgent` is defined).
+      managingPoller: managingPollerRef.current?.liveness() ?? {
+        running: false,
+        cycleMs: 0,
+        defaultIntervalMs: 0,
+      },
       // AI-1908 AC5: per-agent OAuth token status. Exposes lastRefreshOkAt,
       // expiresAt (from the real expires_in, not assumed ~24h), lastFailure,
       // and a computed state (healthy/stale/expired/failing). Powers the
@@ -1016,6 +1031,7 @@ export function createApp(options?: CreateAppOptions) {
     resolveDeliveryConfig: wakeConfigForAgent,
   });
   managingPoller.start();
+  managingPollerRef.current = managingPoller;
 
   // Operator nudge endpoint — sends a short instruction into an already-active
   // agent session. Phase 1 is local/Nakazawa only; no cross-gateway routing.
