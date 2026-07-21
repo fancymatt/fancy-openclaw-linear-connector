@@ -47,6 +47,7 @@ import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerLabelSyncAuditCron } from "./cron/label-sync-audit.js";
 import { registerAntiEntropyCron } from "./cron/anti-entropy.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
+import { createBacklogController } from "./cron/backlog-controller.js";
 import { registerConfigSanityAlertCron, getConfigSanityAlertLiveness } from "./config-sanity-alert.js";
 import { registerMatrixApprovalGate, getMatrixApprovalGateLiveness } from "./matrix-approval-gate.js";
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
@@ -1427,7 +1428,13 @@ export function createApp(options?: CreateAppOptions) {
   registerTtlInvalidationCron(ttlCache, 60_000);
   log.info("INF-193: TTL cache invalidation cron registered (every 60s)");
 
-  return { app, agentQueue, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, transcriptRedactionHealth: getTranscriptRedactionHealth() };
+  // INF-219 / INF-247: backlog controller — bounded concurrency, per-ticket dedup,
+  // and recovery rate-guard for cron-driven wake floods. Created here and exposed
+  // on the createApp() return value so cron drivers can submit jobs through it
+  // without owning their own concurrency/dedup machinery.
+  const backlogController = createBacklogController();
+
+  return { app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, transcriptRedactionHealth: getTranscriptRedactionHealth() };
 }
 
 /**
