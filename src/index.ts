@@ -1613,7 +1613,7 @@ if (isEntryPoint) {
     listTickets: async () => {
       const rows = enrolledTicketsStore.getAll();
       return rows
-        .filter((row) => row.terminal !== 1 && row.state && row.state !== "done")
+        .filter((row) => row.terminal !== 1 && row.suspended !== 1 && row.state && row.state !== "done")
         .map((row) => {
           const delegate = row.delegate ?? "";
           // Only AI agents in the roster are watched; a null delegate or a

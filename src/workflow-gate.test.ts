@@ -2572,28 +2572,34 @@ describe("checkWorkflowRules — AI-1402: needs-human blocked when forward path 
     expect(result).toContain("needs-human");
   });
 
-  it("blocks needs-human in code-review (forward path: approve, request-changes)", async () => {
+  it("blocks needs-human in code-review for non-escalating callers", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
     const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "charles");
     expect(result).not.toBeNull();
     expect(result).toContain("needs-human");
   });
 
-  it("blocks needs-human in deploy state (forward path: continue, reject)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"]);
+  it("allows needs-human in code-review for human:escalate holders (INF-231 suspend path)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:code-review"]);
     const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "astrid");
-    expect(result).not.toBeNull();
-    expect(result).toContain("needs-human");
+    expect(result).toBeNull();
   });
 
-  it("blocks needs-human when no state label — fail-closed for this intent", async () => {
+  it("blocks needs-human when no state label — fail-closed for non-escalating callers", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl"]); // no state:* label
-    const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "astrid");
+    // Use charles (dev container, no human:escalate) — still blocked
+    const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "charles");
     expect(result).not.toBeNull();
     expect(result).toContain("[Proxy]");
     expect(result).toContain("needs-human");
-    // Should suggest escape as the legal alternative
     expect(result).toContain("escape");
+  });
+
+  it("allows needs-human when no state label for human:escalate holders (INF-231 suspend path)", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl"]); // no state:* label
+    // astrid has human:escalate via the steward container
+    const result = await checkWorkflowRules("needs-human", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).toBeNull();
   });
 
   it("break-glass (escape) is still legal from every state (§4.4)", async () => {

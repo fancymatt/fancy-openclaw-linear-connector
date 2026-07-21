@@ -2980,10 +2980,16 @@ export async function checkWorkflowRules(
       ? snapshotState
       : getAppliedState(appliedStateKey) ?? getCurrentState(labels, def); // AI-2357: applied-state store wins over stale label; AI-2094: def-aware fallback
   if (!currentState) {
-    // AI-1402: For needs-human, fail-closed even without a state label.
-    // We cannot determine if there is a forward path, so treat the ticket as actionable.
-    // Agents must use 'escape' (break-glass) to exit the workflow.
+    // INF-231: needs-human with human:escalate capability → allow through for
+    // suspension (B2 handles the suspend). The ticket has no state label but
+    // still carries wf:* — the escalation-authorized caller is explicitly
+    // routing to a human; suspension preserves the enrollment for later resume.
     if (intent === "needs-human") {
+      const hasHumanEscalate = isCallerKnown ? await bodyHasCapability(bodyId, "human:escalate") : false;
+      if (hasHumanEscalate) {
+        log.info(`workflow-gate: needs-human bypass for state-corrupted ticket ${issueId} by ${bodyId} (human:escalate)`);
+        return null;
+      }
       const legalMoves = `${breakGlassCommand} (break-glass)`;
       return (
         `[Proxy] 'needs-human' is blocked on this workflow ticket (state unknown — treated as actionable). ` +
@@ -3040,14 +3046,17 @@ export async function checkWorkflowRules(
 
   if (!match) {
     const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
-    // AI-2055: `needs-human` is not a transition in any workflow def, so a governed
-    // ticket rejects it here — before the mutation, so nothing is half-applied and no
-    // delegate is stranded. The bare "not a legal command" text left an agent that is
-    // genuinely blocked on a human with no idea what to do, and the delegate-clear guard
-    // (Layer 2) used to answer that question with `undelegate`, which it also blocks.
-    // Name the sanctioned exit: break-glass hands the ticket to the steward, who owns
-    // the human escalation from there.
+    // INF-231: needs-human is not a workflow transition, but the escalation-authorized
+    // caller (human:escalate holder) may use it to suspend a governed ticket. The
+    // CLI already guards against agents calling needs-human on governed tickets through
+    // the `handoff-work` → `needs-human` conversion; this B1 bypass is the proxy-side
+    // authorization for the suspension path that preserves labels and enrollment.
     if (intent === "needs-human") {
+      const hasHumanEscalate = isCallerKnown ? await bodyHasCapability(bodyId, "human:escalate") : false;
+      if (hasHumanEscalate) {
+        log.info(`workflow-gate: needs-human allowed from state '${currentState}' on ${issueId} by ${bodyId} (human:escalate)`);
+        return null;
+      }
       return (
         `[Proxy] 'needs-human' is not a legal command in state '${currentState}' — governed tickets ` +
         `escalate by exiting the workflow, not by clearing the delegate. ` +
@@ -4239,6 +4248,15 @@ export async function applyStateTransition(
   } else if (intent === "park") {
     toStateName = "__ad_hoc__";
     log.info(`workflow-gate: B2 apply: ${issueId} parking — demoting to __ad_hoc__`);
+  } else if (intent === "needs-human") {
+    // INF-231: needs-human suspends enrollment — retains wf:* and state:* labels,
+    // clears delegate, sets assignee to the named human. The mirror marks the
+    // row as suspended so dispatch stops waking agents for this ticket.
+    if (!currentStateName) {
+      log.warn(`workflow-gate: B2 apply: needs-human on ${issueId} has no state:* label — suspending without state anchor`);
+    }
+    toStateName = "__suspended__";
+    log.info(`workflow-gate: B2 apply: ${issueId} needs-human — suspending enrollment at state '${currentStateName ?? "unknown"}'`);
   } else if (intent === "handoff") {
     // INF-124: handoff is a delegate-routing meta-command — self-loop, same state.
     // Skip state label swap; delegate resolution still runs below.
@@ -4298,6 +4316,21 @@ export async function applyStateTransition(
       `workflow-gate: B2 apply: ${issueId} demoted to __ad_hoc__ — removed state:* and wf:* labels`,
     );
     return { status: "applied", code: "demoted-ad-hoc", from: currentStateName, to: "__ad_hoc__" };
+  }
+
+  // ── Special target: __suspended__ ────────────────────────────────────────
+  // INF-231: needs-human suspends enrollment — labels retained, dispatch paused.
+  if (toStateName === "__suspended__") {
+    // Labels stay — we only clear the delegate in the mirror. The proxy already
+    // forwarded the issueUpdate (delegateId: null, assigneeId: <human>) to Linear;
+    // we just mark the mirror row as suspended.
+    const bodyId = options?.bodyId ?? "unknown";
+    options?.enrolledTicketsStore?.suspend(issue.identifier ?? issueId, bodyId);
+    // Keep applied state in case of resume.
+    log.info(
+      `workflow-gate: B2 apply: ${issueId} suspended by ${bodyId} at state '${currentStateName ?? "unknown"}'`,
+    );
+    return { status: "applied", code: "suspended", from: currentStateName, to: "__suspended__" };
   }
 
   // ── AI-1992: Pre-transition fan-out spec gate (AC5) ──────────────────────

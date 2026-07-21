@@ -150,6 +150,68 @@ export async function enrichCommentEventForRouting(event: LinearEvent): Promise<
   }
 }
 
+/**
+ * INF-231: Check a suspended ticket's Linear state and auto-resume enrollment
+ * when the human has released it (delegate is restored to an agent, or assignee
+ * is cleared/null). Fires asynchronously from the webhook Issue handler;
+ * never blocks routing.
+ */
+async function checkAndResumeSuspendedTicket(
+  issueId: string,
+  identifier: string,
+  authToken: string,
+  enrolledTicketsStore: EnrolledTicketsStore,
+): Promise<void> {
+  const query = `
+    query CheckSuspended($id: String!) {
+      issue(id: $id) {
+        delegate { id name }
+        assignee { id name }
+        labels { nodes { name } }
+      }
+    }`;
+  let issue: { delegate?: { id: string; name: string } | null; assignee?: { id: string; name: string } | null; labels?: { nodes: Array<{ name: string }> } } | undefined;
+  try {
+    const res = await fetch("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authToken.startsWith("Bearer") ? authToken : `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({ query, variables: { id: issueId } }),
+    });
+    const json = (await res.json()) as { data?: { issue?: typeof issue } };
+    issue = json.data?.issue ?? undefined;
+  } catch (err) {
+    log.warn(`[webhook] checkAndResumeSuspendedTicket: fetch failed for ${identifier}: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  if (!issue) return;
+
+  const hasDelegate = issue.delegate !== null && issue.delegate !== undefined;
+  const hasHumanAssignee = issue.assignee !== null && issue.assignee !== undefined;
+  const hasWfLabel = (issue.labels?.nodes ?? []).some((l) => l.name.startsWith("wf:"));
+  const hasStateLabel = (issue.labels?.nodes ?? []).some((l) => l.name.startsWith("state:"));
+
+  // Resume when the ticket still has wf:* + state:* labels, has an agent
+  // delegate, and no human assignee — the human released the ticket.
+  if (hasWfLabel && hasStateLabel && hasDelegate && !hasHumanAssignee) {
+    enrolledTicketsStore.resume(identifier);
+    log.info(
+      `[webhook] auto-resumed suspended ticket ${identifier}: delegate=${issue.delegate?.name ?? "(set)"}, ` +
+      `no human assignee — enrollment reactivated`,
+    );
+  } else if (!hasWfLabel || !hasStateLabel) {
+    // Labels were stripped (old needs-human behavior or external action).
+    // Keep the ticket suspended — no labels means no state to resume to.
+    // The steward should demote or re-enroll manually.
+    log.info(
+      `[webhook] suspended ticket ${identifier} has no wf:* or state:* label — suspension preserved ` +
+      `(steward intervention needed to re-enroll or demote)`,
+    );
+  }
+}
+
 function acknowledgeAgentAuthoredActivity(
   event: LinearEvent,
   onAgentActivity?: (agentId: string, ticketId: string) => void,
@@ -452,6 +514,15 @@ export function createWebhookRouter(
             const am = auditErr instanceof Error ? auditErr.message : String(auditErr);
             log.warn(`[webhook] label-sync audit failed for ${enrollIdentifier}: ${am}`);
           });
+
+          // ── INF-231: Auto-resume suspended enrollment on Issue events ───────
+          // When a suspended ticket's delegate is restored to an agent (human
+          // released it), automatically resume enrollment so dispatch re-activates.
+          if (enrolledTicketsStore && enrolledTicketsStore.isSuspended(enrollIdentifier)) {
+            checkAndResumeSuspendedTicket(enrollIssueId, enrollIdentifier, enrollToken, enrolledTicketsStore).catch((err) => {
+              log.warn(`[webhook] auto-resume check failed for ${enrollIdentifier}: ${err instanceof Error ? err.message : String(err)}`);
+            });
+          }
         }
       }
 
