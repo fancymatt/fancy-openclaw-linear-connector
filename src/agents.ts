@@ -271,6 +271,57 @@ export function safeReloadAgents(): boolean {
     const reloaded = load();
     const added = reloaded.filter((r) => !_agents.some((a) => a.name === r.name));
     const removed = _agents.filter((a) => !reloaded.some((r) => r.name === a.name));
+
+    // INF-239: Detect potential blind full-file restore — token change on a
+    // previously-online agent. A legitimate external token rotation is rare and
+    // produces one alert per agent; a backup restore flips ALL tokens at once.
+    // We warn but DO NOT reject the reload — a legit rotate must still land.
+    const tokenChanges = _agents
+      .filter((existing) => existing.lastRefreshOkAt)
+      .map((existing) => {
+        const incoming = reloaded.find((r) => r.name === existing.name);
+        if (!incoming) return null;
+        const changed =
+          incoming.refreshToken !== existing.refreshToken ||
+          incoming.accessToken !== existing.accessToken;
+        if (!changed) return null;
+        return {
+          name: existing.name,
+          prevRefreshPrefix: existing.refreshToken?.slice(0, 12) ?? "none",
+          newRefreshPrefix: incoming.refreshToken?.slice(0, 12) ?? "none",
+          hadLastRefresh: existing.lastRefreshOkAt,
+        };
+      })
+      .filter(Boolean) as Array<{
+        name: string;
+        prevRefreshPrefix: string;
+        newRefreshPrefix: string;
+        hadLastRefresh: string | undefined;
+      }>;
+
+    if (tokenChanges.length > 0) {
+      const names = tokenChanges.map((t) => t.name);
+      const detail = tokenChanges
+        .map(
+          (t) =>
+            `${t.name}: ${t.prevRefreshPrefix}… → ${t.newRefreshPrefix}… (last refresh: ${t.hadLastRefresh ?? "unknown"})`,
+        )
+        .join("; ");
+      log.error(
+        `AGENTS RESTORE DETECTED: token change(s) on ${tokenChanges.length} previously-online agent(s): ${detail}. ` +
+          `If this was NOT an intentional token rotation, a full-file restore of agents.json may have ` +
+          `overwritten live credentials with stale backup values — check immediately. (INF-239)`,
+      );
+      notify({
+        severity: "critical",
+        source: "config-health",
+        title:
+          `agents.json hot-reload changed token(s) for ${tokenChanges.length} previously-online agent(s) — possible blind restore (INF-239)`,
+        detail,
+        dedupKey: `agents|token-restore-detected|${names.sort().join(",")}`,
+      });
+    }
+
     _agents = reloaded;
     log.info(`agents.json reloaded: ${_agents.length} agent(s)` +
       (added.length ? ` — added: ${added.map((a) => a.name).join(", ")}` : "") +
