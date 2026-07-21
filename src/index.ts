@@ -887,10 +887,10 @@ export function createApp(options?: CreateAppOptions) {
         if (stateLabels.length === 0) return { inWorkflow: false, resolvableVerb: null };
         // Ticket has a state label — check the workflow registry for a forward verb
         try {
-          const registry = loadWorkflowRegistry();
-          for (const [_defId, def_] of Object.entries(registry)) {
-            for (const [stateName, stateDef_] of Object.entries(def_.states ?? {})) {
-              if (stateLabels.includes(`state:${stateName}`)) {
+          const registry = await loadWorkflowRegistry();
+          for (const [, def_] of registry) {
+            for (const stateDef_ of (def_.states ?? [])) {
+              if (stateLabels.includes(`state:${stateDef_.id}`)) {
                 const forwardVerb = stateDef_.transitions?.[0] ?? null;
                 return { inWorkflow: true, resolvableVerb: forwardVerb };
               }
