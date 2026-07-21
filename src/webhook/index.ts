@@ -38,6 +38,7 @@ import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
 import { notify } from "../alerts/alert-bus.js";
 import { loadKnownHumans } from "../known-humans.js";
 import { emitStreamTopic } from "../admin-stream.js";
+import { DelegatePingPongDetector } from "../delegate-ping-pong-detector.js";
 
 const log = componentLogger(createLogger(), "webhook");
 
@@ -65,6 +66,40 @@ function errorSummary(err: unknown): string {
 function appendOperationalEvent(store: OperationalEventStore | undefined, input: OperationalEventInput): void {
   if (!store) return;
   try { store.append(input); } catch (err) { log.error(`Operational event write failed: ${errorSummary(err)}`); }
+}
+
+async function checkDelegatePingPong(
+  event: LinearEvent,
+  detector: DelegatePingPongDetector,
+): Promise<boolean> {
+  if (event.type !== "Issue" || event.action !== "update") return false;
+  const updatedFrom = (event as { updatedFrom?: Record<string, unknown> }).updatedFrom;
+  if (!updatedFrom || (!("delegateId" in updatedFrom) && !("delegate" in updatedFrom))) return false;
+
+  const data = (event as { data?: Record<string, unknown> }).data;
+  const delegate = data?.delegate as { id?: string; name?: string } | null | undefined;
+  const delegateId = delegate?.id;
+  if (!delegateId) return false;
+
+  const ticketId = issueIdentifierFromEvent(event) ?? (data?.id as string | undefined);
+  if (!ticketId) return false;
+
+  const mappedAgentName = buildAgentMap()[delegateId];
+  const agentName = mappedAgentName ? getOpenclawAgentName(mappedAgentName) : delegate.name ?? delegateId;
+
+  try {
+    const result = await detector.checkAndHandle(ticketId, delegateId, agentName);
+    if (result.suppressDispatch) {
+      log.warn(
+        `Delegate ping-pong cycle detected for ${ticketId}; suppressing dispatch ` +
+        `and escalating to ${result.escalation?.escalatedTo ?? "ai"}`,
+      );
+      return true;
+    }
+  } catch (err) {
+    log.warn(`Delegate ping-pong check failed (fail-open): ${errorSummary(err)}`);
+  }
+  return false;
 }
 
 /**
@@ -171,6 +206,7 @@ export function createWebhookRouter(
   dispatchLeaseStore?: DispatchLeaseStore,
 ): Router {
   const router = Router();
+  const delegatePingPongDetector = new DelegatePingPongDetector(undefined, undefined, operationalEventStore);
 
   // AI-2091 §2/§9 (G2): the delivery-time fetchability gate is wired into the
   // PRIMARY dispatch path (dispatchRoute → checkLinearIssueRouting →
@@ -539,6 +575,10 @@ export function createWebhookRouter(
         } catch (err) {
           log.warn(`Workflow bootstrap failed (fail-safe): ${err instanceof Error ? err.message : String(err)}`);
         }
+      }
+
+      if (await checkDelegatePingPong(event, delegatePingPongDetector)) {
+        return;
       }
 
       await enrichCommentEventForRouting(event);
