@@ -4391,6 +4391,64 @@ export async function applyStateTransition(
     }
   }
 
+  // ── INF-212: Pre-transition destination fan-out spec gate ────────────────
+  // When the DESTINATION state declares a `fanout` with `spec_source` but the
+  // current state does not have one (so the AI-1992 block above did not already
+  // validate), pre-validate the spec before allowing the advance. This prevents
+  // the LIF-153 class of stall: advancing product-definition → spawn-arms without
+  // the required `## structured` section, which would silently wedge the sprint
+  // inside spawn-arms with no output.
+  //
+  // The existing AI-1992 block validates the CURRENT state's fanout at spawn time
+  // (the consumer boundary), but the spec is authored one state earlier (the
+  // producer boundary). This gate catches an absent or unparseable spec at the
+  // authoring boundary, so the failure lands on the session that owns writing it.
+  if (!pendingFanout && intent !== breakGlassCommand && currentStateName !== toStateName) {
+    const destState = def.states.find((s) => s.id === toStateName);
+    if (destState?.fanout?.spec_source) {
+      const specSource = destState.fanout.spec_source;
+      const specDescription = await fetchFanoutSpecDescription(issueId, authToken);
+      const findings = extractSpecFindings(specDescription, specSource);
+      if (findings.length === 0) {
+        const msg =
+          `The \`${intent}\` transition advances into \`${toStateName}\`, ` +
+          `which fans out into \`${destState.fanout.child_workflow}\` children, ` +
+          `but the \`## ${specSource}\` spawn spec section is missing or empty in the ticket description. ` +
+          `Add a \`## ${specSource}\` section with at least one bullet ` +
+          `(e.g. \`- **Title**: detail\`) and retry the transition.`;
+        log.warn(
+          `workflow-gate: INF-212: pre-transition dest-fanout spec gate REFUSED for ${issueId} ` +
+          `(state '${currentStateName}' → '${toStateName}'): empty or unparseable '${specSource}' spec`,
+        );
+        await postComment(
+          issue.internalId,
+          `\u26d4\ufe0f **Transition refused — spawn spec required.**\n\n` +
+          msg,
+          authToken,
+        );
+        notify({
+          severity: "warning",
+          source: "fanout-spec",
+          title: `transition refused on ${issueId}: empty or unparseable '${specSource}' spec heading into '${toStateName}'`,
+          detail: msg,
+          ticket: issueId,
+          dedupKey: `pre-fanout-spec-refused|${issueId}|${toStateName}`,
+        });
+        return {
+          status: "failed",
+          code: "pre-fanout-spec-invalid",
+          detail: msg,
+          from: currentStateName,
+          to: toStateName,
+        };
+      }
+      log.info(
+        `workflow-gate: INF-212: pre-transition dest-fanout spec gate PASSED for ${issueId} ` +
+        `(state '${currentStateName}' → '${toStateName}'): ${findings.length} finding(s) in '${specSource}'`,
+      );
+    }
+  }
+
   // ── Idempotency check (AI-1490 hardened) ────────────────────────────────
   // If the ticket is already in the target state, verify the state:* label
   // is actually present. If it's missing (CLI partial failure, race condition),
