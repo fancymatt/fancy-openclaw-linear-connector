@@ -900,7 +900,7 @@ export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
             }
 
             // No unknown fields
-            const knownFields = new Set(["label_present", "scope"]);
+            const knownFields = new Set(["label_present", "scope", "parent_label_present"]);
             for (const key of Object.keys(sif)) {
               if (!knownFields.has(key)) {
                 errors.push(
