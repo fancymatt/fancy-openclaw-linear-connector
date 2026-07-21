@@ -22,6 +22,10 @@ import { realpathSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// CI environments always have clean, disposable checkouts. The build-location
+// guard has the same exemption; keep this duplicate runtime guard aligned.
+if (process.env.CI) process.exit(0);
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 

@@ -62,7 +62,8 @@ def run_server(settings: Settings) -> None:
     from mam_downloader.app import create_app
 
     app = create_app(settings)
-    uvicorn.run(app, host="0.0.0.0", port=8687, log_level="info")
+    # The CLI server must bind for LAN/container access.
+    uvicorn.run(app, host="0.0.0.0", port=8687, log_level="info")  # nosec B104
 
 
 def main() -> None:
