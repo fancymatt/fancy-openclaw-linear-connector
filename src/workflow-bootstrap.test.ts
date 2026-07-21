@@ -599,6 +599,466 @@ describe("AC6: removing wf:* label (demote) cleans up state:* label", () => {
   });
 });
 
+// ── Tests: INF-268 — sprint-spawner auto-binds designated_approver = Ai ──
+
+/**
+ * Minimal sprint-spawner-like workflow def with the signoff gate transition.
+ * The distinguishing trait is `id: sprint-spawner`; workflow-bootstrap must
+ * recognize this and bind designated_approver = Ai on enrollment.
+ */
+const SPAWNER_YAML = `
+id: sprint-spawner
+version: 1
+archetype: continuous-loop
+entry_state: evaluating
+break_glass:
+  command: escape
+  to: evaluating
+  owner_role: steward
+states:
+  - id: evaluating
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: proceed
+        to: determining-scope
+        generic: continue
+  - id: determining-scope
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: propose-brief
+        to: spawning-scope
+        generic: continue
+        requires_capability: sprint:signoff
+        designated_approver: true
+      - command: deliver-direct
+        to: releasing
+        requires_capability: sprint:signoff
+        designated_approver: true
+  - id: spawning-scope
+    owner_role: engine
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: spawn
+        to: done
+  - id: releasing
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: release
+        to: done
+  - id: done
+    kind: terminal
+    native_state: done
+  - id: escape
+    kind: terminal
+    native_state: invalid
+`;
+
+/** Non-spawner workflow for AC2 negative control — must NOT bind designated_approver. */
+const BACKLOG_YAML = `
+id: backlog-triage
+version: 1
+entry_state: triage
+break_glass:
+  command: escape
+  to: triage
+  owner_role: steward
+states:
+  - id: triage
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: accept
+        to: done
+  - id: done
+    kind: terminal
+    native_state: done
+`;
+
+/**
+ * INF-268 AC1/AC2 (see AC mapping below).
+ * Policy: steward = astrid; ai holds sprint:signoff.
+ * agents.json includes both with known linearUserIds.
+ */
+const SPAWNER_POLICY_YAML = `
+capabilities:
+  - id: linear:transition
+  - id: sprint:signoff
+
+containers:
+  - id: workflow
+    grants: [linear:transition]
+  - id: ai
+    grants: [linear:transition, sprint:signoff]
+
+roles:
+  - id: steward
+    requires: [linear:transition]
+
+bodies:
+  - id: astrid
+    container: workflow
+    fills_roles: [steward]
+  - id: ai
+    container: ai
+    fills_roles: []
+`;
+
+const SPAWNER_AGENTS_JSON = JSON.stringify({
+  agents: [
+    { name: "astrid", linearUserId: "astrid-linear-id", clientId: "c1", clientSecret: "s1", accessToken: "tok-astrid", refreshToken: "r1", openclawAgent: "astrid" },
+    { name: "ai", linearUserId: "ai-linear-id", clientId: "c2", clientSecret: "s2", accessToken: "tok-ai", refreshToken: "r2", openclawAgent: "ai" },
+  ],
+});
+
+const SPAWNER_ISSUE_ID = "issue-internal-uuid-456";
+const SPAWNER_TEAM_ID = "team-uuid-xyz";
+const SPAWNER_WF_LABEL_ID = "label-wf-sprint-spawner-id";
+const SPAWNER_STATE_LABEL_ID = "label-state-evaluating-id";
+
+// ── Sprint-spawner bootstrap helpers ──────────────────────────────────────
+
+function makeSpawnerBootstrapFetch(opts: {
+  currentLabelNames: string[];
+  teamLabels?: Array<{ id: string; name: string }>;
+  mutationSuccess?: boolean;
+}): typeof globalThis.fetch {
+  const teamLabels = opts.teamLabels ?? [
+    { id: SPAWNER_STATE_LABEL_ID, name: "state:evaluating" },
+    { id: "label-state-determining-scope-id", name: "state:determining-scope" },
+    { id: SPAWNER_WF_LABEL_ID, name: "wf:sprint-spawner" },
+  ];
+  const mutationSuccess = opts.mutationSuccess ?? true;
+
+  return async (_url: RequestInfo | URL, init?: RequestInit) => {
+    const body = typeof init?.body === "string" ? init.body : "";
+
+    if (body.includes("IssueWithLabels") || body.includes("IssueContext")) {
+      return new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              id: SPAWNER_ISSUE_ID,
+              identifier: "INF-268",
+              title: "Sprint spawner signoff",
+              team: { id: SPAWNER_TEAM_ID },
+              labels: {
+                nodes: opts.currentLabelNames.map((name) => {
+                  const known = teamLabels.find((l) => l.name === name);
+                  return { id: known?.id ?? `label-${name}-id`, name };
+                }),
+              },
+              delegate: null,
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    if (body.includes("labels") && body.includes(SPAWNER_TEAM_ID)) {
+      return new Response(
+        JSON.stringify({
+          data: { team: { labels: { nodes: teamLabels } } },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    if (body.includes("issueUpdate") || body.includes("ApplyAtomicTransition")) {
+      return new Response(
+        JSON.stringify({ data: { issueUpdate: { success: mutationSuccess } } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    return new Response(JSON.stringify({ data: {} }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+}
+
+function makeSpawnerIssueUpdateEvent(opts: {
+  currentLabelIds: string[];
+  previousLabelIds?: string[];
+}) {
+  return {
+    type: "Issue" as const,
+    action: "update" as const,
+    actor: { id: "human-user-id", name: "Human" },
+    createdAt: "2026-07-21T10:00:00.000Z",
+    data: {
+      id: SPAWNER_ISSUE_ID,
+      identifier: "INF-268",
+      title: "Sprint spawner signoff",
+      description: "Test",
+      state: { id: "s1", name: "Todo", type: "unstarted" },
+      priority: 0,
+      priorityLabel: "No priority",
+      teamId: SPAWNER_TEAM_ID,
+      teamKey: "INF",
+      labelIds: opts.currentLabelIds,
+      url: "https://linear.app/test/issue/INF-268",
+      createdAt: "2026-07-21T10:00:00.000Z",
+      updatedAt: "2026-07-21T10:00:01.000Z",
+    },
+    updatedFrom: {
+      labelIds: opts.previousLabelIds ?? [],
+    },
+    raw: {},
+  };
+}
+
+// Now import what we need for store-based testing
+import { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
+
+describe("INF-268: sprint-spawner enrollment auto-binds designated_approver = Ai", () => {
+  let spawnerTmp: string;
+  let storeDbPath: string;
+  let store: EnrolledTicketsStore;
+  let savedFetch: typeof globalThis.fetch;
+
+  const SPAWNER_DEFS_DIR = "spawner-defs";
+
+  beforeAll(async () => {
+    spawnerTmp = await fs.mkdtemp(path.join(os.tmpdir(), "spawner-designated-approver-"));
+
+    const defsDir = path.join(spawnerTmp, SPAWNER_DEFS_DIR);
+    await fs.mkdir(defsDir);
+    await fs.writeFile(path.join(defsDir, "sprint-spawner.yaml"), SPAWNER_YAML);
+    await fs.writeFile(path.join(defsDir, "backlog-triage.yaml"), BACKLOG_YAML);
+
+    const policyFile = path.join(spawnerTmp, "policy.yaml");
+    await fs.writeFile(policyFile, SPAWNER_POLICY_YAML);
+
+    const agentsFile = path.join(spawnerTmp, "agents.json");
+    await fs.writeFile(agentsFile, SPAWNER_AGENTS_JSON);
+  });
+
+  beforeEach(async () => {
+    savedFetch = globalThis.fetch;
+    resetWorkflowCache();
+    resetPolicyCache();
+
+    // Each test gets a fresh on-disk store so AC4 can re-open from the same path
+    storeDbPath = path.join(spawnerTmp, `enrolled-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    store = new EnrolledTicketsStore(storeDbPath);
+  });
+
+  afterEach(() => {
+    globalThis.fetch = savedFetch;
+    store.close();
+  });
+
+  afterAll(async () => {
+    await fs.rm(spawnerTmp, { recursive: true, force: true });
+  });
+
+  // ── INF-268 AC1: sprint-spawner enrollment binds designated_approver = Ai ──
+
+  it("AC1: applyBootstrapToIssue records designated_approver = 'ai' for sprint-spawner workflow", async () => {
+    // This test MUST fail until the implementation records designated_approver.
+    // Currently, sprint-spawner bootstrap is treated identically to any other
+    // workflow and does not write the designated_approver field.
+
+    process.env.WORKFLOW_DEFS_DIR = path.join(spawnerTmp, SPAWNER_DEFS_DIR);
+    process.env.CAPABILITY_POLICY_PATH = path.join(spawnerTmp, "policy.yaml");
+    process.env.AGENTS_PATH = path.join(spawnerTmp, "agents.json");
+
+    globalThis.fetch = makeSpawnerBootstrapFetch({
+      currentLabelNames: ["wf:sprint-spawner"],
+    });
+
+    const { maybeBootstrapWorkflow } = await import("./workflow-bootstrap.js");
+
+    const event = makeSpawnerIssueUpdateEvent({
+      currentLabelIds: [SPAWNER_WF_LABEL_ID],
+      previousLabelIds: [],
+    });
+
+    const result = await maybeBootstrapWorkflow(event, "test-token", store);
+
+    expect(result).not.toBeNull();
+    expect(result?.action).toBe("bootstrapped");
+    expect(result?.workflowId).toBe("sprint-spawner");
+
+    // Verify the enrolled ticket exists
+    const enrolled = store.getByTicketId("INF-268");
+    expect(enrolled).not.toBeNull();
+
+    // INF-268 AC1: the enrolled ticket must have designated_approver set to "ai"
+    // THIS ASSERTION WILL FAIL until applyBootstrapToIssue is patched to bind
+    // designated_approver for sprint-spawner workflows.
+    expect((enrolled as Record<string, unknown>).designated_approver).toBe("ai");
+  });
+
+  // ── INF-268 AC2: non-spawner enrollment does NOT bind designated_approver ──
+
+  it("AC2: non-sprint-spawner workflow enrollment does NOT set designated_approver", async () => {
+    process.env.WORKFLOW_DEFS_DIR = path.join(spawnerTmp, SPAWNER_DEFS_DIR);
+    process.env.CAPABILITY_POLICY_PATH = path.join(spawnerTmp, "policy.yaml");
+    process.env.AGENTS_PATH = path.join(spawnerTmp, "agents.json");
+
+    const BACKLOG_WF_LABEL_ID = "label-wf-backlog-triage-id";
+    const BACKLOG_STATE_LABEL_ID = "label-state-triage-id";
+    const BACKLOG_ISSUE_ID = "issue-backlog-uuid-789";
+
+    globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+
+      if (body.includes("IssueWithLabels") || body.includes("IssueContext")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: BACKLOG_ISSUE_ID,
+                identifier: "INF-269",
+                title: "Backlog triage",
+                team: { id: SPAWNER_TEAM_ID },
+                labels: {
+                  nodes: [{ id: BACKLOG_WF_LABEL_ID, name: "wf:backlog-triage" }],
+                },
+                delegate: null,
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (body.includes("labels") && body.includes(SPAWNER_TEAM_ID)) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              team: {
+                labels: {
+                  nodes: [
+                    { id: BACKLOG_STATE_LABEL_ID, name: "state:triage" },
+                    { id: BACKLOG_WF_LABEL_ID, name: "wf:backlog-triage" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (body.includes("issueUpdate") || body.includes("ApplyAtomicTransition")) {
+        return new Response(
+          JSON.stringify({ data: { issueUpdate: { success: true } } }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      return new Response(JSON.stringify({ data: {} }), { status: 200 });
+    }) as typeof globalThis.fetch;
+
+    const { applyBootstrapToIssue } = await import("./workflow-bootstrap.js");
+
+    const issue = {
+      id: BACKLOG_ISSUE_ID,
+      teamId: SPAWNER_TEAM_ID,
+      identifier: "INF-269",
+      title: "Backlog triage",
+      labels: [{ id: BACKLOG_WF_LABEL_ID, name: "wf:backlog-triage" }],
+    };
+
+    const result = await applyBootstrapToIssue(issue, "test-token", undefined, store);
+
+    expect(result).not.toBeNull();
+    expect(result?.action).toBe("bootstrapped");
+
+    // Verify the enrolled ticket exists
+    const enrolled = store.getByTicketId("INF-269");
+    expect(enrolled).not.toBeNull();
+
+    // AC2: non-spawner workflow must NOT set designated_approver
+    // (this should pass once the assertion works — implementers make sure
+    //  the designated_approver binding is scoped to sprint-spawner only)
+    expect((enrolled as Record<string, unknown>).designated_approver).toBeUndefined();
+  });
+
+  // ── INF-268 AC3: existing bootstrap behavior preserved for sprint-spawner ──
+
+  it("AC3: sprint-spawner bootstrap still applies entry state label and sets delegate", async () => {
+    process.env.WORKFLOW_DEFS_DIR = path.join(spawnerTmp, SPAWNER_DEFS_DIR);
+    process.env.CAPABILITY_POLICY_PATH = path.join(spawnerTmp, "policy.yaml");
+    process.env.AGENTS_PATH = path.join(spawnerTmp, "agents.json");
+
+    const mutationBodies: string[] = [];
+    globalThis.fetch = async (url: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+      if (body.includes("issueUpdate") || body.includes("ApplyAtomicTransition")) {
+        mutationBodies.push(body);
+      }
+      return makeSpawnerBootstrapFetch({ currentLabelNames: ["wf:sprint-spawner"] })(url, init);
+    };
+
+    const { maybeBootstrapWorkflow } = await import("./workflow-bootstrap.js");
+
+    const event = makeSpawnerIssueUpdateEvent({
+      currentLabelIds: [SPAWNER_WF_LABEL_ID],
+      previousLabelIds: [],
+    });
+
+    const result = await maybeBootstrapWorkflow(event, "test-token", store);
+
+    expect(result).not.toBeNull();
+    expect(result?.workflowId).toBe("sprint-spawner");
+    expect(result?.entryState).toBe("evaluating");
+    expect(result?.delegateAgentName).toBe("astrid");
+
+    // Mutation should reference entry state label + steward delegate
+    const mutationCall = mutationBodies.find(
+      (b) => b.includes("issueUpdate") || b.includes("ApplyAtomicTransition"),
+    );
+    expect(mutationCall).toBeDefined();
+    expect(mutationCall).toContain(SPAWNER_STATE_LABEL_ID);
+    expect(mutationCall).toContain("astrid-linear-id");
+  });
+
+  // ── INF-268 AC4: designated_approver survives store round-trip ──
+
+  it("AC4: designated_approver persisted in enrolled tickets store can be queried after re-open", async () => {
+    process.env.WORKFLOW_DEFS_DIR = path.join(spawnerTmp, SPAWNER_DEFS_DIR);
+    process.env.CAPABILITY_POLICY_PATH = path.join(spawnerTmp, "policy.yaml");
+    process.env.AGENTS_PATH = path.join(spawnerTmp, "agents.json");
+
+    globalThis.fetch = makeSpawnerBootstrapFetch({
+      currentLabelNames: ["wf:sprint-spawner"],
+    });
+
+    const { maybeBootstrapWorkflow } = await import("./workflow-bootstrap.js");
+
+    const event = makeSpawnerIssueUpdateEvent({
+      currentLabelIds: [SPAWNER_WF_LABEL_ID],
+      previousLabelIds: [],
+    });
+
+    await maybeBootstrapWorkflow(event, "test-token", store);
+
+    // Close and re-open the store from the known path — the designated_approver
+    // must survive the connection close (SQLite durability).
+    store.close();
+    const reopened = new EnrolledTicketsStore(storeDbPath);
+
+    const enrolled = reopened.getByTicketId("INF-268");
+    expect(enrolled).not.toBeNull();
+    expect((enrolled as Record<string, unknown>).designated_approver).toBe("ai");
+
+    reopened.close();
+  });
+});
+
 describe("bootstrap wake regression (2026-07-03) — issue query must select identifier + title", () => {
   it("IssueWithLabels selects identifier and title (wake gate depends on them)", async () => {
     // The wake block in webhook/index.ts is gated on result.ticketIdentifier.
