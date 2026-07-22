@@ -30,37 +30,48 @@ function read(rel: string): string {
 
 // ── Token custom properties the Connector UI must surface ──
 const REQUIRED_TOKENS = [
-  "--ff-color-brand-primary",
-  "--ff-color-accent",
-  "--ff-color-neutral-50",
-  "--ff-color-neutral-900",
-  "--ff-font-sans",
-  "--ff-font-size-base",
-  "--ff-space-2",
-  "--ff-space-4",
-  "--ff-radius-md",
-  "--ff-radius-lg",
-  "--ff-shadow-sm",
-  "--ff-shadow-focus",
-  "--ff-text-primary",
-  "--ff-text-secondary",
-  "--ff-surface-primary",
-  "--ff-surface-secondary",
-  "--ff-border-default",
-  "--ff-border-subtle",
+  "--color-text",
+  "--color-text-secondary",
+  "--color-text-inverse",
+  "--color-bg",
+  "--color-surface",
+  "--color-border",
+  "--color-accent",
+  "--color-accent-strong",
+  "--color-success",
+  "--color-warning",
+  "--color-error",
+  "--color-surface-raised",
+  "--color-surface-code",
+  "--color-surface-input",
+  "--color-surface-overlay",
+  "--font-size-base",
+  "--font-family-body",
+  "--font-family-mono",
+  "--line-height-body",
+  "--space-4",
+  "--space-5",
+  "--space-6",
+  "--radius-full",
+  "--radius-lg",
+  "--radius-md",
+  "--radius-xl",
+  "--elevation-3",
+  "--elevation-4",
 ];
 
 // ── Surface tokens that MUST differ from Gen's defaults (lighter adaptation) ──
 // The design direction (Laren) specifies "Connector UI inherits and adapts:
 // slightly lighter surface, same accent, same type scale."
+// INF-298 migrated from --ff-* to --color-surface-* tokens.
 const SURFACE_OVERRIDES = [
-  "--ff-surface-primary",
-  "--ff-surface-secondary",
-  "--ff-surface-elevated",
-  "--ff-text-primary",
-  "--ff-text-secondary",
-  "--ff-border-default",
-  "--ff-border-subtle",
+  "--color-surface-raised",
+  "--color-surface-code",
+  "--color-surface-input",
+  "--color-surface-overlay",
+  "--color-accent",
+  "--color-accent-strong",
+  "--color-accent-dim",
 ];
 
 // ── CSS entry files that must import @fancyfleet/tokens ──
@@ -109,26 +120,23 @@ describe("GEN-285 AC4: connector UI adapts surface tokens (lighter)", () => {
     ).toBe(true);
   });
 
-  it("surface overrides use lighter values (e.g., lighter neutral tones)", () => {
+  it("surface overrides use color-mix for lighter surface values", () => {
     const css = read("theme.css");
 
-    // The light-mode Gen defaults (Editorial Dark from Laren's direction) set
-    // a dark theme. The Connector UI inherits tokens but overrides surface
-    // values to be lighter. Expect the surface-primary override to use
-    // a lighter neutral (neutral-50, neutral-100) or a custom light value.
-    // At minimum, the surface-primary should be redeclared with SOME value.
-    // The implementer may use var(--ff-color-neutral-*) or a raw OKLCH value.
-    const surfaceMatch = css.match(/--ff-surface-primary\s*:\s*([^;]+)/);
+    // The connector uses color-mix to create lighter surface layers on top
+    // of the design system's surface tokens. Each --color-surface-* token
+    // should use color-mix to blend with a transparent base for lightness.
+    const surfaceRenderedMatch = css.match(/--color-surface-raised\s*:\s*([^;]+)/);
     expect(
-      surfaceMatch,
-      "--ff-surface-primary must be redeclared in theme.css with a lighter value",
+      surfaceRenderedMatch,
+      "--color-surface-raised must be declared in theme.css with a lighter value",
     ).not.toBeNull();
 
-    if (surfaceMatch) {
-      const value = surfaceMatch[1].trim();
+    if (surfaceRenderedMatch) {
+      const value = surfaceRenderedMatch[1].trim();
       expect(
         value.length > 0,
-        `--ff-surface-primary override value must be non-empty (got: "${value}")`,
+        `--color-surface-raised override value must be non-empty (got: "${value}")`,
       ).toBe(true);
     }
   });
@@ -152,14 +160,15 @@ describe("GEN-285 AC5: token values verified live", () => {
 
     // Critical subset that must always be present
     const critical = [
-      "--ff-color-brand-primary",
-      "--ff-color-accent",
-      "--ff-font-sans",
-      "--ff-font-size-base",
-      "--ff-space-4",
-      "--ff-surface-primary",
-      "--ff-text-primary",
+      "--color-text",
+      "--color-bg",
+      "--color-surface",
+      "--color-border",
+      "--color-accent",
+      "--font-size-base",
+      "--space-4",
     ];
+
 
     const missingCritical = critical.filter((t) => !css.includes(t) && !css.includes(`var(${t})`));
     expect(

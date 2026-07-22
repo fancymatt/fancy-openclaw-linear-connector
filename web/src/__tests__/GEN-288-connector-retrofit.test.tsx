@@ -237,25 +237,24 @@ describe("GEN-288 AC3 — Typography components render the console title block",
 // AC4 — Lighter surface adaptation (CSS custom properties)
 // ---------------------------------------------------------------------------
 
-describe("GEN-288 AC4 — Connector CSS custom properties override Gen defaults for surfaces", () => {
-  it("defines --bg in theme.css with a lighter value than Gen's Editorial Dark baseline (#0b0f14 vs #05070a)", () => {
-    // Gen's default Editorial Dark palette uses --bg: #05070a. The connector
-    // overrides it with a lighter value. We assert the exact lighter value
-    // that the connector's theme.css declares today.
-    expect(themeCss).toMatch(/--bg\s*:\s*#0b0f14\s*;/);
-    expect(themeCss).toMatch(/--panel\s*:\s*#111821\s*;/);
+describe("GEN-288 AC4 — Connector CSS custom properties override design-system defaults for surfaces", () => {
+  it("defines surface-adaptive tokens in theme.css using color-mix for a lighter connector appearance", () => {
+    // INF-298 migrated from the --bg/--panel alias slab to --color-surface-*
+    // tokens. The connector defines surface-adaptive layers using color-mix
+    // to create visually distinct raised/code/input surfaces.
+    expect(themeCss).toMatch(/--color-surface-raised\s*:\s*color-mix/);
+    expect(themeCss).toMatch(/--color-surface-code\s*:\s*color-mix/);
+    expect(themeCss).toMatch(/--color-surface-input\s*:\s*color-mix/);
   });
 
-  it("imports Gen's default tokens but overrides surface backgrounds after the import", () => {
-    // After the retrofit theme.css should pull in @fancyfleet/components/tokens
-    // and then re-declare --bg and --panel with the connector's lighter values.
-    // The ordering matters: connector values must come AFTER the import so they
-    // win the cascade.
-    const importIdx = themeCss.indexOf("@fancyfleet/components/tokens");
-    // If there is no import, the test fails — the retrofit must add it.
+  it("imports @fancyfleet/tokens/tokens.css and defines connector-specific surface properties after the import", () => {
+    // INF-298 AC1 migrated from @fancyfleet/components/tokens to
+    // @fancyfleet/tokens/tokens.css. Connector-specific surface tokens
+    // must come AFTER the import to win the cascade.
+    const importIdx = themeCss.indexOf("@fancyfleet/tokens/tokens.css");
     expect(importIdx).toBeGreaterThanOrEqual(0);
-    const bgIdx = themeCss.indexOf("--bg:", importIdx);
-    expect(bgIdx).toBeGreaterThan(importIdx);
+    const surfaceRaisedIdx = themeCss.indexOf("--color-surface-raised:", importIdx);
+    expect(surfaceRaisedIdx).toBeGreaterThan(importIdx);
   });
 });
 
