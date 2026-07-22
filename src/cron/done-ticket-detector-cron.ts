@@ -13,6 +13,7 @@
 import { createLogger, componentLogger } from "../logger.js";
 import { execSync } from "node:child_process";
 import { getAccessToken } from "../agents.js";
+import { formatIntervalMs, registerCron } from "./registry.js";
 import {
   DoneTicketDetector,
   type DoneTicketDetectorConfig,
@@ -347,6 +348,7 @@ export function registerDoneDetectorCron(options?: DoneDetectorCronOptions): voi
   const lookbackDays = options?.lookbackDays ?? parseInt(process.env.DONE_DETECTOR_LOOKBACK_DAYS ?? "14", 10);
   const graceHours = options?.graceHours ?? parseInt(process.env.DONE_DETECTOR_GRACE_HOURS ?? "4", 10);
   const pollIntervalMs = options?.pollIntervalMs ?? parseInt(process.env.DONE_DETECTOR_POLL_INTERVAL_MS ?? String(60 * 60 * 1000), 10);
+  registerCron("done-ticket-detector", `every ${formatIntervalMs(pollIntervalMs)}`);
 
   // Build real dependencies
   const deps = {

@@ -20,7 +20,7 @@ import { runRescueSweep } from "../rescue-sweep.js";
 import type { OperationalEventStore } from "../store/operational-event-store.js";
 import { loadWorkflowRegistry } from "../workflow-gate.js";
 import { createLogger, componentLogger } from "../logger.js";
-import { registerCron, formatIntervalMs } from "./registry.js";
+import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import { getAccessToken } from "../agents.js";
 import {
   recordRescueSweepRun,
@@ -80,6 +80,8 @@ async function runSweepIteration(operationalEventStore?: OperationalEventStore):
     const msg = err instanceof Error ? err.message : String(err);
     log.error(`[rescue-sweep] Scheduled sweep failed: ${msg}`);
     recordRescueSweepFail(msg);
+  } finally {
+    markCronRun("rescue-sweep");
   }
 }
 

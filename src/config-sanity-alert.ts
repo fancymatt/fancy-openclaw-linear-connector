@@ -20,7 +20,7 @@
 
 import { componentLogger, createLogger } from "./logger.js";
 import { notify } from "./alerts/alert-bus.js";
-import { registerCron, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 import fs from "node:fs";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "config-sanity-alert");
@@ -250,6 +250,8 @@ export function registerConfigSanityAlertCron(): void {
       }
     } catch (err) {
       log.error(`config-sanity-alert: initial cycle threw: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      markCronRun("config-sanity-alert");
     }
   });
 
@@ -258,6 +260,8 @@ export function registerConfigSanityAlertCron(): void {
       runCycle();
     } catch (err) {
       log.error(`config-sanity-alert: cycle threw: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      markCronRun("config-sanity-alert");
     }
   }, intervalMs);
   timer.unref();
