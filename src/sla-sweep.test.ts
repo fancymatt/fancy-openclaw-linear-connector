@@ -878,6 +878,34 @@ describe("AC5 — no per-ticket Linear API fan-out; configurable cadence", () =>
     expect(timer).not.toBeNull();
     clearInterval(timer as ReturnType<typeof setInterval>);
   });
+
+  it("resolves authToken on each scheduled tick", async () => {
+    jest.useFakeTimers();
+    const tokens = ["Bearer stale-token", "Bearer fresh-token"];
+    const seenAuth: string[] = [];
+    const fetchFn = jest.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      seenAuth.push(String((init?.headers as Record<string, string>)?.Authorization));
+      return new Response(JSON.stringify({ data: { issues: { nodes: [] } } }));
+    });
+
+    const timer = registerSlaSweepCron({
+      authToken: () => tokens.shift() ?? "Bearer final-token",
+      workflowDefPath: writeWorkflowRegistry(),
+      cadenceMs: 100,
+      fetchFn,
+      notify: jest.fn(),
+      wakeAgent: jest.fn(async () => {}),
+    });
+
+    try {
+      await jest.advanceTimersByTimeAsync(100);
+      await jest.advanceTimersByTimeAsync(100);
+      expect(seenAuth).toEqual(["Bearer stale-token", "Bearer fresh-token"]);
+    } finally {
+      clearInterval(timer as ReturnType<typeof setInterval>);
+      jest.useRealTimers();
+    }
+  });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -885,6 +913,20 @@ describe("AC5 — no per-ticket Linear API fan-out; configurable cadence", () =>
 // ════════════════════════════════════════════════════════════════════════════
 
 describe("runSlaSweep result shape", () => {
+  it("reports GraphQL errors instead of treating them as an empty healthy sweep", async () => {
+    const opts = makeOptions({
+      fetchFn: jest.fn(async () =>
+        new Response(JSON.stringify({ errors: [{ message: "Invalid OAuth token" }] })),
+      ),
+    });
+
+    const result = await runSlaSweep(opts);
+
+    expect(result.scanned).toBe(0);
+    expect(result.errors).toHaveLength(1);
+    expect(String(result.errors[0])).toContain("Invalid OAuth token");
+  });
+
   it("returns a well-formed SlaSweepResult with all expected fields", async () => {
     const opts = makeOptions({
       fetchFn: makeFetchMock([]),

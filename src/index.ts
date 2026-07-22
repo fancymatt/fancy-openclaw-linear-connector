@@ -1937,7 +1937,9 @@ if (isEntryPoint) {
   const slaWorkflowDefPath = process.env.WORKFLOW_DEFS_DIR ?? process.env.WORKFLOW_DEF_PATH ?? defaultWorkflowDefPath;
   const slaDataDir = process.env.DATA_DIR ?? resolveStatePath("data");
   const slaBreachStorePath = process.env.SLA_BREACH_STORE_PATH ?? path.join(slaDataDir, "sla-breaches.db");
-  const slaAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const resolveCronAuthToken = () =>
+    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const slaAuthToken = resolveCronAuthToken();
   const slaCadenceMs = process.env.SLA_SWEEP_CADENCE_MS ? parseInt(process.env.SLA_SWEEP_CADENCE_MS, 10) : undefined;
 
   if (slaAuthToken) {
@@ -1956,13 +1958,13 @@ if (isEntryPoint) {
       };
       const actionText = `SLA breach detected for ${identifier}`;
       const message =
-        (await buildWorkflowAwareDeliveryMessage(identifier, slaAuthToken, actionText)) ??
+        (await buildWorkflowAwareDeliveryMessage(identifier, resolveCronAuthToken(), actionText)) ??
         actionText;
       await deliverMessageToAgent("ai", sessionKey, message, deliveryConfig);
     };
 
     const slaTimer = registerSlaSweepCron({
-      authToken: slaAuthToken,
+      authToken: resolveCronAuthToken,
       workflowDefPath: slaWorkflowDefPath,
       breachStorePath: slaBreachStorePath,
       cadenceMs: slaCadenceMs,
@@ -2079,9 +2081,9 @@ if (isEntryPoint) {
   // INF-122: periodic anti-entropy reconciliation (G-7/G-17).
   // AC1 — native state desync heal; AC2 — missed barrier webhook auto-advance.
   // Uses the same auth token and workflow def path as the SLA sweep.
-  const antiEntropyAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const antiEntropyAuthToken = resolveCronAuthToken();
   if (antiEntropyAuthToken) {
-    registerAntiEntropyCron({ authToken: antiEntropyAuthToken });
+    registerAntiEntropyCron({ authToken: resolveCronAuthToken });
     const intervalMs = process.env.ANTI_ENTROPY_INTERVAL
       ? parseInt(process.env.ANTI_ENTROPY_INTERVAL, 10)
       : 15 * 60 * 1000;
