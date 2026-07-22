@@ -67,9 +67,14 @@ export function Tabs({ pendingProposals = 0 }: { pendingProposals?: number } = {
 }
 
 export function Stat({ value, label, tone }: { value: ReactNode; label: string; tone?: "red" | "yellow" | "green" }) {
+  const toneMap: Record<string, string> = {
+    red: "var(--color-error)",
+    yellow: "var(--color-warning)",
+    green: "var(--color-success)",
+  };
   return (
     <div className="stat">
-      <Text className="value" style={tone ? { color: `var(--${tone})` } : undefined}>{value}</Text>
+      <Text className="value" style={tone ? { color: toneMap[tone] } : undefined}>{value}</Text>
       <Text className="label">{label}</Text>
     </div>
   );
