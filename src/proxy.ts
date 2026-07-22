@@ -318,6 +318,50 @@ function stripNullDelegateAssigneeFields(body: GraphQLRequestBody | null, effect
 }
 
 /**
+ * INF-274: Guard raw-path delegate=null on plain (non-workflow) tickets.
+ *
+ * Intent-bearing verbs (needs-human, complete, park) legitimately clear delegate
+ * and are exempted by stripNullDelegateAssigneeFields above — this guard catches
+ * the remaining case where a CLI sends delegateId:null directly on a ticket that
+ * has no workflow definition (ad-hoc / plain ticket).
+ *
+ * Workflow tickets are deferred to checkRawMutationInterception which already
+ * governs delegate mutations.
+ *
+ * Returns a blocking message string when the mutation should be rejected, or
+ * null to allow the request to proceed.
+ */
+export async function guardPlainTicketDelegateClear(
+  body: GraphQLRequestBody | null,
+  issueId: string | null,
+  authToken: string,
+): Promise<string | null> {
+  // Only applies to issueUpdate mutations that set delegateId to null
+  if (!isIssueUpdateMutation(body)) return null;
+  const input = issueUpdateInput(body);
+  if (!input || !("delegateId" in input) || input.delegateId !== null) return null;
+
+  // If the caller could not determine an issueId, we cannot verify the ticket
+  // type — allow through
+  if (!issueId) return null;
+
+  // Fetch labels to determine if this is a workflow or plain ticket
+  let labels: string[];
+  try {
+    labels = await fetchWorkflowLabels(issueId, authToken);
+  } catch {
+    // Fail-open — can't verify ticket type, allow through
+    return null;
+  }
+
+  // If the ticket has workflow labels, defer to workflow-gate's interception
+  if (getWorkflowId(labels) !== null) return null;
+
+  // Plain (non-workflow) ticket — block the delegate clear
+  return `Rejected delegate=null on plain (non-workflow) ticket ${issueId}: the proxy owns delegate management; CLI must not directly null the delegate field.`;
+}
+
+/**
  * Build the ticket context string for log lines (empty string when no ID found).
  */
 function extractTicketContext(body: GraphQLRequestBody | null): string {
@@ -1016,6 +1060,19 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             const msg = err instanceof Error ? err.message : String(err);
             log.warn(`state-label-strip failed agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${msg} — blocking (fail-closed)`);
             res.status(200).json({ errors: [{ message: `[Proxy] '${effectiveIntent}' blocked: workflow label safety check failed (${msg}). Try again or contact a steward.` }] });
+            return;
+          }
+        }
+
+        // INF-274: Guard raw-path delegate=null on plain (non-workflow) tickets.
+        // Only applies to non-intent-bearing mutations (raw-path). Intent-bearing
+        // verbs like note, handoff-work, etc. are handled by
+        // stripNullDelegateAssigneeFields below.
+        if (!effectiveIntent && isIssueUpdateMutation(body)) {
+          const guardResult = await guardPlainTicketDelegateClear(body, issueId ?? null, authorization);
+          if (guardResult !== null) {
+            log.warn(`plain-delegate-clear-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${guardResult}`);
+            res.status(200).json({ errors: [{ message: `[Proxy] ${guardResult}` }] });
             return;
           }
         }
