@@ -1,0 +1,161 @@
+# design — wf:design, first-class design workflow (DSN-2)
+# Shape locked by Laren (CDO) 2026-07-21 on DSN-2; steward-handoff answer to
+#   Matt's design→dev question: no auto-spawn — design-lead decides follow-on
+#   work (dev-impl, asset, 3D, or none) at the handoff gate before close.
+# owner roles: design-lead (Laren) authors briefs/reviews/closes;
+#   designer (Penny, or Clay for 3D) implements and codifies the design system.
+#
+# Why this shape (per Matt, DSN-2): design work runs ON the engine — dispatched,
+#   gated, audited — instead of off-connector in chat (the DSN-1 failure, INF-287).
+#   The review→request-changes→implementing loop is THE feedback loop; it is
+#   repeatable until design-lead approves, and every request-changes requires a
+#   categorized feedback comment so revisions are specific and auditable.
+#   design-system-update is a MANDATORY state — done is unreachable without it —
+#   enforcing "update the design system before marking complete." The reviewer
+#   (design-lead) closes, never the implementer.
+#
+# ds-verify live-verification checklist (required artifact, posted as a comment
+#   with evidence before approve — enforced by convention/guidance, not engine):
+#   - deployed URL returns authenticated 200
+#   - light theme renders correctly (screenshot/visual confirmation)
+#   - dark theme renders correctly (screenshot/visual confirmation)
+#   - no regressions in existing showcase/components
+#   - all internal links resolve
+#
+# "The design system" (designer codifies at design-system-update): token set,
+#   component library (/components/), showcase (/docs/showcase/), behavior notes
+#   (layer-model contracts for affected components).
+#
+# Archetype: single-task with review loop + mandatory ds-update + steward handoff.
+
+id: design
+version: 1
+archetype: single-task
+entry_state: intake
+
+break_glass:
+  command: escape
+  to: escape
+  owner_role: steward
+
+states:
+
+  - id: intake
+    owner_role: design-lead
+    kind: normal
+    native_state: todo
+    # design-lead authors (or endorses/amends) the brief IN this state; the brief
+    # is the artifact that exits intake. Two accepts: well-defined tickets go
+    # straight to implementing; open-ended ones route through exploring first.
+    transitions:
+      - command: accept
+        to: implementing
+        assign: { mode: auto }
+        generic: continue
+      - command: explore
+        to: exploring
+        assign: { mode: auto }
+        generic: continue
+
+  - id: exploring
+    owner_role: designer
+    kind: normal
+    native_state: doing
+    # Design spike: output is a proposal (mood, direction, options) that the
+    # design-lead synthesizes into the brief back at intake.
+    transitions:
+      - command: propose
+        to: intake
+        assign: { mode: auto }
+        generic: continue
+
+  - id: implementing
+    owner_role: designer
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: submit
+        to: review
+        assign: { mode: auto }
+        generic: continue
+
+  - id: review
+    owner_role: design-lead
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: approve
+        to: design-system-update
+        assign: { mode: auto }
+        generic: continue
+      - command: request-changes
+        to: implementing
+        assign: { mode: auto }
+        generic: revision
+        feedback:
+          required: true
+          category_enum:
+            - visual-language
+            - motion-behavior
+            - token-discipline
+            - off-brief
+            - craft
+            - infra
+            - interaction
+
+  - id: design-system-update
+    owner_role: designer
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: submit
+        to: ds-verify
+        assign: { mode: auto }
+        generic: continue
+
+  - id: ds-verify
+    owner_role: design-lead
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: approve
+        to: handoff
+        assign: { mode: auto }
+        generic: continue
+      - command: request-changes
+        to: design-system-update
+        assign: { mode: auto }
+        generic: revision
+        feedback:
+          required: true
+          category_enum:
+            - visual-language
+            - motion-behavior
+            - token-discipline
+            - off-brief
+            - craft
+            - infra
+            - interaction
+
+  - id: handoff
+    owner_role: design-lead
+    kind: normal
+    native_state: todo
+    # Terminal steward step (Laren's answer to Matt's design→dev question):
+    # decide what follow-on work the approved design implies — dev-impl, asset
+    # task, 3D task, several, or none — create + delegate those tickets as
+    # children/related, each carrying its OWN workflow. wf:design never
+    # auto-spawns and never reaches into spawned tickets.
+    transitions:
+      - command: complete
+        to: done
+        generic: continue
+
+  - id: done
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true
+
+  - id: escape
+    kind: terminal
+    native_state: invalid
