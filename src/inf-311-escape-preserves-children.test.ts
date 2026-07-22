@@ -76,6 +76,7 @@ states:
     owner_role: steward
     kind: normal
     native_state: doing
+    generic: continue
     transitions:
       - command: continue
         to: managing-arms
@@ -658,13 +659,13 @@ describe("INF-311 AC3: escape never leaves children in state:escape with zero le
     expect(bgToMatch).not.toBeNull();
     const bgTo = bgToMatch![1];
 
-    // Extract the state block for the destination
-    const stateBlock = armYaml.split(`- id: ${bgTo}`)[1];
-    expect(stateBlock).not.toBeUndefined();
+    // Extract the state block for the destination — use a state-delimiting
+    // split to isolate only the target state's block (not everything after it).
+    const stateBlock = armYaml.split(`- id: ${bgTo}`)[1]?.split(/\n(?=\s+- id:)/s)?.[0] ?? "";
 
     // If the state is `kind: terminal`, it's a dead-end — LIF-182/183.
     // After the fix, break_glass.to should target a `kind: normal` state.
-    const isTerminal = stateBlock!.includes("kind: terminal");
+    const isTerminal = stateBlock.includes("kind: terminal");
     // FAILING: currently escape is kind: terminal with zero transitions.
     expect(isTerminal).toBe(false);
   });
