@@ -23,7 +23,7 @@ import yaml from "js-yaml";
 import { getWorkflowId, getCurrentState, type WorkflowDef } from "./workflow-gate.js";
 import { isManagedBarrierFromLabels } from "./barrier.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
-import { registerCron, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -316,6 +316,8 @@ export function registerSlaSweepCron(opts: SlaSweepOptions): ReturnType<typeof s
       // but a whole-sweep failure (e.g. unreadable workflowDefPath) must not
       // be silent — that would be dead-code-in-prod with a registry entry.
       console.error(`[sla-sweep] sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+    }).finally(() => {
+      markCronRun("sla-sweep");
     });
   }, cadenceMs);
   if (typeof timer.unref === "function") timer.unref();

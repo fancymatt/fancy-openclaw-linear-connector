@@ -15,7 +15,7 @@
  */
 
 import { componentLogger, createLogger } from "./logger.js";
-import { registerCron, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 import { runRegistryPolicyCheck } from "./registry-policy.js";
 
 const log = componentLogger(
@@ -76,6 +76,8 @@ export function registerRegistryIntegrityCron(
         log.error(
           `registry-integrity: unexpected check failure: ${err instanceof Error ? err.message : String(err)}`,
         );
+      }).finally(() => {
+        markCronRun("registry-integrity-check");
       });
   }, intervalMs);
 

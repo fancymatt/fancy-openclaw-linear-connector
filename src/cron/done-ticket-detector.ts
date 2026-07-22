@@ -20,7 +20,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createLogger, componentLogger } from "../logger.js";
-import { registerCron, formatIntervalMs } from "./registry.js";
+import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import {
   recordDetectorRun,
   recordDetectorSkip,
@@ -355,6 +355,8 @@ async function runScanIteration(): Promise<void> {
     const msg = err instanceof Error ? err.message : String(err);
     log.error(`[done-ticket-detector] Scan failed: ${msg}`);
     recordDetectorFail(msg);
+  } finally {
+    markCronRun("done-ticket-detector");
   }
 }
 

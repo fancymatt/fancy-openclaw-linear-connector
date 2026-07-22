@@ -27,6 +27,7 @@ import { isBarrierState, resolveBarrierTarget } from "../barrier.js";
 import fs from "node:fs/promises";
 import yaml from "js-yaml";
 import { createLogger, componentLogger } from "../logger.js";
+import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import { type WorkflowDef } from "../workflow-gate.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "anti-entropy");
@@ -444,6 +445,8 @@ export function registerAntiEntropyCron(opts?: {
     process.env.LINEAR_API_KEY ??
     "";
 
+  registerCron("anti-entropy", `every ${formatIntervalMs(intervalMs)}`);
+
   const timer = setInterval(() => {
     void (async () => {
       try {
@@ -461,6 +464,8 @@ export function registerAntiEntropyCron(opts?: {
         log.error(
           `[anti-entropy] Scheduled pass failed: ${err instanceof Error ? err.message : String(err)}`,
         );
+      } finally {
+        markCronRun("anti-entropy");
       }
     })();
   }, intervalMs);

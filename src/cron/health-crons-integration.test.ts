@@ -29,6 +29,7 @@ const DIST_ENTRY = path.resolve(__dirname, "../../dist/index.js");
 
 // Every driver the production bootstrap is expected to schedule.
 const EXPECTED_CRONS = [
+  "anti-entropy", // INF-122: periodic transition-atomicity anti-entropy reconciliation loop
   "bootstrap-reconciliation-sweep",
   "config-sanity-alert", // AI-2619: config-sanity watchdog alert consumer
   "delegation-reconciliation-sweep",
