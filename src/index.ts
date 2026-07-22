@@ -74,6 +74,7 @@ import { getAccessToken, getAgent, getLinearUserIdForAgent, getAllTokenStatuses,
 import { loadUniversalCanon, getCanonLiveness } from "./policy/universal-canon.js";
 import { loadRoster, getRoutingFunctionaryLiveness } from "./department-roster.js";
 import { createGuidanceRouter, getDocsLiveness } from "./docs/guidance-router.js";
+import { createHealthSnapshotRouter, getSnapshotLiveness, registerSnapshot } from "./health/snapshot.js";
 import { TtlCache, buildFullCacheLiveness, markCacheFlushRouteMounted, registerTtlInvalidationCron } from "./cache/ttl-cache.js";
 import { DispatchRecordStore } from "./liveness-channel/dispatch-record-store.js";
 import { LivenessChannelEndpoint } from "./liveness-channel/index.js";
@@ -486,6 +487,10 @@ export function createApp(options?: CreateAppOptions) {
       // and a computed state (healthy/stale/expired/failing). Powers the
       // console token panel (AI-1955 AC3) and operator triage without log access.
       tokens: getAllTokenStatuses(),
+      // INF-322 AC4: health snapshot endpoint liveness — confirms the route
+      // is wired at bootstrap, observable at ac-validate without waiting for
+      // a health event to fire.
+      healthSnapshot: getSnapshotLiveness(),
       dispatchCircuitBreaker: getCircuitBreakerHealth(),
       // AI-2116 AC8/AC9: dispatch watchdog hardening liveness — confirms the
       // retry-hardening and precondition-guard features are wired and active,
@@ -518,6 +523,12 @@ export function createApp(options?: CreateAppOptions) {
       remediationActor: getRemediationHealth(),
     });
   });
+
+  // INF-322: health snapshot endpoint — registered at bootstrap so GET
+  // /health/snapshot returns 200 immediately. Mark the route active so
+  // /health.healthSnapshot.active === true proves the wiring.
+  app.use("/health", createHealthSnapshotRouter());
+  registerSnapshot();
 
   // AI-1849 (Pillar 2 D2): docs endpoint — serves instance-config docs to
   // authenticated agents using their lpx proxy token (read-only, no admin secret).
