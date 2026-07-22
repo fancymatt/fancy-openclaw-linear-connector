@@ -1016,3 +1016,239 @@ describe("registerDelegationReconciliationCron: behavioral — heal produces ale
     expect(wakeDispatches).toHaveLength(0);
   });
 });
+// ══════════════════════════════════════════════════════════════════════════
+// INF-332 AC1: Pagination — queryGovernedTickets must iterate all pages via
+//      first: + after: cursor + pageInfo.hasNextPage loop.
+//      Without pagination, any ticket beyond the default page-1 slice is invisible.
+// ══════════════════════════════════════════════════════════════════════════
+
+describe("INF-332 AC1: queryGovernedTickets returns all tickets across paginated pages", () => {
+
+  /** Mock fetch that simulates paginated GraphQL for the governed-tickets query.
+   *
+   * Recognizes `first:` / `after:` params in the query body. Returns
+   * PAGE_SIZE (5) tickets per page with pageInfo.hasNextPage and pageInfo.endCursor.
+   * If the implementation does NOT include first:/after:, all tickets are returned
+   * at once — the paginated mock only hands out one page per call, proving
+   * the implementation must loop.
+   */
+  function makePaginatedGovernedFetch(totalTickets: MockTicket[]): typeof fetch {
+    return async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+
+      // Only intercept the governed-tickets query — exclude AdhocDelegationReconciliation
+      if (body.includes("AdhocDelegationReconciliation") || (!body.includes("DelegationReconciliation") && !body.includes("wf:"))) {
+        // Pass through for other queries (issue re-fetch, issueUpdate, history)
+        if (body.includes("IssueContext") || body.includes("IssueWithLabels")) {
+          const ticket = totalTickets[0];
+          if (ticket) {
+            return new Response(
+              JSON.stringify({
+                data: {
+                  issue: {
+                    id: ticket.id,
+                    identifier: ticket.identifier,
+                    title: ticket.title ?? `Ticket ${ticket.identifier}`,
+                    labels: { nodes: ticket.labels },
+                    delegate: ticket.delegateId
+                      ? { id: ticket.delegateId, name: ticket.delegateName }
+                      : null,
+                    team: { id: ticket.teamId },
+                  },
+                },
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+        }
+        if (body.includes("issueUpdate")) {
+          return new Response(
+            JSON.stringify({ data: { issueUpdate: { success: true } } }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        if (body.includes("TicketDelegateHistory")) {
+          return new Response(
+            JSON.stringify({
+              data: {
+                issue: {
+                  history: { nodes: [] },
+                },
+              },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response(JSON.stringify({ data: {} }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      // Parse pagination params from the query body
+      const afterMatch = body.match(/after:\s*"([^"]*)"/);
+      const after = afterMatch?.[1] ?? null;
+      const firstMatch = body.match(/first:\s*(\d+)/);
+      const first = firstMatch ? parseInt(firstMatch[1], 10) : PAGE_SIZE;
+
+      // Determine slice position from cursor
+      let startIdx = 0;
+      if (after !== null) {
+        startIdx = parseInt(after, 10) + 1;
+      }
+      const page = totalTickets.slice(startIdx, startIdx + first);
+      const nextStart = startIdx + first;
+      const hasNextPage = nextStart < totalTickets.length;
+      const endCursor = hasNextPage ? String(nextStart - 1) : null;
+
+      const nodes = page.map((t) => ({
+        id: t.id,
+        identifier: t.identifier,
+        updatedAt: t.updatedAt,
+        title: t.title ?? `Ticket ${t.identifier}`,
+        labels: { nodes: t.labels },
+        delegate: t.delegateId ? { id: t.delegateId, name: t.delegateName } : null,
+        team: { id: t.teamId },
+      }));
+
+      return new Response(
+        JSON.stringify({
+          data: {
+            issues: {
+              nodes,
+              pageInfo: { hasNextPage, endCursor },
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    };
+  }
+
+  it("processes all governed tickets when results span multiple pages (first: + after: cursor loop)", async () => {
+    // 13 governed tickets across 3 pages (5 + 5 + 3) — all stranded
+    // (no dispatch record, non-terminal). Expected: all 13 scanned, all 13 healed.
+    const tickets: MockTicket[] = Array.from({ length: 13 }, (_, i) => ({
+      id: `gov-page-${i}`,
+      identifier: `GOV-${100 + i}`,
+      updatedAt: OLD_TIMESTAMP,
+      labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+      delegateId: DELEGATE_LINEAR_ID,
+      delegateName: DELEGATE_AGENT_NAME,
+      teamId: TEAM_ID,
+    }));
+
+    const eventStore = makeEventStore();
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makePaginatedGovernedFetch(tickets);
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (_, id) => { wakeDispatches.push(id); },
+    });
+
+    // If pagination is missing (no first:/after: loop), only the first
+    // page (5 tickets) would be scanned, not all 13.
+    expect(result.scanned).toBe(13);
+    expect(result.healed).toBe(13);
+    expect(wakeDispatches).toHaveLength(13);
+    eventStore.close();
+  });
+
+  it("handles empty governed-ticket results gracefully (zero pages)", async () => {
+    const eventStore = makeEventStore();
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makePaginatedGovernedFetch([]);
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async () => {},
+    });
+
+    expect(result.scanned).toBe(0);
+    expect(result.healed).toBe(0);
+    expect(result.errors).toHaveLength(0);
+    eventStore.close();
+  });
+
+  it("handles single-page governed results correctly", async () => {
+    const tickets: MockTicket[] = Array.from({ length: 3 }, (_, i) => ({
+      id: `gov-single-${i}`,
+      identifier: `GOV-SINGLE-${i}`,
+      updatedAt: OLD_TIMESTAMP,
+      labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+      delegateId: DELEGATE_LINEAR_ID,
+      delegateName: DELEGATE_AGENT_NAME,
+      teamId: TEAM_ID,
+    }));
+
+    const eventStore = makeEventStore();
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makePaginatedGovernedFetch(tickets);
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (_, id) => { wakeDispatches.push(id); },
+    });
+
+    expect(result.scanned).toBe(3);
+    expect(result.healed).toBe(3);
+    expect(wakeDispatches).toHaveLength(3);
+    eventStore.close();
+  });
+
+  it("single-ticket mode (ticketIdentifiers) works with paginated governed results", async () => {
+    const tickets: MockTicket[] = Array.from({ length: 10 }, (_, i) => ({
+      id: `gov-ti-${i}`,
+      identifier: `GOV-TI-${i}`,
+      updatedAt: OLD_TIMESTAMP,
+      labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+      delegateId: DELEGATE_LINEAR_ID,
+      delegateName: DELEGATE_AGENT_NAME,
+      teamId: TEAM_ID,
+    }));
+
+    // Add the target ticket
+    tickets.push({
+      id: "gov-target",
+      identifier: "GOV-TARGET",
+      updatedAt: OLD_TIMESTAMP,
+      labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+      delegateId: DELEGATE_LINEAR_ID,
+      delegateName: DELEGATE_AGENT_NAME,
+      teamId: TEAM_ID,
+    });
+
+    const eventStore = makeEventStore();
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makePaginatedGovernedFetch(tickets);
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      ticketIdentifiers: ["GOV-TARGET"],
+      wakeFn: async (_, id) => { wakeDispatches.push(id); },
+    });
+
+    // All pages still fetched for client-side filter; exactly 1 target healed
+    expect(result.healed).toBe(1);
+    expect(wakeDispatches).toHaveLength(1);
+    expect(wakeDispatches[0]).toBe("GOV-TARGET");
+    eventStore.close();
+  });
+});
+

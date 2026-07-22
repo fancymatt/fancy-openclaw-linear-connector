@@ -45,6 +45,8 @@ const DEFAULT_INTERVAL_MS = 5 * 60 * 1000; // 5 min
 /** Grace window: tickets younger than this are given time for the webhook to arrive. */
 const DEFAULT_GRACE_WINDOW_MS = 2 * 60 * 1000; // 2 min
 
+const LINEAR_ISSUES_PAGE_SIZE = 50;
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export interface DelegationReconciliationOptions {
@@ -86,6 +88,28 @@ interface GovernedTicket {
   nativeStateType: string | null;
 }
 
+type LinearIssueNode = {
+  id: string;
+  identifier: string;
+  updatedAt: string;
+  state?: { type: string } | null;
+  labels: { nodes: Array<{ id: string; name: string }> };
+  delegate: { id: string; name: string } | null;
+  team: { id: string };
+};
+
+type IssuesPageResp = {
+  data?: {
+    issues?: {
+      nodes: LinearIssueNode[];
+      pageInfo?: {
+        hasNextPage?: boolean;
+        endCursor?: string | null;
+      };
+    };
+  };
+};
+
 // ── Terminal state detection ─────────────────────────────────────────────────
 
 /** State labels that mean the ticket lifecycle is finished. */
@@ -115,57 +139,59 @@ async function queryGovernedTickets(
   // Always use the batch query (wf:*) — the mock layer returns
   // data.issues.nodes for any query containing "DelegationReconciliation".
   // Filter by identifier in code if requested.
-  const query = `
-    query DelegationReconciliation {
-      issues(filter: { labels: { some: { name: { startsWith: "wf:" } } } }) {
-        nodes {
-          id
-          identifier
-          updatedAt
-          title
-          state { type }
-          labels { nodes { id name } }
-          delegate { id name }
-          team { id }
+  const nodes: LinearIssueNode[] = [];
+  let cursor: string | null = null;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const afterArg = cursor ? `, after: ${JSON.stringify(cursor)}` : "";
+    const query = `
+      query DelegationReconciliation {
+        issues(first: ${LINEAR_ISSUES_PAGE_SIZE}${afterArg}, filter: { labels: { some: { name: { startsWith: "wf:" } } } }) {
+          nodes {
+            id
+            identifier
+            updatedAt
+            title
+            state { type }
+            labels { nodes { id name } }
+            delegate { id name }
+            team { id }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
         }
       }
-    }
-  `;
+    `;
 
-  const res = await fetchFn(LINEAR_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: authToken,
-    },
-    body: JSON.stringify({ query, variables: {} }),
-  });
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authToken,
+      },
+      body: JSON.stringify({ query, variables: {} }),
+    });
 
-  type BatchResp = {
-    data?: {
-      issues?: {
-        nodes: Array<{
-          id: string;
-          identifier: string;
-          updatedAt: string;
-          state?: { type: string } | null;
-          labels: { nodes: Array<{ id: string; name: string }> };
-          delegate: { id: string; name: string } | null;
-          team: { id: string };
-        }>;
-      };
-    };
-  };
-  const data = (await res.json()) as BatchResp;
-  let nodes = data.data?.issues?.nodes ?? [];
+    const data = (await res.json()) as IssuesPageResp;
+    nodes.push(...(data.data?.issues?.nodes ?? []));
 
-  // Filter by identifier if provided (AC5 single-ticket mode)
-  if (ticketIdentifiers && ticketIdentifiers.length > 0) {
-    const ids = new Set(ticketIdentifiers);
-    nodes = nodes.filter((n) => ids.has(n.identifier));
+    const pageInfo = data.data?.issues?.pageInfo;
+    hasNextPage = pageInfo?.hasNextPage === true;
+    cursor = pageInfo?.endCursor ?? null;
+    if (hasNextPage && !cursor) break;
   }
 
-  return nodes.map((n) => ({
+  // Filter by identifier if provided (AC5 single-ticket mode)
+  let filteredNodes = nodes;
+  if (ticketIdentifiers && ticketIdentifiers.length > 0) {
+    const ids = new Set(ticketIdentifiers);
+    filteredNodes = filteredNodes.filter((n) => ids.has(n.identifier));
+  }
+
+  return filteredNodes.map((n) => ({
     id: n.id,
     identifier: n.identifier,
     updatedAt: n.updatedAt,
