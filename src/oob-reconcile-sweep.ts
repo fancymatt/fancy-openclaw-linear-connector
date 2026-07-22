@@ -27,7 +27,7 @@ import { componentLogger, createLogger } from "./logger.js";
 import type { MutationAuditStore, MutationAuditRecord, ChangeType } from "./store/mutation-audit-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
-import { registerCron, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "oob-reconcile");
 
@@ -202,7 +202,9 @@ export function registerOobReconcileCron(
   registerCron("oob-reconcile-sweep", formatIntervalMs(interval));
 
   setInterval(() => {
-    reconcileOobMutations(store, { operationalEventStore }).catch((err) => {
+    reconcileOobMutations(store, { operationalEventStore }).then(() => {
+      markCronRun("oob-reconcile-sweep");
+    }).catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
       log.error(`reconcile sweep failed: ${msg}`);
     });

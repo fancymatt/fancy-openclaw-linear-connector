@@ -27,7 +27,7 @@ import {
   applyBootstrapToIssue,
 } from "./workflow-bootstrap.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
-import { registerCron, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
 import { OperationalEventStore, type OperationalEventStore as OperationalEventStoreType } from "./store/operational-event-store.js";
 import type { SessionTracker } from "./bag/session-tracker.js";
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
@@ -683,6 +683,8 @@ export function registerDelegationReconciliationCron(opts: {
       sessionTracker: opts.sessionTracker,
       fetchFn: opts.fetchFn,
       dispatchLeaseStore: opts.dispatchLeaseStore,
+    }).then(() => {
+      markCronRun("delegation-reconciliation-sweep");
     }).catch((err) => {
       log.error(
         `delegation-reconciliation: unexpected sweep failure: ${err instanceof Error ? err.message : String(err)}`,
