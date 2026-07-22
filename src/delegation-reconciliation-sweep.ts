@@ -98,6 +98,10 @@ function hasStateLabel(labels: Array<{ name: string }>): boolean {
   return labels.some((l) => l.name.startsWith("state:"));
 }
 
+function hasWfLabel(labels: Array<{ name: string }>): boolean {
+  return labels.some((l) => l.name.startsWith("wf:"));
+}
+
 // ── Linear API query ─────────────────────────────────────────────────────────
 
 /**
@@ -115,6 +119,75 @@ async function queryGovernedTickets(
   const query = `
     query DelegationReconciliation {
       issues(filter: { labels: { some: { name: { startsWith: "wf:" } } } }) {
+        nodes {
+          id
+          identifier
+          updatedAt
+          title
+          labels { nodes { id name } }
+          delegate { id name }
+          team { id }
+        }
+      }
+    }
+  `;
+
+  const res = await fetchFn(LINEAR_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: authToken,
+    },
+    body: JSON.stringify({ query, variables: {} }),
+  });
+
+  type BatchResp = {
+    data?: {
+      issues?: {
+        nodes: Array<{
+          id: string;
+          identifier: string;
+          updatedAt: string;
+          labels: { nodes: Array<{ id: string; name: string }> };
+          delegate: { id: string; name: string } | null;
+          team: { id: string };
+        }>;
+      };
+    };
+  };
+  const data = (await res.json()) as BatchResp;
+  let nodes = data.data?.issues?.nodes ?? [];
+
+  // Filter by identifier if provided (AC5 single-ticket mode)
+  if (ticketIdentifiers && ticketIdentifiers.length > 0) {
+    const ids = new Set(ticketIdentifiers);
+    nodes = nodes.filter((n) => ids.has(n.identifier));
+  }
+
+  return nodes.map((n) => ({
+    id: n.id,
+    identifier: n.identifier,
+    updatedAt: n.updatedAt,
+    labels: n.labels.nodes,
+    delegateId: n.delegate?.id ?? null,
+    delegateName: n.delegate?.name ?? null,
+    teamId: n.team.id,
+  }));
+}
+
+/**
+ * Query Linear for ad-hoc delegated tickets (no wf:* label, has delegate set).
+ * INF-287: catches tickets delegated outside the workflow engine whose
+ * delegate-change webhook was dropped.
+ */
+async function queryAdhocDelegatedTickets(
+  authToken: string,
+  fetchFn: typeof fetch,
+  ticketIdentifiers?: string[],
+): Promise<GovernedTicket[]> {
+  const query = `
+    query AdhocDelegationReconciliation {
+      issues(filter: { labels: { none: { name: { startsWith: "wf:" } } }, delegate: { isSet: true } }) {
         nodes {
           id
           identifier
@@ -329,11 +402,17 @@ export async function runDelegationReconciliationSweep(
   // ── Query ──────────────────────────────────────────────────────────────
   let tickets: GovernedTicket[];
   try {
-    tickets = await queryGovernedTickets(
+    const governedTickets = await queryGovernedTickets(
       authToken,
       fetchFn,
       opts.ticketIdentifiers,
     );
+    const adhocTickets = await queryAdhocDelegatedTickets(
+      authToken,
+      fetchFn,
+      opts.ticketIdentifiers,
+    );
+    tickets = [...governedTickets, ...adhocTickets];
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     result.errors.push(`query failed: ${msg}`);
@@ -363,7 +442,7 @@ export async function runDelegationReconciliationSweep(
     if (isTerminal(ticket.labels)) continue;
 
     // ── AC2: wf:* but no state:* and no delegate (dropped enrollment) ────
-    if (!hasStateLabel(ticket.labels) && !ticket.delegateId) {
+    if (!hasStateLabel(ticket.labels) && !ticket.delegateId && hasWfLabel(ticket.labels)) {
       try {
         // Re-fetch fresh context for idempotency
         const issue = await fetchIssueContext(ticket.id, authToken);
@@ -496,7 +575,7 @@ export async function runDelegationReconciliationSweep(
     }
 
     // ── AC1: Enrolled ticket with delegate but no dispatch record ───────
-    if (ticket.delegateId && ticket.delegateName && hasStateLabel(ticket.labels)) {
+    if (ticket.delegateId && ticket.delegateName) {
       // Check idempotency (AC4): has this delegate been dispatched since
       // they were set? Use the real delegate-set timestamp from Linear
       // history, NOT ticket.updatedAt (which changes on any mutation).

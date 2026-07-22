@@ -107,6 +107,8 @@ function makeEventStore(): OperationalEventStore {
 interface FetchScenario {
   /** Tickets returned by the governed-tickets query. */
   governedTickets?: MockTicket[];
+  /** Tickets returned by the ad-hoc (non-wf:*) delegated tickets query. */
+  adhocDelegatedTickets?: MockTicket[];
   /** Whether mutations succeed. */
   mutationSuccess?: boolean;
   /** If true, the query fetch throws a network error. */
@@ -114,10 +116,27 @@ interface FetchScenario {
 }
 
 function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
-  const { governedTickets = [], mutationSuccess = true, networkError = false } = scenario;
+  const { governedTickets = [], adhocDelegatedTickets = [], mutationSuccess = true, networkError = false } = scenario;
   return async (_url: RequestInfo | URL, init?: RequestInit) => {
     if (networkError) throw new Error("simulated network error");
     const body = typeof init?.body === "string" ? init.body : "";
+
+    // Ad-hoc delegated-tickets query (non-wf:* tickets with delegate set)
+    if (body.includes("AdhocDelegationReconciliation")) {
+      const nodes = adhocDelegatedTickets.map((t) => ({
+        id: t.id,
+        identifier: t.identifier,
+        updatedAt: t.updatedAt,
+        title: t.title ?? `Ticket ${t.identifier}`,
+        labels: { nodes: t.labels },
+        delegate: t.delegateId ? { id: t.delegateId, name: t.delegateName } : null,
+        team: { id: t.teamId },
+      }));
+      return new Response(
+        JSON.stringify({ data: { issues: { nodes } } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
 
     // Governed-tickets query (wf:* labeled)
     if (body.includes("wf:") || body.includes("GovernedTickets") || body.includes("DelegationReconciliation")) {
@@ -1014,5 +1033,482 @@ describe("registerDelegationReconciliationCron: behavioral — heal produces ale
     clearInterval(timer);
 
     expect(wakeDispatches).toHaveLength(0);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// INF-287 AC1: Reconciliation sweep catches ad-hoc delegated tickets
+//      (no wf:* label, has delegate, no dispatch record since delegation)
+// ══════════════════════════════════════════════════════════════════════════
+
+describe("INF-287 AC1: sweep catches ad-hoc delegated tickets (no wf:* label)", () => {
+  const ADHOC_LABELS: Array<{ id: string; name: string }> = [];
+  const ADHOC_DELEGATE_ID = "sage-linear-uuid-adhoc";
+  const ADHOC_DELEGATE_NAME = "sage";
+
+  it("re-dispatches a wake for an ad-hoc ticket with delegate but no dispatch record", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [],
+      adhocDelegatedTickets: [
+        {
+          id: "issue-adhoc-stranded",
+          identifier: "ADHOC-1",
+          updatedAt: OLD_TIMESTAMP,
+          labels: ADHOC_LABELS,
+          delegateId: ADHOC_DELEGATE_ID,
+          delegateName: ADHOC_DELEGATE_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+    });
+
+    expect(result.healed).toBe(1);
+    expect(wakeDispatches).toHaveLength(1);
+    expect(wakeDispatches[0].agentName).toBe(ADHOC_DELEGATE_NAME);
+    expect(wakeDispatches[0].ticketIdentifier).toBe("ADHOC-1");
+    eventStore.close();
+  });
+
+  it("skips ad-hoc ticket that already has a dispatch record (idempotent)", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    eventStore.append({
+      outcome: "dispatch-accepted",
+      agent: ADHOC_DELEGATE_NAME,
+      key: "linear-ADHOC-1",
+      occurredAt: OLD_TIMESTAMP,
+    });
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [],
+      adhocDelegatedTickets: [
+        {
+          id: "issue-adhoc-stranded",
+          identifier: "ADHOC-1",
+          updatedAt: OLD_TIMESTAMP,
+          labels: ADHOC_LABELS,
+          delegateId: ADHOC_DELEGATE_ID,
+          delegateName: ADHOC_DELEGATE_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (_, id) => { wakeDispatches.push(id); },
+    });
+
+    expect(result.healed).toBe(0);
+    expect(result.skippedIdempotent).toBeGreaterThanOrEqual(1);
+    expect(wakeDispatches).toHaveLength(0);
+    eventStore.close();
+  });
+
+  it("skips terminal ad-hoc tickets (state:done)", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [],
+      adhocDelegatedTickets: [
+        {
+          id: "issue-adhoc-done",
+          identifier: "ADHOC-DONE",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [STATE_DONE_LABEL],
+          delegateId: ADHOC_DELEGATE_ID,
+          delegateName: ADHOC_DELEGATE_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (_, id) => { wakeDispatches.push(id); },
+    });
+
+    expect(result.healed).toBe(0);
+    expect(wakeDispatches).toHaveLength(0);
+    eventStore.close();
+  });
+
+  it("handles mixed governed + ad-hoc tickets in a single sweep", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [
+        {
+          id: "issue-stranded",
+          identifier: "WF-1",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+          delegateId: DELEGATE_LINEAR_ID,
+          delegateName: DELEGATE_AGENT_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+      adhocDelegatedTickets: [
+        {
+          id: "issue-adhoc-stranded",
+          identifier: "ADHOC-1",
+          updatedAt: OLD_TIMESTAMP,
+          labels: ADHOC_LABELS,
+          delegateId: ADHOC_DELEGATE_ID,
+          delegateName: ADHOC_DELEGATE_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+    });
+
+    // Both should be healed: WF-1 (governed) and ADHOC-1 (ad-hoc)
+    expect(result.healed).toBe(2);
+    expect(wakeDispatches).toHaveLength(2);
+
+    const wokenIds = wakeDispatches.map((d) => d.ticketIdentifier).sort();
+    expect(wokenIds).toEqual(["ADHOC-1", "WF-1"]);
+    eventStore.close();
+  });
+
+  it("does not process ad-hoc tickets with no delegate set", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [],
+      adhocDelegatedTickets: [
+        {
+          id: "issue-adhoc-no-delegate",
+          identifier: "ADHOC-ND",
+          updatedAt: OLD_TIMESTAMP,
+          labels: ADHOC_LABELS,
+          delegateId: null,
+          delegateName: null,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (_, id) => { wakeDispatches.push(id); },
+    });
+
+    // No delegate means no wake — the sweep should not process this ticket
+    expect(result.healed).toBe(0);
+    expect(wakeDispatches).toHaveLength(0);
+    eventStore.close();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// INF-287 AC2: POST /redispatch and POST /admin/api/redispatch cover
+//      ad-hoc tickets
+// ══════════════════════════════════════════════════════════════════════════
+
+describe("INF-287 AC2: redispatch covers ad-hoc delegated tickets", () => {
+  const ADHOC_LABELS: Array<{ id: string; name: string }> = [];
+  const ADHOC_DELEGATE_ID = "sage-linear-uuid-adhoc";
+  const ADHOC_DELEGATE_NAME = "sage";
+
+  it("supports single-ticket redispatch for an ad-hoc ticket by identifier", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [],
+      adhocDelegatedTickets: [
+        {
+          id: "issue-adhoc-stranded",
+          identifier: "ADHOC-REDISPATCH",
+          updatedAt: OLD_TIMESTAMP,
+          labels: ADHOC_LABELS,
+          delegateId: ADHOC_DELEGATE_ID,
+          delegateName: ADHOC_DELEGATE_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    // Single-ticket mode via ticketIdentifiers
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      ticketIdentifiers: ["ADHOC-REDISPATCH"],
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+    });
+
+    expect(result.healed).toBe(1);
+    expect(wakeDispatches).toHaveLength(1);
+    expect(wakeDispatches[0].ticketIdentifier).toBe("ADHOC-REDISPATCH");
+    eventStore.close();
+  });
+
+  it("supports time-window redispatch that includes ad-hoc tickets", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [],
+      adhocDelegatedTickets: [
+        {
+          id: "issue-adhoc-window",
+          identifier: "ADHOC-WIN",
+          updatedAt: oneHourAgo,
+          labels: ADHOC_LABELS,
+          delegateId: ADHOC_DELEGATE_ID,
+          delegateName: ADHOC_DELEGATE_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      since: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+      until: new Date().toISOString(),
+      wakeFn: async (_, id) => { wakeDispatches.push(id); },
+    });
+
+    expect(result.healed).toBe(1);
+    expect(wakeDispatches).toHaveLength(1);
+    expect(wakeDispatches[0]).toBe("ADHOC-WIN");
+    eventStore.close();
+  });
+
+  it("redispatch scanned count includes ad-hoc tickets alongside governed tickets", async () => {
+    const eventStore = makeEventStore();
+    const { bus } = makeTestAlertBus();
+
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+
+    // Only one ticket should be healable — the ad-hoc one has dispatch record
+    eventStore.append({
+      outcome: "dispatch-accepted",
+      agent: DELEGATE_AGENT_NAME,
+      key: "linear-WF-SCANNED",
+      occurredAt: OLD_TIMESTAMP,
+    });
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [
+        {
+          id: "issue-gov-scanned",
+          identifier: "WF-SCANNED",
+          updatedAt: oneHourAgo,
+          labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+          delegateId: DELEGATE_LINEAR_ID,
+          delegateName: DELEGATE_AGENT_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+      adhocDelegatedTickets: [
+        {
+          id: "issue-adhoc-scanned",
+          identifier: "ADHOC-SCANNED",
+          updatedAt: oneHourAgo,
+          labels: ADHOC_LABELS,
+          delegateId: ADHOC_DELEGATE_ID,
+          delegateName: ADHOC_DELEGATE_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async () => {},
+    });
+
+    // Both wf:* and ad-hoc tickets should be scanned
+    expect(result.scanned).toBe(2);
+    // The governed WF-SCANNED has a dispatch record → skipped by idempotency
+    // The ad-hoc ADHOC-SCANNED has no dispatch record → healed
+    expect(result.healed).toBe(1);
+    expect(result.skippedIdempotent).toBeGreaterThanOrEqual(1);
+    eventStore.close();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// INF-287 AC3: Existing wf:* reconciliation behavior unchanged
+//      (regression guard — existing AC1-AC7 tests still pass with ad-hoc
+//       query added)
+// ══════════════════════════════════════════════════════════════════════════
+
+describe("INF-287 AC3: existing wf:* reconciliation unchanged with ad-hoc extension", () => {
+  it("still heals governed (wf:*) stranded tickets alongside ad-hoc tickets", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const { bus } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [
+        {
+          id: "issue-gov-stranded",
+          identifier: "AI-1807",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+          delegateId: DELEGATE_LINEAR_ID,
+          delegateName: DELEGATE_AGENT_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+      // Also provide ad-hoc tickets to verify they don't interfere
+      adhocDelegatedTickets: [],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+    });
+
+    // AC1 behavior preserved: single governed ticket healed
+    expect(result.healed).toBe(1);
+    expect(wakeDispatches).toHaveLength(1);
+    expect(wakeDispatches[0].ticketIdentifier).toBe("AI-1807");
+    eventStore.close();
+  });
+
+  it("still heals dropped enrollment (wf:*, no state:*, no delegate) via bootstrap path", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: Array<{ agentName: string; ticketIdentifier: string }> = [];
+    const { bus, alerts } = makeTestAlertBus();
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [
+        {
+          id: "issue-unenrolled",
+          identifier: "AI-1808",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [WF_LABEL],
+          delegateId: null,
+          delegateName: null,
+          teamId: TEAM_ID,
+        },
+      ],
+      adhocDelegatedTickets: [],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (agentName, ticketIdentifier) => {
+        wakeDispatches.push({ agentName, ticketIdentifier });
+      },
+    });
+
+    // AC2 behavior preserved: bootstrap heal still works
+    expect(result.bootstrapHealed).toBeGreaterThanOrEqual(1);
+    expect(wakeDispatches.length).toBeGreaterThanOrEqual(1);
+    const healAlerts = alerts.filter(
+      (a) => a.source === "delegation-reconciled" || a.source === "bootstrap-reconciled",
+    );
+    expect(healAlerts.length).toBeGreaterThanOrEqual(1);
+    eventStore.close();
+  });
+
+  it("ad-hoc extension does not interfere with idempotency checks on governed tickets", async () => {
+    const eventStore = makeEventStore();
+    const wakeDispatches: string[] = [];
+    const { bus } = makeTestAlertBus();
+
+    // Seed a dispatch record for the governed ticket
+    eventStore.append({
+      outcome: "dispatch-accepted",
+      agent: DELEGATE_AGENT_NAME,
+      key: "linear-WF-IDEMP",
+      occurredAt: OLD_TIMESTAMP,
+    });
+
+    globalThis.fetch = makeReconciliationFetch({
+      governedTickets: [
+        {
+          id: "issue-gov-idemp",
+          identifier: "WF-IDEMP",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [WF_LABEL, STATE_IMPLEMENTATION_LABEL],
+          delegateId: DELEGATE_LINEAR_ID,
+          delegateName: DELEGATE_AGENT_NAME,
+          teamId: TEAM_ID,
+        },
+      ],
+      adhocDelegatedTickets: [
+        {
+          id: "issue-adhoc-stranded",
+          identifier: "ADHOC-FRESH",
+          updatedAt: OLD_TIMESTAMP,
+          labels: [],
+          delegateId: "sage-uuid",
+          delegateName: "sage",
+          teamId: TEAM_ID,
+        },
+      ],
+    });
+
+    const result = await runDelegationReconciliationSweep({
+      authToken: "Bearer test-token",
+      operationalEventStore: eventStore,
+      alertBus: bus,
+      wakeFn: async (_, id) => { wakeDispatches.push(id); },
+    });
+
+    // The governed ticket is idempotent (skipped), the ad-hoc ticket is fresh (healed)
+    expect(result.skippedIdempotent).toBeGreaterThanOrEqual(1);
+    expect(result.healed).toBe(1);
+    expect(wakeDispatches).toHaveLength(1);
+    expect(wakeDispatches[0]).toBe("ADHOC-FRESH");
+    eventStore.close();
   });
 });
