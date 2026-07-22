@@ -46,6 +46,7 @@ import { registerDelegationReconciliationCron, runDelegationReconciliationSweep 
 import { registerStalePlainDelegateCron } from "./stale-plain-delegate-sweep.js";
 import { registerRegistryIntegrityCron } from "./registry-integrity-cron.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
+import { wireDispositionGate, getDispositionGateLiveness } from "./alerts/alert-disposition-gate.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerLabelSyncAuditCron } from "./cron/label-sync-audit.js";
 import { registerAntiEntropyCron } from "./cron/anti-entropy.js";
@@ -511,6 +512,10 @@ export function createApp(options?: CreateAppOptions) {
       // the .env has the wrong LINEAR_CONNECTOR_ENCRYPTION_KEY / KEY_FILE reference;
       // every token refresh save() would silently corrupt the token store.
       encryptionKey: getEncryptionKeyValidation(),
+      // INF-324 AC4: alert disposition gate liveness — confirms the
+      // disposition map loaded at bootstrap and the gate intercepted notify(),
+      // observable at /health without waiting for an alert to fire.
+      alertDispositionGate: getDispositionGateLiveness(),
     });
   });
 
@@ -1647,6 +1652,13 @@ if (isEntryPoint) {
   // Registration here at the production entry point is proven by the
   // bootstrap integration test (inf-97-spawner-preflight-bootstrap.test.ts).
   registerSpawnerPreflight();
+
+  // INF-324: wire the alert disposition gate onto the alert bus.
+  // Reads alert-disposition-map.yaml and intercepts every notify() to
+  // classify the alert as class A (auto-remediation), B (remedy callback),
+  // or C (pass-through). Unknown sources raise a meta-alert.
+  // Safe to call before initAlertBus() — getAlertBus() lazily creates the bus.
+  wireDispositionGate(getAlertBus());
 
   // Phase 2 (rebuild): assert agents.json ⇄ capability-policy agreement at
   // startup and on every registry hot-reload. Drift alerts, never crashes.

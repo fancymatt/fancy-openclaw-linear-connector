@@ -1,0 +1,194 @@
+# Alert Disposition Map
+# Every alert source must have an entry. Classes:
+#   A — executeRemediation() with mapped failure_class (INF-320)
+#   B — mapped remedy callback
+#   C — pass through (surface to owner is follow-up)
+#
+# This file is read at startup and hot-reloaded on SIGHUP.
+
+sources:
+  # ── Class A: auto-remediation ──────────────────────────────────────
+  token-refresh:
+    class: A
+    failure_class: oauth_token_refresh
+    label: Token refresh failure
+
+  fixture-drift:
+    class: A
+    failure_class: workflow_fixture_drift
+    label: Workflow fixture drift
+
+  # ── Class B: mapped remedy ─────────────────────────────────────────
+  dispatch:
+    class: B
+    remedy: re-dispatch
+    owner: dispatch-system
+    label: Dispatch delivery failure
+
+  dispatch-circuit-breaker:
+    class: B
+    remedy: circuit-reset
+    owner: operations
+    label: Dispatch circuit breaker trip
+
+  config-health:
+    class: B
+    remedy: reload-config
+    owner: operations
+    label: Configuration health failure
+
+  config-sanity:
+    class: B
+    remedy: auto-correct
+    owner: operations
+    label: Configuration sanity drift
+
+  sla-sweep:
+    class: B
+    remedy: escalate-owner
+    owner: astrid
+    label: SLA breach
+
+  stale-plain-delegate:
+    class: B
+    remedy: reassign-delegate
+    owner: dispatch-system
+    label: Stale plain delegate
+
+  first-action-watchdog:
+    class: B
+    remedy: re-dispatch
+    owner: dispatch-system
+    label: First action deadline breach
+
+  lifecycle:
+    class: B
+    remedy: acknowledge
+    owner: operations
+    label: Connector lifecycle event
+
+  agents:
+    class: B
+    remedy: reload-agents
+    owner: operations
+    label: Agent configuration issue
+
+  workflow-gate:
+    class: B
+    remedy: inspect-policy
+    owner: astrid
+    label: Workflow gate issue
+
+  delegation-reconciled:
+    class: B
+    remedy: reconcile-delegation
+    owner: dispatch-system
+    label: Delegation reconciliation
+
+  bootstrap-reconciled:
+    class: B
+    remedy: reconcile-bootstrap
+    owner: dispatch-system
+    label: Bootstrap reconciliation
+
+  oob-reconcile:
+    class: B
+    remedy: reconcile-out-of-band
+    owner: dispatch-system
+    label: Out-of-band reconciliation
+
+  # ── Class C: pass through ──────────────────────────────────────────
+  webhook:
+    class: C
+    owner: operations
+    label: Webhook processing
+
+  canary:
+    class: C
+    owner: grover
+    label: G-20 canary
+
+  comment:
+    class: C
+    owner: operations
+    label: Linear comment posting
+
+  deploy-policy:
+    class: C
+    owner: operations
+    label: Deploy policy violation
+
+  deploy-stamp:
+    class: C
+    owner: operations
+    label: Deploy stamp
+
+  description:
+    class: C
+    owner: operations
+    label: Ticket description
+
+  env:
+    class: C
+    owner: operations
+    label: Environment configuration
+
+  fallback:
+    class: C
+    owner: operations
+    label: Fallback handler
+
+  fanout-spec:
+    class: C
+    owner: operations
+    label: Fanout spec
+
+  header:
+    class: C
+    owner: operations
+    label: Request header
+
+  implementer-store:
+    class: C
+    owner: operations
+    label: Implementer store
+
+  known-humans:
+    class: C
+    owner: operations
+    label: Known humans
+
+  process:
+    class: C
+    owner: operations
+    label: Process crash
+
+  proxy:
+    class: C
+    owner: operations
+    label: Proxy request
+
+  registry-policy:
+    class: C
+    owner: operations
+    label: Registry policy check
+
+  routing:
+    class: C
+    owner: dispatch-system
+    label: Routing failure
+
+  "steward:astrid":
+    class: C
+    owner: astrid
+    label: Steward token event
+
+  unknown:
+    class: C
+    owner: operations
+    label: Unknown source
+
+  done-gate:
+    class: C
+    owner: operations
+    label: Done gate
