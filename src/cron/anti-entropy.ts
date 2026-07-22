@@ -37,7 +37,7 @@ const LINEAR_API_URL = "https://api.linear.app/graphql";
 // ── Public types ───────────────────────────────────────────────────────────
 
 export interface AntiEntropyOptions {
-  authToken: string;
+  authToken: string | (() => string);
 }
 
 export interface AntiEntropyResult {
@@ -150,6 +150,22 @@ function isChildTerminal(
   });
 }
 
+function resolveAuthToken(authToken: AntiEntropyOptions["authToken"]): string {
+  return typeof authToken === "function" ? authToken() : authToken;
+}
+
+function formatGraphQlErrors(errors: unknown): string {
+  if (!Array.isArray(errors) || errors.length === 0) return "none";
+  return errors
+    .map((err) => {
+      if (err && typeof err === "object" && "message" in err) {
+        return String((err as { message?: unknown }).message);
+      }
+      return JSON.stringify(err);
+    })
+    .join("; ");
+}
+
 // ── Linear API helpers ─────────────────────────────────────────────────────
 
 async function fetchTeamWorkflowStates(
@@ -177,8 +193,12 @@ async function fetchTeamWorkflowStates(
     data?: {
       team?: { workflowStates?: { nodes: Array<{ id: string; name: string; type: string }> } };
     };
+    errors?: unknown[];
   };
   const data = (await res.json()) as Resp;
+  if (Array.isArray(data.errors) && data.errors.length > 0) {
+    throw new Error(`Linear GraphQL errors: ${formatGraphQlErrors(data.errors)}`);
+  }
   const nodes = data.data?.team?.workflowStates?.nodes ?? [];
   _teamStateCache.set(teamId, nodes);
   return nodes;
@@ -226,8 +246,11 @@ async function fetchWorkflowIssues(authToken: string): Promise<IssueNode[]> {
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({ query }),
   });
-  type Resp = { data?: { issues?: { nodes?: IssueNode[] } } };
+  type Resp = { data?: { issues?: { nodes?: IssueNode[] } }; errors?: unknown[] };
   const data = (await res.json()) as Resp;
+  if (Array.isArray(data.errors) && data.errors.length > 0) {
+    throw new Error(`Linear GraphQL errors: ${formatGraphQlErrors(data.errors)}`);
+  }
   return data.data?.issues?.nodes ?? [];
 }
 
@@ -248,8 +271,11 @@ async function issueUpdateState(
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({ query: mutation, variables: { issueId, input: { stateId } } }),
   });
-  type Resp = { data?: { issueUpdate?: { success?: boolean } } };
+  type Resp = { data?: { issueUpdate?: { success?: boolean } }; errors?: unknown[] };
   const data = (await res.json()) as Resp;
+  if (Array.isArray(data.errors) && data.errors.length > 0) {
+    throw new Error(`Linear GraphQL errors: ${formatGraphQlErrors(data.errors)}`);
+  }
   return data.data?.issueUpdate?.success === true;
 }
 
@@ -271,8 +297,11 @@ async function issueUpdateLabelsAndState(
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({ query: mutation, variables: { issueId, input: { labelIds, stateId } } }),
   });
-  type Resp = { data?: { issueUpdate?: { success?: boolean } } };
+  type Resp = { data?: { issueUpdate?: { success?: boolean } }; errors?: unknown[] };
   const data = (await res.json()) as Resp;
+  if (Array.isArray(data.errors) && data.errors.length > 0) {
+    throw new Error(`Linear GraphQL errors: ${formatGraphQlErrors(data.errors)}`);
+  }
   return data.data?.issueUpdate?.success === true;
 }
 
@@ -378,7 +407,7 @@ async function processIssue(
 // ── Public API ─────────────────────────────────────────────────────────────
 
 export async function runAntiEntropyPass(opts: AntiEntropyOptions): Promise<AntiEntropyResult> {
-  const { authToken } = opts;
+  const authToken = resolveAuthToken(opts.authToken);
 
   if (process.env.ANTI_ENTROPY_TEST_RESET === "1") {
     resetAntiEntropyCache();
@@ -440,7 +469,7 @@ export async function runAntiEntropyPass(opts: AntiEntropyOptions): Promise<Anti
 
 export function registerAntiEntropyCron(opts?: {
   intervalMs?: number;
-  authToken?: string;
+  authToken?: string | (() => string);
 }): NodeJS.Timeout {
   const intervalMs =
     opts?.intervalMs ??
@@ -450,9 +479,7 @@ export function registerAntiEntropyCron(opts?: {
 
   const authToken =
     opts?.authToken ??
-    process.env.LINEAR_OAUTH_TOKEN ??
-    process.env.LINEAR_API_KEY ??
-    "";
+    (() => process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "");
 
   const timer = setInterval(() => {
     void (async () => {
