@@ -30,6 +30,12 @@ import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js"
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { OperationalEventStore } from "./store/operational-event-store.js";
 import type { DispatchAckTracker } from "./bag/dispatch-ack-tracker.js";
+import {
+  assertNoLinearGraphqlErrors,
+  resolveAuthToken,
+  type AuthTokenSource,
+  type LinearGraphqlResponse,
+} from "./linear-auth.js";
 
 const log = componentLogger(
   createLogger(process.env.LOG_LEVEL ?? "info"),
@@ -45,7 +51,7 @@ const DEFAULT_MAX_REDISPATCH = 2;
 const DEFAULT_RECENT_DISPATCH_WINDOW_MS = 15 * 60 * 1000; // 15 min
 
 export interface StalePlainDelegateOptions {
-  authToken: string;
+  authToken: AuthTokenSource;
   operationalEventStore: OperationalEventStore;
   alertBus: AlertBus;
   ackTracker?: DispatchAckTracker;
@@ -109,20 +115,19 @@ async function queryStalePlainTickets(
     body: JSON.stringify({ query, variables: { cutoff } }),
   });
 
-  const body = (await res.json()) as {
-    data?: {
-      issues?: {
-        nodes: Array<{
-          id: string;
-          identifier: string;
-          updatedAt: string;
-          state: { name: string } | null;
-          labels: { nodes: Array<{ name: string }> };
-          delegate: { id: string; name: string } | null;
-        }>;
-      };
+  const body = (await res.json()) as LinearGraphqlResponse<{
+    issues?: {
+      nodes: Array<{
+        id: string;
+        identifier: string;
+        updatedAt: string;
+        state: { name: string } | null;
+        labels: { nodes: Array<{ name: string }> };
+        delegate: { id: string; name: string } | null;
+      }>;
     };
-  };
+  }>;
+  assertNoLinearGraphqlErrors(body);
 
   const nodes = body.data?.issues?.nodes ?? [];
 
@@ -159,9 +164,10 @@ async function applyStaleDelegateLabel(
       body: JSON.stringify({ query: labelQuery, variables: {} }),
     });
 
-    const labelBody = (await labelRes.json()) as {
-      data?: { organization?: { labels?: { nodes: Array<{ id: string; name: string }> } } };
-    };
+    const labelBody = (await labelRes.json()) as LinearGraphqlResponse<{
+      organization?: { labels?: { nodes: Array<{ id: string; name: string }> } };
+    }>;
+    assertNoLinearGraphqlErrors(labelBody);
     const staleLabel = labelBody.data?.organization?.labels?.nodes
       .find((l) => l.name === "stale-delegate");
 
@@ -185,7 +191,8 @@ async function applyStaleDelegateLabel(
       body: JSON.stringify({ query: updateQuery, variables: { issueId, labelId: staleLabel.id } }),
     });
 
-    const updateBody = (await updateRes.json()) as { data?: { issueUpdate?: { success?: boolean } } };
+    const updateBody = (await updateRes.json()) as LinearGraphqlResponse<{ issueUpdate?: { success?: boolean } }>;
+    assertNoLinearGraphqlErrors(updateBody);
     return updateBody.data?.issueUpdate?.success === true;
   } catch (err) {
     log.warn(`Failed to apply stale-delegate label: ${err instanceof Error ? err.message : String(err)}`);
@@ -197,13 +204,13 @@ export async function runStalePlainDelegateSweep(
   opts: StalePlainDelegateOptions,
 ): Promise<StalePlainDelegateResult> {
   const {
-    authToken,
     operationalEventStore,
     alertBus,
     ackTracker,
     wakeFn,
     postLinearComment,
   } = opts;
+  const authToken = resolveAuthToken(opts.authToken);
 
   const fetchFn = opts.fetchFn ?? globalThis.fetch;
   const staleTimeoutMs = opts.staleTimeoutMs ?? DEFAULT_STALE_TIMEOUT_MS;
@@ -361,7 +368,7 @@ export async function runStalePlainDelegateSweep(
 }
 
 export function registerStalePlainDelegateCron(opts: {
-  authToken: string;
+  authToken: AuthTokenSource;
   intervalMs?: number;
   staleTimeoutMs?: number;
   operationalEventStore?: OperationalEventStore;
@@ -384,7 +391,7 @@ export function registerStalePlainDelegateCron(opts: {
     const alert = opts.alertBus ?? getAlertBus();
 
     void runStalePlainDelegateSweep({
-      authToken: opts.authToken,
+      authToken: resolveAuthToken(opts.authToken),
       operationalEventStore: store,
       alertBus: alert,
       ackTracker: opts.ackTracker,

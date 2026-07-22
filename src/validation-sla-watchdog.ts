@@ -24,6 +24,7 @@ import path from "node:path";
 import { createLogger, componentLogger } from "./logger.js";
 import { registerCron, formatIntervalMs } from "./cron/registry.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
+import { assertNoLinearGraphqlErrors, resolveAuthToken, type AuthTokenSource } from "./linear-auth.js";
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -47,7 +48,7 @@ const DEFAULT_WATCHED_STATES = "ac-validate,review";
 
 export interface ValidationWatchdogOptions {
   /** Linear API auth token. */
-  authToken: string;
+  authToken: AuthTokenSource;
   /** Linear user ID of the validator (the agent who validates). */
   validatorLinearUserId: string;
   /** Injectable fetch for testing. */
@@ -235,7 +236,6 @@ export async function runValidationWatchdog(
   opts: ValidationWatchdogOptions,
 ): Promise<ValidationWatchdogResult> {
   const {
-    authToken,
     validatorLinearUserId,
     wakeValidator,
     now = () => Date.now(),
@@ -244,6 +244,7 @@ export async function runValidationWatchdog(
     cooldownMs = DEFAULT_COOLDOWN_MS,
     watchedStates = DEFAULT_WATCHED_STATES,
   } = opts;
+  const authToken = resolveAuthToken(opts.authToken);
   const fetchFn = opts.fetchFn ?? globalThis.fetch;
 
   const result: ValidationWatchdogResult = {
@@ -282,11 +283,7 @@ export async function runValidationWatchdog(
     };
 
     const json = (await res.json()) as ValResp;
-    if (json.errors?.length) {
-      throw new Error(
-        `Linear API errors: ${json.errors.map((e) => e.message).join("; ")}`,
-      );
-    }
+    assertNoLinearGraphqlErrors(json);
 
     const nodes = json.data?.issues?.nodes ?? [];
     result.scanned = nodes.length;
@@ -344,8 +341,9 @@ export async function runValidationWatchdog(
           }),
         });
 
-        type CommentResp = { data?: { commentCreate?: { success: boolean } } };
+        type CommentResp = { data?: { commentCreate?: { success: boolean } }; errors?: unknown[] };
         const commentJson = (await commentRes.json()) as CommentResp;
+        assertNoLinearGraphqlErrors(commentJson);
 
         if (!commentJson.data?.commentCreate?.success) {
           result.errors.push(

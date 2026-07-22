@@ -29,6 +29,12 @@ import yaml from "js-yaml";
 import { createLogger, componentLogger } from "../logger.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import { type WorkflowDef } from "../workflow-gate.js";
+import {
+  assertNoLinearGraphqlErrors,
+  resolveAuthToken,
+  type AuthTokenSource,
+  type LinearGraphqlResponse,
+} from "../linear-auth.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "anti-entropy");
 
@@ -37,7 +43,7 @@ const LINEAR_API_URL = "https://api.linear.app/graphql";
 // ── Public types ───────────────────────────────────────────────────────────
 
 export interface AntiEntropyOptions {
-  authToken: string;
+  authToken: AuthTokenSource;
 }
 
 export interface AntiEntropyResult {
@@ -165,12 +171,11 @@ async function fetchTeamWorkflowStates(
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({ query, variables: { teamId } }),
   });
-  type Resp = {
-    data?: {
-      team?: { workflowStates?: { nodes: Array<{ id: string; name: string; type: string }> } };
-    };
-  };
+  type Resp = LinearGraphqlResponse<{
+    team?: { workflowStates?: { nodes: Array<{ id: string; name: string; type: string }> } };
+  }>;
   const data = (await res.json()) as Resp;
+  assertNoLinearGraphqlErrors(data);
   const nodes = data.data?.team?.workflowStates?.nodes ?? [];
   _teamStateCache.set(teamId, nodes);
   return nodes;
@@ -217,8 +222,9 @@ async function fetchWorkflowIssues(authToken: string): Promise<IssueNode[]> {
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({ query }),
   });
-  type Resp = { data?: { issues?: { nodes?: IssueNode[] } } };
+  type Resp = LinearGraphqlResponse<{ issues?: { nodes?: IssueNode[] } }>;
   const data = (await res.json()) as Resp;
+  assertNoLinearGraphqlErrors(data);
   return data.data?.issues?.nodes ?? [];
 }
 
@@ -239,8 +245,9 @@ async function issueUpdateState(
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({ query: mutation, variables: { issueId, input: { stateId } } }),
   });
-  type Resp = { data?: { issueUpdate?: { success?: boolean } } };
+  type Resp = LinearGraphqlResponse<{ issueUpdate?: { success?: boolean } }>;
   const data = (await res.json()) as Resp;
+  assertNoLinearGraphqlErrors(data);
   return data.data?.issueUpdate?.success === true;
 }
 
@@ -262,8 +269,9 @@ async function issueUpdateLabelsAndState(
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({ query: mutation, variables: { issueId, input: { labelIds, stateId } } }),
   });
-  type Resp = { data?: { issueUpdate?: { success?: boolean } } };
+  type Resp = LinearGraphqlResponse<{ issueUpdate?: { success?: boolean } }>;
   const data = (await res.json()) as Resp;
+  assertNoLinearGraphqlErrors(data);
   return data.data?.issueUpdate?.success === true;
 }
 
@@ -369,7 +377,7 @@ async function processIssue(
 // ── Public API ─────────────────────────────────────────────────────────────
 
 export async function runAntiEntropyPass(opts: AntiEntropyOptions): Promise<AntiEntropyResult> {
-  const { authToken } = opts;
+  const authToken = resolveAuthToken(opts.authToken);
 
   if (process.env.ANTI_ENTROPY_TEST_RESET === "1") {
     resetAntiEntropyCache();
@@ -431,7 +439,7 @@ export async function runAntiEntropyPass(opts: AntiEntropyOptions): Promise<Anti
 
 export function registerAntiEntropyCron(opts?: {
   intervalMs?: number;
-  authToken?: string;
+  authToken?: AuthTokenSource;
 }): NodeJS.Timeout {
   const intervalMs =
     opts?.intervalMs ??
@@ -441,9 +449,7 @@ export function registerAntiEntropyCron(opts?: {
 
   const authToken =
     opts?.authToken ??
-    process.env.LINEAR_OAUTH_TOKEN ??
-    process.env.LINEAR_API_KEY ??
-    "";
+    (() => process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "");
 
   registerCron("anti-entropy", `every ${formatIntervalMs(intervalMs)}`);
 

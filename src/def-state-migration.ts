@@ -26,6 +26,12 @@ import type { WorkflowDef } from "./workflow-gate.js";
 import { getWorkflowId, getCurrentState } from "./workflow-gate.js";
 import { resolveBodiesForRole } from "./escalation-gate.js";
 import type { OperationalEventInput } from "./store/operational-event-store.js";
+import {
+  assertNoLinearGraphqlErrors,
+  resolveAuthToken,
+  type AuthTokenSource,
+  type LinearGraphqlResponse,
+} from "./linear-auth.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "def-state-migration");
 
@@ -165,8 +171,9 @@ async function fetchGovernedTickets(authToken: string): Promise<FetchedTicket[]>
     labels: { nodes: Array<{ id: string; name: string }> };
     team: { id: string } | null;
   };
-  type Resp = { data?: { issues?: { nodes: IssueNode[] } } };
+  type Resp = LinearGraphqlResponse<{ issues?: { nodes: IssueNode[] } }>;
   const data = (await res.json()) as Resp;
+  assertNoLinearGraphqlErrors(data);
   return (data.data?.issues?.nodes ?? []).map((n) => ({
     id: n.id,
     identifier: n.identifier,
@@ -184,8 +191,9 @@ async function fetchTeamLabelMap(teamId: string, authToken: string): Promise<Map
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query, variables: { teamId } }),
     });
-    type Resp = { data?: { team?: { labels: { nodes: Array<{ id: string; name: string }> } } } };
+    type Resp = LinearGraphqlResponse<{ team?: { labels: { nodes: Array<{ id: string; name: string }> } } }>;
     const data = (await res.json()) as Resp;
+    assertNoLinearGraphqlErrors(data);
     const map = new Map<string, string>();
     for (const n of data.data?.team?.labels?.nodes ?? []) map.set(n.name, n.id);
     return map;
@@ -202,8 +210,9 @@ async function applyLabelIds(ticketId: string, labelIds: string[], authToken: st
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({ query: mutation, variables: { id: ticketId, labelIds } }),
   });
-  type Resp = { data?: { issueUpdate?: { success: boolean } } };
+  type Resp = LinearGraphqlResponse<{ issueUpdate?: { success: boolean } }>;
   const data = (await res.json()) as Resp;
+  assertNoLinearGraphqlErrors(data);
   return data.data?.issueUpdate?.success ?? false;
 }
 
@@ -371,7 +380,7 @@ export function resetDefStateMigrationLiveness(): void {
 }
 
 export interface DefStateMigrationRunnerOptions {
-  authToken: string;
+  authToken: AuthTokenSource;
   /** Lazily resolve the workflow registry (async load happens off the boot path). */
   loadRegistry: () => Promise<Map<string, WorkflowDef>>;
   operationalEventStore?: OperationalEventSink;
@@ -393,7 +402,7 @@ export function registerDefStateMigrationRunner(options: DefStateMigrationRunner
   // gate). This keeps the runner from triggering a config-health-recording
   // registry load on every createApp() in the test suite, which would otherwise
   // race into unrelated tests. Liveness still reports ranOnLoad with a 0 count.
-  if (!options.authToken || options.authToken.trim() === "") {
+  if (!resolveAuthToken(options.authToken).trim()) {
     _liveness = { ranOnLoad: true, migratedCount: 0, scanned: 0, lastRunAt: null, errors: ["skipped: no Linear auth token"] };
     log.info("def-state migration runner registered but skipped — no Linear auth token available");
     return;
@@ -402,8 +411,12 @@ export function registerDefStateMigrationRunner(options: DefStateMigrationRunner
   void (async () => {
     try {
       const registry = await options.loadRegistry();
+      const authToken = resolveAuthToken(options.authToken);
+      if (!authToken.trim()) {
+        throw new Error("skipped: no Linear auth token");
+      }
       const result = await runDefStateMigrationSweep({
-        authToken: options.authToken,
+        authToken,
         workflowRegistry: registry,
         operationalEventStore: options.operationalEventStore,
         wakeFn: options.wakeFn,

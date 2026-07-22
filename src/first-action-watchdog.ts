@@ -40,6 +40,7 @@ import {
 } from "./first-action-watchdog-state.js";
 import type { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
 import { StallReasonCode, type StallReason } from "./wake-observability/index.js";
+import type { AuthTokenSource } from "./linear-auth.js";
 
 const CRON_NAME = "first-action-watchdog";
 const MINUTE = 60_000;
@@ -126,7 +127,7 @@ export interface ReroutePayload {
 }
 
 export interface FirstActionWatchdogOptions {
-  authToken?: string;
+  authToken?: AuthTokenSource;
   /** File OR directory of workflow def YAML; per-state first_action_deadline. */
   workflowDefPath?: string;
   listTickets: () => Promise<WatchdogTicket[]>;

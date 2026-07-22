@@ -10,6 +10,7 @@
 import { componentLogger, createLogger } from "./logger.js";
 import { getAppliedState } from "./store/applied-state-store.js";
 import type { TransitionApplyResult } from "./workflow-gate.js";
+import { assertNoLinearGraphqlErrors, type LinearGraphqlResponse } from "./linear-auth.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "transition-audit");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
@@ -187,14 +188,7 @@ export async function checkLabelSyncForTicket(
   const proxyState = getAppliedState(ticketId);
   if (!proxyState) return null; // No proxy state recorded — nothing to audit.
 
-  let linearStateLabel: string | null = null;
-  try {
-    linearStateLabel = await fetchStateLabel(ticketId, authToken);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log.warn(`[transition-audit] label-sync check failed for ${ticketId}: ${msg}`);
-    return null;
-  }
+  const linearStateLabel = await fetchStateLabel(ticketId, authToken);
 
   // Strip the "state:" prefix for comparison.
   const linearState = linearStateLabel?.startsWith("state:")
@@ -244,8 +238,9 @@ async function fetchStateLabel(
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({ query, variables: { id: issueId } }),
   });
-  type Resp = { data?: { issue?: { labels?: { nodes?: Array<{ name: string }> } } | null } | null };
+  type Resp = LinearGraphqlResponse<{ issue?: { labels?: { nodes?: Array<{ name: string }> } } | null } | null>;
   const data = (await res.json()) as Resp;
+  assertNoLinearGraphqlErrors(data);
   const labels = data.data?.issue?.labels?.nodes ?? [];
   for (const l of labels) {
     if (l.name.startsWith("state:")) return l.name;
@@ -280,8 +275,9 @@ export async function resolveTicketIdentifier(
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query, variables: { id: issueId } }),
     });
-    type Resp = { data?: { issue?: { identifier?: string } | null } | null };
+    type Resp = LinearGraphqlResponse<{ issue?: { identifier?: string } | null } | null>;
     const data = (await res.json()) as Resp;
+    assertNoLinearGraphqlErrors(data);
     if (data.data?.issue?.identifier) return data.data.issue.identifier;
   } catch {
     // Fall through

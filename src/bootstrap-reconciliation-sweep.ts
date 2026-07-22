@@ -32,6 +32,12 @@ import {
 } from "./workflow-bootstrap.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
 import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
+import {
+  assertNoLinearGraphqlErrors,
+  resolveAuthToken,
+  type AuthTokenSource,
+  type LinearGraphqlResponse,
+} from "./linear-auth.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "bootstrap-reconciliation");
 
@@ -105,15 +111,14 @@ async function queryEnrolledTicketState(
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query, variables: { id: issueId } }),
     });
-    type Resp = {
-      data?: {
-        issue?: {
-          state: { id: string; name: string; type: string } | null;
-          delegate: { id: string } | null;
-        } | null;
-      };
-    };
+    type Resp = LinearGraphqlResponse<{
+      issue?: {
+        state: { id: string; name: string; type: string } | null;
+        delegate: { id: string } | null;
+      } | null;
+    }>;
     const data = (await res.json()) as Resp;
+    assertNoLinearGraphqlErrors(data);
     const issue = data.data?.issue;
     if (!issue) return null;
     return {
@@ -153,14 +158,13 @@ async function queryEnrolledPRStatus(
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query, variables: { id: issueId } }),
     });
-    type Resp = {
-      data?: {
-        issue?: {
-          attachments: { nodes: Array<{ url?: string | null; sourceType?: string | null; metadata?: Record<string, unknown> | null }> };
-        } | null;
-      };
-    };
+    type Resp = LinearGraphqlResponse<{
+      issue?: {
+        attachments: { nodes: Array<{ url?: string | null; sourceType?: string | null; metadata?: Record<string, unknown> | null }> };
+      } | null;
+    }>;
     const data = (await res.json()) as Resp;
+    assertNoLinearGraphqlErrors(data);
     const nodes = data.data?.issue?.attachments?.nodes ?? [];
     const prNodes = nodes.filter((n) =>
       typeof n.url === "string" && /github\.com\/[^/]+\/[^/]+\/pull\/\d+/i.test(n.url),
@@ -207,10 +211,9 @@ async function closeEnrolledTicket(
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query: labelsQuery, variables: { id: issueId } }),
     });
-    type LResp = {
-      data?: { issue?: { labels: { nodes: Array<{ id: string; name: string }> } } | null };
-    };
+    type LResp = LinearGraphqlResponse<{ issue?: { labels: { nodes: Array<{ id: string; name: string }> } } | null }>;
     const data = (await res.json()) as LResp;
+    assertNoLinearGraphqlErrors(data);
     issueLabels = data.data?.issue?.labels?.nodes ?? [];
   } catch {
     return false;
@@ -238,8 +241,9 @@ async function closeEnrolledTicket(
         variables: { issueId, labelIds: keepIds },
       }),
     });
-    type MResp = { data?: { issueUpdate?: { success: boolean } } };
+    type MResp = LinearGraphqlResponse<{ issueUpdate?: { success: boolean } }>;
     const data = (await res.json()) as MResp;
+    assertNoLinearGraphqlErrors(data);
     return data.data?.issueUpdate?.success ?? false;
   } catch {
     return false;
@@ -291,21 +295,20 @@ async function queryUnenrolledTickets(
     body: JSON.stringify({ query }),
   });
 
-  type Resp = {
-    data?: {
-      issues?: {
-        nodes: Array<{
-          id: string;
-          identifier: string;
-          updatedAt: string;
-          labels: { nodes: Array<{ id: string; name: string }> };
-          delegate: { id: string } | null;
-          team: { id: string };
-        }>;
-      };
+  type Resp = LinearGraphqlResponse<{
+    issues?: {
+      nodes: Array<{
+        id: string;
+        identifier: string;
+        updatedAt: string;
+        labels: { nodes: Array<{ id: string; name: string }> };
+        delegate: { id: string } | null;
+        team: { id: string };
+      }>;
     };
-  };
+  }>;
   const data = (await res.json()) as Resp;
+  assertNoLinearGraphqlErrors(data);
   const nodes = data.data?.issues?.nodes ?? [];
 
   return nodes.map((n) => ({
@@ -524,7 +527,7 @@ export async function runBootstrapReconciliationSweep(
  */
 export function registerBootstrapReconciliationCron(
   opts: {
-    authToken: string;
+    authToken: AuthTokenSource;
     intervalMs?: number;
     /** Alert bus for heal/failure notifications. Defaults to the global singleton. */
     alertBus?: AlertBus;
@@ -537,7 +540,7 @@ export function registerBootstrapReconciliationCron(
   const intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
   registerCron("bootstrap-reconciliation-sweep", `every ${formatIntervalMs(intervalMs)}`);
 
-  if (!opts.authToken) {
+  if (!resolveAuthToken(opts.authToken)) {
     log.warn(
       "bootstrap-reconciliation: no auth token provided — sweep will be skipped until the next call",
     );
@@ -547,7 +550,7 @@ export function registerBootstrapReconciliationCron(
     // Fire-and-forget — errors are captured inside the sweep and surfaced
     // via the alert bus, not propagated to the interval handler.
     void runBootstrapReconciliationSweep({
-      authToken: opts.authToken,
+      authToken: resolveAuthToken(opts.authToken),
       alertBus: opts.alertBus,
       wakeFn: opts.wakeFn,
     }).catch((err) => {

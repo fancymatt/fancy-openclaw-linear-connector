@@ -12,11 +12,12 @@ import { componentLogger, createLogger } from "../logger.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import { checkLabelSyncForTicket, emitLabelSyncWarning, type LabelSyncDivergence } from "../transition-audit.js";
 import type { EnrolledTicketsStore } from "../store/enrolled-tickets-store.js";
+import { resolveAuthToken, type AuthTokenSource } from "../linear-auth.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "label-sync-audit");
 
 export interface LabelSyncAuditOptions {
-  authToken: string;
+  authToken: AuthTokenSource;
   enrolledTicketsStore?: EnrolledTicketsStore;
   intervalMs?: number;
 }
@@ -37,7 +38,8 @@ export interface LabelSyncAuditResult {
 export async function runLabelSyncAuditPass(
   opts: LabelSyncAuditOptions,
 ): Promise<LabelSyncAuditResult> {
-  const { authToken, enrolledTicketsStore } = opts;
+  const { enrolledTicketsStore } = opts;
+  const authToken = resolveAuthToken(opts.authToken);
   const result: LabelSyncAuditResult = {
     scanned: 0,
     divergencesFound: 0,

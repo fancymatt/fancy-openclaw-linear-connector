@@ -30,6 +30,12 @@ import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js"
 import { OperationalEventStore, type OperationalEventStore as OperationalEventStoreType } from "./store/operational-event-store.js";
 import type { SessionTracker } from "./bag/session-tracker.js";
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
+import {
+  assertNoLinearGraphqlErrors,
+  resolveAuthToken,
+  type AuthTokenSource,
+  type LinearGraphqlResponse,
+} from "./linear-auth.js";
 
 const log = componentLogger(
   createLogger(process.env.LOG_LEVEL ?? "info"),
@@ -94,17 +100,15 @@ type LinearIssueNode = {
   team: { id: string };
 };
 
-type IssuesPageResp = {
-  data?: {
-    issues?: {
-      nodes: LinearIssueNode[];
-      pageInfo?: {
-        hasNextPage?: boolean;
-        endCursor?: string | null;
-      };
+type IssuesPageResp = LinearGraphqlResponse<{
+  issues?: {
+    nodes: LinearIssueNode[];
+    pageInfo?: {
+      hasNextPage?: boolean;
+      endCursor?: string | null;
     };
   };
-};
+}>;
 
 // ── Terminal state detection ─────────────────────────────────────────────────
 
@@ -175,6 +179,7 @@ async function queryGovernedTickets(
     });
 
     const data = (await res.json()) as IssuesPageResp;
+    assertNoLinearGraphqlErrors(data);
     nodes.push(...(data.data?.issues?.nodes ?? []));
 
     const pageInfo = data.data?.issues?.pageInfo;
@@ -247,6 +252,7 @@ async function queryAdhocDelegatedTickets(
     });
 
     const data = (await res.json()) as IssuesPageResp;
+    assertNoLinearGraphqlErrors(data);
     nodes.push(...(data.data?.issues?.nodes ?? []));
 
     const pageInfo = data.data?.issues?.pageInfo;
@@ -315,22 +321,21 @@ async function queryDelegateSetTimestamp(
       body: JSON.stringify({ query, variables: { issueId } }),
     });
 
-    type DelegateHistoryResp = {
-      data?: {
-        issue?: {
-          history: {
-            nodes: Array<{
-              __typename: string;
-              createdAt: string;
-              toAssignee?: { id: string } | null;
-              fromAssignee?: { id: string } | null;
-            }>;
-          };
+    type DelegateHistoryResp = LinearGraphqlResponse<{
+      issue?: {
+        history: {
+          nodes: Array<{
+            __typename: string;
+            createdAt: string;
+            toAssignee?: { id: string } | null;
+            fromAssignee?: { id: string } | null;
+          }>;
         };
       };
-    };
+    }>;
 
     const body = (await res.json()) as DelegateHistoryResp;
+    assertNoLinearGraphqlErrors(body);
     const historyNodes = body.data?.issue?.history?.nodes ?? [];
 
     // Find the most recent delegate-change event (toAssignee was set)
@@ -754,7 +759,7 @@ export async function runDelegationReconciliationSweep(
  * Returns the NodeJS.Timeout so the caller can clear it on shutdown.
  */
 export function registerDelegationReconciliationCron(opts: {
-  authToken: string;
+  authToken: AuthTokenSource;
   intervalMs?: number;
   operationalEventStore?: OperationalEventStoreType;
   alertBus?: AlertBus;
@@ -776,7 +781,7 @@ export function registerDelegationReconciliationCron(opts: {
     // store for the sweep (no idempotency across ticks, but safe).
     const store = opts.operationalEventStore ?? new OperationalEventStore(":memory:");
     void runDelegationReconciliationSweep({
-      authToken: opts.authToken,
+      authToken: resolveAuthToken(opts.authToken),
       operationalEventStore: store,
       alertBus: opts.alertBus ?? getAlertBus(),
       wakeFn: opts.wakeFn ?? (() => Promise.resolve()),
