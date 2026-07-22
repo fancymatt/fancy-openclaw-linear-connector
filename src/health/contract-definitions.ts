@@ -51,10 +51,41 @@ export const DEFAULT_CONTRACTS: LifecycleContract[] = [
 ];
 
 /**
- * STUB — throws Not Implemented.
+ * Load contract definitions, merging optional overrides with defaults.
+ *
+ * Overrides are merged by gateId — non-overridden gates remain from defaults.
+ * The original DEFAULT_CONTRACTS array is never mutated.
  */
 export function loadContractDefinitions(
-  _overrides?: LifecycleContract[],
+  overrides?: LifecycleContract[],
 ): LifecycleContract[] {
-  throw new Error("Not implemented: loadContractDefinitions");
+  if (!overrides || overrides.length === 0) {
+    return DEFAULT_CONTRACTS.map((c) => ({ ...c, suppression: [...c.suppression] }));
+  }
+
+  const overrideMap = new Map<GateId, LifecycleContract>();
+  for (const override of overrides) {
+    overrideMap.set(override.gateId, {
+      ...override,
+      suppression: [...override.suppression],
+    });
+  }
+
+  const results = DEFAULT_CONTRACTS.map(
+    (defaultContract) =>
+      overrideMap.get(defaultContract.gateId) ?? {
+        ...defaultContract,
+        suppression: [...defaultContract.suppression],
+      },
+  );
+
+  // Include any override gates that aren't in DEFAULT_CONTRACTS
+  const seenGateIds = new Set(DEFAULT_CONTRACTS.map((c) => c.gateId));
+  for (const [gateId, override] of overrideMap) {
+    if (!seenGateIds.has(gateId)) {
+      results.push(override);
+    }
+  }
+
+  return results;
 }
