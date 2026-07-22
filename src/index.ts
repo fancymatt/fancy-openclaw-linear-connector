@@ -61,6 +61,7 @@ import { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import { ProposalStore } from "./store/proposal-store.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
 import { getRegisteredCrons } from "./cron/registry.js";
+import { evaluateCronStartupReadiness, parseCronStartupGraceMs } from "./cron/startup-readiness.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { getDetectorState } from "./done-ticket-detector-state.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
@@ -251,6 +252,7 @@ export function createApp(options?: CreateAppOptions) {
   clearAcRecordStore();
   const app = express();
   app.set("trust proxy", true);
+  const bootedAt = new Date();
 
   // Create stores early — needed before route registration.
   const observationStore = new ObservationStore(options?.observationsDbPath);
@@ -333,7 +335,15 @@ export function createApp(options?: CreateAppOptions) {
   // and dropped webhooks.
   app.get("/health", async (_req: Request, res: Response) => {
     const agents = getAgents();
-    const healthy = agents.length > 0;
+    const crons = getRegisteredCrons();
+    const cronReadiness = evaluateCronStartupReadiness({
+      crons,
+      bootedAt,
+      now: new Date(),
+      bootGraceMs: parseCronStartupGraceMs(process.env.CRON_STARTUP_GRACE_MS),
+      log,
+    });
+    const healthy = agents.length > 0 && cronReadiness.status === "ok";
 
     // AI-2008 AC3: loud dispatch-undeliverable surfacing. Every dispatch that
     // exhausted its bounded retries is a first-class operational event; project
@@ -382,7 +392,8 @@ export function createApp(options?: CreateAppOptions) {
       // registers at the moment its timer is created; an expected driver
       // missing from this list means it shipped without bootstrap wiring
       // (the AI-1773/AI-1775 dead-code-in-prod failure mode).
-      crons: getRegisteredCrons(),
+      crons,
+      cronReadiness,
       // AI-2036 AC1.6: observation write-path liveness. `wired`/`subscribed` are
       // true only because bootstrap called registerObservationWritePath() — never
       // hardcoded — and `rows` is read from the live table, so a broken schema
