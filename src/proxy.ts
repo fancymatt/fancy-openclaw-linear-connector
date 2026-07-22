@@ -1060,7 +1060,25 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           ) {
             inputForDelegate.assigneeId = null;
             log.info(
-              `app-user-delegate-assignee-clear agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected assigneeId:null alongside delegateId so the delegate persists (AI-2417)`,
+              `app-user-delegate-assignee-clear agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected assigneeId:null alongside delegateId in input (AI-2417)`,
+            );
+          }
+          // AI-1395/INF-312: Also handle inline input format where delegateId is a
+          // top-level variable (e.g. `input: { delegateId: $delegateId }` with
+          // variables: { id, delegateId } rather than variables: { id, input: { delegateId } }).
+          // The issueUpdateInput helper returns undefined for this shape, so we check
+          // body.variables directly for delegateId at the top level.
+          const vars = body?.variables as Record<string, unknown> | undefined;
+          if (
+            vars &&
+            typeof vars === "object" &&
+            "delegateId" in vars &&
+            vars.delegateId != null &&
+            !("assigneeId" in vars)
+          ) {
+            vars.assigneeId = null;
+            log.info(
+              `app-user-delegate-assignee-clear agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected assigneeId:null alongside delegateId in top-level variables (AI-2417/INF-312)`,
             );
           }
         }

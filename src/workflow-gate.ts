@@ -3122,7 +3122,10 @@ export async function checkWorkflowRules(
   // transition or a branch-evidence gate — it changes delegate only, not workflow
   // progress. Allow it from any state; applyStateTransition handles the self-loop
   // delegate-only semantics.
-  if (intent === "handoff") {
+  // AI-1395/INF-312: `handoff-work` is the same meta-command — the CLI sends it
+  // as the intent for `linear handoff-work <id> <agent>`. Allow it from any state
+  // alongside `handoff` so delegate-routing on governed-state tickets is not blocked.
+  if (intent === "handoff" || intent === "handoff-work") {
     log.info(`workflow-gate: handoff meta-command allowed from state '${currentState}' on ${issueId}`);
     return null;
   }
@@ -5485,19 +5488,33 @@ async function issueUpdateAtomic(
   const hasDelegate = delegateId !== undefined;
   const hasStateId = nativeStateId !== undefined;
 
+  const hasDelegateOrClear = hasDelegate;
+
   const inputParts: string[] = ["labelIds: $labelIds"];
   if (hasDelegate) inputParts.push("delegateId: $delegateId");
   if (hasStateId) inputParts.push("stateId: $stateId");
 
+  // AI-1395: The Linear API silently drops a delegateId write for app/bot users
+  // unless assigneeId is carried in the SAME mutation. Include assigneeId:null
+  // alongside delegateId so the delegate write persists across connector sweeps.
+  // This is the applyStateTransition path (governed-state tickets). The generic
+  // handoff-work path is handled by proxy.ts's AI-2417 block.
+  if (hasDelegate) {
+    inputParts.push("assigneeId: $assigneeId");
+  }
+
   const mutation = `
-    mutation ApplyAtomicTransition($issueId: String!, $labelIds: [String!]!${hasDelegate ? ", $delegateId: String" : ""}${hasStateId ? ", $stateId: String" : ""}) {
+    mutation ApplyAtomicTransition($issueId: String!, $labelIds: [String!]!${hasDelegate ? ", $delegateId: String" : ""}${hasStateId ? ", $stateId: String" : ""}${hasDelegate ? ", $assigneeId: String" : ""}) {
       issueUpdate(id: $issueId, input: { ${inputParts.join(", ")} }) {
         success
       }
     }
   `;
   const variables: Record<string, unknown> = { issueId: internalId, labelIds };
-  if (hasDelegate) variables.delegateId = delegateId;
+  if (hasDelegate) {
+    variables.delegateId = delegateId;
+    variables.assigneeId = null;
+  }
   if (hasStateId) variables.stateId = nativeStateId;
   try {
     const res = await fetch(LINEAR_API_URL, {
