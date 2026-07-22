@@ -147,11 +147,12 @@ describe("INF-339 stale cron detection", () => {
 
   test("AC5: fresh crons and exact-threshold crons are not flagged", () => {
     jest.setSystemTime(new Date("2026-07-22T12:00:00.000Z"));
-    registerCron("not-yet-due", "every 5m");
     registerCron("fresh-driver", "every 10m");
     markCronRun("fresh-driver", new Date("2026-07-22T12:20:00.000Z"));
     registerCron("exact-threshold", "every 10m");
     markCronRun("exact-threshold", new Date("2026-07-22T12:00:00.000Z"));
+    jest.setSystemTime(new Date("2026-07-22T12:26:00.000Z"));
+    registerCron("not-yet-due", "every 5m");
 
     const stale = getStaleCronsForTest({
       now: new Date("2026-07-22T12:30:00.000Z"),
