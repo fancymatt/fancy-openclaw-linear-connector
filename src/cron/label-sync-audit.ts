@@ -9,7 +9,7 @@
  */
 
 import { componentLogger, createLogger } from "../logger.js";
-import { registerCron, formatIntervalMs } from "./registry.js";
+import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import { checkLabelSyncForTicket, emitLabelSyncWarning, type LabelSyncDivergence } from "../transition-audit.js";
 import type { EnrolledTicketsStore } from "../store/enrolled-tickets-store.js";
 
@@ -115,6 +115,8 @@ export function registerLabelSyncAuditCron(opts: LabelSyncAuditOptions): ReturnT
         log.error(
           `[label-sync-audit] Scheduled pass failed: ${err instanceof Error ? err.message : String(err)}`,
         );
+      } finally {
+        markCronRun("label-sync-audit");
       }
     })();
   }, intervalMs);

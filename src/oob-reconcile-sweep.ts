@@ -207,6 +207,8 @@ export function registerOobReconcileCron(
     }).catch((err) => {
       const msg = err instanceof Error ? err.message : String(err);
       log.error(`reconcile sweep failed: ${msg}`);
+    }).finally(() => {
+      markCronRun("oob-reconcile-sweep");
     });
   }, interval);
 

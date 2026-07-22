@@ -251,6 +251,8 @@ export function registerConfigSanityAlertCron(): void {
       }
     } catch (err) {
       log.error(`config-sanity-alert: initial cycle threw: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      markCronRun("config-sanity-alert");
     }
   });
 
@@ -260,6 +262,8 @@ export function registerConfigSanityAlertCron(): void {
       markCronRun("config-sanity-alert");
     } catch (err) {
       log.error(`config-sanity-alert: cycle threw: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      markCronRun("config-sanity-alert");
     }
   }, intervalMs);
   timer.unref();

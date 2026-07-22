@@ -6,6 +6,7 @@
  */
 
 import { createLogger, componentLogger } from "../logger.js";
+import { markCronRun } from "../cron/registry.js";
 
 const log = componentLogger(createLogger(), "done-ticket-detector");
 
@@ -97,6 +98,8 @@ export class DoneTicketDetector {
         log.error(
           `Done ticket detector cycle error: ${err instanceof Error ? err.message : String(err)}`,
         );
+      }).finally(() => {
+        markCronRun("done-ticket-detector");
       });
     }, config.pollIntervalMs);
     this.timer.unref();

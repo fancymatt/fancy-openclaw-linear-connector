@@ -20,7 +20,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createLogger, componentLogger } from "../logger.js";
-import { registerCron, formatIntervalMs } from "./registry.js";
+import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import {
   recordDetectorRun,
   recordDetectorSkip,
@@ -325,17 +325,17 @@ export async function scanDoneTickets(
  * hallmark symbol via git grep, record state.
  */
 async function runScanIteration(): Promise<void> {
-  const authToken =
-    process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
-  if (!authToken) {
-    const reason = "No LINEAR_OAUTH_TOKEN or LINEAR_API_KEY configured";
-    log.warn(`[done-ticket-detector] ${reason} — skipping`);
-    recordDetectorSkip(reason);
-    return;
-  }
-
-  const repoDir = process.env.CONNECTOR_REPO_DIR ?? process.cwd();
   try {
+    const authToken =
+      process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+    if (!authToken) {
+      const reason = "No LINEAR_OAUTH_TOKEN or LINEAR_API_KEY configured";
+      log.warn(`[done-ticket-detector] ${reason} — skipping`);
+      recordDetectorSkip(reason);
+      return;
+    }
+
+    const repoDir = process.env.CONNECTOR_REPO_DIR ?? process.cwd();
     const result = await scanDoneTickets({
       authToken,
       repoDir,
@@ -355,6 +355,8 @@ async function runScanIteration(): Promise<void> {
     const msg = err instanceof Error ? err.message : String(err);
     log.error(`[done-ticket-detector] Scan failed: ${msg}`);
     recordDetectorFail(msg);
+  } finally {
+    markCronRun("done-ticket-detector");
   }
 }
 

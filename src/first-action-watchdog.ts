@@ -29,7 +29,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { registerCron, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 import {
   markFirstActionWatchdogScheduled,
   getFirstActionLadder,
@@ -645,6 +645,8 @@ export function registerFirstActionWatchdogCron(
   const timer = setInterval(() => {
     runFirstActionWatchdogSweep(opts).catch((err) => {
       console.error(`[${CRON_NAME}] sweep failed:`, err);
+    }).finally(() => {
+      markCronRun(CRON_NAME);
     });
   }, cadenceMs);
   if (typeof timer.unref === "function") timer.unref();

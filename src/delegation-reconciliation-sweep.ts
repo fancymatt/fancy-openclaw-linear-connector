@@ -715,6 +715,8 @@ export function registerDelegationReconciliationCron(opts: {
       log.error(
         `delegation-reconciliation: unexpected sweep failure: ${err instanceof Error ? err.message : String(err)}`,
       );
+    }).finally(() => {
+      markCronRun("delegation-reconciliation-sweep");
     });
   }, intervalMs);
 
