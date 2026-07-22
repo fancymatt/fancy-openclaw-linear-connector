@@ -23,6 +23,8 @@
 
 export interface CronRegistryEntry {
   /** Stable driver name, kebab-case (e.g. "sla-sweep"). */
+  id: string;
+  /** Stable driver name, kebab-case (e.g. "sla-sweep"). Alias of id. */
   name: string;
   /** Human-readable trigger description (e.g. "every 5m"). */
   schedule: string;
@@ -55,6 +57,7 @@ export function formatIntervalMs(ms: number): string {
  */
 export function registerCron(name: string, schedule: string): void {
   entries.set(name, {
+    id: name,
     name,
     schedule,
     registeredAt: new Date().toISOString(),

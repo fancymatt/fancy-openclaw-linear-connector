@@ -35,12 +35,13 @@ const EXPECTED_CRONS = [
   "dispatch-delivery-scheduler", // AI-2008: acknowledged dispatch delivery + retry driver
   "first-action-watchdog",
   "g20-canary",
-"label-sync-audit", // AI-2554: periodic proxy-store vs Linear label divergence check
+  "label-sync-audit", // AI-2554: periodic proxy-store vs Linear label divergence check
   "oob-reconcile-sweep",
   "p4-metrics-distillation",
   "registry-integrity-check", // AI-2359: periodic registry⇄policy integrity check (registered in createApp)
   "rescue-sweep",
   "sla-sweep",
+  "stall-liveness-sweep", // INF-314: stall detection liveness sweep
   "transcript-redaction", // AI-2582: periodic .trajectory.jsonl credential redaction sweep
 ].sort();
 
