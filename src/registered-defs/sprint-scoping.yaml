@@ -46,6 +46,9 @@ states:
       - command: begin
         to: articulating
         generic: continue          # AI-2519: `linear continue-workflow` resolves here
+      - command: retire
+        to: done
+        owner_role: steward        # INF-307 AC2: retire path for junk/errant intake tickets
 
   - id: articulating
     owner_role: steward

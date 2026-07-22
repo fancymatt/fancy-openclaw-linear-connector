@@ -1488,6 +1488,22 @@ export async function executeFanout(
     const finding = toSpawn[i];
     const childTitle = finding.title;
 
+    // INF-307 AC1: reject spec-hash marker titles (dangling -->).
+    // The Cycle 4 spawner leak materialized internal HTML-comment spec-registry
+    // entries as standalone issues with titles like
+    // "inf-131:spec-hash:f7d9e2c4 for structured (updated for Cycle 3) -->".
+    // The trailing --> proves the minter took a <!-- ... --> spec marker body
+    // and wrote it as the issue title. Guard by refusing to mint any child
+    // whose title contains a dangling --> (spec-hash marker pattern).
+    if (/-->/.test(childTitle)) {
+      result.errors.push({
+        findingIndex: i,
+        message: `Refusing to spawn: title "${childTitle}" contains a spec-hash marker (dangling -->) — spec-registry entries must remain internal HTML-comment markers, not standalone issues`,
+      });
+      log.warn(`fanout: REFUSED — spec-hash marker title for finding ${i + 1}/${toSpawn.length}: "${childTitle}"`);
+      continue;
+    }
+
     // AI-2199: per-entry child workflow override. Falls back to config default.
     const findingWorkflow = finding.child_workflow ?? childWorkflowLabel;
     const wfLabelId = workflowLabelIds.get(findingWorkflow);
