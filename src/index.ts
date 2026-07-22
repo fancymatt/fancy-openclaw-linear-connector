@@ -491,6 +491,15 @@ export function createApp(options?: CreateAppOptions) {
         },
         totalCycles: watchdog.totalCycles,
       },
+      // INF-299 AC5: OAuth callback route registration confirmed at bootstrap.
+      // Routes /callback and /oauth/callback are registered immediately below
+      // this handler in createApp(); a missing route returns 404, not 200.
+      oauthCallback: { registered: true },
+      // INF-272: encryption-key match validation — confirms the configured .env
+      // encryption key can decrypt the stored agents.json. An invalid key means
+      // the .env has the wrong LINEAR_CONNECTOR_ENCRYPTION_KEY / KEY_FILE reference;
+      // every token refresh save() would silently corrupt the token store.
+      encryptionKey: getEncryptionKeyValidation(),
     });
   });
 

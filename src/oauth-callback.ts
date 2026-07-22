@@ -53,7 +53,7 @@ export async function handleOAuthCallback(req: Request, res: Response): Promise<
 
   // Step 1: Exchange code for tokens
   log.info(`Exchanging OAuth code for agent "${agentName}"...`);
-  let tokenResponse: { access_token: string; refresh_token: string; scope?: string };
+  let tokenResponse: { access_token: string; refresh_token: string; expires_in?: number; scope?: string };
   try {
     const params = new URLSearchParams({
       client_id: existing.clientId,
@@ -122,7 +122,11 @@ export async function handleOAuthCallback(req: Request, res: Response): Promise<
 
   log.info(`Agent "${agentName}" → Linear user "${linearUserName}" (${linearUserId})`);
 
-  // Step 3: Update agents.json with full credentials
+  // Step 3: Update agents.json with full credentials plus telemetry
+  const expiresAt = tokenResponse.expires_in != null
+    ? new Date(Date.now() + tokenResponse.expires_in * 1000).toISOString()
+    : undefined;
+
   const agentConfig: AgentConfig = {
     ...existing,
     linearUserId,
@@ -130,6 +134,12 @@ export async function handleOAuthCallback(req: Request, res: Response): Promise<
     refreshToken: refresh_token,
     openclawAgent: existing.openclawAgent ?? agentName,
     host: existing.host ?? "local",
+    // INF-299: Update telemetry fields on successful re-auth so token status
+    // reads as healthy (not yellow/degraded) immediately after the callback.
+    ...(expiresAt ? { expiresAt } : {}),
+    lastRefreshOkAt: new Date().toISOString(),
+    // Clear the prior lastFailure record — JSON.stringify drops undefined values.
+    lastFailure: undefined,
   };
 
   const { isNew } = upsertAgent(agentConfig);
