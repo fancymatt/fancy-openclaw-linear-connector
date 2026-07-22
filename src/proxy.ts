@@ -237,6 +237,35 @@ function issueUpdateInput(body: GraphQLRequestBody | null): Record<string, unkno
   return input && typeof input === "object" ? (input as Record<string, unknown>) : undefined;
 }
 
+function issueUpdateUsesTopLevelVariable(body: GraphQLRequestBody | null, field: string): boolean {
+  if (!body?.query) return false;
+  return new RegExp(`\\b${field}\\s*:\\s*\\$${field}\\b`).test(body.query);
+}
+
+function issueUpdateHasTopLevelVariable(body: GraphQLRequestBody | null, field: string): boolean {
+  const variables = body?.variables;
+  return !!variables && Object.prototype.hasOwnProperty.call(variables, field);
+}
+
+function issueUpdateHasNullField(body: GraphQLRequestBody | null, field: string): boolean {
+  const input = issueUpdateInput(body);
+  if (input && input[field] === null) return true;
+  return issueUpdateHasTopLevelVariable(body, field) && body?.variables?.[field] === null;
+}
+
+function injectIssueUpdateField(body: GraphQLRequestBody | null, field: string, value: unknown): boolean {
+  const input = issueUpdateInput(body);
+  if (input) {
+    input[field] = value;
+    return true;
+  }
+  if (body?.variables && (issueUpdateHasTopLevelVariable(body, field) || issueUpdateUsesTopLevelVariable(body, field))) {
+    body.variables[field] = value;
+    return true;
+  }
+  return false;
+}
+
 /**
  * True when the mutation carries a non-empty `state:*`-eligible label delta
  * (`addedLabelIds`/`removedLabelIds`). Used to skip the team-label resolution
@@ -307,14 +336,15 @@ function stripStateLabelDeltas(body: GraphQLRequestBody | null, stateLabelIds: S
  */
 function stripNullDelegateAssigneeFields(body: GraphQLRequestBody | null, effectiveIntent: string | null): void {
   const input = issueUpdateInput(body);
-  if (!input) return;
   // AI-2067: needs-human, complete, and park legitimately send delegateId:null as
   // part of their documented contract — don't block it.
   if (effectiveIntent === 'needs-human' || effectiveIntent === 'complete' || effectiveIntent === 'park') {
     return;
   }
-  if (input.delegateId === null) delete input.delegateId;
-  if (input.assigneeId === null) delete input.assigneeId;
+  if (input?.delegateId === null) delete input.delegateId;
+  if (input?.assigneeId === null) delete input.assigneeId;
+  if (body?.variables?.delegateId === null) delete body.variables.delegateId;
+  if (body?.variables?.assigneeId === null) delete body.variables.assigneeId;
 }
 
 /**
@@ -338,8 +368,7 @@ export async function guardPlainTicketDelegateClear(
 ): Promise<string | null> {
   // Only applies to issueUpdate mutations that set delegateId to null
   if (!isIssueUpdateMutation(body)) return null;
-  const input = issueUpdateInput(body);
-  if (!input || !("delegateId" in input) || input.delegateId !== null) return null;
+  if (!issueUpdateHasNullField(body, "delegateId")) return null;
 
   // If the caller could not determine an issueId, we cannot verify the ticket
   // type — allow through
@@ -1184,10 +1213,9 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
                     );
                     if (resolved !== undefined) {
                       delegateOverride = resolved;
-                      // Inject into the forwarded mutation's input.
-                      const input = issueUpdateInput(body);
-                      if (input) {
-                        input.delegateId = resolved;
+                      // Inject into the forwarded mutation. The CLI uses both
+                      // variables.input and top-level $delegateId shapes.
+                      if (injectIssueUpdateField(body, "delegateId", resolved)) {
                         log.info(
                           `delegate-pre-resolve agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected delegateId=${resolved} into forwarded mutation`,
                         );
