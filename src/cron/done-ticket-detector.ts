@@ -325,17 +325,17 @@ export async function scanDoneTickets(
  * hallmark symbol via git grep, record state.
  */
 async function runScanIteration(): Promise<void> {
-  const authToken =
-    process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
-  if (!authToken) {
-    const reason = "No LINEAR_OAUTH_TOKEN or LINEAR_API_KEY configured";
-    log.warn(`[done-ticket-detector] ${reason} — skipping`);
-    recordDetectorSkip(reason);
-    return;
-  }
-
-  const repoDir = process.env.CONNECTOR_REPO_DIR ?? process.cwd();
   try {
+    const authToken =
+      process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+    if (!authToken) {
+      const reason = "No LINEAR_OAUTH_TOKEN or LINEAR_API_KEY configured";
+      log.warn(`[done-ticket-detector] ${reason} — skipping`);
+      recordDetectorSkip(reason);
+      return;
+    }
+
+    const repoDir = process.env.CONNECTOR_REPO_DIR ?? process.cwd();
     const result = await scanDoneTickets({
       authToken,
       repoDir,
