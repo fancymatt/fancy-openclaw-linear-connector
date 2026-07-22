@@ -58,6 +58,58 @@ describe("cron registry (AI-1810)", () => {
     expect(formatIntervalMs(90 * 1000)).toBe("90s");
     expect(formatIntervalMs(1500)).toBe("1500ms");
   });
+
+  test("INF-351: markCronRun persists lastRunAt and registerCron reloads it after restart", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cron-run-stamps-"));
+    const originalStampPath = process.env.CRON_RUN_STAMP_PATH;
+    process.env.CRON_RUN_STAMP_PATH = path.join(dir, "stamps.json");
+    try {
+      registerCron("persisted-driver", "every 1m");
+      markCronRun("persisted-driver", new Date("2026-07-22T22:15:00.000Z"));
+
+      resetCronRegistryForTest();
+      registerCron("persisted-driver", "every 1m");
+
+      expect(getRegisteredCrons()).toEqual([
+        expect.objectContaining({
+          name: "persisted-driver",
+          lastRunAt: "2026-07-22T22:15:00.000Z",
+        }),
+      ]);
+    } finally {
+      if (originalStampPath === undefined) {
+        delete process.env.CRON_RUN_STAMP_PATH;
+      } else {
+        process.env.CRON_RUN_STAMP_PATH = originalStampPath;
+      }
+      resetCronRegistryForTest();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("INF-351: missing or corrupt run-stamp files are treated as never stamped", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cron-run-stamps-corrupt-"));
+    const originalStampPath = process.env.CRON_RUN_STAMP_PATH;
+    const stampPath = path.join(dir, "stamps.json");
+    process.env.CRON_RUN_STAMP_PATH = stampPath;
+    try {
+      registerCron("missing-stamp-file", "every 1m");
+      expect(getRegisteredCrons()[0].lastRunAt).toBeNull();
+
+      resetCronRegistryForTest();
+      fs.writeFileSync(stampPath, "{not json", "utf8");
+      expect(() => registerCron("corrupt-stamp-file", "every 1m")).not.toThrow();
+      expect(getRegisteredCrons()[0].lastRunAt).toBeNull();
+    } finally {
+      if (originalStampPath === undefined) {
+        delete process.env.CRON_RUN_STAMP_PATH;
+      } else {
+        process.env.CRON_RUN_STAMP_PATH = originalStampPath;
+      }
+      resetCronRegistryForTest();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 type StaleCronEntry = {

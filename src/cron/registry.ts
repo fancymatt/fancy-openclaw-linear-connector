@@ -20,6 +20,8 @@
  * /health and looks for the component by name — mechanical and generic,
  * instead of per-feature grep archaeology in index.ts.
  */
+import fs from "node:fs";
+import path from "node:path";
 
 export interface CronRegistryEntry {
   /** Stable driver name, kebab-case (e.g. "sla-sweep"). */
@@ -53,6 +55,58 @@ export interface GetStaleCronsOptions {
 
 const entries = new Map<string, CronRegistryEntry>();
 const DEFAULT_STALENESS_MULTIPLIER = 3;
+const STAMP_STORE_VERSION = 1;
+let loadedStampPath: string | null = null;
+let persistedLastRunAt = new Map<string, string>();
+
+function resolveRunStampPath(): string {
+  return process.env.CRON_RUN_STAMP_PATH ?? path.join(process.env.DATA_DIR ?? "data", "cron-run-stamps.json");
+}
+
+function isValidIsoTimestamp(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function loadPersistedRunStamps(): void {
+  const stampPath = resolveRunStampPath();
+  if (loadedStampPath === stampPath) return;
+
+  loadedStampPath = stampPath;
+  persistedLastRunAt = new Map();
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(stampPath, "utf8"));
+  } catch {
+    return;
+  }
+
+  if (!parsed || typeof parsed !== "object") return;
+  const stamps = (parsed as { stamps?: unknown }).stamps;
+  if (!stamps || typeof stamps !== "object" || Array.isArray(stamps)) return;
+
+  for (const [name, lastRunAt] of Object.entries(stamps)) {
+    if (isValidIsoTimestamp(lastRunAt)) {
+      persistedLastRunAt.set(name, lastRunAt);
+    }
+  }
+}
+
+function persistRunStamps(): void {
+  const stampPath = resolveRunStampPath();
+  loadedStampPath = stampPath;
+  fs.mkdirSync(path.dirname(stampPath), { recursive: true });
+  const tmpPath = `${stampPath}.${process.pid}.tmp`;
+  fs.writeFileSync(
+    tmpPath,
+    `${JSON.stringify({
+      version: STAMP_STORE_VERSION,
+      stamps: Object.fromEntries([...persistedLastRunAt.entries()].sort(([a], [b]) => a.localeCompare(b))),
+    }, null, 2)}\n`,
+    "utf8",
+  );
+  fs.renameSync(tmpPath, stampPath);
+}
 
 /** Format a millisecond interval as a compact human-readable duration. */
 export function formatIntervalMs(ms: number): string {
@@ -70,13 +124,14 @@ export function formatIntervalMs(ms: number): string {
  * hot-reload path can refresh its schedule without duplicating entries.
  */
 export function registerCron(name: string, schedule: string): void {
+  loadPersistedRunStamps();
   entries.set(name, {
     id: name,
     name,
     schedule,
     registeredAt: new Date().toISOString(),
     // A hot-reload re-registers the driver but does not un-run it.
-    lastRunAt: entries.get(name)?.lastRunAt ?? null,
+    lastRunAt: entries.get(name)?.lastRunAt ?? persistedLastRunAt.get(name) ?? null,
   });
 }
 
@@ -87,9 +142,13 @@ export function registerCron(name: string, schedule: string): void {
  * No-op for an unregistered name: liveness cannot precede scheduling.
  */
 export function markCronRun(name: string, now = new Date()): void {
+  loadPersistedRunStamps();
   const entry = entries.get(name);
   if (!entry) return;
-  entry.lastRunAt = now.toISOString();
+  const lastRunAt = now.toISOString();
+  entry.lastRunAt = lastRunAt;
+  persistedLastRunAt.set(name, lastRunAt);
+  persistRunStamps();
 }
 
 /** All drivers registered in this process, sorted by name. */
@@ -263,4 +322,6 @@ export function getStaleCrons(options: GetStaleCronsOptions = {}): StaleCronEntr
 /** Test-only: clear the registry between cases. */
 export function resetCronRegistryForTest(): void {
   entries.clear();
+  loadedStampPath = null;
+  persistedLastRunAt = new Map();
 }
