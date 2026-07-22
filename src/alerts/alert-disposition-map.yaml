@@ -192,3 +192,8 @@ sources:
     class: C
     owner: operations
     label: Done gate
+
+  routing-guard:
+    class: C
+    owner: operations
+    label: Routing guard violation

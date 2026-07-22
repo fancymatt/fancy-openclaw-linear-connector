@@ -14,6 +14,7 @@ import { jest } from "@jest/globals";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import yaml from "js-yaml";
 import {
   loadDispositionMap,
@@ -171,21 +172,102 @@ describe("AC5 — unknown source does not block alert delivery", () => {
 // ── AC6 ─────────────────────────────────────────────────────────────────────
 
 describe("AC6 — every codebase source has a map entry", () => {
-  test("all known alert sources are mapped", () => {
-    const mappedSources = new Set(Object.keys(loadMapData().sources));
-    const codebaseSources = [
-      "agents", "bootstrap-reconciled", "canary", "comment", "config-health",
-      "config-sanity", "delegation-reconciled", "deploy-policy", "deploy-stamp",
-      "description", "dispatch", "dispatch-circuit-breaker", "done-gate", "env",
-      "fallback", "fanout-spec", "first-action-watchdog", "fixture-drift",
-      "header", "implementer-store", "known-humans", "lifecycle", "oob-reconcile",
-      "process", "proxy", "registry-policy", "routing", "sla-sweep",
-      "stale-plain-delegate", "steward:astrid", "token-refresh", "unknown",
-      "webhook", "workflow-gate",
-    ];
-    for (const src of codebaseSources) {
-      expect(mappedSources.has(src)).toBe(true);
+  /**
+   * Extract all `source: "..."` string literals from production .ts files
+   * that appear within notify() call sites. This is an authoritative scan
+   * of the actual alert sources the codebase emits, not a hand-maintained
+   * list that drifts from reality.
+   */
+  function getCodebaseAlertSources(): Set<string> {
+    // Grep production .ts files (skip tests, declarations, dist, and the
+    // alerts/ directory itself — the meta-alert source "alert-disposition"
+    // is internal to the gate and should not require a map entry).
+    const srcDir = path.resolve(__dirname, "..");
+
+    const result = spawnSync(
+      "grep",
+      [
+        "-rnh",
+        "--include=*.ts",
+        "--exclude=*.test.ts",
+        "--exclude=*.d.ts",
+        "--exclude-dir=alerts",
+        "source:",
+        srcDir,
+      ],
+      { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 },
+    );
+    if (result.status !== 0) {
+      throw new Error(`Failed to scan source files: ${result.stderr}`);
     }
+
+    const lines = result.stdout.split("\n");
+    const sources = new Set<string>();
+    // Known false positives — fields named "source" that aren't alert sources
+    // (spec_source field values, deploy-stamp source types, workflow context,
+    //  meta-alert circular ref, comment artifacts, etc.)
+    const falsePositives = new Set([
+      "Findings",
+      "findings",
+      "Structured",
+      "git",
+      "sprint",
+      "test",
+      "transition",
+      "alert-disposition",
+      "...",
+    ]);
+
+    for (const line of lines) {
+      const match = line.match(/source:\s*"([^"]+)"/);
+      if (match) {
+        const value = match[1];
+        // Skip single-char values (test fixture names like "a", "b")
+        if (value.length === 1) continue;
+        // Skip known false positives
+        if (falsePositives.has(value)) continue;
+        sources.add(value);
+      }
+    }
+
+    return sources;
+  }
+
+  test("every alert source emitted by the codebase has a map entry", () => {
+    const map = loadMapData();
+    const mappedSources = new Set(Object.keys(map.sources));
+    const codebaseSources = getCodebaseAlertSources();
+
+    // Log for debugging
+    console.log(`Mapped sources (${mappedSources.size}):`, [...mappedSources].sort().join(", "));
+    console.log(`Codebase sources (${codebaseSources.size}):`, [...codebaseSources].sort().join(", "));
+
+    const unmapped: string[] = [];
+    for (const src of codebaseSources) {
+      if (!mappedSources.has(src)) {
+        unmapped.push(src);
+      }
+    }
+
+    expect(unmapped).toEqual([]);
+  });
+
+  test("no stale map entries (every mapped source exists in codebase)", () => {
+    const map = loadMapData();
+    const mappedSources = new Set(Object.keys(map.sources));
+    const codebaseSources = getCodebaseAlertSources();
+
+    const stale: string[] = [];
+    for (const src of mappedSources) {
+      if (!codebaseSources.has(src)) {
+        stale.push(src);
+      }
+    }
+
+    // Only allow sources that are reserved/structural (e.g. "unknown" is a catch-all)
+    const structuralSources = new Set(["unknown"]);
+    const unexpectedStale = stale.filter((s) => !structuralSources.has(s));
+    expect(unexpectedStale).toEqual([]);
   });
 });
 
