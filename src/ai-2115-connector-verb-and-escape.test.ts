@@ -270,6 +270,16 @@ function issueUpdateTriggerBody() {
   };
 }
 
+function topLevelDelegateAssignBody() {
+  return {
+    operationName: "AssignWithTopLevelDelegate",
+    query: `mutation AssignWithTopLevelDelegate($id: String!, $delegateId: String) {
+      issueUpdate(id: $id, input: { delegateId: $delegateId }) { success }
+    }`,
+    variables: { id: ISSUE_UUID, delegateId: null },
+  };
+}
+
 describe("AI-2115 Bug 1: continue-workflow from routing resolves to the routing verb (not intake's singleton request)", () => {
   let dir: string;
   let appState: ReturnType<typeof createApp>;
@@ -354,6 +364,28 @@ describe("AI-2115 Bug 1: continue-workflow from routing resolves to the routing 
     const labelIds = (lastApply.variables as { labelIds?: string[] }).labelIds ?? [];
     expect(labelIds).toContain("doing-lbl");
     expect(labelIds).not.toContain("intake-lbl");
+  });
+
+  it("routing assign replaces a top-level delegateId:null before forwarding", async () => {
+    const mf = makeTaskFetch({ state: "routing", delegate: "u-astrid" });
+    globalThis.fetch = mf.fetch;
+
+    const res = await request(appState.app)
+      .post("/proxy/graphql")
+      .set("Authorization", "Bearer tok-astrid")
+      .set("X-Openclaw-Agent", "astrid")
+      .set("X-Openclaw-Linear-Cli-Version", "0.3.6")
+      .set("X-Openclaw-Linear-Intent", "continue-workflow")
+      .set("X-Openclaw-Linear-Target", "signe")
+      .set("X-Openclaw-Command-Id", crypto.randomUUID())
+      .send(topLevelDelegateAssignBody());
+
+    expect(res.status).toBe(200);
+    expect(res.body?.errors ?? []).toHaveLength(0);
+
+    const forwardedAssign = mf.calls.find((c) => c.query.includes("AssignWithTopLevelDelegate"));
+    expect(forwardedAssign).toBeDefined();
+    expect(forwardedAssign?.variables.delegateId).toBe("u-signe");
   });
 });
 
