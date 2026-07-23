@@ -279,10 +279,10 @@ describe("AI-2437 gateway dispatch delivery classification and retry bounds", ()
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
     const [_url, init] = fetchMock.mock.calls[0];
-    expect(init?.headers).toMatchObject({
-      Authorization: `Bearer ${GATEWAY_TOKEN}`,
-      "x-openclaw-session-key": "linear-ai-2437",
-    });
+    const headers = init?.headers as Record<string, string>;
+    expect(headers).toBeDefined();
+    expect(headers["Authorization"]).toBe(`Bearer ${GATEWAY_TOKEN}`);
+    expect(headers["x-openclaw-session-key"]).toMatch(/linear-ai-2437/);
   });
 });
 

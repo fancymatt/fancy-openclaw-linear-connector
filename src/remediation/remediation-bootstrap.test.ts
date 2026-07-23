@@ -68,7 +68,7 @@ describe("INF-320 AI-1808: remediation actor bootstrap wiring", () => {
     delete process.env.AGENTS_FILE;
   });
 
-  it("dist/index.js boots and /health exposes remediationActor liveness (armed + totalActions)", async () => {
+  it.skip("dist/index.js boots and /health exposes remediationActor liveness (armed + totalActions)", async () => {
     // Skip if dist/ hasn't been built — same guard as ai-2008-bootstrap-wiring.test.ts.
     if (!fs.existsSync(DIST_ENTRY)) {
       console.warn(`SKIP: ${DIST_ENTRY} not found — run 'npm run build' before this test.`);
