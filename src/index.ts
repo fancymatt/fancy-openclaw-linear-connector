@@ -58,6 +58,7 @@ import { registerMatrixApprovalGate, getMatrixApprovalGateLiveness } from "./mat
 import { MutationAuditStore } from "./store/mutation-audit-store.js";
 import { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js";
 import { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
+import { DispatchInFlightStore } from "./store/dispatch-inflight-store.js";
 import { ProposalStore } from "./store/proposal-store.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
 import { getCronStalenessMultiplierFromEnv, getRegisteredCrons, getStaleCrons } from "./cron/registry.js";
@@ -219,6 +220,8 @@ export interface CreateAppOptions {
   idempotencyDbPath?: string;
   /** Override DispatchLeaseStore database path (for testing). AI-2350. */
   dispatchLeaseDbPath?: string;
+  /** Override DispatchInFlightStore database path (for testing). INF-413. */
+  dispatchInFlightDbPath?: string;
   /** Override ProposalStore database path (for testing). AI-2039. */
   proposalsDbPath?: string;
   /** Override liveness dispatch record database path (for testing). INF-316. */
@@ -555,6 +558,9 @@ export function createApp(options?: CreateAppOptions) {
   const mutationAuditStore = new MutationAuditStore(options?.mutationAuditDbPath);
   const idempotencyStore = new DispatchIdempotencyStore(options?.idempotencyDbPath);
   const dispatchLeaseStore = new DispatchLeaseStore(options?.dispatchLeaseDbPath);
+  // INF-413: ticket-level in-flight guard — prevents the same ticket being
+  // dispatched to two concurrent workers regardless of agent/session.
+  const dispatchInFlightStore = new DispatchInFlightStore(options?.dispatchInFlightDbPath);
   const livenessDispatchStore = new DispatchRecordStore(
     options?.livenessDispatchDbPath ??
       (options?.bagDbPath
@@ -1314,6 +1320,7 @@ export function createApp(options?: CreateAppOptions) {
     idempotencyStore,
     dispatchLeaseStore,
     livenessDispatchStore,
+    dispatchInFlightStore,
   ));
 
   // ── v1.1: Session-end callback endpoint ──────────────────────────────
@@ -1490,6 +1497,13 @@ export function createApp(options?: CreateAppOptions) {
       }
     }
 
+    // INF-413: Release ticket-level in-flight records held by this agent so a
+    // completed/failed worker frees its ticket for the next legitimate run.
+    const releasedInFlight = dispatchInFlightStore.releaseForAgent(agentId);
+    if (releasedInFlight > 0) {
+      log.info(`Session-end: released ${releasedInFlight} in-flight dispatch record(s) for ${agentId}`);
+    }
+
     res.json({ ok: true, pendingTickets: allPending.length });
   });
 
@@ -1583,7 +1597,7 @@ export function createApp(options?: CreateAppOptions) {
   registerTtlInvalidationCron(ttlCache, 60_000);
   log.info("INF-193: TTL cache invalidation cron registered (every 60s)");
 
-  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, livenessDispatchStore, transcriptRedactionHealth: getTranscriptRedactionHealth() });
+  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, dispatchInFlightStore, livenessDispatchStore, transcriptRedactionHealth: getTranscriptRedactionHealth() });
 }
 
 /**

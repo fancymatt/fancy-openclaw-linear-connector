@@ -11,6 +11,7 @@ import type { EnrolledTicketsStore } from "../store/enrolled-tickets-store.js";
 import type { MutationAuditStore } from "../store/mutation-audit-store.js";
 import type { DispatchIdempotencyStore } from "../store/dispatch-idempotency-store.js";
 import type { DispatchLeaseStore } from "../store/dispatch-lease-store.js";
+import type { DispatchInFlightStore } from "../store/dispatch-inflight-store.js";
 import { extractWebhookMutations } from "./mutation-extraction.js";
 import { routeEvent, routeEventAll, unresolvedRoutingCandidates } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
@@ -183,10 +184,11 @@ async function deliverWithSlot(
   config: DeliveryConfig,
   throttle?: DeliveryThrottle,
   dispatchLeaseStore?: DispatchLeaseStore,
+  dispatchInFlightStore?: DispatchInFlightStore,
 ): Promise<Awaited<ReturnType<typeof deliverToAgent>>> {
   if (throttle) await throttle.acquireSlot();
   try {
-    return await deliverToAgent(route, config, dispatchLeaseStore);
+    return await deliverToAgent(route, config, dispatchLeaseStore, dispatchInFlightStore);
   } finally {
     if (throttle) throttle.releaseSlot();
   }
@@ -209,6 +211,7 @@ export function createWebhookRouter(
   idempotencyStore?: DispatchIdempotencyStore,
   dispatchLeaseStore?: DispatchLeaseStore,
   livenessDispatchStore?: Pick<DispatchRecordStore, "recordDispatch" | "recordAck" | "getDispatch">,
+  dispatchInFlightStore?: DispatchInFlightStore,
 ): Router {
   const router = Router();
   const delegatePingPongDetector = new DelegatePingPongDetector(undefined, undefined, operationalEventStore);
@@ -387,6 +390,10 @@ export function createWebhookRouter(
             if (leaseIdentifier) {
               const leaseTicketKey = normalizeSessionKey(leaseIdentifier);
               dispatchLeaseStore.renew(leaseAgentId, leaseTicketKey);
+              // INF-413: renew the ticket-level in-flight record on the same
+              // signal so a long-running worker's guard is not lost to TTL
+              // expiry mid-run (which would let a second worker be spawned).
+              dispatchInFlightStore?.renew(leaseTicketKey);
             }
           }
         }
@@ -581,7 +588,7 @@ export function createWebhookRouter(
                   await throttle.wait(wakeRoute.agentId);
                   throttle.record(wakeRoute.agentId);
                 }
-                const wakeResult = await deliverWithSlot(wakeRoute, wakeDeliveryConfig, throttle, dispatchLeaseStore);
+                const wakeResult = await deliverWithSlot(wakeRoute, wakeDeliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore);
                 log.info(
                   `Bootstrap wake delivered to ${bootstrapResult.delegateAgentName} for ${bootstrapResult.ticketIdentifier} (runId=${wakeResult.runId ?? "ok"})`,
                 );
@@ -1244,7 +1251,7 @@ export function createWebhookRouter(
               await throttle.wait(route.agentId);
               throttle.record(route.agentId);
             }
-            const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle, dispatchLeaseStore);
+            const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle, dispatchLeaseStore, dispatchInFlightStore);
             bag.removeTicket(agentName, normalizedTicketId);
             appendOperationalEvent(operationalEventStore, {
               outcome: sameTicketResult.runId ? "dispatch-accepted" : "delivered",
@@ -1330,7 +1337,7 @@ export function createWebhookRouter(
           await throttle.wait(route.agentId);
           throttle.record(route.agentId);
         }
-        const directResult = await deliverWithSlot(route, deliveryConfig, throttle, dispatchLeaseStore);
+        const directResult = await deliverWithSlot(route, deliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore);
         appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null, wakeId, plane: "connector", detail: directResult.canonVersion ? { canonVersion: directResult.canonVersion } : undefined });
         // Direct deliveries (incl. comment-routed wakes into an existing
         // session) must register the dispatch and flip engagement → Thinking
@@ -1352,7 +1359,7 @@ export function createWebhookRouter(
                 await throttle.wait(route.agentId);
                 throttle.record(route.agentId);
               }
-              const drainResult = await deliverWithSlot(next, deliveryConfig, throttle, dispatchLeaseStore);
+              const drainResult = await deliverWithSlot(next, deliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore);
               appendOperationalEvent(operationalEventStore, { outcome: drainResult.runId ? "dispatch-accepted" : "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, runId: drainResult.runId ?? null, detail: drainResult.canonVersion ? { canonVersion: drainResult.canonVersion } : undefined });
             } catch (err) {
               log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);
