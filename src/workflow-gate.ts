@@ -1683,7 +1683,7 @@ export function getCurrentState(labels: string[], def?: WorkflowDef): string | n
 export class TransientLabelFetchError extends Error {
   constructor(
     message: string,
-    public readonly statusCode?: number,
+    public readonly status?: number,
   ) {
     super(message);
     this.name = "TransientLabelFetchError";

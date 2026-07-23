@@ -100,6 +100,7 @@ type LinearIssueNode = {
 };
 
 type IssuesPageResp = {
+  errors?: Array<{ message: string }>;
   data?: {
     issues?: {
       nodes: LinearIssueNode[];
