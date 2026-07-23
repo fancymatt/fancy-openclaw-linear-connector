@@ -45,6 +45,7 @@ import type { NoActivityDetector } from "./bag/no-activity-detector.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { IssueCreateDedupCache, extractIssueCreateInput, fingerprintIssueCreate, isSuccessfulIssueCreate, DEFAULT_DEDUP_TTL_MS, type Claim } from "./issue-create-dedup.js";
 import { checkArtifactDisclosure } from "./artifact-disclosure.js";
+import { recordTransitionCarriedComment } from "./transition-comment-logic.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
@@ -696,7 +697,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // (begin-work, handoff-work, etc.) don't need a command nonce because they
       // already resolve to the user-supplied verb directly.
       if (
-        (intent === 'continue-workflow' || intent === 'request-revision') &&
+        (intent === 'continue-workflow' || intent === 'request-revision' || intent === 'begin-workflow') &&
         issueId &&
         !commandId
       ) {
@@ -721,7 +722,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // preserved in the header for logging; effectiveIntent drives all validation and
       // state transition logic.
       let effectiveIntent = intent!;
-      if ((intent === 'continue-workflow' || intent === 'request-revision') && issueId) {
+      if ((intent === 'continue-workflow' || intent === 'request-revision' || intent === 'begin-workflow') && issueId) {
         const metaResult = await resolveMetaIntent(intent, issueId, authorization, snapshotState);
         if ('error' in metaResult) {
           log.warn(`meta-intent-block agent=${agentId} intent=${intent}${ticketCtx}: ${metaResult.error}`);
@@ -942,6 +943,13 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         } else {
           log.warn(`comment-satisfied-by rejected agent=${agentId} intent=${effectiveIntent}${ticketCtx} comment=${satisfiedByHeader}`);
         }
+      }
+      // INF-443: a comment carried alongside a transition intent is mandatory
+      // transition metadata, not free-standing agent chatter — record it on the
+      // transition-carried counter so it never feeds a recent-comment
+      // rate-limit/dedup counter.
+      if (requestHasComment) {
+        recordTransitionCarriedComment();
       }
       const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment, snapshotDelegateId, snapshotState);
       if (p3rejection) {

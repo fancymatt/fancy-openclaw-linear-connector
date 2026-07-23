@@ -34,6 +34,7 @@ import { assertDispatchTargetFetchable } from "./delivery/index.js";
 import { markDispatchIntegrityGateActive, getDispatchIntegrityState } from "./dispatch-integrity-state.js";
 import { getCircuitBreakerHealth } from "./dispatch-circuit-breaker.js";
 import { getRemediationHealth } from "./remediation/remediation-state.js";
+import { getCommentStats, getTransitionCommentLogicHealth } from "./transition-comment-logic.js";
 import { getPreFlightLiveness, registerSpawnerPreflight } from "./spawner-preflight.js";
 import { checkFanoutOutcomeStoreLiveness, getFanoutOutcomeStoreLiveness } from "./fanout-outcome-store.js";
 import { registerDistillationCron, createProdGenerationContext } from "./cron/p4-metrics-distillation.js";
@@ -537,6 +538,14 @@ export function createApp(options?: CreateAppOptions) {
       // at the production entry point (AI-1808 guard), observable at
       // /health without waiting for a failure_class event.
       remediationActor: getRemediationHealth(),
+      // INF-443: transition-comment-logic liveness — proves the comment-stats
+      // component is wired at the production entry point (AI-1808 guard).
+      transitionCommentLogic: getTransitionCommentLogicHealth(),
+      // INF-443: comment stats — transition-carried comments are tracked
+      // separately from (mock, until a real store exists) recent free-standing
+      // agent comments, so mandatory transition metadata never feeds a
+      // rate-limit/dedup counter.
+      commentStats: getCommentStats(),
     });
   });
 
