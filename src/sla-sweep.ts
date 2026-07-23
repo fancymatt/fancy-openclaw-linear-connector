@@ -24,7 +24,7 @@ import { getWorkflowId, getCurrentState, type WorkflowDef } from "./workflow-gat
 import { isManagedBarrierFromLabels } from "./barrier.js";
 import { isNativelyTerminal } from "./terminality.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
-import { registerCron, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, markCronRun, formatIntervalMs } from "./cron/registry.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -339,7 +339,9 @@ export function registerSlaSweepCron(opts: SlaSweepOptions): ReturnType<typeof s
   const cadenceMs = opts.cadenceMs ?? DEFAULT_CADENCE_MS;
   registerCron("sla-sweep", `every ${formatIntervalMs(cadenceMs)}`);
   const timer = setInterval(() => {
-    runSlaSweep(opts).catch((err) => {
+    runSlaSweep(opts).then(() => {
+      markCronRun("sla-sweep");
+    }).catch((err) => {
       // Sweep errors are non-fatal (result.errors captures per-ticket issues),
       // but a whole-sweep failure (e.g. unreadable workflowDefPath) must not
       // be silent — that would be dead-code-in-prod with a registry entry.
