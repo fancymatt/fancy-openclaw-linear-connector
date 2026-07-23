@@ -11,7 +11,7 @@
  */
 
 import { Router, Request, Response } from "express";
-import { getAgents } from "../agents.js";
+import { getAccessToken, getAgents } from "../agents.js";
 import { LINEAR_API_URL } from "../linear-helpers.js";
 import type { LivenessChannelEndpoint, LivenessSnapshot } from "../liveness-channel/index.js";
 import { ContractEngine } from "./index.js";
@@ -138,7 +138,11 @@ const TRACKED_ISSUES_QUERY = `
 `;
 
 function linearAuthorization(): string | null {
-  const token = process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? null;
+  const token =
+    getAccessToken("ai") ??
+    process.env.LINEAR_OAUTH_TOKEN ??
+    process.env.LINEAR_API_KEY ??
+    null;
   if (!token) return null;
   return /^Bearer\s+/i.test(token) ? token : `Bearer ${token}`;
 }
