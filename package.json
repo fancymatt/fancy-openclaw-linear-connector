@@ -19,7 +19,7 @@
   "license": "MIT",
   "dependencies": {
     "@types/better-sqlite3": "^7.6.13",
-    "better-sqlite3": "^12.8.0",
+    "better-sqlite3": "^12.11.1",
     "dotenv": "^17.4.2",
     "express": "^4.18.2",
     "fancy-openclaw-linear-skill-cli": "file:vendor/fancy-openclaw-linear-skill-cli-0.3.5.tgz",
