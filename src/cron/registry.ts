@@ -42,16 +42,17 @@ export interface StaleCronEntry {
   name: string;
   schedule: string;
   lastRunAt: string | null;
+  overdueBy: string;
   overdueByMs: number;
 }
 
 export interface GetStaleCronsOptions {
   now?: Date;
-  staleFactor?: number;
+  stalenessMultiplier?: number;
 }
 
 const entries = new Map<string, CronRegistryEntry>();
-const DEFAULT_STALE_FACTOR = 3;
+const DEFAULT_STALENESS_MULTIPLIER = 3;
 
 /** Format a millisecond interval as a compact human-readable duration. */
 export function formatIntervalMs(ms: number): string {
@@ -101,13 +102,17 @@ function positiveNumberOrDefault(value: unknown, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-/** Config-driven stale threshold factor for /health.staleCrons. */
-export function getCronStaleFactorFromEnv(env: NodeJS.ProcessEnv = process.env): number {
-  return positiveNumberOrDefault(env.CRON_STALE_FACTOR, DEFAULT_STALE_FACTOR);
+/** Config-driven stale threshold multiplier for /health.staleCrons. */
+export function getCronStalenessMultiplierFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  return positiveNumberOrDefault(env.CRON_STALENESS_MULTIPLIER, DEFAULT_STALENESS_MULTIPLIER);
 }
 
 function parseIntervalMs(schedule: string): number | null {
-  const normalized = schedule.trim().toLowerCase().replace(/^every\s+/, "");
+  const normalized = schedule
+    .trim()
+    .toLowerCase()
+    .replace(/\s*\([^)]*\)\s*$/, "")
+    .replace(/^every\s+/, "");
   const match = normalized.match(/^(\d+(?:\.\d+)?)\s*(ms|msec|millisecond|milliseconds|s|sec|second|seconds|m|min|minute|minutes|h|hr|hour|hours|d|day|days)$/);
   if (!match) return null;
 
@@ -222,7 +227,10 @@ export function getStaleCrons(options: GetStaleCronsOptions = {}): StaleCronEntr
   const nowMs = (options.now ?? new Date()).getTime();
   if (!Number.isFinite(nowMs)) return [];
 
-  const staleFactor = positiveNumberOrDefault(options.staleFactor, DEFAULT_STALE_FACTOR);
+  const stalenessMultiplier = positiveNumberOrDefault(
+    options.stalenessMultiplier,
+    DEFAULT_STALENESS_MULTIPLIER,
+  );
   const stale: StaleCronEntry[] = [];
 
   for (const entry of getRegisteredCrons()) {
@@ -235,14 +243,16 @@ export function getStaleCrons(options: GetStaleCronsOptions = {}): StaleCronEntr
 
     const dueMs = entry.lastRunAt == null
       ? baseMs + intervalMs
-      : baseMs + intervalMs * staleFactor;
+      : baseMs + intervalMs * stalenessMultiplier;
 
     if (nowMs > dueMs) {
+      const overdueByMs = nowMs - dueMs;
       stale.push({
         name: entry.name,
         schedule: entry.schedule,
         lastRunAt: entry.lastRunAt,
-        overdueByMs: nowMs - dueMs,
+        overdueBy: formatIntervalMs(overdueByMs),
+        overdueByMs,
       });
     }
   }

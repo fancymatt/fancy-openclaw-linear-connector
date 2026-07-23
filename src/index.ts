@@ -60,7 +60,7 @@ import { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js"
 import { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import { ProposalStore } from "./store/proposal-store.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
-import { getCronStaleFactorFromEnv, getRegisteredCrons, getStaleCrons } from "./cron/registry.js";
+import { getCronStalenessMultiplierFromEnv, getRegisteredCrons, getStaleCrons } from "./cron/registry.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { getDetectorState } from "./done-ticket-detector-state.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
@@ -383,7 +383,7 @@ export function createApp(options?: CreateAppOptions) {
       // missing from this list means it shipped without bootstrap wiring
       // (the AI-1773/AI-1775 dead-code-in-prod failure mode).
       crons: getRegisteredCrons(),
-      staleCrons: getStaleCrons({ staleFactor: getCronStaleFactorFromEnv() }),
+      staleCrons: getStaleCrons({ stalenessMultiplier: getCronStalenessMultiplierFromEnv() }),
       // AI-2036 AC1.6: observation write-path liveness. `wired`/`subscribed` are
       // true only because bootstrap called registerObservationWritePath() — never
       // hardcoded — and `rows` is read from the live table, so a broken schema

@@ -18,6 +18,7 @@ import {
   markCronRun,
   resetCronRegistryForTest,
   formatIntervalMs,
+  getCronStalenessMultiplierFromEnv,
 } from "./registry.js";
 import { registerRescueSweepCron } from "./rescue-sweep-cron.js";
 import { registerG20CanaryCron } from "./g20-canary-runner.js";
@@ -63,12 +64,13 @@ type StaleCronEntry = {
   name: string;
   schedule: string;
   lastRunAt: string | null;
+  overdueBy: string;
   overdueByMs: number;
 };
 
-function getStaleCronsForTest(opts: { now: Date; staleFactor?: number }): StaleCronEntry[] {
+function getStaleCronsForTest(opts: { now: Date; stalenessMultiplier?: number }): StaleCronEntry[] {
   const fn = (cronRegistry as unknown as {
-    getStaleCrons?: (opts: { now: Date; staleFactor?: number }) => StaleCronEntry[];
+    getStaleCrons?: (opts: { now: Date; stalenessMultiplier?: number }) => StaleCronEntry[];
   }).getStaleCrons;
   expect(fn).toEqual(expect.any(Function));
   return fn!(opts);
@@ -98,6 +100,7 @@ describe("INF-339 stale cron detection", () => {
         name: "never-fired",
         schedule: "every 5m",
         lastRunAt: null,
+        overdueBy: "1m",
         overdueByMs: 60_000,
       },
     ]);
@@ -117,6 +120,7 @@ describe("INF-339 stale cron detection", () => {
         name: "lagging-driver",
         schedule: "every 10m",
         lastRunAt: "2026-07-22T12:00:00.000Z",
+        overdueBy: "1m",
         overdueByMs: 60_000,
       },
     ]);
@@ -129,20 +133,30 @@ describe("INF-339 stale cron detection", () => {
 
     expect(getStaleCronsForTest({
       now: new Date("2026-07-22T12:31:00.000Z"),
-      staleFactor: 4,
+      stalenessMultiplier: 4,
     })).toEqual([]);
 
     expect(getStaleCronsForTest({
       now: new Date("2026-07-22T12:41:00.000Z"),
-      staleFactor: 4,
+      stalenessMultiplier: 4,
     })).toEqual([
       {
         name: "configurable-driver",
         schedule: "every 10m",
         lastRunAt: "2026-07-22T12:00:00.000Z",
+        overdueBy: "1m",
         overdueByMs: 60_000,
       },
     ]);
+  });
+
+  test("AC4: stale threshold multiplier is read from CRON_STALENESS_MULTIPLIER", () => {
+    expect(getCronStalenessMultiplierFromEnv({
+      CRON_STALENESS_MULTIPLIER: "4",
+    } as NodeJS.ProcessEnv)).toBe(4);
+    expect(getCronStalenessMultiplierFromEnv({
+      CRON_STALENESS_MULTIPLIER: "0",
+    } as NodeJS.ProcessEnv)).toBe(3);
   });
 
   test("AC5: fresh crons and exact-threshold crons are not flagged", () => {
@@ -159,6 +173,33 @@ describe("INF-339 stale cron detection", () => {
     });
 
     expect(stale).toEqual([]);
+  });
+
+  test("AC5: parenthetical interval suffixes are still covered by stale detection", () => {
+    jest.setSystemTime(new Date("2026-07-22T12:00:00.000Z"));
+    registerCron("delegation-reconciliation-sweep", "every 5m (300000ms)");
+    registerCron("stale-plain-delegate-sweep", "every 5m (stale=15m)");
+
+    const stale = getStaleCronsForTest({
+      now: new Date("2026-07-22T12:06:00.000Z"),
+    });
+
+    expect(stale).toEqual([
+      {
+        name: "delegation-reconciliation-sweep",
+        schedule: "every 5m (300000ms)",
+        lastRunAt: null,
+        overdueBy: "1m",
+        overdueByMs: 60_000,
+      },
+      {
+        name: "stale-plain-delegate-sweep",
+        schedule: "every 5m (stale=15m)",
+        lastRunAt: null,
+        overdueBy: "1m",
+        overdueByMs: 60_000,
+      },
+    ]);
   });
 });
 
