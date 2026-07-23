@@ -656,10 +656,11 @@ export function createAdminRouter(deps: AdminDeps): Router {
   // AI-1802: Per-agent capacity strip (slots used / cap, parked count).
   // Read-only feed for the console's fleet/board page. Only agents with
   // any live sessions or parked tickets appear (idle agents are filtered
-  // out). Cap source: per-agent maxConcurrent from agents.json with
-  // fallback to AGENT_DEFAULT_MAX_CONCURRENT (3) — NOT delivery/throttle.ts.
+  // out). Cap source: explicit per-agent maxConcurrent from agents.json with
+  // fallback to unlimited; maxConcurrent is a serialize knob, not the fleet
+  // delivery-rate throttle.
   router.get("/api/capacity", (_req: Request, res: Response) => {
-    const DEFAULT_MAX_CONCURRENT = 3;
+    const DEFAULT_MAX_CONCURRENT = Number.MAX_SAFE_INTEGER;
     const agents = getAgents();
 
     // Build cap lookup: every known name/openclawAgent alias → maxConcurrent.

@@ -27,7 +27,7 @@
  *   NO_ACTIVITY_WARN_MS              — warn threshold (default: 2 min)
  *   NO_ACTIVITY_FAIL_MS              — hard fail threshold (default: 5 min)
  *   NO_ACTIVITY_POLL_MS              — check interval (default: 30 sec)
- *   AGENT_DEFAULT_MAX_CONCURRENT     — concurrent session cap per agent (default: 3)
+ *   AGENT_DEFAULT_MAX_CONCURRENT     — optional per-agent serialize cap (default: unlimited)
  *   NO_ACTIVITY_DEFERRED_STALE_MS   — how long a deferred entry may sit before rescue (default: 90 min)
  */
 
@@ -48,7 +48,7 @@ const log = componentLogger(createLogger(), "no-activity-detector");
 const DEFAULT_WARN_MS = 2 * 60 * 1000;          // 2 minutes
 const DEFAULT_FAIL_MS = 5 * 60 * 1000;           // 5 minutes
 const DEFAULT_POLL_MS = 30 * 1000;               // 30 seconds
-const DEFAULT_MAX_CONCURRENT = 3;
+const DEFAULT_AGENT_SERIALIZE_CAP = Number.MAX_SAFE_INTEGER;
 const DEFAULT_DEFERRED_STALE_MS = 90 * 60 * 1000; // 90 minutes
 
 export interface NoActivityConfig {
@@ -58,7 +58,7 @@ export interface NoActivityConfig {
   failMs: number;
   /** How often to check for no-activity sessions. Default: 30 sec. */
   pollMs: number;
-  /** Max concurrent sessions per agent for capacity classification. Default: 3. */
+  /** Optional per-agent serialize cap for correctness-only cases. Default: unlimited. */
   maxConcurrent: number;
   /** How long a deferred entry may sit before the stale-rescue sweep re-dispatches it. Default: 90 min. */
   deferredStaleMs: number;
@@ -78,9 +78,9 @@ export interface NoActivityDeps {
   resignalOptions?: Partial<ResignalOptions>;
   /** Optional: custom Linear comment poster for failed dispatches. */
   postLinearComment?: (agentId: string, ticketId: string, message: string) => Promise<boolean>;
-  /** Optional: per-agent max concurrent override. Return 0 to use the global default. */
+  /** Optional: per-agent serialize cap override. Return 0 for no cap. */
   getAgentMaxConcurrent?: (agentId: string) => number;
-  /** Optional: per-agent config lookup (used to read maxConcurrent from AgentConfig). */
+  /** Optional: per-agent config lookup (used to read explicit maxConcurrent from AgentConfig). */
   getAgentConfig?: (agentId: string) => AgentConfig | undefined;
   /** AI-1666: optional per-ticket no-activity fail threshold override in ms.
    *  When provided and returns a number, that value replaces the global failMs
@@ -103,6 +103,10 @@ function parseEnvInt(name: string, defaultVal: number): number {
   return isNaN(parsed) || parsed <= 0 ? defaultVal : parsed;
 }
 
+function normalizeSerializeCap(value: number | undefined): number | undefined {
+  return value !== undefined && value > 0 ? value : undefined;
+}
+
 export class NoActivityDetector {
   private timer?: ReturnType<typeof setInterval>;
   private config: NoActivityConfig;
@@ -118,7 +122,8 @@ export class NoActivityDetector {
       warnMs: config?.warnMs ?? parseEnvInt("NO_ACTIVITY_WARN_MS", DEFAULT_WARN_MS),
       failMs: config?.failMs ?? parseEnvInt("NO_ACTIVITY_FAIL_MS", DEFAULT_FAIL_MS),
       pollMs: config?.pollMs ?? parseEnvInt("NO_ACTIVITY_POLL_MS", DEFAULT_POLL_MS),
-      maxConcurrent: config?.maxConcurrent ?? parseEnvInt("AGENT_DEFAULT_MAX_CONCURRENT", DEFAULT_MAX_CONCURRENT),
+      maxConcurrent: normalizeSerializeCap(config?.maxConcurrent) ??
+        parseEnvInt("AGENT_DEFAULT_MAX_CONCURRENT", DEFAULT_AGENT_SERIALIZE_CAP),
       deferredStaleMs: config?.deferredStaleMs ?? parseEnvInt("NO_ACTIVITY_DEFERRED_STALE_MS", DEFAULT_DEFERRED_STALE_MS),
     };
   }
@@ -174,10 +179,10 @@ export class NoActivityDetector {
   }
 
   private getAgentMaxConcurrentValue(agentId: string): number {
-    const fromAgentConfig = this.deps.getAgentConfig?.(agentId)?.maxConcurrent;
-    if (fromAgentConfig) return fromAgentConfig;
-    const fromDep = this.deps.getAgentMaxConcurrent?.(agentId);
-    if (fromDep) return fromDep;
+    const fromAgentConfig = normalizeSerializeCap(this.deps.getAgentConfig?.(agentId)?.maxConcurrent);
+    if (fromAgentConfig !== undefined) return fromAgentConfig;
+    const fromDep = normalizeSerializeCap(this.deps.getAgentMaxConcurrent?.(agentId));
+    if (fromDep !== undefined) return fromDep;
     return this.config.maxConcurrent;
   }
 
@@ -455,7 +460,7 @@ export class NoActivityDetector {
 
     // 1a. Classify failure: alive-but-at-capacity vs. hard-down
     const remainingActiveSessions = sessionTracker.getActiveSessionKeys(agentId).length;
-    const maxConcurrent = (this.deps.getAgentMaxConcurrent?.(agentId) || 0) || this.config.maxConcurrent;
+    const maxConcurrent = this.getAgentMaxConcurrentValue(agentId);
     const agentAlive = remainingActiveSessions > 0;
     // After removing the failing session, if remaining >= maxConcurrent-1, the agent was full.
     const atCapacity = remainingActiveSessions >= maxConcurrent - 1;
