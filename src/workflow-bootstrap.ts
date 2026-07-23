@@ -384,6 +384,9 @@ export async function applyBootstrapToIssue(
       state: entryState,
       delegate: delegateAgentName ?? null,
       designatedApprover: workflowId === 'sprint-spawner' ? 'ai' : undefined,
+      // INF-441: sprint-spawner children always mint to 'To Do' (state:todo)
+      // instead of Backlog (state:intake) to ensure they are dispatched.
+      entryStateLabel: workflowId === 'sprint-spawner' ? 'state:todo' : undefined,
     });
   }
 
