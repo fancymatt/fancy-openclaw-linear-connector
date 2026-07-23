@@ -9,7 +9,7 @@ TARGET="${1:-HEAD}"
 REMOTE="${2:-origin}"
 
 # Resolve TARGET to a full SHA
-LOCAL_SHA=$(git rev-parse "$TARGET" 2>/dev/null) || {
+LOCAL_SHA=$(git -C "$(dirname "$0")/.." rev-parse "$TARGET" 2>/dev/null) || {
   echo "error: cannot resolve '$TARGET' locally."
   exit 1
 }
@@ -18,10 +18,10 @@ echo "INF-422: Verifying that $TARGET ($LOCAL_SHA) has landed on $REMOTE..."
 
 # Check if LOCAL_SHA is an ancestor of the remote branch
 # We use ls-remote to get the latest remote state without fetching.
-REMOTE_BRANCH=$(git rev-parse --abbrev-ref "$TARGET" 2>/dev/null || echo "$TARGET")
+REMOTE_BRANCH=$(git -C "$(dirname "$0")/.." rev-parse --abbrev-ref "$TARGET" 2>/dev/null || echo "$TARGET")
 
 # Get remote SHA for that branch
-REMOTE_SHA=$(git ls-remote "$REMOTE" "refs/heads/$REMOTE_BRANCH" | cut -f1)
+REMOTE_SHA=$(git -C "$(dirname "$0")/.." ls-remote "$REMOTE" "refs/heads/$REMOTE_BRANCH" | cut -f1)
 
 if [ -z "$REMOTE_SHA" ]; then
   echo "error: branch '$REMOTE_BRANCH' not found on $REMOTE."
