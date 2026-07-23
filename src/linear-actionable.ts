@@ -5,10 +5,10 @@ import type { LinearEvent } from "./webhook/schema.js";
 
 const log = componentLogger(createLogger(), "linear-actionable");
 
-const TERMINAL_STATE_TYPES = new Set(["completed", "canceled", "cancelled"]);
-const TERMINAL_STATE_NAMES = new Set(["done", "canceled", "cancelled"]);
-const PARKED_STATE_TYPES = new Set<string>();
-const PARKED_STATE_NAMES = new Set<string>();
+const TERMINAL_STATE_TYPES = new Set(["completed", "canceled", "cancelled", "duplicate"]);
+const TERMINAL_STATE_NAMES = new Set(["done", "canceled", "cancelled", "duplicate"]);
+const PARKED_STATE_TYPES = new Set(["backlog"]);
+const PARKED_STATE_NAMES = new Set(["backlog"]);
 
 export function isTerminalIssueState(state: unknown): boolean {
   if (!state || typeof state !== "object") return false;
@@ -59,6 +59,12 @@ export interface LinearIssueWithRelations extends LinearIssueReference {
   delegate?: LinearUserReference | null;
   assignee?: LinearUserReference | null;
   relations?: { nodes?: LinearIssueRelation[] | null } | null;
+  /** INF-83: whether the ticket is soft-deleted (trashed). Trashed tickets
+   *  are still fetchable but reject commentCreate. */
+  trashed?: boolean | null;
+  /** INF-83: when the ticket was archived. Archived tickets have the same
+   *  constraint as trashed — they are fetchable but not dispatchable. */
+  archivedAt?: string | null;
 }
 
 /** How the dispatch route to this agent was decided. */
@@ -235,6 +241,8 @@ export async function checkLinearIssueRouting(
             delegate { id name app }
             assignee { id name app }
             state { name type }
+            trashed
+            archivedAt
             relations(first: 50) {
               nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
             }
@@ -275,6 +283,14 @@ export async function checkLinearIssueRouting(
       log.info(`Dropping pending Linear ticket ${identifier}: blocked by unfinished prerequisite`);
       return { actionable: false, failOpen: false };
     }
+    // INF-83: archived/trashed tickets are fetchable but not dispatchable —
+    // commentCreate fails on them with "Entity not found: Issue", and any
+    // agent woken on them will bounce commentless. Reject at the liveness
+    // gate before a dispatch is armed.
+    if (issue.trashed || issue.archivedAt) {
+      log.info(`Dropping ${routingReason ?? "unrouted"} event for ${identifier}: ticket is ${issue.trashed ? "trashed" : "archived"}`);
+      return { actionable: false, failOpen: false };
+    }
 
     // ── Gate 2a: HUMAN-BLOCKED prune (roster-fanout reasons only, AI-2295) ─
     // A department-prefix / steward-escalation route onto a ticket with NO
@@ -287,6 +303,23 @@ export async function checkLinearIssueRouting(
       if (!issue.delegate && isHumanLinearUser(issue.assignee, agentLinearUserIdSet())) {
         log.info(
           `Dropping ${routingReason} event for ${identifier}: no delegate and assigned to human ${issue.assignee?.name ?? "unknown"} — human-blocked, not unrouted work`,
+        );
+        return { actionable: false, failOpen: false };
+      }
+      // ── INF-226 Defect A: STALE-DELEGATE prune (roster-fanout only) ──────
+      // A department-prefix / steward-escalation fanout targets the STATIC
+      // department default, blind to who currently holds the ticket. After an
+      // ad-hoc `handoff-work` moves the delegate to a different agent, every
+      // subsequent non-routing event (comment, label edit) re-fans-out to the
+      // old default and — absent this guard — re-wakes it in a loop (INF-221:
+      // Felix woken 5x after INF-221 was handed to Sage). Mirror Gate 2b's
+      // ownership re-verification: when a live delegate exists and is verifiably
+      // NOT the agent being woken, this fanout is stale. The null-delegate case
+      // falls through untouched, so genuinely unrouted departmental work still
+      // wakes the default.
+      if (issue.delegate && agent?.linearUserId && issue.delegate.id !== agent.linearUserId) {
+        log.info(
+          `Dropping ${routingReason} event for ${identifier}: delegated to ${issue.delegate.name ?? "another agent"}, not ${agentId} — stale department fanout`,
         );
         return { actionable: false, failOpen: false };
       }
@@ -366,6 +399,8 @@ export async function isLinearIssueActionable(ticketId: string, agentId: string)
           issue(id: $id) {
             id identifier
             state { name type }
+            trashed
+            archivedAt
             relations(first: 50) {
               nodes { type issue { id identifier state { name type } } relatedIssue { id identifier state { name type } } }
             }
@@ -393,6 +428,13 @@ export async function isLinearIssueActionable(ticketId: string, agentId: string)
     const issue = body.data?.issue;
     if (!issue) {
       log.info(`Dropping pending Linear ticket ${identifier}: issue no longer exists`);
+      return false;
+    }
+
+    // INF-83: archived/trashed tickets are not dispatchable — they fail
+    // commentCreate with "Entity not found: Issue". Treat as non-actionable.
+    if (issue.trashed || issue.archivedAt) {
+      log.info(`Dropping pending Linear ticket ${identifier}: ticket is ${issue.trashed ? "trashed" : "archived"}`);
       return false;
     }
 

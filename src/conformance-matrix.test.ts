@@ -38,6 +38,8 @@ import {
 } from "./conformance-matrix.js";
 import {
   checkWorkflowRules,
+  checkRawMutationInterception,
+  applyStateTransition,
   resetWorkflowCache,
   resetNativeStateCache,
   type WorkflowDef,
@@ -1021,5 +1023,200 @@ describe("G-13a T-rows: break-glass header identity gate (AI-1551)", () => {
     );
 
     expect(result).toBeNull();
+  });
+});
+
+
+// ── AI-2262 T-rows: park intent end-to-end (AC4) ────────────────────────────
+//
+// Hand-written adversarial/lifecycle rows for the `park` intent. The generated
+// conformance matrix only covers workflow transitions defined in the def YAML;
+// `park` is a special-cased lifecycle verb handled directly by B2
+// (applyStateTransition routes it to __ad_hoc__ demotion). These T-rows verify:
+//
+//   1. park demotes a wf-enrolled ticket to __ad_hoc__
+//   2. park on an ad-hoc ticket is a no-op
+//   3. checkRawMutationInterception blocks delegateId:null for non-park intents
+//
+// Together with the proxy-path tests in ai-2262-park-proxy-path.test.ts (which
+// verify the proxy-level exemption in stripNullDelegateAssigneeFields and the
+// checkRawMutationInterception bypass), this suite covers park end-to-end.
+
+describe("AI-2262 T-rows: park intent end-to-end (AC4)", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let dir: string;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    // Create temp dir for workflow def and policy files
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-2262-conformance-"));
+    // Write agents.json
+    fs.writeFileSync(path.join(dir, "agents.json"), JSON.stringify({
+      agents: [
+        { name: "charles", linearUserId: "charles-uuid", openclawAgent: "charles", accessToken: "tok-c", host: "local" },
+        { name: "hanzo", linearUserId: "hanzo-uuid", openclawAgent: "hanzo", accessToken: "tok-h", host: "local" },
+        { name: "astrid", linearUserId: "astrid-uuid", openclawAgent: "astrid", accessToken: "tok-a", host: "local" },
+      ],
+    }), "utf8");
+    // Write capability-policy.yaml
+    fs.writeFileSync(path.join(dir, "capability-policy.yaml"), TEST_POLICY_YAML, "utf8");
+    // Write workflow def yaml
+    fs.writeFileSync(path.join(dir, "dev-impl.yaml"), TEST_WORKFLOW_YAML, "utf8");
+    process.env.AGENTS_FILE = path.join(dir, "agents.json");
+    process.env.CAPABILITY_POLICY_PATH = path.join(dir, "capability-policy.yaml");
+    process.env.WORKFLOW_DEF_PATH = path.join(dir, "dev-impl.yaml");
+    resetWorkflowCache();
+    resetPolicyCache();
+    resetConfigHealth();
+    reloadAgents();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    fs.rmSync(dir, { recursive: true, force: true });
+    delete process.env.AGENTS_FILE;
+    delete process.env.CAPABILITY_POLICY_PATH;
+    delete process.env.WORKFLOW_DEF_PATH;
+    resetWorkflowCache();
+    resetPolicyCache();
+    resetConfigHealth();
+  });
+
+  // ── T-AC1: park demotes wf-enrolled ticket via applyStateTransition ───
+
+  it("T-AC1: applyStateTransition('park') demotes wf-enrolled ticket to __ad_hoc__", async () => {
+    let labelMutationCalled = false;
+
+    globalThis.fetch = async (url: any, init?: RequestInit) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        const parsed = JSON.parse(bodyText) as { query?: string };
+        const q = parsed.query ?? "";
+
+        if (q.includes("IssueWithLabels")) {
+          return new Response(
+            JSON.stringify({
+              data: {
+                issue: {
+                  id: "internal-uuid",
+                  identifier: "AI-2262-TEST",
+                  team: { id: "team-uuid" },
+                  labels: {
+                    nodes: [
+                      { id: "lbl-wf", name: "wf:dev-impl" },
+                      { id: "lbl-state", name: "state:intake" },
+                    ],
+                  },
+                },
+              },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
+        if (q.includes("TeamStates")) {
+          return new Response(
+            JSON.stringify({
+              data: { team: { states: { nodes: [{ id: "st-todo", name: "Todo", type: "unstarted" }] } } },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
+        if (q.includes("ApplyAtomicTransition")) {
+          labelMutationCalled = true;
+          return new Response(
+            JSON.stringify({ data: { issueUpdate: { success: true } } }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
+        return new Response(JSON.stringify({ data: {} }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return originalFetch(url, init);
+    };
+
+    const result = await applyStateTransition("park", "issue-uuid", "Bearer tok");
+
+    expect(result.status).toBe("applied");
+    expect(result.code).toBe("demoted-ad-hoc");
+    expect(result).toMatchObject({ from: "intake", to: "__ad_hoc__" });
+    expect(labelMutationCalled).toBe(true);
+  });
+
+  // ── T-AC2: park on ad-hoc ticket returns noop ─────────────────────────
+
+  it("T-AC2: applyStateTransition('park') on ad-hoc (non-wf) ticket returns noop", async () => {
+    globalThis.fetch = async (url: any, init?: RequestInit) => {
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+      if (typeof url === "string" && url.includes("api.linear.app")) {
+        const parsed = JSON.parse(bodyText) as { query?: string };
+        const q = parsed.query ?? "";
+
+        if (q.includes("IssueWithLabels")) {
+          return new Response(
+            JSON.stringify({
+              data: {
+                issue: {
+                  id: "internal-uuid",
+                  identifier: "AI-2262-TEST",
+                  team: { id: "team-uuid" },
+                  labels: { nodes: [{ id: "lbl-bug", name: "bug" }] },
+                },
+              },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
+        return new Response(JSON.stringify({ data: {} }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return originalFetch(url, init);
+    };
+
+    const result = await applyStateTransition("park", "issue-uuid", "Bearer tok");
+
+    expect(result.status).toBe("noop");
+    expect(result.code).toBe("ad-hoc");
+  });
+
+  // ── T-AC3: checkRawMutationInterception blocks delegateId:null ────────
+
+  it("T-AC3: checkRawMutationInterception blocks delegateId:null for non-park intent on wf-enrolled ticket", async () => {
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          data: {
+            issue: {
+              id: "internal-uuid",
+              labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:intake" }] },
+              delegate: { id: "hanzo-uuid" },
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+
+    const body = {
+      query: `mutation M($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
+      variables: { id: "issue-uuid", input: { delegateId: null, assigneeId: null } },
+    };
+
+    // Non-park intent from a non-delegate caller — must be blocked by the
+    // isClearingDelegate guard (AI-1857), which fires when delegateId:null
+    // is sent alongside assigneeId:null (the "partial semantic-verb" shape).
+    const result = await checkRawMutationInterception(
+      body, "issue-uuid", "Bearer tok", "charles", "charles-uuid",
+    );
+
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toMatch(/delegate/i);
   });
 });

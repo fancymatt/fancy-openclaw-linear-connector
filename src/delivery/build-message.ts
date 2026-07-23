@@ -31,6 +31,7 @@ import { getAppliedState } from "../store/applied-state-store.js";
 import { componentLogger, createLogger } from "../logger.js";
 import { defaultGuidanceDir } from "../instance-config.js";
 import { loadUniversalCanon, formatCanonBlock } from "../policy/universal-canon.js";
+import { remediateAgentToken } from "../agents.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "build-message");
 
@@ -56,6 +57,7 @@ function guidanceDir(): string {
 async function fetchLabelsWithRetry(
   identifier: string,
   authToken: string,
+  agentId?: string,
   maxRetries = parseInt(process.env.LABEL_FETCH_MAX_RETRIES ?? "2", 10),
   baseDelayMs = parseInt(process.env.LABEL_FETCH_BASE_DELAY_MS ?? "500", 10),
 ): Promise<string[]> {
@@ -65,12 +67,21 @@ async function fetchLabelsWithRetry(
       return await fetchWorkflowLabels(identifier, authToken);
     } catch (err) {
       lastError = err;
-      if (err instanceof TransientLabelFetchError && attempt < maxRetries) {
-        const delayMs = baseDelayMs * Math.pow(2, attempt);
-        log.warn(
-          `build-message: label fetch attempt ${attempt + 1}/${maxRetries + 1} failed for ${identifier} (${err.message}) — retrying in ${delayMs}ms`,
-        );
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      if (err instanceof TransientLabelFetchError) {
+        // INF-381: Trigger background token refresh on 401.
+        if (err.status === 401 && agentId) {
+          void remediateAgentToken(agentId);
+        }
+
+        if (attempt < maxRetries) {
+          const delayMs = baseDelayMs * Math.pow(2, attempt);
+          log.warn(
+            `build-message: label fetch attempt ${attempt + 1}/${maxRetries + 1} failed for ${identifier} (${err.message}) — retrying in ${delayMs}ms`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        } else {
+          throw err;
+        }
       } else {
         throw err;
       }
@@ -147,7 +158,7 @@ export async function buildDeliveryMessage(route: RouteResult, authToken?: strin
   if (reason === "mention" || reason === "body-mention") {
     message = buildMentionMessage(actorName, identifier, title);
   } else {
-    message = await buildDelegationMessage(reason, identifier, title, authToken);
+    message = await buildDelegationMessage(reason, identifier, title, authToken, eventKnowsTicketIsPlain(route), route.agentId);
   }
 
   // Inject the canon block after the hook line (before per-step guidance).
@@ -173,6 +184,7 @@ export async function buildDeliveryMessage(route: RouteResult, authToken?: strin
 export async function buildWorkflowAwareDeliveryMessage(
   identifier: string,
   authToken: string,
+  agentId?: string,
   actionText = `You have a pending ticket: ${identifier}`,
 ): Promise<string | null> {
   const query = `query IssueTitle($id: String!) { issue(id: $id) { title labels { nodes { name } } } }`;
@@ -188,6 +200,10 @@ export async function buildWorkflowAwareDeliveryMessage(
       log.warn(
         `build-message: title fetch for ${identifier} returned ${res.status} — proceeding with fallback`,
       );
+      // INF-381: Trigger background token refresh on 401.
+      if (res.status === 401 && agentId) {
+        void remediateAgentToken(agentId);
+      }
     } else {
       const json = (await res.json()) as { data?: { issue?: { title?: string; labels?: { nodes: Array<{ name: string }> } } } };
       title = json.data?.issue?.title ?? "";
@@ -203,7 +219,7 @@ export async function buildWorkflowAwareDeliveryMessage(
   }
   // AI-1848: load canon and inject into the workflow-aware message too.
   const canon = await loadUniversalCanon();
-  const wfMessage = await tryBuildWorkflowMessage(actionText, identifier, title, authToken);
+  const wfMessage = await tryBuildWorkflowMessage(actionText, identifier, title, authToken, agentId);
   return wfMessage !== null ? withCanonBlock(wfMessage, canon) : null;
 }
 
@@ -212,6 +228,8 @@ async function buildDelegationMessage(
   identifier: string,
   title: string,
   authToken: string | undefined,
+  knownPlainTicket = false,
+  agentId?: string,
 ): Promise<string> {
   const actionText =
     reason === "delegate"
@@ -219,17 +237,33 @@ async function buildDelegationMessage(
       : `You were assigned ${identifier}`;
 
   // §4.6 mode switch: attempt workflow-aware per-step injection for delegation events.
-  if (authToken) {
+  if (authToken && !knownPlainTicket) {
     const workflowMessage = await tryBuildWorkflowMessage(
       actionText,
       identifier,
       title,
       authToken,
+      agentId,
     );
     if (workflowMessage !== null) return workflowMessage;
   }
 
   return buildGenericDelegationMessage(actionText, identifier, title);
+}
+
+function eventKnowsTicketIsPlain(route: RouteResult): boolean {
+  const data = (route.event.data ?? {}) as Record<string, unknown>;
+  const labels = data.labels as { nodes?: Array<{ name?: string | null }> } | undefined;
+  const labelNames = Array.isArray(labels?.nodes)
+    ? labels.nodes.map((label) => label.name).filter((name): name is string => typeof name === "string")
+    : null;
+
+  if (labelNames && !labelNames.some((name) => name.startsWith("wf:"))) return true;
+
+  const labelIds = data.labelIds;
+  if (Array.isArray(labelIds) && labelIds.length === 0) return true;
+
+  return false;
 }
 
 /** Fetch the most recent comment on a ticket. Returns null on any failure. */
@@ -276,10 +310,11 @@ export async function tryBuildWorkflowMessage(
   identifier: string,
   title: string,
   authToken: string,
+  agentId?: string,
 ): Promise<string | null> {
   let labels: string[];
   try {
-    labels = await fetchLabelsWithRetry(identifier, authToken);
+    labels = await fetchLabelsWithRetry(identifier, authToken, agentId);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     log.warn(
@@ -329,8 +364,20 @@ export async function tryBuildWorkflowMessage(
   const breakGlassCommand = def.break_glass?.command ?? "escape";
   const transitions = stateNode.transitions ?? [];
 
+  // INF-201: barrier states auto-advance via engine native-state detection the
+  // moment their child barrier is satisfied. Their forward transitions are
+  // intentionally untagged (AI-2519) and have no registered CLI verb — the
+  // steward cannot and need not fire them. Rendering them as `linear <verb>`
+  // commands sends the steward chasing a phantom verb (observed: 'linear
+  // launch INF-196' → unknown command 'launch'). Render them as informational
+  // auto-advance lines instead of commands.
+  const isBarrierState = stateNode.barrier === true;
+
   const [stepLines, guidance, lastComment] = await Promise.all([
     Promise.all(transitions.map(async (t) => {
+      if (isBarrierState && t.generic !== 'continue' && t.generic !== 'revision') {
+        return `- (advances automatically → ${t.to} when the child barrier is satisfied; no steward command needed)`;
+      }
       const { bodies, mode } = await resolveTransitionTargets(t, def);
 
       // Use the generic command name when available (Matt's directive: guidance always

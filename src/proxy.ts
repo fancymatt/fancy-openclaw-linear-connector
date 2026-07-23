@@ -31,7 +31,10 @@
 import type { Request, Response } from "express";
 import { componentLogger, createLogger } from "./logger.js";
 import { checkEnforcementRules, bodyHasCapability } from "./escalation-gate.js";
+import { checkStaleSnapshotForTerminal } from "./proxy-cas-check.js";
 import { checkWorkflowRules, checkRawMutationInterception, applyStateTransition, buildStateTransitionReminder, fetchWorkflowLabels, fetchTeamStateLabelIds, getCurrentState, getWorkflowId, loadWorkflowDefById, resolveMetaIntent, resolveTransitionDelegate, setStateAtomic, verifyCommentSatisfiedBy, fetchTicketVerification, type TransitionFeedback, type TransitionApplyResult } from "./workflow-gate.js";
+import { buildTransitionAuditRecord, emitTransitionAuditRecord, verifyPostTransition, type GateResult, type TransitionAuditRecord } from "./transition-audit.js";
+import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
 import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
@@ -305,13 +308,67 @@ function stripStateLabelDeltas(body: GraphQLRequestBody | null, stateLabelIds: S
 function stripNullDelegateAssigneeFields(body: GraphQLRequestBody | null, effectiveIntent: string | null): void {
   const input = issueUpdateInput(body);
   if (!input) return;
-  // AI-2067: needs-human and complete legitimately send delegateId:null as
+  // AI-2067: needs-human, complete, and park legitimately send delegateId:null as
   // part of their documented contract — don't block it.
-  if (effectiveIntent === 'needs-human' || effectiveIntent === 'complete') {
+  if (effectiveIntent === 'needs-human' || effectiveIntent === 'complete' || effectiveIntent === 'park') {
     return;
   }
   if (input.delegateId === null) delete input.delegateId;
   if (input.assigneeId === null) delete input.assigneeId;
+}
+
+function rejectStrippedAppUserHandoffShape(body: GraphQLRequestBody | null, effectiveIntent: string | null): string | null {
+  if (effectiveIntent !== "handoff-work" || !isIssueUpdateMutation(body)) return null;
+  const input = issueUpdateInput(body);
+  if (!input) return null;
+  if (input.assigneeId === null && !("delegateId" in input)) {
+    return "[Proxy] 'handoff-work' blocked: app-user delegate handoffs must include delegateId alongside assigneeId:null. This request looks like the known stripped delegateId fallback shape; update the Linear skill CLI and retry.";
+  }
+  return null;
+}
+
+/**
+ * INF-274: Guard raw-path delegate=null on plain (non-workflow) tickets.
+ *
+ * Intent-bearing verbs (needs-human, complete, park) legitimately clear delegate
+ * and are exempted by stripNullDelegateAssigneeFields above — this guard catches
+ * the remaining case where a CLI sends delegateId:null directly on a ticket that
+ * has no workflow definition (ad-hoc / plain ticket).
+ *
+ * Workflow tickets are deferred to checkRawMutationInterception which already
+ * governs delegate mutations.
+ *
+ * Returns a blocking message string when the mutation should be rejected, or
+ * null to allow the request to proceed.
+ */
+export async function guardPlainTicketDelegateClear(
+  body: GraphQLRequestBody | null,
+  issueId: string | null,
+  authToken: string,
+): Promise<string | null> {
+  // Only applies to issueUpdate mutations that set delegateId to null
+  if (!isIssueUpdateMutation(body)) return null;
+  const input = issueUpdateInput(body);
+  if (!input || !("delegateId" in input) || input.delegateId !== null) return null;
+
+  // If the caller could not determine an issueId, we cannot verify the ticket
+  // type — allow through
+  if (!issueId) return null;
+
+  // Fetch labels to determine if this is a workflow or plain ticket
+  let labels: string[];
+  try {
+    labels = await fetchWorkflowLabels(issueId, authToken);
+  } catch {
+    // Fail-open — can't verify ticket type, allow through
+    return null;
+  }
+
+  // If the ticket has workflow labels, defer to workflow-gate's interception
+  if (getWorkflowId(labels) !== null) return null;
+
+  // Plain (non-workflow) ticket — block the delegate clear
+  return `Rejected delegate=null on plain (non-workflow) ticket ${issueId}: the proxy owns delegate management; CLI must not directly null the delegate field.`;
 }
 
 /**
@@ -375,6 +432,69 @@ function isMutationRequest(body: GraphQLRequestBody | null): boolean {
   return /^mutation\b/.test(stripped);
 }
 
+/**
+ * True when a string looks like a human-readable Linear issue identifier
+ * (e.g. "BBS-3", "AI-2597") rather than a UUID.
+ */
+function isHumanReadableIdentifier(value: string): boolean {
+  return /^[A-Z]+-\d+$/.test(value);
+}
+
+/**
+ * AI-2597: Resolve a human-readable issue identifier to its internal UUID
+ * before forwarding write mutations. The Linear API's `commentCreate` and
+ * other write mutations require the internal UUID for teams outside the AI
+ * namespace; the CLI may pass identifiers (e.g. "BBS-3") when it lacks
+ * workflow context to pre-resolve them.
+ *
+ * Mutates `body.variables` in-place, replacing identifier values in `issueId`
+ * and `id` keys with the resolved UUID. Returns true if a rewrite occurred.
+ */
+async function resolveMutationIssueIds(
+  body: GraphQLRequestBody | null,
+  authToken: string,
+): Promise<boolean> {
+  if (!body?.variables) return false;
+  const vars = body.variables as Record<string, unknown>;
+
+  // Identifiers that need resolving — one call handles both commentCreate
+  // ($issueId) and issueUpdate ($id) mutation variable keys.
+  const idKeys = ["issueId", "id"];
+  let resolved = false;
+
+  for (const key of idKeys) {
+    const value = vars[key];
+    if (typeof value !== "string" || !isHumanReadableIdentifier(value)) continue;
+
+    try {
+      const res = await fetch(LINEAR_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: authToken },
+        body: JSON.stringify({
+          query: `query($id: String!) { issue(id: $id) { id } }`,
+          variables: { id: value },
+        }),
+      });
+      if (!res.ok) {
+        // Fail-open: if the resolution query fails, forward the original
+        // identifier and let the upstream return the appropriate error.
+        continue;
+      }
+      const data = (await res.json()) as { data?: { issue?: { id: string } | null } };
+      const uuid = data.data?.issue?.id;
+      if (uuid && uuid !== value) {
+        vars[key] = uuid;
+        resolved = true;
+      }
+    } catch {
+      // Fail-open on resolution error — the upstream error will be clearer
+      // than a proxy-internal resolution failure.
+    }
+  }
+
+  return resolved;
+}
+
 // AI-1860: TTL for per-command authorization snapshots.
 const COMMAND_AUTH_SNAPSHOT_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -422,6 +542,8 @@ export interface ProxyDeps {
    * idempotent; calling it multiple times for the same agent+ticket is harmless.
    */
   onProxyCall?: (agentId: string, ticketId: string) => void;
+  /** AI-2565: dispatch lease store for CAS stale-snapshot enforcement on terminal transitions. */
+  dispatchLeaseStore?: DispatchLeaseStore;
 }
 
 export async function handleProxyRequest(req: Request, res: Response, deps?: ProxyDeps): Promise<void> {
@@ -639,18 +761,29 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         }
 
         // Target must be a state in the live def for this ticket's workflow.
+        // Three failure modes share distinct errors (AI-2016 AC2).
+        const msLabels = await fetchWorkflowLabels(issueId ?? "", authorization);
+        const msWorkflowId = getWorkflowId(msLabels);
+        if (!msWorkflowId) {
+          log.warn(`migrate-state-block agent=${agentId}${ticketCtx} target=${migrateTarget ?? "(none)"}: no wf: label — def unresolvable`);
+          res.status(200).json({ errors: [{ message: `[Proxy] migrate-state rejected: could not resolve the workflow def — the ticket has no wf:* workflow label. Use 'escape' to re-enroll or attach the correct wf:* label first.` }] });
+          return;
+        }
         let def: Awaited<ReturnType<typeof loadWorkflowDefById>> = null;
         try {
-          const labels = await fetchWorkflowLabels(issueId ?? "", authorization);
-          const workflowId = getWorkflowId(labels);
-          def = workflowId ? await loadWorkflowDefById(workflowId) : null;
+          def = await loadWorkflowDefById(msWorkflowId);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           log.warn(`migrate-state-target-check-failed agent=${agentId}${ticketCtx}: ${msg}`);
-          res.status(200).json({ errors: [{ message: `[Proxy] migrate-state rejected: could not resolve the workflow def to validate the target (${msg}).` }] });
+          res.status(200).json({ errors: [{ message: `[Proxy] migrate-state rejected: could not resolve the workflow def for '${msWorkflowId}' (${msg}).` }] });
           return;
         }
-        if (!migrateTarget || !def || !def.states.some((s) => s.id === migrateTarget)) {
+        if (!def) {
+          log.warn(`migrate-state-block agent=${agentId}${ticketCtx} target=${migrateTarget ?? "(none)"}: def not found for workflow '${msWorkflowId}'`);
+          res.status(200).json({ errors: [{ message: `[Proxy] migrate-state rejected: could not resolve the workflow def — workflow '${msWorkflowId}' is not registered in the registry.` }] });
+          return;
+        }
+        if (!migrateTarget || !def.states.some((s) => s.id === migrateTarget)) {
           log.warn(`migrate-state-block agent=${agentId}${ticketCtx} target=${migrateTarget ?? "(none)"}: not a live-def state`);
           res.status(200).json({ errors: [{ message: `[Proxy] migrate-state rejected: target '${migrateTarget ?? "(missing)"}' is not a state in the live workflow def. Migrate only to a state that exists in the current def.` }] });
           return;
@@ -839,6 +972,28 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         return;
       }
 
+      // ====================================================================
+      // AI-2565: CAS stale-snapshot check for terminal transitions.
+      // Runs after B1 (workflow rules) passes but before the forward mutation.
+      // Only applies to terminal/routing intents (handoff-work, complete-work,
+      // needs-human, refuse-work).
+      // ====================================================================
+      if (issueId && effectiveIntent) {
+        const staleRejection = await checkStaleSnapshotForTerminal(
+          effectiveIntent,
+          issueId,
+          agentId,
+          authorization,
+          callerLinearUserId,
+          deps?.dispatchLeaseStore,
+        );
+        if (staleRejection) {
+          log.warn(`stale-snapshot-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${staleRejection}`);
+          res.status(200).json({ errors: [{ message: staleRejection }] });
+          return;
+        }
+      }
+
       // AI-1860: first successful authorization — store the snapshot so subsequent
       // mutations in this multi-step command are not re-gated against its own
       // post-transition state. The source state is captured here (before the forward /
@@ -919,12 +1074,31 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           }
         }
 
+        // INF-274: Guard raw-path delegate=null on plain (non-workflow) tickets.
+        // Only applies to non-intent-bearing mutations (raw-path). Intent-bearing
+        // verbs like note, handoff-work, etc. are handled by
+        // stripNullDelegateAssigneeFields below.
+        if (!effectiveIntent && isIssueUpdateMutation(body)) {
+          const guardResult = await guardPlainTicketDelegateClear(body, issueId ?? null, authorization);
+          if (guardResult !== null) {
+            log.warn(`plain-delegate-clear-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${guardResult}`);
+            res.status(200).json({ errors: [{ message: `[Proxy] ${guardResult}` }] });
+            return;
+          }
+        }
+
         // AI-1857: Strip null delegateId/assigneeId from forwarded intent-bearing mutations.
         // The proxy manages delegates; partial semantic-verb application (e.g. complete)
         // bundles these null clears, which must not reach Linear directly.
         // AI-2067: needs-human is exempt — it is the documented path for clearing delegate
         // while setting a human assignee.
         if (isIssueUpdateMutation(body)) {
+          const strippedAppUserHandoffRejection = rejectStrippedAppUserHandoffShape(body, effectiveIntent);
+          if (strippedAppUserHandoffRejection) {
+            log.warn(`app-user-handoff-stripped-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${strippedAppUserHandoffRejection}`);
+            res.status(200).json({ errors: [{ message: strippedAppUserHandoffRejection }] });
+            return;
+          }
           stripNullDelegateAssigneeFields(body, effectiveIntent);
         }
 
@@ -959,7 +1133,25 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           ) {
             inputForDelegate.assigneeId = null;
             log.info(
-              `app-user-delegate-assignee-clear agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected assigneeId:null alongside delegateId so the delegate persists (AI-2417)`,
+              `app-user-delegate-assignee-clear agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected assigneeId:null alongside delegateId in input (AI-2417)`,
+            );
+          }
+          // AI-1395/INF-312: Also handle inline input format where delegateId is a
+          // top-level variable (e.g. `input: { delegateId: $delegateId }` with
+          // variables: { id, delegateId } rather than variables: { id, input: { delegateId } }).
+          // The issueUpdateInput helper returns undefined for this shape, so we check
+          // body.variables directly for delegateId at the top level.
+          const vars = body?.variables as Record<string, unknown> | undefined;
+          if (
+            vars &&
+            typeof vars === "object" &&
+            "delegateId" in vars &&
+            vars.delegateId != null &&
+            !("assigneeId" in vars)
+          ) {
+            vars.assigneeId = null;
+            log.info(
+              `app-user-delegate-assignee-clear agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected assigneeId:null alongside delegateId in top-level variables (AI-2417/INF-312)`,
             );
           }
         }
@@ -1033,15 +1225,29 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
         // mutation. Running it here — after strip has removed legitimate state:* deltas
         // — catches anything that survived (strip failure, non-state label manipulation).
         // commentCreate is excluded: workflow commands legitimately use it.
-        const intentPathRawRejection = await checkRawMutationInterception(
-          body, issueId, authorization, agentId, callerLinearUserId, /* skipCommentCreate */ true, /* skipLabelFields */ true
-        );
-        if (intentPathRawRejection) {
-          log.warn(`raw-mutation-block-on-intent-path agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${intentPathRawRejection}`);
-          res.status(200).json({ errors: [{ message: intentPathRawRejection }] });
-          return;
+        // AI-2262: `park` is exempt — it sends stateId for Backlog + null delegate/assignee
+        // as its documented contract, and B2 handles the workflow demotion.
+        // INF-108: skipTransitionFields=true — the intent path has already validated
+        // the workflow transition through B1; stateId/assigneeId/delegateId changes
+        // are legitimate parts of the governed transition (e.g. `complete` on a
+        // barrier-state managing ticket sends all three) and must not be blocked.
+        if (effectiveIntent !== 'park') {
+          const intentPathRawRejection = await checkRawMutationInterception(
+            body, issueId, authorization, agentId, callerLinearUserId, /* skipCommentCreate */ true, /* skipLabelFields */ true, /* skipTransitionFields */ true
+          );
+          if (intentPathRawRejection) {
+            log.warn(`raw-mutation-block-on-intent-path agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${intentPathRawRejection}`);
+            res.status(200).json({ errors: [{ message: intentPathRawRejection }] });
+            return;
+          }
         }
       }
+
+      // AI-2597: resolve human-readable issue identifiers to UUIDs before
+      // forwarding write mutations. This is safe to call on every request —
+      // it's a no-op when variables contain UUIDs or the keys don't exist.
+      await resolveMutationIssueIds(body, authorization);
+
       let upstreamRes: globalThis.Response;
       try {
         upstreamRes = await fetch(LINEAR_API_URL, {
@@ -1156,6 +1362,59 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             operationalEventStore: deps?.operationalEventStore,
             delegateOverride,
           });
+
+          // ── AI-2554: Structured transition audit record ──────────────
+          if (issueId && transitionResult) {
+            try {
+              const gateResults: GateResult[] = [];
+              gateResults.push({ name: "phase-2-escalation-gate", passed: true, detail: null });
+              gateResults.push({ name: "b1-workflow-def-validation", passed: true, detail: null });
+              gateResults.push({ name: "layer-2-raw-interception", passed: true, detail: null });
+              gateResults.push({ name: "config-health", passed: true, detail: null });
+
+              const auditRecord = buildTransitionAuditRecord(
+                issueId,
+                effectiveIntent,
+                transitionResult.to ?? null,
+                transitionResult.from ?? null,
+                transitionResult.to ?? null,
+                transitionResult.status,
+                transitionResult.code,
+                transitionResult.detail ?? null,
+                agentId,
+                gateResults,
+              );
+              emitTransitionAuditRecord(auditRecord);
+            } catch (auditErr) {
+              log.warn(`[transition-audit] failed to emit audit record: ${auditErr instanceof Error ? auditErr.message : String(auditErr)}`);
+            }
+
+            // ── AI-2554: Post-transition verification ────────────────────
+            // After a successful applied transition, re-read the state:* label
+            // from Linear to confirm it matches the expected target state.
+            // Verification is fire-and-forget to avoid blocking the response.
+            // It runs at next microtask to avoid interfering with inline fetch mocks in tests.
+            const verifyTargetState = transitionResult.to;
+            if (transitionResult.status === "applied" && verifyTargetState) {
+              // Schedule on next tick so test mocks don't see the verification fetch
+              // interleaved with the transition-associated fetches.
+              Promise.resolve().then(() => {
+                verifyPostTransition(issueId, verifyTargetState, authorization).then((verification) => {
+                if (verification && !verification.match) {
+                  log.warn(
+                    `[transition-audit] post-transition LABEL MISMATCH for ${issueId} ${ticketCtx}: ` +
+                    `expected state:${verifyTargetState}, got ${verification.actualState ?? "(null)"}`,
+                  );
+                }
+              }).catch((verifyErr: unknown) => {
+                const vm = verifyErr instanceof Error ? verifyErr.message : String(verifyErr);
+                log.warn(`[transition-audit] post-transition verify threw for ${issueId}: ${vm}`);
+              });
+              });
+            }
+          }
+
+          // Legacy log line for backwards compatibility
           if (transitionResult.status === "failed") {
             log.error(`state-transition FAILED agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${transitionResult.code}${transitionResult.detail ? ` — ${transitionResult.detail}` : ""}`);
           }
@@ -1299,6 +1558,10 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       createClaim = claim;
     }
   }
+
+  // AI-2597: resolve human-readable issue identifiers to UUIDs before
+  // forwarding write mutations.
+  await resolveMutationIssueIds(body, authorization);
 
   // Non-intent forward path (reads and raw non-workflow mutations).
   let upstreamRes: globalThis.Response;

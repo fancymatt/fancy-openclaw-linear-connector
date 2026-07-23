@@ -1006,5 +1006,121 @@ describe("StuckDelegateDetector", () => {
       sessionTracker.close();
       operationalEventStore.close();
     });
+
+    // ── AI-2129: barrier-held suppression ────────────────────────────────
+
+    /** A wf:dev-sprint parent at state:validation with a delegate comment and no
+     *  transition — the classic false-positive shape. `nonTerminalChildCount`
+     *  varies per test to exercise the barrier. */
+    function sprintParentCandidate(nonTerminalChildCount: number, totalChildren: number): StuckCandidate {
+      return {
+        identifier: "AI-2021",
+        currentState: "validation",
+        labels: ["wf:dev-sprint", "state:validation"],
+        delegateId: "linear-user-igor",
+        stateEnteredAt: "2026-07-10T05:00:00.000Z",
+        delegateComments: [
+          {
+            id: "comment-fp",
+            createdAt: "2026-07-10T06:20:00.000Z",
+            body: "false positive — barrier still open, C6 in flight",
+          },
+        ],
+        transitionsAfterEntry: [],
+        workflowId: "dev-sprint",
+        totalChildren,
+        nonTerminalChildCount,
+      };
+    }
+
+    function barrierDetector(
+      candidates: StuckCandidate[],
+      wakeCalls: Array<{ agent: string; ticket: string; prompt: string }>,
+      deps: ReturnType<typeof setupDeps>,
+    ): StuckDelegateDetector {
+      return new StuckDelegateDetector(
+        {
+          sessionTracker: deps.sessionTracker,
+          bag: deps.bag,
+          operationalEventStore: deps.operationalEventStore,
+          deliveryConfig: deps.deliveryConfig,
+          listAgents: () => [TEST_AGENT],
+          fetchStuckCandidates: async () => candidates,
+          loadDef: async () => TEST_WORKFLOW_DEF,
+          sendWake: async (agent, ticket, prompt) => {
+            wakeCalls.push({ agent, ticket, prompt });
+            return true;
+          },
+        },
+        { pollMs: 60_000, idleGraceMs: 0, maxPrompts: 2 },
+      );
+    }
+
+    test("AC1: barrier-held sprint parent with a non-terminal child is suppressed", async () => {
+      const deps = setupDeps(dir);
+      const wakeCalls: Array<{ agent: string; ticket: string; prompt: string }> = [];
+      const detector = barrierDetector([sprintParentCandidate(1, 3)], wakeCalls, deps);
+
+      const result = await detector.runCycle();
+
+      expect(result.skippedBarrierHeld).toBe(1);
+      expect(result.stuckFound).toBe(0);
+      expect(result.rePromptsSent).toBe(0);
+      expect(wakeCalls).toHaveLength(0);
+
+      detector.stop();
+      deps.bag.close();
+      deps.sessionTracker.close();
+      deps.operationalEventStore.close();
+    });
+
+    test("AC2: once all children are terminal, the sprint parent resumes dispatch", async () => {
+      const deps = setupDeps(dir);
+      const wakeCalls: Array<{ agent: string; ticket: string; prompt: string }> = [];
+      const detector = barrierDetector([sprintParentCandidate(0, 3)], wakeCalls, deps);
+
+      const result = await detector.runCycle();
+
+      expect(result.skippedBarrierHeld).toBe(0);
+      expect(result.stuckFound).toBe(1);
+      expect(result.rePromptsSent).toBe(1);
+      expect(wakeCalls).toHaveLength(1);
+      expect(wakeCalls[0].ticket).toBe("AI-2021");
+
+      detector.stop();
+      deps.bag.close();
+      deps.sessionTracker.close();
+      deps.operationalEventStore.close();
+    });
+
+    test("AC3: ordinary stuck delegate (leaf ticket, no children) still fires", async () => {
+      const deps = setupDeps(dir);
+      const wakeCalls: Array<{ agent: string; ticket: string; prompt: string }> = [];
+      // Leaf implementer ticket — no children fields at all (backward-compat path).
+      const leaf: StuckCandidate = {
+        identifier: "AI-1451",
+        currentState: "implementation",
+        labels: ["wf:dev-impl", "state:implementation"],
+        delegateId: "linear-user-igor",
+        stateEnteredAt: "2026-06-08T19:00:00.000Z",
+        delegateComments: [
+          { id: "c1", createdAt: "2026-06-08T20:00:00.000Z", body: "## B-1 Complete" },
+        ],
+        transitionsAfterEntry: [],
+      };
+      const detector = barrierDetector([leaf], wakeCalls, deps);
+
+      const result = await detector.runCycle();
+
+      expect(result.skippedBarrierHeld).toBe(0);
+      expect(result.stuckFound).toBe(1);
+      expect(result.rePromptsSent).toBe(1);
+      expect(wakeCalls).toHaveLength(1);
+
+      detector.stop();
+      deps.bag.close();
+      deps.sessionTracker.close();
+      deps.operationalEventStore.close();
+    });
   });
 });

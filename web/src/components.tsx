@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { Heading, Nav, Text } from "@fancyfleet/components";
 import { NavLink } from "react-router-dom";
 import type { Severity } from "./types";
 
@@ -10,19 +11,19 @@ export function Chip({ tone, children }: { tone: Severity | "blue" | string; chi
 export function Card({ span = 12, title, children }: { span?: 4 | 6 | 8 | 12; title?: ReactNode; children: ReactNode }) {
   return (
     <section className={`card span-${span}`}>
-      {title !== undefined && <h2>{title}</h2>}
+      {title !== undefined && <Heading as="h2" className="card-heading">{title}</Heading>}
       {children}
     </section>
   );
 }
 
 export function Empty({ children }: { children: ReactNode }) {
-  return <div className="empty">{children}</div>;
+  return <Text className="empty">{children}</Text>;
 }
 
 export function ErrorBanner({ message }: { message: string | null }) {
   if (!message) return null;
-  return <div className="error-banner">API error: {message}</div>;
+  return <Text className="error-banner">API error: {message}</Text>;
 }
 
 export function Diagnostics({ value, label = "Raw diagnostics" }: { value: unknown; label?: string }) {
@@ -50,7 +51,7 @@ const TABS: Array<[string, string]> = [
 
 export function Tabs({ pendingProposals = 0 }: { pendingProposals?: number } = {}) {
   return (
-    <nav className="tabs">
+    <Nav>
       {TABS.map(([to, label]) => (
         <NavLink key={to} to={to} end={to === "/"} className={({ isActive }) => (isActive ? "active" : "")}>
           {label}
@@ -61,15 +62,20 @@ export function Tabs({ pendingProposals = 0 }: { pendingProposals?: number } = {
           )}
         </NavLink>
       ))}
-    </nav>
+    </Nav>
   );
 }
 
 export function Stat({ value, label, tone }: { value: ReactNode; label: string; tone?: "red" | "yellow" | "green" }) {
+  const toneMap: Record<string, string> = {
+    red: "var(--color-error)",
+    yellow: "var(--color-warning)",
+    green: "var(--color-success)",
+  };
   return (
     <div className="stat">
-      <div className="value" style={tone ? { color: `var(--${tone})` } : undefined}>{value}</div>
-      <div className="label">{label}</div>
+      <Text className="value" style={tone ? { color: toneMap[tone] } : undefined}>{value}</Text>
+      <Text className="label">{label}</Text>
     </div>
   );
 }

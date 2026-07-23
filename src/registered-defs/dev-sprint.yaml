@@ -1,15 +1,25 @@
-# dev-sprint — Sprint Execution Workflow (v2)
+# dev-sprint — Sprint Execution Workflow (v8)
 # owner: steward (Astrid), engine (spawn-arms, spawn-impl)
-# last-updated: 2026-07-16
-# status: v2 deployed to production (INF-40, 2026-07-16)
+# last-updated: 2026-07-22
+# status: v8 deployed to production (INF-359 sprint coherence)
+#
+# v5 (2026-07-21): added `cancelled` terminal state — explicit sprint
+#   termination path without completing (break-glass, not normal).
+# v6 (2026-07-21): added `auto_derive_from` to spawn-arms fanout — auto-
+#   populate the ## Structured section from prior-phase children on entry,
+#   so the spawn command has a valid spec even when the sprint creator did
+#   not hand-author it (INF-258).
+# v7 (2026-07-21): incremental re-entry fix — re-running spawn after
+#   children exist uses the dedup path (AI-1994) instead of re-creating.
+# v8 (2026-07-22): sprint coherence gates — product-definition requires
+#   capability statements; implementation fanout requires classification and
+#   adds per-capability integration-verify children; validation approval
+#   requires passed demonstration-walk evidence.
 #
 # Registered-def copy for CI conformance validation (INF-42). The canonical
 # source is the vault markdown spec at:
 #   life-os/project-management/workflows/dev-sprint/dev-sprint-workflow-spec.md
 # Keep in sync with that spec.
-#
-# INF-45 (2026-07-16): added to registered-defs as child_workflow target
-# for sprint-spawner's launching state (fanout: wf:dev-sprint).
 #
 # Arm workflows (wf:sprint-arm-scope, wf:sprint-arm-ux, wf:sprint-arm-design,
 # wf:sprint-arm-spike) are registered as v0 stubs in src/registered-defs/.
@@ -20,13 +30,18 @@
 #   → 5. ac-definition → 6. spawn-impl → 7. managing-impl → 8. validation → done
 
 id: dev-sprint
-version: 2
+version: 8
 archetype: orchestrator
 entry_state: intake
 
+# INF-311: escape → product-definition recovery state (was intake)
+# Tickets already in escape state migrate to product-definition for recovery.
+migrations:
+  escape: product-definition
+
 break_glass:
   command: escape
-  to: escape
+  to: product-definition
   owner_role: steward
 
 states:
@@ -55,6 +70,7 @@ states:
       - command: continue
         to: spawn-arms
         generic: continue
+        requires_capability_statement: true
 
   - id: spawn-arms
     owner_role: engine
@@ -62,7 +78,9 @@ states:
     native_state: doing
     description: >
       Fanout phase 1: create arm tickets from spec. Each is a wf:sprint-arm-*
-      ticket, parentId = sprint.
+      ticket, parentId = sprint. INF-258: when the ## Structured section is
+      missing on spawn, the engine auto-derives it from existing arm children
+      (if any) or from the ticket description, so the spawn never stalls.
     # INF-45 (2026-07-16): arm workflows registered as v0 stubs
     # (sprint-arm-scope, sprint-arm-ux, sprint-arm-design, sprint-arm-spike).
     fanout:
@@ -110,6 +128,16 @@ states:
       spec_source: findings
       child_workflow: wf:dev-impl
       initial_delegate: astrid
+      classification_required: true
+      classification_field: classification
+      allowed_classifications:
+        - traces-to-capability
+        - declared-standalone
+      standalone_share_nudge_above: 0.5
+      integration_verify:
+        child_workflow: wf:integration-verify
+        per_capability: true
+        blocked_by: capability-components
     transitions:
       - command: spawn
         to: managing-impl
@@ -134,21 +162,54 @@ states:
     native_state: thinking
     description: >
       Author Matt-facing sprint validation. cra reviews technical accuracy.
-      requires_human_signoff_above_stakes — closes only on Matt's explicit yes.
+      requires_human_signoff_above_stakes — the human sign-off is captured HERE,
+      on Matt's explicit yes. On approve the sprint advances to post-validation
+      (the mechanical visual-audit gate), not directly to done.
     transitions:
       - command: approve
-        to: done
+        to: post-validation
         generic: continue
         requires_human_signoff_above_stakes: true
+        requires_demonstration_walk: true
       - command: reject
         to: ac-definition
         generic: revision
 
+  - id: post-validation
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    description: >
+      AI-2524: conditional visual-audit gate at milestone close. Fans out into a
+      wf:ui-audit child ONLY when a closed impl child carries the `ui-impact`
+      label (spawn_if, AI-2523); otherwise the gate is a no-op and the sprint
+      continues to done. The human sign-off was already captured at
+      validation→approve, so this transition is mechanical (no signoff). The
+      milestone-close verification comment carries the Visual Audit breakpoint
+      table + sign-off checkbox (see dev-sprint-milestone-close-template.ts).
+    fanout:
+      spec_source: findings
+      child_workflow: wf:ui-audit
+      initial_delegate: astrid
+      spawn_if:
+        label_present: ui-impact
+        scope: closed_children
+    transitions:
+      - command: continue
+        to: done
+        generic: continue
+
   - id: done
     kind: terminal
+    barrier: true
     native_state: done
     satisfies_parent_barrier: true
 
-  - id: escape
+  # v7: explicit cancellation — a sprint can be terminated via break-glass
+  # escape to cancelled state. Not a normal forward path.
+  - id: cancelled
     kind: terminal
-    native_state: invalid
+    native_state: done
+    description: >
+      Sprint terminated without completing all arms. Used via break-glass
+      escape, not normal forward progression.

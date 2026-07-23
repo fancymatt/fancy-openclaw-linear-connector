@@ -1,0 +1,47 @@
+{
+  "name": "@fancyfleet/components",
+  "version": "0.1.0",
+  "private": true,
+  "description": "React component library for the Warm Precision Design System",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    },
+    "./styles.css": "./styles.css",
+    "./tokens": "./tokens.css",
+    "./tokens.css": "./tokens.css",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "@fancyfleet/tokens": "*",
+    "react": "^18.3.1 || ^19.0.0",
+    "react-dom": "^18.3.1 || ^19.0.0"
+  },
+  "devDependencies": {
+    "@fancyfleet/tokens": "*",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^25.0.1",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.1.0"
+  },
+  "keywords": [
+    "react",
+    "components",
+    "design-system",
+    "fancyfleet"
+  ],
+  "license": "UNLICENSED"
+}

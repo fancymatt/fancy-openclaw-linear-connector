@@ -45,6 +45,10 @@ export interface WatchdogConfig {
   maxResignals: number;
   /** How frequently the watchdog runs its reconciliation cycle. Default: 3 min. */
   cycleIntervalMs: number;
+  /** AI-2116: Base ms for exponential backoff between consecutive re-dispatches.
+   *  Actual delay = exponentialBackoffMs * 2^(attemptCount - 1).
+   *  When 0 or undefined, no exponential delay is applied (uses fixed cycle). */
+  exponentialBackoffMs?: number;
 }
 
 export interface WatchdogDeps {
@@ -59,6 +63,15 @@ export interface WatchdogDeps {
   wakeConfigForAgent?: (agentId: string) => WakeUpConfig;
   /** Optional test overrides forwarded to resignalPendingTickets (sendWakeUp, isTicketActionable). */
   resignalOptions?: Partial<ResignalOptions>;
+  /** AI-2116: precondition guard — check if ticket ID resolves to a real Linear issue.
+   *  Return false to skip re-dispatch and drop/escalate. */
+  linearResolveCheck?: (ticketId: string) => Promise<boolean>;
+  /** AI-2116: precondition guard — check if agentId is the ticket's current delegate.
+   *  Return false to skip re-dispatch. */
+  delegateCheck?: (ticketId: string, agentId: string) => Promise<boolean>;
+  /** AI-2116: precondition guard — check if ticket is in a workflow with a resolvable
+   *  forward verb before emitting a "run pending transition" wake. */
+  workflowStateCheck?: (ticketId: string) => Promise<{ inWorkflow: boolean; resolvableVerb: string | null }>;
 }
 
 export interface WatchdogCycleResult {
@@ -78,6 +91,10 @@ export class DispatchWatchdog {
   private timer?: ReturnType<typeof setInterval>;
   private config: WatchdogConfig;
   private deps: WatchdogDeps;
+  /** AI-2116: total cycles run since construction. */
+  totalCycles: number = 0;
+  /** AI-2116: last cycle result summary for /health liveness. */
+  lastCycleResult?: { resignaled: number; escalated: number; autoAcknowledged: number };
 
   constructor(deps: WatchdogDeps, config?: Partial<WatchdogConfig>) {
     this.deps = deps;
@@ -88,6 +105,8 @@ export class DispatchWatchdog {
         config?.maxResignals ?? parseEnvInt("WATCHDOG_MAX_RESIGNALS", DEFAULT_MAX_RESIGNALS),
       cycleIntervalMs:
         config?.cycleIntervalMs ?? parseEnvInt("WATCHDOG_CYCLE_INTERVAL_MS", DEFAULT_CYCLE_INTERVAL_MS),
+      exponentialBackoffMs:
+        config?.exponentialBackoffMs ?? parseEnvInt("WATCHDOG_EXPONENTIAL_BACKOFF_MS", 0),
     };
   }
 
@@ -124,10 +143,13 @@ export class DispatchWatchdog {
    *   - autoAcknowledged: ticket no longer in bag, silently acked
    */
   async runCycle(): Promise<WatchdogCycleResult> {
-    const { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, wakeConfigForAgent } = this.deps;
+    this.totalCycles++;
+    const { bag, sessionTracker, ackTracker, operationalEventStore, wakeConfig, wakeConfigForAgent,
+            linearResolveCheck, delegateCheck, workflowStateCheck } = this.deps;
     const timedOut = ackTracker.getPendingTimedOut(this.config.ackTimeoutMs);
 
     if (timedOut.length === 0) {
+      this.lastCycleResult = { resignaled: 0, escalated: 0, autoAcknowledged: 0 };
       return { unconfirmed: 0, resignaled: 0, escalated: 0, autoAcknowledged: 0 };
     }
 
@@ -158,9 +180,79 @@ export class DispatchWatchdog {
         },
       });
 
+      // AI-2116: precondition guard — resolve check (phantom ticket → drop/escalate once)
+      if (linearResolveCheck) {
+        try {
+          const resolves = await linearResolveCheck(ticketId);
+          if (!resolves) {
+            ackTracker.markEscalated(agentId, ticketId);
+            escalated++;
+            operationalEventStore.append({
+              outcome: "watchdog-drop-unresolvable",
+              agent: agentId,
+              key: ticketId,
+              sessionKey: ticketId,
+              attemptCount,
+            });
+            continue;
+          }
+        } catch (err) {
+          log.warn(`linearResolveCheck transient error for ${ticketId}: ${err instanceof Error ? err.message : String(err)}`);
+          // fail open — transient error proceeds with re-dispatch
+        }
+      }
+
+      // AI-2116: precondition guard — delegate match check
+      if (delegateCheck) {
+        try {
+          const match = await delegateCheck(ticketId, agentId);
+          if (!match) {
+            operationalEventStore.append({
+              outcome: "watchdog-delegate-mismatch",
+              agent: agentId,
+              key: ticketId,
+              sessionKey: ticketId,
+              attemptCount,
+            });
+            continue;
+          }
+        } catch (err) {
+          log.warn(`delegateCheck transient error for ${ticketId}/${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+          // fail open
+        }
+      }
+
+      // AI-2116: precondition guard — workflow state check
+      if (workflowStateCheck) {
+        try {
+          const state = await workflowStateCheck(ticketId);
+          if (!state.inWorkflow || !state.resolvableVerb) {
+            operationalEventStore.append({
+              outcome: "watchdog-skip-no-workflow",
+              agent: agentId,
+              key: ticketId,
+              sessionKey: ticketId,
+              attemptCount,
+            });
+            continue;
+          }
+        } catch (err) {
+          log.warn(`workflowStateCheck transient error for ${ticketId}: ${err instanceof Error ? err.message : String(err)}`);
+          // fail open
+        }
+      }
+
       if (attemptCount > this.config.maxResignals) {
         ackTracker.markEscalated(agentId, ticketId);
         escalated++;
+        operationalEventStore.append({
+          outcome: "watchdog-escalation",
+          agent: agentId,
+          key: ticketId,
+          sessionKey: ticketId,
+          attemptCount,
+          detail: { maxResignals: this.config.maxResignals },
+        });
         log.error(
           `Watchdog escalation: ${agentId} [${ticketId}] — ${attemptCount} attempts, max is ${this.config.maxResignals}`,
         );
@@ -186,6 +278,12 @@ export class DispatchWatchdog {
         log.warn(
           `Watchdog: re-added ${ticketId} to bag for ${agentId} (not in bag)`,
         );
+      }
+
+      // AI-2116: apply exponential backoff before re-signal
+      if (this.config.exponentialBackoffMs && this.config.exponentialBackoffMs > 0) {
+        const delayMs = this.config.exponentialBackoffMs * Math.pow(2, attemptCount - 1);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
       }
 
       const agentWakeConfig = wakeConfigForAgent ? wakeConfigForAgent(agentId) : wakeConfig;
@@ -231,6 +329,7 @@ export class DispatchWatchdog {
 
     ackTracker.cleanup();
 
+    this.lastCycleResult = { resignaled, escalated, autoAcknowledged };
     return {
       unconfirmed: timedOut.length,
       resignaled,

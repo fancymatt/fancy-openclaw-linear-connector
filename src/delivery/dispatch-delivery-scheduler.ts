@@ -16,7 +16,7 @@
 
 import { OperationalEventStore } from "../store/operational-event-store.js";
 import { DispatchAckTracker } from "../bag/dispatch-ack-tracker.js";
-import { registerCron, formatIntervalMs } from "../cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRun } from "../cron/registry.js";
 import { createLogger, componentLogger } from "../logger.js";
 import {
   deliverWithAck,
@@ -57,6 +57,7 @@ export class DispatchDeliveryScheduler {
     this.active = true;
     this.heartbeat = setInterval(() => {
       // Liveness heartbeat only — the retry loop runs inline in dispatch().
+      markCronRun("dispatch-delivery-scheduler");
     }, this.heartbeatMs);
     this.heartbeat.unref?.();
     registerCron(

@@ -29,16 +29,25 @@ const DIST_ENTRY = path.resolve(__dirname, "../../dist/index.js");
 
 // Every driver the production bootstrap is expected to schedule.
 const EXPECTED_CRONS = [
+  "anti-entropy", // INF-122: periodic transition-atomicity anti-entropy reconciliation loop
   "bootstrap-reconciliation-sweep",
+  "config-sanity-alert", // AI-2619: config-sanity watchdog alert consumer
   "delegation-reconciliation-sweep",
   "dispatch-delivery-scheduler", // AI-2008: acknowledged dispatch delivery + retry driver
+  "done-ticket-detector", // AI-2576/INF-331: Done-ticket detector cron liveness
   "first-action-watchdog",
   "g20-canary",
+  "label-sync-audit", // AI-2554: periodic proxy-store vs Linear label divergence check
+  "matrix-approval-gate", // INF-192: Matrix approval gate bootstrap registrar
   "oob-reconcile-sweep",
   "p4-metrics-distillation",
   "registry-integrity-check", // AI-2359: periodic registry⇄policy integrity check (registered in createApp)
   "rescue-sweep",
   "sla-sweep",
+  "stale-plain-delegate-sweep", // INF-168: stale plain-delegate sweep
+  "stall-liveness-sweep", // INF-314: stall detection liveness sweep
+  "transcript-redaction", // AI-2582: periodic .trajectory.jsonl credential redaction sweep
+  "ttl-cache-invalidation", // AI-2200: TTL cache invalidation liveness
 ].sort();
 
 const PORT = 4100 + (process.pid % 400);
@@ -104,6 +113,10 @@ describe("AI-1810: production entry point registers all crons in /health", () =>
         // makes no network calls until its first 5m tick — the test is long
         // gone by then.
         LINEAR_OAUTH_TOKEN: "test-linear-oauth-token",
+        // The Done-ticket detector only registers when a repo path is
+        // configured; point it at the isolated temp cwd for deterministic
+        // bootstrap coverage without touching the real shared clone.
+        DONE_DETECTOR_REPO_PATH: dir,
         // Prevent inherited hook config from letting the boot path signal
         // real agents if any recovery/drain state were somehow present.
         OPENCLAW_HOOKS_URL: `http://127.0.0.1:${PORT}/nonexistent-hooks`,
@@ -165,6 +178,15 @@ describe("AI-1810: production entry point registers all crons in /health", () =>
       expect(typeof body.universalCanon.loaded).toBe("boolean");
       expect(body.universalCanon).toHaveProperty("version");
       expect(body.universalCanon).toHaveProperty("path");
+
+      // AI-2619: config-sanity-alert liveness field is present from the
+      // production entry point (bootstrap registration proof). The test env
+      // has no watchdog JSON file, so scheduled=true.
+      expect(body.configSanityAlert).toBeDefined();
+      expect(body.configSanityAlert.scheduled).toBe(true);
+      expect(body.configSanityAlert).toHaveProperty("lastReadAt");
+      expect(body.configSanityAlert).toHaveProperty("lastFindingCount");
+      expect(body.configSanityAlert).toHaveProperty("lastAlertAt");
 
       // AC1: every entry carries a human-readable schedule and a timestamp.
       for (const cron of crons) {

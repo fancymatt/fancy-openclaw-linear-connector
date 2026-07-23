@@ -204,6 +204,8 @@ afterEach(() => {
   delete process.env.WORKFLOW_DEF_PATH;
   delete process.env.WORKFLOW_GUIDANCE_DIR;
   delete process.env.CAPABILITY_POLICY_PATH;
+  delete process.env.LABEL_FETCH_MAX_RETRIES;
+  delete process.env.LABEL_FETCH_BASE_DELAY_MS;
   resetPolicyCache();
   // Remove any guidance files written by tests
   for (const f of fs.readdirSync(path.join(tmpGuidanceDir, "dev-impl"))) {
@@ -322,6 +324,19 @@ describe("B3 — outbound per-step instruction injection", () => {
       expect(msg).not.toContain("[dev-impl]");
     });
 
+    it("INF-334 AC5: plain delegation message does not reference workflow state or legal-command list", async () => {
+      globalThis.fetch = makeLabelFetch([]);
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const msg = await buildDeliveryMessage(makeRoute("DSN-334", "Plain delegated DSN ticket"), "Bearer tok");
+
+      expect(msg).toContain("You were delegated DSN-334");
+      expect(msg).not.toMatch(/\bworkflow state\b/i);
+      expect(msg).not.toContain("This is a [");
+      expect(msg).not.toContain("Your legal action(s) for this state:");
+      expect(msg).not.toMatch(/\blegal command/i);
+    });
+
     it("no authToken → generic delegation message without any fetch call", async () => {
       let fetchCalled = false;
       globalThis.fetch = async (..._args) => {
@@ -334,6 +349,32 @@ describe("B3 — outbound per-step instruction injection", () => {
 
       expect(msg).toContain("Next Steps:");
       expect(fetchCalled).toBe(false);
+    });
+
+    it("INF-334 AC5: webhook-known plain delegation stays plain when workflow label fetch fails", async () => {
+      process.env.LABEL_FETCH_MAX_RETRIES = "0";
+      process.env.LABEL_FETCH_BASE_DELAY_MS = "1";
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify({ errors: [{ message: "DSN labels unavailable" }] }), {
+          status: 503,
+          headers: { "Content-Type": "application/json" },
+        });
+
+      const route = makeRoute("DSN-5", "Plain DSN delegation");
+      Object.assign(route.event.data as Record<string, unknown>, {
+        teamKey: "DSN",
+        labelIds: [],
+      });
+
+      const buildDeliveryMessage = await getbuildDeliveryMessage();
+      const msg = await buildDeliveryMessage(route, "Bearer tok");
+
+      expect(msg).toContain("This task has been delegated to you");
+      expect(msg).toContain("linear consider-work DSN-5");
+      expect(msg).not.toContain("Workflow context unavailable");
+      expect(msg).not.toContain("managed workflow");
+      expect(msg).not.toContain("Your legal action(s)");
+      expect(msg).not.toContain("state: **");
     });
   });
 

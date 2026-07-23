@@ -264,6 +264,24 @@ export async function resolveBodiesForRole(roleId: string): Promise<string[]> {
     .map((b) => b.id);
 }
 
+/**
+ * Returns body IDs whose container grants the specified capability.
+ * Used by the workflow gate to identify designated approvers for signoff gates
+ * (INF-197) and provide actionable error messages naming the approver.
+ */
+export async function resolveBodiesWithCapability(capabilityId: string): Promise<string[]> {
+  const policy = await loadPolicy();
+  const containerIds = new Set<string>();
+  for (const c of policy.containers ?? []) {
+    if (c.grants?.includes(capabilityId)) {
+      containerIds.add(c.id);
+    }
+  }
+  return policy.bodies
+    .filter((b) => containerIds.has(b.container))
+    .map((b) => b.id);
+}
+
 // ── Workflow ticket detection ──────────────────────────────────────────────
 
 /**

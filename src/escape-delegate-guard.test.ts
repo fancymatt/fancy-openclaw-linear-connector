@@ -378,27 +378,32 @@ describe("AI-1668 AC5: fail-open when no delegate is set (existing behavior pres
 
 // ── AC6: Ad-hoc (ungoverned) tickets unchanged ────────────────────────────
 
-describe("AI-1668 AC6: escape on ungoverned (ad-hoc) tickets is unchanged", () => {
+describe("AI-1668 AC6: escape is rejected on ungoverned (ad-hoc) tickets (INF-35)", () => {
   let originalFetch: typeof globalThis.fetch;
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("escape on an ad-hoc ticket (no wf:* label) always passes through", async () => {
-    // §4.6 mode switch: tickets without wf:* are ungoverned — full pass-through.
+  const REJECTION_PREFIX = "[Proxy] 'escape' is only valid on workflow tickets";
+
+  it("escape on an ad-hoc ticket (no wf:* label) is rejected", async () => {
+    // INF-35: workflow transition verbs (including escape) are rejected on
+    // unarmed tickets that lack a wf:* label. No more §4.6 pass-through.
     globalThis.fetch = makeContextFetch(["bug", "priority:high"], "tdd-linear-uuid");
     const result = await checkWorkflowRules(
       "escape", "AI-1668", "Bearer tok", "charles",
       null, "charles-linear-uuid",
     );
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result).toContain(REJECTION_PREFIX);
   });
 
-  it("escape on ad-hoc ticket passes through even when caller is not 'owner'", async () => {
+  it("escape on ad-hoc ticket is rejected regardless of caller identity", async () => {
     globalThis.fetch = makeContextFetch(["enhancement"], null);
     const result = await checkWorkflowRules(
       "escape", "AI-1668", "Bearer tok", "charles",
       null, "charles-linear-uuid",
     );
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result).toContain(REJECTION_PREFIX);
   });
 });

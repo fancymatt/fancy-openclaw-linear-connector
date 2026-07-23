@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# post-checkout-deploy-guard — INF-411: defend the deploy worktree against
+# accidental `git checkout` / `git switch` to any branch or commit other than
+# the canonical deploy ref, origin/main.
+#
+# This is a tracked source file that `connector-reftxn-arm.sh` copies into the
+# common hooks dir as `post-checkout`. See the installed copy's header for
+# full design rationale.
+#
+# Bump this version whenever the logic below changes, so drift detection works.
+GUARD_VERSION="INF-411.2026.07.23"
+
+set -uo pipefail
+
+[ "${OC_GIT_UNSAFE:-}" = "1" ] && exit 0
+[ "${3:-}" = "1" ] || exit 0
+
+# Identify the CURRENT worktree from GIT_DIR (set by git).
+GITDIR="${GIT_DIR:-}"
+case "$GITDIR" in
+  */worktrees/fancy-openclaw-linear-connector-deploy) ;;
+  *) exit 0 ;;
+esac
+
+NEW_BRANCH=""
+BRANCH_REF="$(git symbolic-ref -q HEAD 2>/dev/null || true)"
+case "$BRANCH_REF" in
+  refs/heads/*) NEW_BRANCH="${BRANCH_REF#refs/heads/}" ;;
+esac
+
+if [ -z "$NEW_BRANCH" ]; then
+  head="$(git rev-parse HEAD 2>/dev/null || true)"
+  deploy_ref="$(git rev-parse origin/main 2>/dev/null || true)"
+  [ -n "$head" ] && [ "$head" = "$deploy_ref" ] && exit 0
+fi
+
+if [ -z "$NEW_BRANCH" ]; then
+  cat >&2 <<'MSG'
+ERROR [INF-411]: Detached HEAD checkout blocked in the deploy worktree.
+  The deploy worktree may only detach at origin/main. Detaching HEAD onto any
+  other commit or remote ref would break deploy provenance.
+  Auto-restoring to origin/main.
+MSG
+else
+  cat >&2 <<MSG
+ERROR [INF-411]: Branch checkout blocked in the deploy worktree.
+  The deploy worktree must remain detached at origin/main. You just switched to
+  '$NEW_BRANCH', which would break deploy provenance.
+  Auto-restoring to origin/main.
+MSG
+fi
+
+if ! OC_GIT_UNSAFE=1 git checkout --quiet --detach origin/main 2>/dev/null; then
+  prev="${1:-}"
+  [ -n "$prev" ] && [ "$prev" != "0000000000000000000000000000000000000000" ] \
+    && OC_GIT_UNSAFE=1 git checkout --quiet "$prev" 2>/dev/null || true
+fi
+
+exit 1

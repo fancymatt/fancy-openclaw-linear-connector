@@ -21,6 +21,7 @@ export interface EnrollInput {
   workflow: string;
   state: string;
   delegate: string | null;
+  designatedApprover?: string | null;
 }
 
 export interface TransitionInput {
@@ -49,6 +50,7 @@ export interface EnrolledTicketRow {
   workflow: string;
   state: string;
   delegate: string | null;
+  designated_approver: string | null;
   entered_state_at: string;
   enrolled_at: string;
   last_event_kind: string | null;
@@ -109,6 +111,7 @@ export class EnrolledTicketsStore {
         workflow TEXT NOT NULL,
         state TEXT NOT NULL,
         delegate TEXT,
+        designated_approver TEXT,
         entered_state_at TEXT NOT NULL DEFAULT (datetime('now')),
         enrolled_at TEXT NOT NULL DEFAULT (datetime('now')),
         last_event_kind TEXT,
@@ -118,18 +121,26 @@ export class EnrolledTicketsStore {
       CREATE INDEX IF NOT EXISTS idx_enrolled_terminal ON enrolled_tickets(terminal);
       CREATE INDEX IF NOT EXISTS idx_enrolled_workflow ON enrolled_tickets(workflow);
     `);
+
+    // AI-268: add designated_approver column if upgrading from an older schema.
+    try {
+      this.db.exec(`ALTER TABLE enrolled_tickets ADD COLUMN designated_approver TEXT`);
+    } catch {
+      // Column already exists — this is fine.
+    }
   }
 
   /** AC1: Enroll a ticket into the mirror (idempotent). */
   enroll(input: EnrollInput): void {
     const now = preciseTimestamp();
+    const designatedApprover = input.designatedApprover ?? null;
     const inserted = this.db
       .prepare(
-        `INSERT INTO enrolled_tickets (ticket_id, workflow, state, delegate, entered_state_at, enrolled_at, last_event_kind, last_event_at, terminal)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+        `INSERT INTO enrolled_tickets (ticket_id, workflow, state, delegate, designated_approver, entered_state_at, enrolled_at, last_event_kind, last_event_at, terminal)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
          ON CONFLICT(ticket_id) DO NOTHING`,
       )
-      .run(input.ticketId, input.workflow, input.state, input.delegate, now, now, "enroll", now);
+      .run(input.ticketId, input.workflow, input.state, input.delegate, designatedApprover, now, now, "enroll", now);
 
     // Re-enroll of a previously-terminal ticket is a genuine revival — bring
     // the WHOLE row forward (state/delegate/timestamps), not just terminal=0.
@@ -140,10 +151,10 @@ export class EnrolledTicketsStore {
       this.db
         .prepare(
           `UPDATE enrolled_tickets
-           SET workflow = ?, state = ?, delegate = ?, entered_state_at = ?, last_event_kind = 'revived', last_event_at = ?, terminal = 0
+           SET workflow = ?, state = ?, delegate = ?, designated_approver = ?, entered_state_at = ?, last_event_kind = 'revived', last_event_at = ?, terminal = 0
            WHERE ticket_id = ? AND terminal = 1`,
         )
-        .run(input.workflow, input.state, input.delegate, now, now, input.ticketId);
+        .run(input.workflow, input.state, input.delegate, designatedApprover, now, now, input.ticketId);
     }
   }
 
@@ -163,8 +174,8 @@ export class EnrolledTicketsStore {
     if (result.changes === 0) {
       this.db
         .prepare(
-          `INSERT OR IGNORE INTO enrolled_tickets (ticket_id, workflow, state, delegate, entered_state_at, enrolled_at, last_event_kind, last_event_at, terminal)
-           VALUES (?, 'unknown', ?, ?, ?, ?, ?, ?, 0)`,
+          `INSERT OR IGNORE INTO enrolled_tickets (ticket_id, workflow, state, delegate, designated_approver, entered_state_at, enrolled_at, last_event_kind, last_event_at, terminal)
+           VALUES (?, 'unknown', ?, ?, NULL, ?, ?, ?, ?, 0)`,
         )
         .run(input.ticketId, input.toState, input.delegate, now, now, input.eventKind, now);
     }
@@ -195,19 +206,33 @@ export class EnrolledTicketsStore {
     if (result.changes === 0) {
       this.db
         .prepare(
-          `INSERT OR IGNORE INTO enrolled_tickets (ticket_id, workflow, state, delegate, entered_state_at, enrolled_at, last_event_kind, last_event_at, terminal)
-           VALUES (?, 'unknown', '__ad_hoc__', NULL, ?, ?, 'demoted', ?, 1)`,
+          `INSERT OR IGNORE INTO enrolled_tickets (ticket_id, workflow, state, delegate, designated_approver, entered_state_at, enrolled_at, last_event_kind, last_event_at, terminal)
+           VALUES (?, 'unknown', '__ad_hoc__', NULL, NULL, ?, ?, 'demoted', ?, 1)`,
         )
         .run(ticketId, now, now, now);
     }
   }
 
-  /** AI-2542: True when the last lifecycle event was a governed demote/escape. */
-  wasDemoted(ticketId: string): boolean {
+  /**
+   * AI-2542: True when the last lifecycle event was a governed demote/escape.
+   *
+   * INF-334: If sinceTimestamp is provided, the tombstone is only valid if it
+   * occurred AFTER the given timestamp. This allows a fresh re-delegation to
+   * supersede a stale demoted tombstone.
+   */
+  wasDemoted(ticketId: string, sinceTimestamp?: string): boolean {
     const row = this.db
-      .prepare(`SELECT last_event_kind FROM enrolled_tickets WHERE ticket_id = ?`)
-      .get(ticketId) as { last_event_kind: string | null } | undefined;
-    return row?.last_event_kind === "demoted";
+      .prepare(
+        `SELECT last_event_kind, last_event_at FROM enrolled_tickets WHERE ticket_id = ?`,
+      )
+      .get(ticketId) as
+      | { last_event_kind: string | null; last_event_at: string | null }
+      | undefined;
+
+    if (row?.last_event_kind !== "demoted") return false;
+    if (!sinceTimestamp || !row.last_event_at) return true;
+
+    return new Date(row.last_event_at).getTime() > new Date(sinceTimestamp).getTime();
   }
 
   /**
@@ -229,14 +254,50 @@ export class EnrolledTicketsStore {
     const row = this.db
       .prepare(`SELECT * FROM enrolled_tickets WHERE ticket_id = ?`)
       .get(ticketId) as EnrolledTicketRow | undefined;
-    return row ?? null;
+    return row ? normalizeRow(row) : null;
   }
 
   /** Return all enrolled tickets (including terminal). */
   getAll(): EnrolledTicketRow[] {
     return this.db
       .prepare(`SELECT * FROM enrolled_tickets ORDER BY entered_state_at DESC`)
-      .all() as EnrolledTicketRow[];
+      .all()
+      .map((r) => normalizeRow(r as EnrolledTicketRow));
+  }
+
+  /**
+   * INF-271: Retire a ticket from workflow governance when its native Linear state
+   * is already terminal (Duplicate/Canceled/Done). Unlike demoteEnrolled (which also
+   * marks terminal and expects label-stripping), retire is called when the workflow
+   * engine actively strips wf:* and state:* labels and clears the delegate. The mirror
+   * row is marked terminal so it never surfaces in active-enrollment queries.
+   *
+   * Idempotent: calling retire on an already-terminal row is a no-op.
+   */
+  retire(ticketId: string): void {
+    const now = preciseTimestamp();
+    const existing = this.getByTicketId(ticketId);
+    if (existing && existing.terminal === 1) return; // Already retired
+
+    if (existing) {
+      this.db
+        .prepare(
+          `UPDATE enrolled_tickets
+           SET terminal = 1, delegate = NULL, last_event_kind = 'retired', last_event_at = ?
+           WHERE ticket_id = ?`,
+        )
+        .run(now, ticketId);
+    } else {
+      // Ticket not in the mirror at all — create a minimal retired row
+      // so the absence is explicit rather than a silent gap.
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO enrolled_tickets
+           (ticket_id, workflow, state, delegate, entered_state_at, enrolled_at, last_event_kind, last_event_at, terminal)
+           VALUES (?, 'unknown', '__retired__', NULL, ?, ?, 'retired', ?, 1)`,
+        )
+        .run(ticketId, now, now, now);
+    }
   }
 
   /**
@@ -305,4 +366,15 @@ export class EnrolledTicketsStore {
   close(): void {
     this.db.close();
   }
+}
+
+/**
+ * Normalize a raw SQLite row: convert null designated_approver to undefined
+ * so callers can distinguish "not set" from a deliberate null.
+ */
+function normalizeRow(row: EnrolledTicketRow): EnrolledTicketRow {
+  if (row.designated_approver === null) {
+    (row as unknown as Record<string, unknown>).designated_approver = undefined;
+  }
+  return row;
 }

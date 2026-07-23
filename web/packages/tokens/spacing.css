@@ -1,0 +1,41 @@
+/* ❇️ Spacing and sizing tokens — Warm Precision foundation
+ *
+ * 4px base grid. All spacing, sizing, and radius values snap to this
+ * scale. Do not add values that don't fit the 4px rhythm without review.
+ */
+
+:root {
+  /* ── Spacing scale (4px base) ── */
+  --ff-space-0:    0;
+  --ff-space-0-5:  0.125rem;   /* 2px  */
+  --ff-space-1:    0.25rem;    /* 4px  */
+  --ff-space-2:    0.5rem;     /* 8px  */
+  --ff-space-3:    0.75rem;    /* 12px */
+  --ff-space-4:    1rem;       /* 16px */
+  --ff-space-5:    1.25rem;    /* 20px */
+  --ff-space-6:    1.5rem;     /* 24px */
+  --ff-space-8:    2rem;       /* 32px */
+  --ff-space-10:   2.5rem;     /* 40px */
+  --ff-space-12:   3rem;       /* 48px */
+  --ff-space-16:   4rem;       /* 64px */
+  --ff-space-20:   5rem;       /* 80px */
+  --ff-space-24:   6rem;       /* 96px */
+
+  /* ── Border radius ── */
+  --ff-radius-sm:   0.25rem;   /* 4px  — chips, tags */
+  --ff-radius-md:   0.5rem;    /* 8px  — buttons, inputs */
+  --ff-radius-lg:   0.75rem;   /* 12px — cards, panels */
+  --ff-radius-xl:   1rem;      /* 16px — modals, bottom sheets */
+  --ff-radius-full: 9999px;    /* pill-shaped elements */
+
+  /* ── Elevation / shadow ── */
+  --ff-shadow-sm: 0 1px 2px oklch(0% 0 0 / 0.06),
+                  0 1px 3px oklch(0% 0 0 / 0.1);
+  --ff-shadow-md: 0 2px 4px oklch(0% 0 0 / 0.06),
+                  0 4px 8px oklch(0% 0 0 / 0.1);
+  --ff-shadow-lg: 0 4px 8px oklch(0% 0 0 / 0.08),
+                  0 8px 16px oklch(0% 0 0 / 0.12);
+  --ff-shadow-xl: 0 8px 16px oklch(0% 0 0 / 0.1),
+                  0 16px 32px oklch(0% 0 0 / 0.14);
+  --ff-shadow-focus: 0 0 0 2px oklch(58% 0.08 65 / 0.5);  /* accent ring */
+}

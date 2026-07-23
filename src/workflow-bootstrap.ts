@@ -375,11 +375,15 @@ export async function applyBootstrapToIssue(
       `workflow-bootstrap: bootstrapped ${issue.id} → ${workflowId}:${entryState}, delegate=${delegateLinearUserId ?? "none"}`,
     );
     // AI-1799: write enrollment row to the mirror so the board read API has data.
+    // INF-268: auto-bind designated_approver = Ai for sprint-spawner workflows so
+    // the determining-scope:propose-brief signoff gate can resolve the approver
+    // without circular error (the steward — Astrid — cannot self-approve).
     enrolledTicketsStore?.enroll({
       ticketId: issue.identifier ?? issue.id,
       workflow: workflowId,
       state: entryState,
       delegate: delegateAgentName ?? null,
+      designatedApprover: workflowId === 'sprint-spawner' ? 'ai' : undefined,
     });
   }
 

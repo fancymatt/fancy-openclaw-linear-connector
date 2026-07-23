@@ -2,10 +2,12 @@ import { spawn } from "child_process";
 import type { RouteResult } from "../types.js";
 import { createLogger, componentLogger } from "../logger.js";
 import { buildDeliveryMessage } from "./build-message.js";
-import { getAccessToken } from "../agents.js";
+import { getAccessToken, getOpenclawAgentName } from "../agents.js";
 import { getActiveCanonVersion } from "../policy/universal-canon.js";
 import { resolveCanonicalIdentifierFromEvent } from "../canonical-identifier.js";
 import { normalizeSessionKey } from "../session-key.js";
+import type { DispatchLeaseStore } from "../store/dispatch-lease-store.js";
+import type { DispatchInFlightStore } from "../store/dispatch-inflight-store.js";
 
 const log = componentLogger(createLogger(), "delivery");
 
@@ -124,7 +126,54 @@ function classifyFetchError(err: unknown): DeliveryResult {
 export async function deliverToAgent(
   route: RouteResult,
   config: DeliveryConfig,
+  dispatchLeaseStore?: DispatchLeaseStore,
+  inFlightStore?: DispatchInFlightStore,
 ): Promise<DeliveryResult> {
+  const updatedAt =
+    (route.event.data as Record<string, string> | undefined)?.updatedAt;
+
+  // INF-413: Ticket-level in-flight guard, checked BEFORE the agent-scoped
+  // lease. The lease keys on (agentId, ticketKey), so it cannot catch the same
+  // TICKET being dispatched to two concurrent workers on different agents or
+  // sessions (the INF-400 double-spawn class). This guard keys on the ticket
+  // identifier alone — route.sessionKey is the per-ticket `linear-<id>` key and
+  // is agent-agnostic — so at most one active run exists per ticket at a time.
+  // Checked first so a cross-agent duplicate is refused before we touch the
+  // lease (no rollback needed). A genuinely newer ticket state supersedes a
+  // stale in-flight record, mirroring the lease's supersede semantics.
+  if (inFlightStore) {
+    const holder = `${route.agentId}:${route.sessionKey}`;
+    const guard = inFlightStore.tryAcquire(route.sessionKey, holder, { updatedAt });
+    if (!guard.acquired && guard.refused) {
+      log.info(
+        `dispatch in-flight guard: ticket ${route.sessionKey} already has an active run ` +
+        `(holder=${guard.existing?.holder ?? "?"}); refusing duplicate for ${route.agentId}`,
+      );
+      return { dispatched: false };
+    }
+  }
+
+  // AI-2564: Check the dispatch lease before spawning. If an unexpired lease
+  // exists for this (agentId, ticketKey) and the incoming state is not newer,
+  // refuse the dispatch as a duplicate.
+  if (dispatchLeaseStore) {
+    const leaseResult = dispatchLeaseStore.acquire(
+      route.agentId,
+      route.sessionKey,
+      { updatedAt },
+    );
+    if (!leaseResult.acquired && leaseResult.refused) {
+      log.info(
+        `dispatch deduped: live session exists for ${route.agentId} [${route.sessionKey}]`,
+      );
+      // INF-413: this agent already holds the ticket via the lease; release the
+      // in-flight record we just acquired above so it is not left dangling for
+      // an agent whose dispatch we are refusing.
+      inFlightStore?.release(route.sessionKey, { holder: `${route.agentId}:${route.sessionKey}` });
+      return { dispatched: false };
+    }
+  }
+
   const rawToken =
     getAccessToken(route.agentId) ??
     process.env.LINEAR_OAUTH_TOKEN ??
@@ -311,6 +360,24 @@ async function deliverViaGatewayApi(
     const controller = new AbortController();
     timer = setTimeout(() => controller.abort(), opts.timeoutMs);
 
+    // INF-224: agent-prefix the session-key header. A bare key (e.g.
+    // `linear-INF-216`) is scoped by the gateway to the DEFAULT agent (`main`),
+    // NOT the model-resolved agent — the gateway uses `model: openclaw/<agent>`
+    // only for model-override auth and drops that agentId when namespacing an
+    // explicit bare session key. The result is dispatches landing in
+    // `agent:main:linear-*` sessions (main is a Linear non-actor → dead-end).
+    // The gateway honors an explicit `agent:<agentId>:<key>` namespace (only
+    // `subagent:`/`cron:`/`acp:` are reserved), so bind the session to the
+    // correct agent here. This mirrors the canonical stored form that
+    // stale-session forensics already reads (`agent:<openclawAgent>:<key>`).
+    // Idempotent: leave already-prefixed keys untouched so re-poke/wake callers
+    // that pass a full key don't get double-prefixed. The real fix is upstream
+    // (gateway should thread the model-resolved agentId into a bare key) — this
+    // is the connector-side bleed-stopper.
+    const routedSessionKey = sessionId.startsWith("agent:")
+      ? sessionId
+      : `agent:${getOpenclawAgentName(agentName)}:${sessionId}`;
+
     // Construct the OpenAI-compatible chat completions request body.
     // The model field routes to the specific agent; the message content
     // carries the dispatch message (same as hooks mode).
@@ -334,7 +401,7 @@ async function deliverViaGatewayApi(
       headers: {
         Authorization: `Bearer ${config.gatewayToken!}`,
         "Content-Type": "application/json",
-        "x-openclaw-session-key": sessionId,
+        "x-openclaw-session-key": routedSessionKey,
         ...(config.hooksThinking ? { "x-openclaw-model": config.hooksThinking } : {}),
       },
       body,
@@ -354,7 +421,7 @@ async function deliverViaGatewayApi(
     const runId = typeof json.id === "string" ? json.id : undefined;
 
     log.info(
-      `Gateway API delivery dispatched for ${agentName} [${sessionId}]: id=${runId ?? "ok"}`,
+      `Gateway API delivery dispatched for ${agentName} [${routedSessionKey}]: id=${runId ?? "ok"}`,
     );
     return { dispatched: true, runId, rawResponse: json };
   } catch (err) {

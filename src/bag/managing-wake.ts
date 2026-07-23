@@ -21,6 +21,56 @@ export interface ManagingWakeTicket {
   title: string;
   /** Epoch ms of last stewardship wake for this ticket, or null if first time. */
   lastDispatchedAt: number | null;
+  /** Linear issue labels (e.g. "wf:sprint-spawner"). Empty if unavailable. */
+  labels?: string[];
+  /** Current Linear state name (lowercase), e.g. "managing". Empty if unavailable. */
+  stateName?: string;
+}
+
+/**
+ * Workflow labels that should be observe-only when in steward-owned states.
+ * ManagingPoller sessions must NOT drive product decisions for these tickets.
+ */
+export const OBSERVER_WORKFLOW_LABELS = new Set([
+  "wf:sprint-spawner",
+  "wf:dev-sprint",
+]);
+
+/**
+ * Steward-owned states within spawner/dev-sprint workflows.
+ * In these states the main-session steward is driving — the managing-poller
+ * wake is observe-only for these tickets.
+ */
+export const STEWARD_OWNED_STATES = new Set([
+  "evaluating",
+  "scanning",
+  "determining-scope",
+  "scoping",
+  "launching",
+  "managing",
+  "releasing",
+  "retrospecting",
+  "product-definition",
+  "ac-definition",
+]);
+
+const OBSERVER_CAVEAT = [
+  "",
+  "⚠️  OBSERVE-ONLY: One or more tickets above is a spawner loop or dev-sprint",
+  "    in a steward-owned state. For these tickets:",
+  "    - You may surface stalled children and report gaps.",
+  "    - Do NOT author briefs, pick themes, fire fanout, set scope,",
+  "      make product decisions, or drive loop state transitions.",
+  "    - The main-session steward is driving these deliberately.",
+  "    Surface findings via a note; hand decisions back.",
+  "",
+].join("\n");
+
+export function isObserverTicket(ticket: ManagingWakeTicket): boolean {
+  if (!ticket.labels?.length || !ticket.stateName) return false;
+  const hasWorkflowLabel = ticket.labels.some((l) => OBSERVER_WORKFLOW_LABELS.has(l));
+  const isStewardState = STEWARD_OWNED_STATES.has(ticket.stateName.toLowerCase());
+  return hasWorkflowLabel && isStewardState;
 }
 
 const STEWARDSHIP_INSTRUCTIONS = [
@@ -55,11 +105,17 @@ export function buildManagingWakeMessage(
     throw new Error("buildManagingWakeMessage requires at least one ticket");
   }
   const lines: string[] = ["You are managing these tickets:"];
+  const hasObserverTicket = tickets.some(isObserverTicket);
   for (const t of tickets) {
     const stamp = formatRelative(now, t.lastDispatchedAt);
-    lines.push(`- ${t.identifier}: ${t.title} (last reviewed: ${stamp})`);
+    const tag = isObserverTicket(t) ? " [observe-only]" : "";
+    lines.push(`- ${t.identifier}: ${t.title} (last reviewed: ${stamp})${tag}`);
   }
   lines.push("", STEWARDSHIP_INSTRUCTIONS);
+  if (hasObserverTicket) {
+    lines.push("");
+    lines.push(OBSERVER_CAVEAT);
+  }
   return lines.join("\n");
 }
 

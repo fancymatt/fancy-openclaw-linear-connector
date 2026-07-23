@@ -17,6 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { createApp } from "./index.js";
 import { reloadAgents } from "./agents.js";
+import { markCronRun, registerCron, resetCronRegistryForTest } from "./cron/registry.js";
 
 function tempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "health-guard-test-"));
@@ -44,10 +45,16 @@ describe("health endpoint — empty-roster guard (AI-1767)", () => {
   let appState: ReturnType<typeof createApp>;
 
   afterEach(() => {
+    appState?.dispatchDeliveryScheduler?.stop();
+    appState?.watchdog?.stop();
+    appState?.noActivityDetector?.stop();
+    appState?.stuckDelegateDetector?.stop();
+    appState?.managingPoller?.stop();
     appState?.bag?.close();
     appState?.sessionTracker?.close();
     appState?.agentQueue?.close();
     appState?.operationalEventStore?.close();
+    resetCronRegistryForTest();
     delete process.env.AGENTS_FILE;
     delete process.env.OPENCLAW_HOOKS_URL;
     delete process.env.OPENCLAW_HOOKS_TOKEN;
@@ -100,5 +107,23 @@ describe("health endpoint — empty-roster guard (AI-1767)", () => {
     const res = await request(appState.app).get("/health");
     expect(res.body.service).toBe("fancy-openclaw-linear-connector");
     expect(res.body.deployment).toBeDefined();
+  });
+
+  test("INF-339 AC1: /health includes staleCrons empty when registered crons are fresh", async () => {
+    dir = tempDir();
+    process.env.AGENTS_FILE = writeAgentsFile(dir, [sampleAgent]);
+    reloadAgents();
+    appState = createApp({
+      bagDbPath: path.join(dir, "pending-bag.db"),
+      agentQueueDbPath: path.join(dir, "agent-queue.db"),
+      operationalEventsDbPath: path.join(dir, "operational-events.db"),
+    });
+    registerCron("fresh-driver", "every 5m");
+    markCronRun("fresh-driver");
+
+    const res = await request(appState.app).get("/health");
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty("staleCrons");
+    expect(res.body.staleCrons).toEqual([]);
   });
 });

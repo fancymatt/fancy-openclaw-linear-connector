@@ -99,6 +99,20 @@ export interface AgentConfig {
    * See AI-2346.
    */
   status?: "active" | "off-linear" | "never-onboarded";
+  /**
+   * Explicit opt-in for the legacy direct-token write path.
+   *
+   * When set to `true`, syncWorkspaceSecrets will write the raw upstream
+   * `accessToken` into the agent's linear.env when no proxyToken is present.
+   * This is the pre-AI-2304 behavior and should only be used for agents that
+   * cannot use the broker proxy model.
+   *
+   * Default (absent/false): syncWorkspaceSecrets writes NOTHING when there is
+   * no proxyToken — preserving any existing file and logging a loud error.
+   *
+   * The proxy-fleet-sweep.py asserts this flag has zero consumers.
+   */
+  allowDirectToken?: boolean;
 }
 
 export interface TokenFailure {
@@ -203,6 +217,99 @@ function parseAgentsFile(raw: string, filePath: string): AgentsFile {
   return decryptAgentsFile(parsed, key);
 }
 
+// ── Encryption key validation (INF-272) ───────────────────────────────────-
+
+/**
+ * Result of an encryption-key validation check.
+ */
+export interface EncryptionKeyValidation {
+  /** True when the configured key matches the encrypted agents.json (or the file is unencrypted / absent). */
+  valid: boolean;
+  /** Whether the agents.json on disk is encrypted (requires a key). */
+  agentsEncrypted: boolean;
+  /** ISO 8601 timestamp of the last validation attempt, or null if never checked. */
+  lastValidationAt: string | null;
+  /** Error message when valid=false. Undefined when valid=true. */
+  error?: string;
+}
+
+let _lastEncryptionKeyValidation: EncryptionKeyValidation | null = null;
+
+/**
+ * Validate that the configured encryption key can decrypt the stored agents.json.
+ *
+ * Checks the agents file path; if it is an encrypted agents.json, runs a test
+ * decrypt with the current key. A GCM auth-tag failure means the key does NOT
+ * match — saving would corrupt the token store.
+ *
+ * Call this at boot before starting the token refresh cycle (#2 of INF-272:
+ * .env key-reference validation on boot) and before every save() (#3:
+ * refresh-token write guard). The cached result is available for /health via
+ * getEncryptionKeyValidation().
+ */
+export function validateEncryptionKeyMatch(): EncryptionKeyValidation {
+  const filePath = getAgentsPath();
+  const result: EncryptionKeyValidation = {
+    valid: false,
+    agentsEncrypted: false,
+    lastValidationAt: new Date().toISOString(),
+  };
+
+  if (!fs.existsSync(filePath)) {
+    result.valid = true;
+    result.error = "No agents file — no key validation possible";
+    _lastEncryptionKeyValidation = result;
+    return result;
+  }
+
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+
+    if (!isEncryptedAgentsFile(parsed)) {
+      result.valid = true;
+      result.agentsEncrypted = false;
+      result.error = "Agents file is not encrypted — no key validation needed";
+      _lastEncryptionKeyValidation = result;
+      return result;
+    }
+
+    result.agentsEncrypted = true;
+    const key = resolveEncryptionKey();
+    if (!key) {
+      result.valid = false;
+      result.error = "Agents file is encrypted but no encryption key is configured";
+      _lastEncryptionKeyValidation = result;
+      return result;
+    }
+
+    // Test decrypt — AES-256-GCM auth tag rejects a wrong key with an exception
+    decryptAgentsFile(parsed, key);
+    result.valid = true;
+    _lastEncryptionKeyValidation = result;
+    return result;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    result.valid = false;
+    result.error = `Encryption key mismatch: ${message}`;
+    _lastEncryptionKeyValidation = result;
+    return result;
+  }
+}
+
+/**
+ * Get the latest encryption-key validation result (for /health).
+ * Returns a safe default when no validation has run yet.
+ */
+export function getEncryptionKeyValidation(): EncryptionKeyValidation {
+  return _lastEncryptionKeyValidation ?? {
+    valid: false,
+    agentsEncrypted: false,
+    lastValidationAt: null,
+    error: "Not yet validated",
+  };
+}
+
 function load(): AgentConfig[] {
   const filePath = getAgentsPath();
   if (!fs.existsSync(filePath)) return [];
@@ -222,6 +329,40 @@ function load(): AgentConfig[] {
 function save(agents: AgentConfig[]): void {
   const data: AgentsFile = { agents };
   const key = resolveEncryptionKey();
+
+  // ── INF-272: Pre-write encryption-key match guard (Refresh-token write guard) ──
+  // If the agents file on disk IS encrypted and we have a key, verify the key can
+  // decrypt the existing data before re-encrypting. A silent re-encrypt with the
+  // wrong key overwrites the token store with garbage; the next boot crashes on
+  // GCM auth-tag mismatch, and any refresh cycle in between pushes the garbage
+  // refresh token to Linear, triggering reuse-detection and family revocation.
+  //
+  // Guard logic:
+  //  - No key configured → can't validate, skip (plaintext fallback is intentional)
+  //  - File doesn't exist → nothing to validate against
+  //  - File is plaintext → first-encryption transition, skip (no prior key to match)
+  //  - File IS encrypted and key IS configured → test decrypt; reject on failure
+  if (key) {
+    const existingPath = getAgentsPath();
+    if (fs.existsSync(existingPath)) {
+      try {
+        const raw = fs.readFileSync(existingPath, "utf8");
+        const parsed = JSON.parse(raw) as unknown;
+        if (isEncryptedAgentsFile(parsed)) {
+          // AES-256-GCM auth-tag verification throws on key mismatch
+          decryptAgentsFile(parsed, key);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Encryption key mismatch: cannot decrypt existing agents.json with current key. ` +
+          `Refusing to save (would corrupt the token store). Check ` +
+          `LINEAR_CONNECTOR_ENCRYPTION_KEY / LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE. Error: ${message}`,
+        );
+      }
+    }
+  }
+
   const serialized = key
     ? JSON.stringify(encryptAgentsFile(data, key), null, 2) + "\n"
     : JSON.stringify(data, null, 2) + "\n";
@@ -519,7 +660,7 @@ export function getTokenStatus(agentName: string): TokenStatus | undefined {
     state = "expired";
   } else if (agent.lastFailure) {
     // Has a failure but also has a recent successful refresh
-    state = expiresAt != null && now >= expiresAt - 2 * 60 * 60 * 1000
+    state = expiresAt != null && now >= expiresAt - 4 * 60 * 60 * 1000
       ? "stale"
       : "healthy";
   } else if (agent.lastRefreshOkAt == null && expiresAt == null) {
@@ -544,6 +685,31 @@ export function getTokenStatus(agentName: string): TokenStatus | undefined {
 export function getAllTokenStatuses(): TokenStatus[] {
   return _agents.map((a) => getTokenStatus(a.name)!).filter(Boolean);
 }
+
+/**
+ * INF-381 — Remediate a failing agent token by triggering a background refresh.
+ *
+ * Called when a 401 is encountered in the live dispatch path. Triggers a
+ * sequential refresh for the agent. If the refresh token is still valid,
+ * the agent recovers; if revoked, the state becomes `revoked` and alerts.
+ */
+export async function remediateAgentToken(agentId: string): Promise<void> {
+  const agent = _agents.find((a) => a.name === agentId);
+  if (!agent) {
+    log.warn(`remediateAgentToken: unknown agent ${agentId} — skipping`);
+    return;
+  }
+
+  log.info(`remediateAgentToken: triggering background refresh for ${agentId} due to 401`);
+  try {
+    // Dynamic import to avoid circular dependency with token-refresh.ts
+    const { refreshAgent } = await import("./token-refresh.js");
+    await refreshAgent(agent);
+  } catch (err) {
+    log.error(`remediateAgentToken: refresh for ${agentId} failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 
 /**
  * Symlink target of `p`, or null if `p` is absent or a regular file.
@@ -581,14 +747,32 @@ function syncWorkspaceSecrets(agentName: string, accessToken: string): void {
   // the proxy URL so the CLI routes through the connector (which swaps in the
   // vaulted real token). The real accessToken update lands only in agents.json
   // via save(). This also runs on every token refresh, so we re-emit the proxy
-  // URL line here to keep it from being clobbered. Agents with no proxyToken yet
-  // keep the legacy direct-token behavior for an incremental migration.
+  // URL line here to keep it from being clobbered.
+  //
+  // Agents with no proxyToken AND no explicit `allowDirectToken` opt-in get
+  // NOTHING written — the implicit raw-token else branch is dead (AI-2304).
+  // With minting at creation (AI-2308), every properly-onboarded agent has a
+  // proxyToken from the moment its record exists, so this early-return is a
+  // no-op under normal conditions. It exists as a containment hard-stop.
+  if (!agent.proxyToken && !agent.allowDirectToken) {
+    log.error(
+      `Refusing to write accessToken to ${secretsPath} for "${agentName}" — ` +
+        `no proxyToken and no allowDirectToken opt-in. This is a provisioning ` +
+        `bug; the agent must have a proxyToken minted at creation (AI-2308). ` +
+        `Leaving any existing credential file untouched.`,
+    );
+    return;
+  }
+
   let contents: string;
   if (agent.proxyToken) {
     const lines = [`LINEAR_OAUTH_TOKEN=${agent.proxyToken}`];
     if (agent.proxyUrl) lines.push(`LINEAR_PROXY_URL=${agent.proxyUrl}`);
     contents = lines.join("\n") + "\n";
   } else {
+    // The only way to reach here is allowDirectToken: true (the guard above
+    // prevents the implicit path). This is the legacy direct-token write
+    // (mode 600, atomic — reuses the AI-2289/AI-2288 writer below).
     contents = `LINEAR_OAUTH_TOKEN=${accessToken}\n`;
   }
 
@@ -727,6 +911,23 @@ export function mintProxyToken(): string {
   return "lpx_" + crypto.randomBytes(24).toString("hex");
 }
 
+/**
+ * Derive the default proxy URL for the connector.
+ * Reads `LINEAR_CONNECTOR_PROXY_URL` env var first, then falls back to
+ * `http://localhost:{PORT}/proxy/graphql` where PORT defaults to 3100.
+ * Returns `undefined` only when no reasonable default can be constructed.
+ */
+function getDefaultProxyUrl(): string | undefined {
+  if (process.env.LINEAR_CONNECTOR_PROXY_URL) {
+    return process.env.LINEAR_CONNECTOR_PROXY_URL;
+  }
+  const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
+  if (Number.isFinite(port)) {
+    return `http://localhost:${port}/proxy/graphql`;
+  }
+  return undefined;
+}
+
 export function upsertAgent(config: AgentConfig): { isNew: boolean } {
   // Match by name first (for partial entries that don't have linearUserId yet)
   // then fall back to linearUserId for token refresh updates. The fallback must
@@ -754,6 +955,7 @@ export function upsertAgent(config: AgentConfig): { isNew: boolean } {
       // publishing the raw upstream token, the exact leak AI-2308 closes.
       if (needsProxyToken(merged)) {
         merged.proxyToken = mintProxyToken();
+        if (!merged.proxyUrl) merged.proxyUrl = getDefaultProxyUrl();
       }
       return merged;
     });
@@ -767,6 +969,7 @@ export function upsertAgent(config: AgentConfig): { isNew: boolean } {
   // agents with an existing proxyToken are untouched.
   if (needsProxyToken(config)) {
     config.proxyToken = mintProxyToken();
+    if (!config.proxyUrl) config.proxyUrl = getDefaultProxyUrl();
   }
 
   _agents.push(reconcileStatusWithCredential(config));

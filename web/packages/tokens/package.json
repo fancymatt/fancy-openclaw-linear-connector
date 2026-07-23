@@ -1,0 +1,26 @@
+{
+  "name": "@fancyfleet/tokens",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CSS custom property token layer for the Warm Precision Design System",
+  "files": [
+    "tokens.css",
+    "index.css"
+  ],
+  "style": "index.css",
+  "main": "index.css",
+  "exports": {
+    ".": {
+      "style": "./index.css"
+    },
+    "./index.css": "./index.css",
+    "./tokens.css": "./tokens.css"
+  },
+  "keywords": [
+    "design-system",
+    "tokens",
+    "css",
+    "fancyfleet"
+  ],
+  "license": "UNLICENSED"
+}

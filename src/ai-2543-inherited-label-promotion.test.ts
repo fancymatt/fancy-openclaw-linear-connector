@@ -35,12 +35,12 @@
  * canned script of responses. It enforces the two server behaviors that define
  * this bug:
  *   (a) `issueLabelCreate` for a name an ancestor team owns fails with
- *       "conflicting inherited label" UNLESS `replaceTeamLabels: true` is sent,
- *       in which case the label is PROMOTED to the requesting team and a
- *       team-owned id is returned.
+ *       "conflicting inherited label". On retry, omitting `teamId` creates a
+ *       WORKSPACE-LEVEL label (visible to all teams) — no inheritance conflict.
  *   (b) `issueUpdate` REJECTS any labelId whose owning team is not the issue's
  *       own team. This is the server behavior that makes the borrowed id fatal.
- * Assertions are therefore on OUTCOME — "is the returned id owned by the
+ *       Workspace-level labels (no owner) are accepted for any team.
+ * Assertions are therefore on OUTCOME — "is the returned id usable by the
  * requesting team?" — not on a prescribed call sequence. Any correct promotion
  * mechanism satisfies them; the fix is not dictated by the test.
  */
@@ -165,17 +165,27 @@ function makeFakeLinear(opts: FakeLinearOpts, passthrough: typeof globalThis.fet
 
     // ── issueLabelCreate: the inherited-conflict + promotion surface ──
     if (q.includes("issueLabelCreate")) {
-      const teamId = vars.teamId as string;
+      const teamId = vars.teamId as string | undefined;
       const name = vars.name as string;
-      // Linear's `replaceTeamLabels` is an argument on issueLabelCreate. Accept it
-      // either as a GraphQL variable or inlined literally in the mutation text, so
-      // the fix is free to wire it whichever way reads best.
-      const wantsPromotion =
-        vars.replaceTeamLabels === true || /replaceTeamLabels\s*:\s*true/.test(q);
 
-      const conflicting = labels.find((l) => l.name === name && l.teamId !== teamId);
+      // AGI-12: `replaceTeamLabels` was removed from the Linear schema. The
+      // fix instead retries WITHOUT `teamId` to create a workspace-level label
+      // (visible to all teams, no inheritance conflict). The mock models this
+      // correctly: if a label with this name exists on a different team AND the
+      // retry omits teamId, create a workspace-level label (no teamId).
+      const createAsWorkspace = teamId === undefined || teamId === null;
 
-      if (conflicting && !wantsPromotion) {
+      if (createAsWorkspace && opts.promotionFails) {
+        // Fail-closed: workspace-level create was refused by the server.
+        return json({
+          errors: [{ message: "workspace label create refused by server" }],
+          data: { issueLabelCreate: null },
+        });
+      }
+
+      const conflicting = teamId ? labels.find((l) => l.name === name && l.teamId !== teamId) : undefined;
+
+      if (conflicting && !createAsWorkspace) {
         // (a) The exact rejection from the incident.
         return json({
           errors: [
@@ -189,17 +199,11 @@ function makeFakeLinear(opts: FakeLinearOpts, passthrough: typeof globalThis.fet
         });
       }
 
-      if (conflicting && wantsPromotion) {
-        if (opts.promotionFails) {
-          return json({
-            errors: [{ message: "promotion refused by server" }],
-            data: { issueLabelCreate: null },
-          });
-        }
-        // Promotion: the label becomes owned by the REQUESTING team.
-        const promotedId = `lbl-promoted-${++promotedSeq}`;
-        labels.splice(labels.indexOf(conflicting), 1);
-        labels.push({ id: promotedId, name, teamId });
+      if (conflicting && createAsWorkspace) {
+        // Promotion via workspace-level label: no teamId means visible to all teams.
+        // The parent team's label is NOT deleted — it stays on the parent team.
+        const promotedId = `lbl-ws-${++promotedSeq}`;
+        labels.push({ id: promotedId, name }); // no teamId = workspace-level
         return json({ data: { issueLabelCreate: { success: true, issueLabel: { id: promotedId } } } });
       }
 
@@ -272,6 +276,7 @@ function makeFakeLinear(opts: FakeLinearOpts, passthrough: typeof globalThis.fet
       const labelIds = vars.labelIds as string[];
       if (targetIssue) {
         // (b) Linear rejects a label id owned by a team other than the issue's.
+        // Workspace-level labels (no owner) are accepted for every team.
         const foreign = labelIds.filter((id) => {
           const owner = ownerOf(id);
           return owner !== undefined && owner !== targetIssue.teamId;
@@ -343,8 +348,10 @@ describe("AI-2543 SITE 2 — linear-helpers.findOrCreateLabel inherited-label pr
     expect(id).not.toBeNull();
     // The bug: today this returns GEN's id ("lbl-gen-pd").
     expect(id).not.toBe("lbl-gen-pd");
-    // The AC: the returned id must be one the requesting sub-team owns.
-    expect(fake.ownerOf(id!)).toBe(LIF_TEAM);
+    // The AC: the returned id is a workspace-level label (no team ownership),
+    // usable by any team — the bug was returning a GEN-owned id that LIF
+    // cannot use in issueUpdate.
+    expect(fake.ownerOf(id!)).toBeUndefined();
   });
 
   it("AC4: the promoted id is then ACCEPTED in an issueUpdate labelIds write (inherited-conflict → promote → usable-id)", async () => {
@@ -604,9 +611,11 @@ describe("AI-2543 SITE 1 — governed transition on a sub-team with inherited st
       stateId?: string;
     };
 
-    // Every label id in the write must belong to the issue's own team.
+    // Every label id in the write must be usable by LIF (either team-owned
+    // or workspace-level with no team ownership).
     for (const id of vars.labelIds) {
-      expect(fake.ownerOf(id)).toBe(LIF_TEAM);
+      const owner = fake.ownerOf(id);
+      expect(owner === undefined || owner === LIF_TEAM).toBe(true);
     }
     expect(vars.labelIds).not.toContain("lbl-gen-impl"); // the borrowed parent id
     expect(vars.labelIds).not.toContain("lbl-lif-intake"); // stale state label stripped

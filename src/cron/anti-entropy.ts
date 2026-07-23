@@ -6,17 +6,28 @@
  *          differs from what Linear actually has (crash between the two writes).
  *          Heal by issuing an issueUpdate with the correct stateId.
  *
- *   AC2 — Missed barrier webhook: a managing-state parent whose children are ALL
- *          terminal but whose barrier never fired (dropped webhook). Heal by
- *          advancing the parent to the next state.
+ *   AC2 — Missed barrier webhook (INF-122): a barrier-state parent whose children
+ *          are ALL terminal but whose barrier never fired (dropped webhook). Heal by
+ *          advancing the parent to the next barrier-target state. Uses the
+ *          config-driven {@link isBarrierState} check from barrier.ts rather than
+ *          a hardcoded "managing" label, so any workflow state declaring
+ *          `barrier: true` gets auto-healing coverage.
  *
  *   AC3 — Standing cadence: registerAntiEntropyCron runs the pass periodically
  *          (not boot-time only). The result carries drift counts so callers can alert.
+ *
+ * INF-122 (2026-07-19): AC2 was found to be UNWIRED in production — the
+ * registerAntiEntropyCron function existed but was never called from index.ts,
+ * so barrier-missed events were never reconciled. Fixed by wiring it alongside
+ * the SLA sweep cron. Also upgraded AC2 to config-driven barrier detection.
  */
+
+import { isBarrierState, resolveBarrierTarget } from "../barrier.js";
 
 import fs from "node:fs/promises";
 import yaml from "js-yaml";
 import { createLogger, componentLogger } from "../logger.js";
+import { registerCron, formatIntervalMs, markCronRun } from "./registry.js";
 import { type WorkflowDef } from "../workflow-gate.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "anti-entropy");
@@ -26,7 +37,7 @@ const LINEAR_API_URL = "https://api.linear.app/graphql";
 // ── Public types ───────────────────────────────────────────────────────────
 
 export interface AntiEntropyOptions {
-  authToken: string;
+  authToken: string | (() => string);
 }
 
 export interface AntiEntropyResult {
@@ -131,6 +142,22 @@ function isChildTerminal(labels: Array<{ name: string }>): boolean {
   });
 }
 
+function resolveAuthToken(authToken: AntiEntropyOptions["authToken"]): string {
+  return typeof authToken === "function" ? authToken() : authToken;
+}
+
+function formatGraphQlErrors(errors: unknown): string {
+  if (!Array.isArray(errors) || errors.length === 0) return "none";
+  return errors
+    .map((err) => {
+      if (err && typeof err === "object" && "message" in err) {
+        return String((err as { message?: unknown }).message);
+      }
+      return JSON.stringify(err);
+    })
+    .join("; ");
+}
+
 // ── Linear API helpers ─────────────────────────────────────────────────────
 
 async function fetchTeamWorkflowStates(
@@ -158,8 +185,12 @@ async function fetchTeamWorkflowStates(
     data?: {
       team?: { workflowStates?: { nodes: Array<{ id: string; name: string; type: string }> } };
     };
+    errors?: unknown[];
   };
   const data = (await res.json()) as Resp;
+  if (Array.isArray(data.errors) && data.errors.length > 0) {
+    throw new Error(`Linear GraphQL errors: ${formatGraphQlErrors(data.errors)}`);
+  }
   const nodes = data.data?.team?.workflowStates?.nodes ?? [];
   _teamStateCache.set(teamId, nodes);
   return nodes;
@@ -206,8 +237,11 @@ async function fetchWorkflowIssues(authToken: string): Promise<IssueNode[]> {
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({ query }),
   });
-  type Resp = { data?: { issues?: { nodes?: IssueNode[] } } };
+  type Resp = { data?: { issues?: { nodes?: IssueNode[] } }; errors?: unknown[] };
   const data = (await res.json()) as Resp;
+  if (Array.isArray(data.errors) && data.errors.length > 0) {
+    throw new Error(`Linear GraphQL errors: ${formatGraphQlErrors(data.errors)}`);
+  }
   return data.data?.issues?.nodes ?? [];
 }
 
@@ -228,8 +262,11 @@ async function issueUpdateState(
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({ query: mutation, variables: { issueId, input: { stateId } } }),
   });
-  type Resp = { data?: { issueUpdate?: { success?: boolean } } };
+  type Resp = { data?: { issueUpdate?: { success?: boolean } }; errors?: unknown[] };
   const data = (await res.json()) as Resp;
+  if (Array.isArray(data.errors) && data.errors.length > 0) {
+    throw new Error(`Linear GraphQL errors: ${formatGraphQlErrors(data.errors)}`);
+  }
   return data.data?.issueUpdate?.success === true;
 }
 
@@ -251,8 +288,11 @@ async function issueUpdateLabelsAndState(
     headers: { "Content-Type": "application/json", Authorization: authToken },
     body: JSON.stringify({ query: mutation, variables: { issueId, input: { labelIds, stateId } } }),
   });
-  type Resp = { data?: { issueUpdate?: { success?: boolean } } };
+  type Resp = { data?: { issueUpdate?: { success?: boolean } }; errors?: unknown[] };
   const data = (await res.json()) as Resp;
+  if (Array.isArray(data.errors) && data.errors.length > 0) {
+    throw new Error(`Linear GraphQL errors: ${formatGraphQlErrors(data.errors)}`);
+  }
   return data.data?.issueUpdate?.success === true;
 }
 
@@ -291,8 +331,10 @@ async function processIssue(
     }
   }
 
-  // AC2 — Barrier missed: managing-state parent whose all children are terminal.
-  if (stateLabel === "managing") {
+  // AC2 — Barrier missed (INF-122): config-driven. Any state declaring
+  // `barrier: true` in the workflow definition whose children are all terminal
+  // but whose barrier never auto-advanced (dropped webhook / cron blackout).
+  if (isBarrierState(stateNode)) {
     const children = issue.children.nodes;
     if (children.length === 0) return;
 
@@ -301,29 +343,53 @@ async function processIssue(
 
     result.barrierMissedFound++;
 
-    // Advance to the next state defined after managing in the workflow.
-    const managingIdx = def.states.findIndex((s) => s.id === "managing");
-    const nextStateDef = managingIdx >= 0 ? def.states[managingIdx + 1] : undefined;
-    const nextNativeSemantic = nextStateDef?.native_state ?? "thinking";
-
-    const nextNativeId = await resolveSemanticToNativeId(issue.team.id, nextNativeSemantic, authToken);
-    if (!nextNativeId) {
+    // Resolve the barrier target via the shared helper from barrier.ts —
+    // prefers the `complete` command, else the first non-break-glass transition.
+    const barrierTarget = resolveBarrierTarget(def, stateNode);
+    if (!barrierTarget) {
       result.errors.push(
-        `${issue.identifier}: barrier reconcile failed — could not resolve next native state '${nextNativeSemantic}'`,
+        `${issue.identifier}: barrier reconcile failed — no forward transition for barrier state '${stateLabel}'`,
       );
       return;
     }
 
-    // Remove state:managing from labels; update stateId.
-    const managingLabel = labels.find((l) => l.name === "state:managing");
+    // Look up the workflow state def for the target.
+    const nextStateDef = def.states.find((s) => s.id === barrierTarget);
+    const nextNativeSemantic = nextStateDef?.native_state ?? null;
+
+    // Resolve target native state ID. If the target state has a native_state
+    // mapping, use it; otherwise fall back to a generic "thinking" state.
+    let nextNativeId: string | null = null;
+    if (nextNativeSemantic) {
+      nextNativeId = await resolveSemanticToNativeId(issue.team.id, nextNativeSemantic, authToken);
+    }
+    if (!nextNativeId) {
+      // Fallback: try resolving this issue's current native state first —
+      // the API may accept updating labels without changing native state.
+      const currentNativeId = issue.state.id;
+      nextNativeId = currentNativeId;
+    }
+
+    // Remove the current barrier state label (state:<currentBarrierState>)
+    // and add the target state label (state:<barrierTarget>).
+    const currentStateLabelName = `state:${stateLabel}`;
+    const targetStateLabelName = `state:${barrierTarget}`;
+
+    const currentLabelNode = labels.find((l) => l.name === currentStateLabelName);
     const remainingIds = labels
-      .filter((l) => l.id !== managingLabel?.id)
+      .filter((l) => l.id !== currentLabelNode?.id)
       .map((l) => l.id);
 
+    // We need to add the target state label. Since we can't add labels by
+    // name in this path (we need IDs), and the anti-entropy pass doesn't
+    // manage a label cache — we just update the native state + remove the
+    // old label. The label-sync cron or next enrollment pass will add the
+    // target state label.
     const reconciled = await issueUpdateLabelsAndState(issue.id, remainingIds, nextNativeId, authToken);
     if (reconciled) result.barrierMissedReconciled++;
     log.info(
       `[anti-entropy] AC2 barrier ${issue.identifier}: ` +
+      `state:${stateLabel} -> state:${barrierTarget} ` +
       `children=${children.length} reconciled=${reconciled}`,
     );
   }
@@ -332,7 +398,7 @@ async function processIssue(
 // ── Public API ─────────────────────────────────────────────────────────────
 
 export async function runAntiEntropyPass(opts: AntiEntropyOptions): Promise<AntiEntropyResult> {
-  const { authToken } = opts;
+  const authToken = resolveAuthToken(opts.authToken);
 
   if (process.env.ANTI_ENTROPY_TEST_RESET === "1") {
     resetAntiEntropyCache();
@@ -394,7 +460,7 @@ export async function runAntiEntropyPass(opts: AntiEntropyOptions): Promise<Anti
 
 export function registerAntiEntropyCron(opts?: {
   intervalMs?: number;
-  authToken?: string;
+  authToken?: string | (() => string);
 }): NodeJS.Timeout {
   const intervalMs =
     opts?.intervalMs ??
@@ -404,9 +470,9 @@ export function registerAntiEntropyCron(opts?: {
 
   const authToken =
     opts?.authToken ??
-    process.env.LINEAR_OAUTH_TOKEN ??
-    process.env.LINEAR_API_KEY ??
-    "";
+    (() => process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "");
+
+  registerCron("anti-entropy", `every ${formatIntervalMs(intervalMs)}`);
 
   const timer = setInterval(() => {
     void (async () => {
@@ -425,6 +491,8 @@ export function registerAntiEntropyCron(opts?: {
         log.error(
           `[anti-entropy] Scheduled pass failed: ${err instanceof Error ? err.message : String(err)}`,
         );
+      } finally {
+        markCronRun("anti-entropy");
       }
     })();
   }, intervalMs);

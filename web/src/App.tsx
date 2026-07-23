@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { BrowserRouter, Routes, Route, Navigate, useParams } from "react-router-dom";
+import { Button, Heading, Text } from "@fancyfleet/components";
 import { fetchMe, logout, setUnauthorizedHandler } from "./api";
 import { Tabs } from "./components";
 import { LoginPage } from "./pages/LoginPage";
@@ -15,6 +16,7 @@ import { StallsPage } from "./pages/StallsPage";
 import { TicketDetailView } from "./pages/TicketDetailView";
 import { WebhooksPage, type WebhookRow, type WebhookAddInput } from "./pages/WebhooksPage";
 import { ProposalsPage, isPendingQueue, type Proposal, type ProposalDiff } from "./pages/ProposalsPage";
+import { ConnectorHealthPage } from "./pages/ConnectorHealthPage";
 import { apiGet, apiPost, apiDelete } from "./api";
 
 type AuthState = "checking" | "authenticated" | "anonymous";
@@ -181,7 +183,11 @@ export function App() {
   }, [check]);
 
   if (auth === "checking") {
-    return <div className="login-screen"><div className="muted">Connecting…</div></div>;
+    return (
+      <div className="login-screen">
+        <Text className="muted">Connecting…</Text>
+      </div>
+    );
   }
 
   if (auth === "anonymous") {
@@ -193,16 +199,17 @@ export function App() {
       <div className="wrap">
         <div className="topbar">
           <div>
-            <h1>Linear Connector Console</h1>
-            <div className="sub">Workflow engine · fleet routing · operational health</div>
+            <Heading as="h1">Linear Connector Console</Heading>
+            <Text variant="small" style={{ marginTop: 2 }}>Workflow engine · fleet routing · operational health</Text>
           </div>
-          <button
+          <Button
+            variant="ghost"
             onClick={() => {
               void logout().finally(() => setAuth("anonymous"));
             }}
           >
             Sign out
-          </button>
+          </Button>
         </div>
         <Tabs pendingProposals={proposals.filter((p) => isPendingQueue(p, Date.now())).length} />
         <Routes>
@@ -230,6 +237,7 @@ export function App() {
           />
           <Route path="/dead-letters" element={<DeadLettersPage />} />
           <Route path="/stalls" element={<StallsPage />} />
+          <Route path="/connector-health" element={<ConnectorHealthPage />} />
           <Route path="/webhooks" element={<WebhooksRoute />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

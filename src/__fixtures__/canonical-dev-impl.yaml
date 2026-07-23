@@ -4,10 +4,10 @@
 # version history: bump `version` on any state/edge change; in-flight tickets
 #   use the version stamped at their creation time (design.md §12).
 #
-# Verbatim copy of the canonical vault file at:
-#   ai-systems/projects/fleet-orchestration-redesign/workflows/dev-impl.yaml
-# Used as a test fixture so CI can exercise the canonical schema without
-# depending on the vault being present. Keep in sync with the vault source.
+# This fixture is kept in sync with the deployed workflow definition so CI
+# can exercise the canonical schema without depending on the vault being
+# present. The canonical source is the deployed def under WORKFLOW_DEFS_DIR;
+# fixture drift is detected at /health.fixtureDrift. Keep in sync.
 #
 # Shape principle (design decision 2026-06-06): a STATE is a work-phase — one
 #   kind of work, one owner role; "awaiting X" and "doing X" are the same state.
@@ -47,17 +47,28 @@
 #   In-flight tickets at the old `state:deployment` / `state:host-deploy` labels
 #   are migrated via escape → re-intake (the state labels no longer exist in the
 #   def, so the gate rejects any command from them — operators must escape).
+#
+# v15 (INF-98 reconciliation, 2026-07-18): reconciled with deployed def.
+#   recovery_actor: ai added (AI-1579). Version bumped to match deployed (15).
+#   Stakes keys confirmed as stakes:* (canonical; deployed risk:* migrated).
+#   State spine unchanged from v10+ (merge/deploy).
 
 id: dev-impl
-version: 10
+version: 16
 archetype: single-task         # single-task | orchestrator | feature-initiative
 entry_state: intake
+
+# AI-1579 (2026-06-13): recovery actor. `ai` (the orchestrator, fills no workflow
+# role) may re-establish a delegate on a ticket whose delegate is currently EMPTY
+# (orphaned) at ANY state — the authorization counterpart to the stale-session
+# recovery machinery. Scoped to the empty-delegate path only.
+recovery_actor: ai
 
 # Phase 6.5 / H-7 (AI-1482): Stakes-threshold sign-off configuration.
 # When a ticket's stakes level meets or exceeds the threshold, the release
 # transition requires a human sign-off (Matt), not an AI agent.
 # Stakes levels: 0 = low (internal only), 1 = medium, 2 = high (external/irreversible).
-# Labels on the ticket: stakes:low, stakes:medium, stakes:high.
+# Labels on the ticket: stakes:low, stakes:medium, stakes:high (canonical namespace).
 stakes:
   threshold: 2                # release from stakes ≥ this level requires human sign-off
   levels:                     # label name → numeric level mapping
@@ -85,6 +96,11 @@ states:
         capture_ac: true
       - command: demote
         to: __ad_hoc__          # ticket leaves the workflow entirely (design.md §4.5)
+      # INF-150: handoff self-loop — re-attach delegate without changing state
+      - command: handoff
+        to: intake
+        assign:
+          mode: required
 
   - id: write-tests
     owner_role: test-author     # TestDrivenDevelopmentAgent; dev container (§16.2)
@@ -99,6 +115,11 @@ states:
       - command: tests-ready
         to: implementation
         assign: { mode: required }     # dev is multi-body (felix/noah/sage/igor) — target required, validated vs dev role
+      # INF-150: handoff self-loop — re-attach delegate without changing state
+      - command: handoff
+        to: write-tests
+        assign:
+          mode: required
 
   - id: implementation
     owner_role: dev
@@ -116,13 +137,21 @@ states:
         assign:
           mode: required          # reviewer must be explicitly specified (§4.3)
           constraint: not-implementer  # reviewer must differ from implementer (AI-1475 D2)
+      # INF-93 rescue: handoff-work self-loop — write a delegate on a stranded
+      # implementation-state ticket without changing state. The connector's
+      # applyStateTransition self-loop handling (AI-2595 AC2) writes the delegate
+      # atomically; the CLI sets proxyIntent("handoff") to trigger this path.
+      - command: handoff
+        to: implementation
+        assign:
+          mode: required          # caller must specify the delegate target
 
   - id: code-review
     owner_role: code-review
     kind: normal
     native_state: todo           # v7 (AI-1510): resting; connector cycles thinking/doing off engagement
     sla: 24h                    # time-in-state; breach → stall escalation (design.md §5.5)
-    # Review contract (v8): reviewer runs the FULL test suite. Any red ⇒
+    # Review contract (v8): Hanzo runs the FULL test suite. Any red ⇒
     # request-changes with the failing tests named in feedback. `approve` is
     # legal only when the suite is green AND code quality satisfies the reviewer.
     # AI-1872: approve now routes to `merge` (not the old `deployment`).
@@ -134,6 +163,7 @@ states:
         to: implementation
         generic: revision
         requires_comment: true
+        assign: { default: prior-implementer }
         feedback:
           required: true
           category_enum:
@@ -142,6 +172,11 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+      # INF-150: handoff self-loop — re-attach delegate without changing state
+      - command: handoff
+        to: code-review
+        assign:
+          mode: required
 
   - id: merge
     owner_role: deployment      # filled by Hanzo; the deployment container (§16.2)
@@ -165,6 +200,7 @@ states:
       - command: reject
         to: implementation
         requires_comment: true
+        assign: { default: prior-implementer }
         feedback:
           required: true
           category_enum:
@@ -173,6 +209,11 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+      # INF-150: handoff self-loop — re-attach delegate without changing state
+      - command: handoff
+        to: merge
+        assign:
+          mode: required
 
   - id: deploy
     owner_role: host-deploy     # filled by Grover for the connector fleet; configurable per project (§16.2)
@@ -195,6 +236,7 @@ states:
       - command: reject
         to: implementation
         requires_comment: true
+        assign: { default: prior-implementer }
         feedback:
           required: true
           category_enum:
@@ -203,6 +245,11 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+      # INF-150: handoff self-loop — re-attach delegate without changing state
+      - command: handoff
+        to: deploy
+        assign:
+          mode: required
 
   - id: ac-validate
     owner_role: steward         # the SAME steward (Astrid) who validated AC at intake
@@ -219,6 +266,7 @@ states:
       - command: ac-fail
         to: implementation
         requires_comment: true
+        assign: { default: prior-implementer }
         feedback:
           required: true
           category_enum:
@@ -227,6 +275,11 @@ states:
             - scope-creep
             - correctness
             - ac-mismatch
+      # INF-150: handoff self-loop — re-attach delegate without changing state
+      - command: handoff
+        to: ac-validate
+        assign:
+          mode: required
 
   - id: done
     kind: terminal

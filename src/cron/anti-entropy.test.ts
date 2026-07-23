@@ -24,7 +24,7 @@ import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "@jest/globals";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, jest } from "@jest/globals";
 import {
   runAntiEntropyPass,
   registerAntiEntropyCron,
@@ -68,7 +68,7 @@ function writeWorkflowDef(overrides: Partial<Record<string, unknown>> = {}): str
       { id: "intake",   native_state: "todo",     owner_role: "steward" },
       { id: "auditing", native_state: "doing",    owner_role: "dev" },
       { id: "spawning", native_state: "doing",    owner_role: "dev" },
-      { id: "managing", native_state: "managing", owner_role: "dev" },
+      { id: "managing", native_state: "managing", owner_role: "dev", barrier: true, transitions: [{ command: "complete", to: "review" }] },
       { id: "review",   native_state: "thinking", owner_role: "code-review" },
       { id: "done",     native_state: "done" },
       { id: "escape",   native_state: "invalid" },
@@ -675,6 +675,42 @@ describe("AC3 — anti-entropy runs on a cadence and alerts on drift", () => {
     expect(timer).toBeDefined();
     clearInterval(timer);
     delete process.env.ANTI_ENTROPY_INTERVAL;
+  });
+
+  it("registerAntiEntropyCron resolves authToken on each scheduled tick", async () => {
+    jest.useFakeTimers();
+    const tokens = ["Bearer stale-token", "Bearer fresh-token"];
+    const seenAuth: string[] = [];
+    globalThis.fetch = jest.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      seenAuth.push(String((init?.headers as Record<string, string>)?.Authorization));
+      return new Response(JSON.stringify({ data: { issues: { nodes: [] } } }));
+    });
+
+    const timer = registerAntiEntropyCron({
+      intervalMs: 100,
+      authToken: () => tokens.shift() ?? "Bearer final-token",
+    });
+
+    try {
+      await jest.advanceTimersByTimeAsync(100);
+      await jest.advanceTimersByTimeAsync(100);
+      expect(seenAuth).toEqual(["Bearer stale-token", "Bearer fresh-token"]);
+    } finally {
+      clearInterval(timer);
+      jest.useRealTimers();
+    }
+  });
+
+  it("runAntiEntropyPass reports GraphQL errors instead of treating them as an empty healthy pass", async () => {
+    globalThis.fetch = jest.fn(async () =>
+      new Response(JSON.stringify({ errors: [{ message: "Invalid OAuth token" }] })),
+    );
+
+    const result = await runAntiEntropyPass({ authToken: "Bearer dead-token" });
+
+    expect(result.scanned).toBe(0);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain("Invalid OAuth token");
   });
 
   it("runAntiEntropyPass result signals drift when nativeDesyncFound > 0", async () => {

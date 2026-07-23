@@ -26,10 +26,27 @@ import type { OperationalEventStore } from "../store/operational-event-store.js"
 import type { ManagingStateStore } from "../store/managing-state-store.js";
 import type { DeliveryConfig } from "../delivery/index.js";
 import { sendManagingWakeSignal, type ManagingWakeTicket } from "./managing-wake.js";
-import { surfaceStalledChildren } from "../barrier.js";
+import { surfaceStalledChildren, evaluateBarrier, attemptBarrierTransition, isManagedBarrierFromLabels } from "../barrier.js";
 import { notify } from "../alerts/alert-bus.js";
 
 const log = componentLogger(createLogger(), "managing-poller");
+
+// Singleton guard (AI-2624 AC5): prevents a second ManagingPoller from being
+// instantiated while one is already active. If two pollers run independently,
+// neither can see the other's persisted dispatch state during the same cycle
+// (they don't share an in-memory buffer), but more importantly they each
+// maintain their own setInterval — producing double ~1min wakes from the same
+// process. The active-instance count lives on the module so require/import
+// deduplication is the only guard; createApp() calls the constructor at most
+// once per app instance.
+//
+// The guard is only enforced in production (NODE_ENV !== 'test') because
+// test suites call createApp() many times, each creating a fresh ManagingPoller.
+// Construction in test resets the guard automatically via _resetSingletonGuard().
+let activeInstanceCount = 0;
+export function _resetSingletonGuard(): void {
+  activeInstanceCount = 0;
+}
 
 const DEFAULT_CYCLE_MS = 60 * 1000;
 const DEFAULT_INTERVAL_MS = 30 * 60 * 1000;
@@ -63,6 +80,10 @@ export interface LinearManagingIssue {
   identifier: string;
   title: string;
   description: string | null;
+  /** Resolved issue label names (e.g. ["wf:sprint-spawner"]). */
+  labels: string[];
+  /** Current state name (lowercase), e.g. "managing". */
+  stateName: string;
 }
 
 export interface PollerCycleResult {
@@ -127,7 +148,7 @@ export function isDue(
 
 /**
  * Fetch all Managing-state tickets delegated to an agent from Linear.
- * Uses the agent's own OAuth token. Returns identifier + title + body.
+ * Uses the agent's own OAuth token. Returns identifier + title + body + labels + state.
  */
 async function fetchManagingTicketsForAgent(agent: AgentConfig): Promise<LinearManagingIssue[]> {
   const token = getAccessToken(agent.name);
@@ -146,6 +167,14 @@ async function fetchManagingTicketsForAgent(agent: AgentConfig): Promise<LinearM
           identifier
           title
           description
+          labels {
+            nodes {
+              name
+            }
+          }
+          state {
+            name
+          }
         }
       }
     }
@@ -159,13 +188,30 @@ async function fetchManagingTicketsForAgent(agent: AgentConfig): Promise<LinearM
     throw new Error(`Linear API returned ${res.status} for agent ${agent.name}`);
   }
   const body = (await res.json()) as {
-    data?: { issues?: { nodes?: Array<{ identifier: string; title: string; description: string | null }> } };
+    data?: {
+      issues?: {
+        nodes?: Array<{
+          identifier: string;
+          title: string;
+          description: string | null;
+          labels?: { nodes?: Array<{ name: string }> };
+          state?: { name: string } | null;
+        }>;
+      };
+    };
     errors?: unknown;
   };
   if (body.errors) {
     throw new Error(`Linear API errors for agent ${agent.name}: ${JSON.stringify(body.errors)}`);
   }
-  return body.data?.issues?.nodes ?? [];
+  const raw = body.data?.issues?.nodes ?? [];
+  return raw.map((n) => ({
+    identifier: n.identifier,
+    title: n.title,
+    description: n.description,
+    labels: n.labels?.nodes?.map((l) => l.name) ?? [],
+    stateName: n.state?.name?.toLowerCase() ?? "",
+  }));
 }
 
 export class ManagingPoller {
@@ -179,6 +225,22 @@ export class ManagingPoller {
   };
 
   constructor(deps: ManagingPollerDeps, config?: Partial<ManagingPollerConfig>) {
+    // Singleton guard: prevent double instantiation within the same process
+    // (the leading hypothesis for the duplicate ~1min wakes observed on AI-2573).
+    // app.create() is called once in production, but defensive code here catches
+    // a test/packaging/import mistake that creates two active pollers.
+    // Enforced only in production (NODE_ENV !== 'test'); test suites call
+    // createApp() many times and auto-reset via _resetSingletonGuard().
+    if (process.env.NODE_ENV !== "test") {
+      if (activeInstanceCount > 0) {
+        throw new Error(
+          "ManagingPoller already instantiated — a second instance would create " +
+          "an independent timer and lose visibility into the first instance's " +
+          "dispatch state. This is likely a packaging/import bug. See AI-2624.",
+        );
+      }
+    }
+    activeInstanceCount++;
     this.config = {
       cycleMs: config?.cycleMs ?? parseEnvInt("MANAGING_POLLER_CYCLE_MS", DEFAULT_CYCLE_MS),
       defaultIntervalMs:
@@ -213,6 +275,21 @@ export class ManagingPoller {
       clearInterval(this.timer);
       this.timer = undefined;
     }
+  }
+
+  /**
+   * Expose live poller state for /health and ac-validate (AI-2624 AC7).
+   * Without waiting for a wake to fire, an operator or test can confirm
+   * the scheduler is running, the cycle cadence, and the default interval
+   * — and detect at a glance whether the poller was wired at bootstrap
+   * (running=true) or never started (running=false).
+   */
+  liveness(): { running: boolean; cycleMs: number; defaultIntervalMs: number } {
+    return {
+      running: this.timer !== undefined,
+      cycleMs: this.config.cycleMs,
+      defaultIntervalMs: this.config.defaultIntervalMs,
+    };
   }
 
   /**
@@ -262,6 +339,8 @@ export class ManagingPoller {
           identifier: issue.identifier,
           title: issue.title,
           lastDispatchedAt,
+          labels: issue.labels,
+          stateName: issue.stateName,
         });
       }
 
@@ -288,6 +367,51 @@ export class ManagingPoller {
           } catch (err) {
             log.warn(
               `Stall detection failed for ${ticket.identifier}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+      }
+
+      // INF-122: Barrier-stuck detection — check if any due ticket is in a
+      // barrier state with all children terminal but hasn't advanced.
+      // This catches the case where a dropped webhook (during a firefight or
+      // cron blackout) left the barrier stranded. If detected, attempt the
+      // barrier transition to self-heal.
+      if (stallToken) {
+        for (const ticket of dueTickets) {
+          try {
+            const barrier = await evaluateBarrier(
+              ticket.identifier,
+              /^Bearer\s+/i.test(stallToken) ? stallToken : `Bearer ${stallToken}`,
+            );
+            if (barrier.allTerminal) {
+              // All children are terminal but the parent is still in the
+              // barrier state — the barrier webhook was missed. Attempt
+              // self-healing via the standard barrier transition path.
+              log.warn(
+                `INF-122 barrier-stuck: ${ticket.identifier} — all ${barrier.totalChildren} child(ren) ` +
+                `terminal but still in barrier state; attempting self-heal advance`,
+              );
+              const transitionResult = await attemptBarrierTransition(
+                ticket.identifier,
+                /^Bearer\s+/i.test(stallToken) ? stallToken : `Bearer ${stallToken}`,
+              );
+              if (transitionResult.transitioned) {
+                log.info(
+                  `INF-122 barrier-stuck self-heal: ${ticket.identifier} — ` +
+                  `advanced (${barrier.terminalCount}/${barrier.totalChildren} children terminal)`,
+                );
+                result.ticketsDispatched++; // count the auto-advance
+              } else {
+                log.warn(
+                  `INF-122 barrier-stuck self-heal FAILED for ${ticket.identifier}: ` +
+                  `${transitionResult.error ?? "unknown error"}`,
+                );
+              }
+            }
+          } catch (err) {
+            log.warn(
+              `INF-122 barrier-stuck detection failed for ${ticket.identifier}: ${err instanceof Error ? err.message : String(err)}`,
             );
           }
         }

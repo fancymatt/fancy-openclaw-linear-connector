@@ -77,6 +77,41 @@ describe("AI-2420 per-agent gateway-API delivery", () => {
     expect(payload).not.toHaveProperty("sessionKey");
   });
 
+  it("INF-224: agent-prefixes a BARE session key so the gateway binds it to the resolved agent, not main", async () => {
+    const { calls } = installFetchMock();
+    const config: DeliveryConfig = {
+      ...BASE,
+      nodeBin: "node",
+      gatewayUrl: "http://10.10.0.105:18820/v1/chat/completions",
+      gatewayToken: "igor-operator-token",
+    };
+
+    // Bare key as produced by normalizeSessionKey (`linear-<ID>`). Left bare,
+    // the gateway scopes it to the default agent (`main`) and the dispatch
+    // dead-ends. It must be sent as `agent:igor:linear-INF-216`.
+    const result = await deliverMessageToAgent(AGENT, "linear-INF-216", "wake up", config);
+
+    expect(result.dispatched).toBe(true);
+    const headers = calls[0].init.headers as Record<string, string>;
+    expect(headers["x-openclaw-session-key"]).toBe("agent:igor:linear-INF-216");
+  });
+
+  it("INF-224: leaves an already-agent-prefixed session key untouched (idempotent, no double-prefix)", async () => {
+    const { calls } = installFetchMock();
+    const config: DeliveryConfig = {
+      ...BASE,
+      nodeBin: "node",
+      gatewayUrl: "http://10.10.0.105:18820/v1/chat/completions",
+      gatewayToken: "igor-operator-token",
+    };
+
+    const result = await deliverMessageToAgent(AGENT, SESSION, "wake up", config);
+
+    expect(result.dispatched).toBe(true);
+    const headers = calls[0].init.headers as Record<string, string>;
+    expect(headers["x-openclaw-session-key"]).toBe(SESSION); // unchanged, not agent:igor:agent:igor:...
+  });
+
   it("falls back to the per-agent hooks payload path when no gateway fields are set", async () => {
     const { calls } = installFetchMock(200, { ok: true, runId: "hook-run" });
     const config: DeliveryConfig = {

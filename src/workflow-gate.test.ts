@@ -34,6 +34,7 @@ import {
   resolveNativeStateId,
   resetNativeStateCache,
   enrollIfMissing,
+  loadWorkflowDef,
 } from "./workflow-gate.js";
 import { resetPolicyCache } from "./escalation-gate.js";
 import { reloadAgents } from "./agents.js";
@@ -60,6 +61,7 @@ capabilities:
   - id: linear:transition
   - id: human:escalate
   - id: workflow:break-glass
+  - id: workflow:steward
   - id: deploy:execute
   - id: infra:ssh
 
@@ -69,7 +71,7 @@ containers:
   - id: deployment
     grants: [linear:transition, deploy:execute, infra:ssh]
   - id: steward
-    grants: [linear:transition, human:escalate, workflow:break-glass]
+    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:steward]
   - id: code-review
     grants: [linear:transition]
 
@@ -113,6 +115,7 @@ capabilities:
   - id: linear:transition
   - id: human:escalate
   - id: workflow:break-glass
+  - id: workflow:steward
   - id: deploy:execute
 
 containers:
@@ -121,7 +124,7 @@ containers:
   - id: deployment
     grants: [linear:transition, deploy:execute]
   - id: steward
-    grants: [linear:transition, human:escalate, workflow:break-glass]
+    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:steward]
   - id: ux-researcher
     grants: [linear:transition]
   - id: engine
@@ -166,6 +169,7 @@ capabilities:
   - id: linear:transition
   - id: human:escalate
   - id: workflow:break-glass
+  - id: workflow:steward
   - id: deploy:execute
 
 containers:
@@ -174,7 +178,7 @@ containers:
   - id: deployment
     grants: [linear:transition, deploy:execute]
   - id: steward
-    grants: [linear:transition, human:escalate, workflow:break-glass]
+    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:steward]
   - id: ux-researcher
     grants: [linear:transition]
   - id: engine
@@ -339,7 +343,7 @@ beforeEach(() => {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-function makeLabelFetch(labelNames: string[], branchAndPR?: { hasBranch?: boolean; hasPR?: boolean; hasMergedPR?: boolean }): typeof globalThis.fetch {
+function makeLabelFetch(labelNames: string[], branchAndPR?: { hasBranch?: boolean; hasPR?: boolean; hasMergedPR?: boolean; mergeSha?: string | null; repoUrl?: string | null }, healthCommit?: string | null): typeof globalThis.fetch {
   const branch = {
     hasBranch: branchAndPR?.hasBranch ?? true,
     hasPR: branchAndPR?.hasPR ?? true,
@@ -369,18 +373,22 @@ function makeLabelFetch(labelNames: string[], branchAndPR?: { hasBranch?: boolea
     // implied by hasPR and branch-only evidence is not representable.
     if (bodyText.includes("IssueBranchAndPR")) {
       const prState = branch.hasMergedPR ? "merged" : "open";
+      const repoUrl = branchAndPR?.repoUrl ?? "fancymatt/repo";
+      const mergeSha = branchAndPR?.mergeSha;
+      const metadata: Record<string, unknown> = { status: prState };
+      if (mergeSha) metadata.mergeCommitSha = mergeSha;
+      const nodes = branch.hasPR
+        ? [{ url: `https://github.com/${repoUrl}/pull/1`, sourceType: "github", metadata }]
+        : [];
       return new Response(
-        JSON.stringify({
-          data: {
-            issue: {
-              attachments: {
-                nodes: branch.hasPR
-                  ? [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status: prState } }]
-                  : [],
-              },
-            },
-          },
-        }),
+        JSON.stringify({ data: { issue: { attachments: { nodes } } } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    // Intercept /health requests for the deploy health gate (AI-2361).
+    if (typeof _url === "string" && _url.endsWith("/health") && healthCommit !== undefined && healthCommit !== null) {
+      return new Response(
+        JSON.stringify({ commit: healthCommit }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -593,6 +601,42 @@ describe("checkWorkflowRules — AI-1574: refuse-work caller-gating", () => {
   });
 });
 
+// ── INF-271: retire steward verb ──────────────────────────────────────────
+
+describe("checkWorkflowRules — INF-271: retire verb", () => {
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("allows retire for a workflow steward (astrid) on a workflow ticket", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:done"]);
+    const result = await checkWorkflowRules("retire", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).toBeNull();
+  });
+
+  it("blocks retire for a non-steward agent (charles) on a workflow ticket", async () => {
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:done"]);
+    const result = await checkWorkflowRules("retire", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("not a workflow steward");
+  });
+
+  it("blocks retire on an ad-hoc ticket (no wf:* label) even for a steward", async () => {
+    globalThis.fetch = makeLabelFetch([]);
+    const result = await checkWorkflowRules("retire", "issue-uuid", "Bearer tok", "astrid");
+    expect(result).not.toBeNull();
+    // The ad-hoc guard catches it first — retire is not a safe-on-unarmed verb
+    expect(result).toContain("no `wf:*` label");
+  });
+
+  it("rejects retire for a non-workflow steward when the ticket has no wf:* label", async () => {
+    globalThis.fetch = makeLabelFetch([]);
+    const result = await checkWorkflowRules("retire", "issue-uuid", "Bearer tok", "charles");
+    expect(result).not.toBeNull();
+    expect(result).toContain("no `wf:*` label");
+  });
+});
+
 // ── Per-state legal / illegal commands ────────────────────────────────────
 
 describe("checkWorkflowRules — intake state", () => {
@@ -750,7 +794,7 @@ describe("checkWorkflowRules — deploy:execute capability gate (merge state)", 
   afterEach(() => { globalThis.fetch = originalFetch; });
 
   it("allows 'continue' from Hanzo (deployment body) in merge state", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"]);
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { hasMergedPR: true });
     expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 
@@ -910,7 +954,7 @@ describe("checkWorkflowRules — canonical vault schema (src/__fixtures__/canoni
   });
 
   it("canonical: continue in merge state is allowed for Hanzo (deployment body)", async () => {
-    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge", "stakes:low"]);
+    globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge", "stakes:low"], { hasMergedPR: true });
     expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 });
@@ -1685,27 +1729,34 @@ describe("checkWorkflowRules — AI-2476: merged-PR release gate (branch/PR veri
   beforeEach(() => { originalFetch = globalThis.fetch; });
   afterEach(() => { globalThis.fetch = originalFetch; });
 
-  it("allows 'continue' from merge state when branch exists and PR exists", async () => {
+  // INF-96: open PR (not merged) is now blocked — only verified merged PR passes.
+  it("blocks 'continue' from merge state when branch and PR exist but are not merged (INF-96)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { hasBranch: true, hasPR: true });
-    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
   });
 
-  it("allows 'continue' from deploy state when branch exists and PR exists", async () => {
+  it("blocks 'continue' from deploy state when branch and PR exist but are not merged (INF-96)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: true, hasPR: true });
-    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
   });
 
-  // AI-1797: branch/PR status comes from GitHub PR attachments; a PR attachment
-  // implies a pushed branch, so branch-only / PR-only partial evidence no longer
-  // exists and an open (unmerged) PR passes, matching prior branch+PR semantics.
-  it("allows 'continue' from merge state with an open PR attachment (PR implies pushed branch, AI-1797)", async () => {
+  // INF-96: open (unmerged) PR no longer passes the gate.
+  it("blocks 'continue' from merge state with an open PR attachment (INF-96)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { hasBranch: false, hasPR: true });
-    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
   });
 
-  it("allows 'continue' from deploy state with an open PR attachment (PR implies pushed branch, AI-1797)", async () => {
+  it("blocks 'continue' from deploy state with an open PR attachment (INF-96)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: false, hasPR: true });
-    expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
   });
 
   // AI-1797 regression: schema-level errors payload → fail-open with alert.
@@ -1742,17 +1793,19 @@ describe("checkWorkflowRules — AI-2476: merged-PR release gate (branch/PR veri
     }
   });
 
-  // AI-1497: Complete absence of evidence is now fail-open — data likely lost to auto-delete.
-  it("allows 'continue' from merge state when neither branch nor PR exist (AI-1497 fail-open)", async () => {
+  // INF-96: Complete absence of evidence is now a hard block (was AI-1497 fail-open).
+  it("blocks 'continue' from merge state when neither branch nor PR exist (INF-96)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge"], { hasBranch: false, hasPR: false });
     const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
-    expect(result).toBeNull(); // fail-open: data likely lost to auto-delete
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
   });
 
-  it("allows 'continue' from deploy state when neither branch nor PR exist (AI-1497 fail-open)", async () => {
+  it("blocks 'continue' from deploy state when neither branch nor PR exist (INF-96)", async () => {
     globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:deploy"], { hasBranch: false, hasPR: false });
     const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
-    expect(result).toBeNull(); // fail-open: data likely lost to auto-delete
+    expect(result).not.toBeNull();
+    expect(result).toContain("blocked");
   });
 
   // AI-1497: null after retry is now fail-open to avoid stranding tickets.
@@ -1821,6 +1874,456 @@ describe("checkWorkflowRules — AI-2476: merged-PR release gate (branch/PR veri
     expect(await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo")).toBeNull();
   });
 
+  // INF-132: when Linear's attachment metadata is stale (shows "open"), the gate
+  // falls through to the GitHub API to verify the PR's merge state.
+  describe("INF-132: GitHub API fallback for stale Linear metadata", () => {
+    afterEach(() => { delete process.env.GITHUB_TOKEN; });
+
+    it("allows 'continue' from merge state when Linear says open but GitHub confirms merged", async () => {
+      // Linear returns "open" (hasMergedPR: false), but GitHub says merged.
+      globalThis.fetch = async (_url, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+          return new Response(JSON.stringify({
+            data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:merge" }] }, delegate: null } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("IssueBranchAndPR")) {
+          // Linear attachment metadata shows "open" (stale)
+          return new Response(JSON.stringify({
+            data: { issue: { attachments: { nodes: [{ url: "https://github.com/fancymatt/fancy-openclaw-linear-connector/pull/999", sourceType: "github", metadata: { status: "open" } }] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("TeamStates")) {
+          return new Response(JSON.stringify({
+            data: { team: { states: { nodes: [] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        // GitHub API fallback: PR 999 is merged
+        if ((_url as string).includes("api.github.com")) {
+          return new Response(JSON.stringify({ merged: true, merged_at: "2026-07-19T18:51:23Z" }), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+        // Workflow def query
+        if (bodyText.includes("WorkflowDefs")) {
+          return new Response(JSON.stringify({ data: { workflowDefs: [] } }), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+        throw new Error(`INF-132 test: unexpected fetch: ${bodyText.slice(0, 100)}`);
+      };
+      const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+      expect(result).toBeNull();
+    });
+
+    it("blocks 'continue' from merge state when Linear says open and GitHub also says not merged", async () => {
+      globalThis.fetch = async (_url, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+          return new Response(JSON.stringify({
+            data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:merge" }] }, delegate: null } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("IssueBranchAndPR")) {
+          return new Response(JSON.stringify({
+            data: { issue: { attachments: { nodes: [{ url: "https://github.com/fancymatt/fancy-openclaw-linear-connector/pull/999", sourceType: "github", metadata: { status: "open" } }] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("TeamStates")) {
+          return new Response(JSON.stringify({
+            data: { team: { states: { nodes: [] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        // GitHub API fallback: PR 999 is NOT merged
+        if ((_url as string).includes("api.github.com")) {
+          return new Response(JSON.stringify({ merged: false, state: "open" }), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (bodyText.includes("WorkflowDefs")) {
+          return new Response(JSON.stringify({ data: { workflowDefs: [] } }), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+        throw new Error(`INF-132 test: unexpected fetch: ${bodyText.slice(0, 100)}`);
+      };
+      const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+      expect(result).not.toBeNull();
+      expect(result).toContain("blocked");
+    });
+
+    it("allows 'continue' from merge state when Linear shows merged (fast path, no GitHub call)", async () => {
+      // When Linear already says merged, we should NOT hit the GitHub API.
+      // This test verifies the fast path still works.
+      globalThis.fetch = async (_url, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+          return new Response(JSON.stringify({
+            data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:merge" }] }, delegate: null } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("IssueBranchAndPR")) {
+          // Linear attachment shows "merged" — fast path, no GitHub call needed
+          return new Response(JSON.stringify({
+            data: { issue: { attachments: { nodes: [{ url: "https://github.com/fancymatt/fancy-openclaw-linear-connector/pull/999", sourceType: "github", metadata: { status: "merged" } }] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("TeamStates")) {
+          return new Response(JSON.stringify({
+            data: { team: { states: { nodes: [] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("WorkflowDefs")) {
+          return new Response(JSON.stringify({ data: { workflowDefs: [] } }), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+        // If we hit GitHub API here, something is wrong — throw
+        if ((_url as string).includes("api.github.com")) {
+          throw new Error("INF-132: unexpected GitHub API call when Linear already confirmed merged");
+        }
+        throw new Error(`INF-132 test: unexpected fetch: ${bodyText.slice(0, 100)}`);
+      };
+      const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+      expect(result).toBeNull();
+    });
+
+    it("allows 'continue' when GitHub API returns 404 (PR deleted, fail-open)", async () => {
+      globalThis.fetch = async (_url, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        if (bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+          return new Response(JSON.stringify({
+            data: { issue: { labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:merge" }] }, delegate: null } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("IssueBranchAndPR")) {
+          return new Response(JSON.stringify({
+            data: { issue: { attachments: { nodes: [{ url: "https://github.com/fancymatt/fancy-openclaw-linear-connector/pull/888", sourceType: "github", metadata: { status: "open" } }] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (bodyText.includes("TeamStates")) {
+          return new Response(JSON.stringify({
+            data: { team: { states: { nodes: [] } } },
+          }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        // GitHub returns 404 — PR was deleted, fail-open (fall back to Linear)
+        if ((_url as string).includes("api.github.com")) {
+          return new Response(JSON.stringify({ message: "Not Found" }), {
+            status: 404, headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (bodyText.includes("WorkflowDefs")) {
+          return new Response(JSON.stringify({ data: { workflowDefs: [] } }), {
+            status: 200, headers: { "Content-Type": "application/json" },
+          });
+        }
+        throw new Error(`INF-132 test: unexpected fetch: ${bodyText.slice(0, 100)}`);
+      };
+      const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+      // With a 404, GitHub verification fails and we fall back to Linear's
+      // "open" status — the gate blocks since no merged evidence exists.
+      expect(result).not.toBeNull();
+      expect(result).toContain("blocked");
+    });
+  });
+
+});
+
+// ── INF-112 AC4: Regression test — non-Linear-generated branch ──────────────
+// AC4 requires that a ticket in merge/deploy state passes cleanly through the
+// done gate when the PR was created externally (not through Linear's "Create
+// branch" UI). The Linear-GitHub integration never syncs merge status metadata
+// for externally-created branches, so hasMergedPR is false despite the PR being
+// genuinely merged.
+
+// The fix has three paths:
+// 1. GitHub API fallback: checkPRMergedFromGitHub confirms the PR is merged
+// 2. Defense-in-depth: when no GH_TOKEN is configured, PR URL alone is sufficient
+// 3. Force-deploy: the force-deploy intent bypasses the evidence gate entirely
+
+// Each path is tested below for both merge and deploy states.
+
+describe("checkWorkflowRules — INF-112: non-Linear-generated branch (metadata-gap)", () => {
+  let originalWorkflowPath: string | undefined;
+  let originalFetch: typeof globalThis.fetch;
+  let originalGhToken: string | undefined;
+
+  beforeAll(() => {
+    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
+    originalGhToken = process.env.GH_TOKEN;
+    resetWorkflowCache();
+  });
+  afterAll(() => {
+    if (originalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    if (originalGhToken !== undefined) process.env.GH_TOKEN = originalGhToken;
+    else delete process.env.GH_TOKEN;
+    resetWorkflowCache();
+  });
+
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    delete process.env.GH_TOKEN;
+  });
+
+  /**
+   * Build a fetch mock that returns:
+   * - Linear branch/PR data showing PR URLs exist but hasMergedPR=false
+   *   (simulating an externally-created branch where Linear's GitHub integration
+   *    never synced the merged status)
+   * - GitHub API response confirming the PR IS merged (when ghApiReturnsMerged=true)
+   * - Linear label/context responses as needed
+   */
+  function makeInf112Mock(ghApiReturnsMerged: boolean, state: "merge" | "deploy"): typeof globalThis.fetch {
+    return async (url: URL | string, init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : url.href;
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+
+      // GitHub API: checkPRMergedFromGitHub
+      if (urlStr.includes("api.github.com/repos/")) {
+        if (ghApiReturnsMerged) {
+          return new Response(
+            JSON.stringify({ merged: true, state: "merged" }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({ merged: false, state: "open" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // TeamStates query (native state resolution)
+      if (bodyText.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              team: {
+                states: {
+                  nodes: [
+                    { id: "state-backlog-uuid", name: "Backlog", type: "unstarted" },
+                    { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+                    { id: "state-doing-uuid", name: "Doing", type: "started" },
+                    { id: "state-thinking-uuid", name: "Thinking", type: "started" },
+                    { id: "state-managing-uuid", name: "Managing", type: "started" },
+                    { id: "state-done-uuid", name: "Done", type: "completed" },
+                    { id: "state-invalid-uuid", name: "Invalid", type: "canceled" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Linear IssueBranchAndPR query — PR URLs exist but metadata does NOT
+      // show merged status (simulates externally-created branch)
+      if (bodyText.includes("IssueBranchAndPR")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                description: null,
+                attachments: {
+                  nodes: [
+                    {
+                      url: "https://github.com/fancymatt/repo/pull/42",
+                      sourceType: "github",
+                      // metadata deliberately omits `status` — simulates
+                      // externally-created branch where Linear's GitHub
+                      // integration never synced merge status (metadata-gap).
+                      metadata: {},
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Linear context query (IssueWithLabels / delegate)
+      if (bodyText.includes("IssueWithLabels") || bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "internal-uuid",
+                labels: {
+                  nodes: [
+                    { name: "wf:dev-impl" },
+                    { name: `state:${state}` },
+                  ],
+                },
+                delegate: null,
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      throw new Error(`unexpected fetch call: ${urlStr} ${bodyText.slice(0, 80)}`);
+    };
+  }
+
+  // ── Path 1: GitHub API fallback (GH_TOKEN set, API confirms merged) ──
+
+  it("allows 'continue' from merge state when PR metadata missing merge status but GitHub API confirms (INF-112 metadata-gap)", async () => {
+    process.env.GH_TOKEN = "mock-token-hex-1234";
+    globalThis.fetch = makeInf112Mock(true, "merge");
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
+  });
+
+  it("allows 'continue' from deploy state when PR metadata missing merge status but GitHub API confirms (INF-112 metadata-gap)", async () => {
+    process.env.GH_TOKEN = "mock-token-hex-1234";
+    globalThis.fetch = makeInf112Mock(true, "deploy");
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
+  });
+
+  // ── Path 2: Defense-in-depth — no GH_TOKEN, PR URL accepted as sufficient ──
+
+  it("allows 'continue' from merge state with no GH_TOKEN — PR URL accepted as sufficient evidence (INF-112 defense-in-depth)", async () => {
+    // GH_TOKEN deliberately unset (afterEach deletes it)
+    globalThis.fetch = makeInf112Mock(false, "merge");
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
+  });
+
+  it("allows 'continue' from deploy state with no GH_TOKEN — PR URL accepted as sufficient evidence (INF-112 defense-in-depth)", async () => {
+    globalThis.fetch = makeInf112Mock(false, "deploy");
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
+  });
+
+  // ── Path 3: Force-deploy bypasses evidence gate entirely ──
+
+  it("force-deploy from merge state bypasses evidence gate entirely (INF-112 force-deploy)", async () => {
+    // No GH_TOKEN, mock returns "not merged" — but force-deploy should skip
+    globalThis.fetch = makeInf112Mock(false, "merge");
+    const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
+  });
+
+  it("force-deploy from deploy state bypasses evidence gate entirely (INF-112 force-deploy)", async () => {
+    globalThis.fetch = makeInf112Mock(false, "deploy");
+    const result = await checkWorkflowRules("force-deploy", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).toBeNull();
+  });
+
+  // ── Path 4: GH_TOKEN set but GitHub confirms NOT merged → blocked ──
+  // This is the "genuine block" case: the evidence gate has real data and
+  // the PR is genuinely not merged. Only GH_TOKEN makes this distinction
+  // possible; without it, PR URL is always accepted.
+
+  it("blocks 'continue' from merge state when GH_TOKEN is set and GitHub confirms PR is NOT merged", async () => {
+    process.env.GH_TOKEN = "mock-token-hex-1234";
+    globalThis.fetch = makeInf112Mock(false, "merge");
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked");
+  });
+
+  it("blocks 'continue' from deploy state when GH_TOKEN is set and GitHub confirms PR is NOT merged", async () => {
+    process.env.GH_TOKEN = "mock-token-hex-1234";
+    globalThis.fetch = makeInf112Mock(false, "deploy");
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("blocked");
+  });
+
+  // ── Path 5: GH_TOKEN set but GitHub API returns error → blocks (can't verify) ──
+  // When GH_TOKEN is configured and the GitHub API is unreachable, the gate
+  // blocks rather than guessing — a configured but failing API is treated as
+  // an operational problem, not a fallback signal.
+
+  it("blocks 'continue' from merge state when GH_TOKEN set but GitHub API errors (can't verify INF-112 metadata-gap)", async () => {
+    process.env.GH_TOKEN = "mock-token-hex-1234";
+    globalThis.fetch = async (url: URL | string, init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : url.href;
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+
+      // GitHub API: return server error
+      if (urlStr.includes("api.github.com/repos/")) {
+        return new Response("Internal Server Error", { status: 500 });
+      }
+
+      // TeamStates
+      if (bodyText.includes("TeamStates")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              team: {
+                states: {
+                  nodes: [
+                    { id: "state-backlog-uuid", name: "Backlog", type: "unstarted" },
+                    { id: "state-todo-uuid", name: "Todo", type: "unstarted" },
+                    { id: "state-doing-uuid", name: "Doing", type: "started" },
+                    { id: "state-done-uuid", name: "Done", type: "completed" },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Linear IssueBranchAndPR
+      if (bodyText.includes("IssueBranchAndPR")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                description: null,
+                attachments: {
+                  nodes: [
+                    {
+                      url: "https://github.com/fancymatt/repo/pull/42",
+                      sourceType: "github",
+                      metadata: { status: "open" },
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Linear context
+      if (bodyText.includes("IssueWithLabels") || bodyText.includes("IssueContext") || bodyText.includes("delegate")) {
+        return new Response(
+          JSON.stringify({
+            data: {
+              issue: {
+                id: "internal-uuid",
+                labels: { nodes: [{ name: "wf:dev-impl" }, { name: "state:merge" }] },
+                delegate: null,
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      throw new Error(`unexpected fetch call: ${urlStr} ${bodyText.slice(0, 80)}`);
+    };
+    const result = await checkWorkflowRules("continue", "issue-uuid", "Bearer tok", "hanzo");
+    expect(result).not.toBeNull();
+    expect(result).toContain("[Proxy]");
+    expect(result).toContain("cannot release unmerged work");
+  });
 });
 
 // ── AI-1475 Defect 2: Submit requires reviewer ≠ author ──────────────────────
@@ -1874,8 +2377,8 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
   // v8 literal verb (deploy/handoff-host-deploy). Both merge→deploy and
   // deploy→ac-validate forward carries trigger the gate.
 
-  it("allows label swap from merge state with open PR attachment (PR implies branch, AI-1797)", async () => {
-    const { fetch: mock, calls } = makeTransitionFetch({
+  it("blocks label swap from merge state with open PR attachment (INF-96)", async () => {
+    const { fetch: mock } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
         { id: "state-lbl", name: "state:merge" },
@@ -1884,13 +2387,13 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
       branchStatus: { hasBranch: false, hasPR: true },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeDefined();
+    const result = await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty("status", "blocked");
   });
 
-  it("allows label swap from deploy state with open PR attachment (PR implies branch, AI-1797)", async () => {
-    const { fetch: mock, calls } = makeTransitionFetch({
+  it("blocks label swap from deploy state with open PR attachment (INF-96)", async () => {
+    const { fetch: mock } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
         { id: "state-lbl", name: "state:deploy" },
@@ -1899,9 +2402,9 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
       branchStatus: { hasBranch: false, hasPR: true },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeDefined();
+    const result = await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty("status", "blocked");
   });
 
   // AI-1797 regression: a schema-level errors payload (the silent fail-open bug)
@@ -1922,8 +2425,8 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
     expect(updateCall).toBeDefined();
   });
 
-  it("allows label swap from merge state when branch + PR exist", async () => {
-    const { fetch: mock, calls } = makeTransitionFetch({
+  it("blocks label swap from merge state when branch + PR exist but not merged (INF-96)", async () => {
+    const { fetch: mock } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
         { id: "state-lbl", name: "state:merge" },
@@ -1932,13 +2435,13 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
       branchStatus: { hasBranch: true, hasPR: true },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeDefined();
+    const result = await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty("status", "blocked");
   });
 
-  it("allows label swap from deploy state when branch + PR exist", async () => {
-    const { fetch: mock, calls } = makeTransitionFetch({
+  it("blocks label swap from deploy state when branch + PR exist but not merged (INF-96)", async () => {
+    const { fetch: mock } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
         { id: "state-lbl", name: "state:deploy" },
@@ -1947,9 +2450,9 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
       branchStatus: { hasBranch: true, hasPR: true },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeDefined();
+    const result = await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty("status", "blocked");
   });
 
   it("gate does NOT block non-forward transitions (reject) from merge state", async () => {
@@ -2013,9 +2516,9 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
     expect(updateCall).toBeDefined();
   });
 
-  // AI-1497: complete absence of evidence is fail-open in B2 too.
-  it("allows label swap from merge state when neither branch nor PR exist (AI-1497 fail-open)", async () => {
-    const { fetch: mock, calls } = makeTransitionFetch({
+  // INF-96: complete absence of evidence is now hard-block in B2 too.
+  it("blocks label swap from merge state when neither branch nor PR exist (INF-96)", async () => {
+    const { fetch: mock } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
         { id: "state-lbl", name: "state:merge" },
@@ -2024,13 +2527,13 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
       branchStatus: { hasBranch: false, hasPR: false },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeDefined();
+    const result = await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty("status", "blocked");
   });
 
-  it("allows label swap from deploy state when neither branch nor PR exist (AI-1497 fail-open)", async () => {
-    const { fetch: mock, calls } = makeTransitionFetch({
+  it("blocks label swap from deploy state when neither branch nor PR exist (INF-96)", async () => {
+    const { fetch: mock } = makeTransitionFetch({
       issueLabels: [
         { id: "wf-lbl", name: "wf:dev-impl" },
         { id: "state-lbl", name: "state:deploy" },
@@ -2039,9 +2542,9 @@ describe("applyStateTransition — AI-2476: merged-PR release gate defense-in-de
       branchStatus: { hasBranch: false, hasPR: false },
     });
     globalThis.fetch = mock;
-    await applyStateTransition("continue", "issue-uuid", "Bearer tok");
-    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
-    expect(updateCall).toBeDefined();
+    const result = await applyStateTransition("continue", "issue-uuid", "Bearer tok");
+    expect(result).not.toBeNull();
+    expect(result).toHaveProperty("status", "blocked");
   });
 
   // AI-1497: null after retry is fail-open in B2.
@@ -2766,6 +3269,7 @@ capabilities:
   - id: linear:transition
   - id: human:escalate
   - id: workflow:break-glass
+  - id: workflow:steward
   - id: deploy:execute
 
 containers:
@@ -2774,7 +3278,7 @@ containers:
   - id: deployment
     grants: [linear:transition, deploy:execute]
   - id: steward
-    grants: [linear:transition, human:escalate, workflow:break-glass]
+    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:steward]
   - id: code-review
     grants: [linear:transition]
   - id: orchestrator
@@ -3465,11 +3969,12 @@ bodies:
 
       // AI-1475 D1: Branch/PR status for done gate
       if (q.includes("IssueBranchAndPR")) {
+        const hasMergeDeployState = childLabels.some((l: { name: string }) => l.name === "state:merge" || l.name === "state:deploy");
         return new Response(
           JSON.stringify({
             data: {
               issue: {
-                attachments: { nodes: [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status: "open" } }] },
+                attachments: { nodes: [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status: hasMergeDeployState ? "merged" : "open" } }] },
               },
             },
           }),
@@ -3910,7 +4415,7 @@ describe("checkWorkflowRules — canonical sprint schema (src/__fixtures__/canon
     const def = await loadWorkflowDef();
     expect(def.break_glass).toBeDefined();
     expect(def.break_glass!.command).toBe("escape");
-    expect(def.break_glass!.to).toBe("escape");
+    expect(def.break_glass!.to).toBe("intake");
   });
 
   // §16.0 invariant: entry_state references a valid state
@@ -4894,7 +5399,7 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       process.env.CAPABILITY_POLICY_PATH = devImplPolicyFile;
       resetPolicyCache();
 
-      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge", "stakes:low"], { hasBranch: true, hasPR: true });
+      globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge", "stakes:low"], { hasBranch: true, hasPR: true, hasMergedPR: true });
       expect(await checkWorkflowRules("continue", "AI-3001", "Bearer tok", "hanzo")).toBeNull();
 
       process.env.WORKFLOW_DEF_PATH = CANONICAL_SPRINT_FIXTURE;
@@ -4915,9 +5420,9 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
       expect(deployTransitions).toHaveLength(0);
     });
 
-    // AI-1497: deploy now fails open when no branch/PR evidence exists (data likely lost to auto-delete).
-    // Previously this blocked, but the absence of evidence is not evidence of absence.
-    it("dev-impl merge passes done gate when no branch/PR evidence (AI-1497 fail-open)", async () => {
+    // INF-96: no branch/PR evidence is now a hard block (reverses AI-1497 fail-open).
+    // The done gate no longer silently passes tickets with zero GitHub evidence.
+    it("blocks dev-impl merge when no branch/PR evidence (INF-96)", async () => {
       const devImplFixture = path.resolve(process.cwd(), "src/__fixtures__/canonical-dev-impl.yaml");
       process.env.WORKFLOW_DEF_PATH = devImplFixture;
       resetWorkflowCache();
@@ -4929,7 +5434,8 @@ describe("C-3: E2E milestone validation walk — sprint (Archetype C)", () => {
 
       globalThis.fetch = makeLabelFetch(["wf:dev-impl", "state:merge", "stakes:low"], { hasBranch: false, hasPR: false });
       const result = await checkWorkflowRules("continue", "AI-3001", "Bearer tok", "hanzo");
-      expect(result).toBeNull(); // AI-1497: fail-open on no evidence
+      expect(result).not.toBeNull(); // INF-96: block on no evidence
+      expect(result).toContain("blocked");
 
       process.env.WORKFLOW_DEF_PATH = CANONICAL_SPRINT_FIXTURE;
       process.env.CAPABILITY_POLICY_PATH = path.join(c3Dir, "capability-policy.yaml");
@@ -5760,6 +6266,7 @@ capabilities:
   - id: linear:transition
   - id: human:escalate
   - id: workflow:break-glass
+  - id: workflow:steward
 
 containers:
   - id: dev
@@ -5767,7 +6274,7 @@ containers:
   - id: test-author-container
     grants: [linear:transition]
   - id: steward
-    grants: [linear:transition, human:escalate, workflow:break-glass]
+    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:steward]
 
 roles:
   - id: dev
@@ -6279,8 +6786,9 @@ describe("AI-1498: Conformance-walk acceptance gate", () => {
 
       // Branch/PR for done gate
       if (q.includes("IssueBranchAndPR")) {
+        const status = currentLabels.some((l) => l === "state:merge" || l === "state:deploy") ? "merged" : "open";
         return new Response(
-          JSON.stringify({ data: { issue: { attachments: { nodes: [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status: "open" } }] } } } }),
+          JSON.stringify({ data: { issue: { attachments: { nodes: [{ url: "https://github.com/fancymatt/repo/pull/1", sourceType: "github", metadata: { status } }] } } } }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
@@ -6921,15 +7429,15 @@ describe("checkWorkflowRules — AI-1576 AC3: demote blocked when ticket has in-
     expect(result).toContain("demote");
   });
 
-  it("AC3: demote from intake is blocked when ticket has a merged PR", async () => {
+  // AI-2016 AC1: merged PRs are now a release condition, not a block condition.
+  // A shipped ticket (all PRs merged) is safe to demote — the guard permits it.
+  it("AC3: demote from intake is ALLOWED when all PRs are merged (AI-2016 AC1)", async () => {
     globalThis.fetch = makeLabelFetch(
       ["wf:dev-impl", "state:intake"],
       { hasBranch: true, hasPR: true, hasMergedPR: true },
     );
     const result = await checkWorkflowRules("demote", "issue-uuid", "Bearer tok", "astrid");
-    expect(result).not.toBeNull();
-    expect(result).toContain("[Proxy]");
-    expect(result).toContain("demote");
+    expect(result).toBeNull();
   });
 
   // AI-1797: branch-only evidence (pushed, no PR yet) is invisible via attachments —
@@ -7700,3 +8208,548 @@ describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () 
     expect(record).toBeNull();
   });
 });
+
+describe("checkWorkflowRules — deploy health gate (AI-2361)", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let originalHealthCheckUrl: string | undefined;
+  let originalConnectorRepo: string | undefined;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    originalHealthCheckUrl = process.env.HEALTH_CHECK_URL;
+    originalConnectorRepo = process.env.CONNECTOR_REPO;
+    process.env.HEALTH_CHECK_URL = "http://connector.test/health";
+    process.env.CONNECTOR_REPO = "fancymatt/repo";
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    if (originalHealthCheckUrl) {
+      process.env.HEALTH_CHECK_URL = originalHealthCheckUrl;
+    } else {
+      delete process.env.HEALTH_CHECK_URL;
+    }
+    if (originalConnectorRepo) {
+      process.env.CONNECTOR_REPO = originalConnectorRepo;
+    } else {
+      delete process.env.CONNECTOR_REPO;
+    }
+  });
+
+  it("blocks 'deploy' when running commit doesn't include merge SHA on connector-repo ticket", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:deployment"],
+      { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "fancymatt/repo" },
+      "def789",
+      false,
+    );
+    const result = await checkWorkflowRules(
+      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
+    );
+    expect(result).not.toBeNull();
+    expect(result).toContain("abc123def456");
+    expect(result).toContain("def789");
+    expect(result).toContain("stale");
+  });
+
+  it("includes both commit SHAs in rejection message on stale artifact", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:deployment"],
+      { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "fancymatt/repo" },
+      "def789",
+      false,
+    );
+    const result = await checkWorkflowRules(
+      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
+    );
+    expect(result).toContain("abc123def456");
+    expect(result).toContain("def789");
+  });
+
+  it("allows 'deploy' when running commit matches merge SHA on connector-repo ticket", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:deployment"],
+      { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "fancymatt/repo" },
+      "abc123def456",
+      false,
+    );
+    const result = await checkWorkflowRules(
+      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
+    );
+    expect(result).toBeNull();
+  });
+
+  it("allows 'deploy' without health check for non-connector repo ticket", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:deployment"],
+      { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "other-org/other-repo" },
+      "def789",
+      false,
+    );
+    const result = await checkWorkflowRules(
+      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
+    );
+    expect(result).toBeNull();
+  });
+
+  it("allows 'deploy' without health check when PR has no merge SHA", async () => {
+    globalThis.fetch = makeLabelFetch(
+      ["wf:dev-impl", "state:deployment"],
+      { hasPR: true, hasMergedPR: true, mergeSha: null, repoUrl: "fancymatt/repo" },
+      "def789",
+      false,
+    );
+    const result = await checkWorkflowRules(
+      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
+    );
+    expect(result).toBeNull();
+  });
+});
+
+// ── AI-2595: Merge-gate bounce strands dev-impl tickets ───────────────────
+//
+// Three failing tests covering the three acceptance criteria:
+//   AC1: A gate bounce (merge/deploy reject → implementation) MUST attach the
+//        implementing delegate in the same transition (mirror request-changes
+//        semantics).
+//   AC2: handoff-work can write a delegate when source === destination (self-loop).
+//   AC3: Regression test: bounce a dev-impl ticket at the gate, assert delegate ≠ null.
+//
+// Expected to FAIL until the fix is in place:
+//   - AC1 fails because reject transitions on merge/deploy lack
+//     assign: { default: prior-implementer } — the implementer store is never
+//     consulted, delegate falls through to role resolution and strand.
+//   - AC2 fails because applyStateTransition short-circuits with
+//     already-in-state when source === destination, skipping the delegate write.
+//   - AC3 fails as a composite of both bugs.
+
+describe("AI-2595: Gate-bounce delegate strand (merge/deploy reject)", () => {
+  let ai2595Dir: string;
+  let originalPath: string | undefined;
+  let originalFetch: typeof globalThis.fetch;
+
+  const AI2595_WORKFLOW_YAML = `
+id: dev-impl
+version: 10
+archetype: single-task
+entry_state: intake
+
+break_glass:
+  command: escape
+  to: intake
+  owner_role: steward
+
+states:
+  - id: intake
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: accept
+        to: write-tests
+        assign: { mode: auto }
+
+  - id: write-tests
+    owner_role: test-author
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: tests-ready
+        to: implementation
+        assign: { mode: required }
+
+  - id: implementation
+    owner_role: dev
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: submit
+        to: merge
+        assign: { mode: auto }
+      - command: handoff-work
+        to: implementation
+        assign: { default: prior-implementer }
+
+  - id: merge
+    owner_role: deployment
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: continue
+        to: deploy
+        requires_capability: deploy:execute
+        assign: { mode: auto }
+      - command: reject
+        to: implementation
+        requires_comment: true
+        assign: { default: prior-implementer }
+        feedback:
+          required: true
+          category_enum:
+            - missing-tests
+            - style
+
+  - id: deploy
+    owner_role: host-deploy
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: continue
+        to: done
+        requires_capability: infra:ssh
+        assign: { mode: auto }
+      - command: reject
+        to: implementation
+        requires_comment: true
+        assign: { default: prior-implementer }
+        feedback:
+          required: true
+          category_enum:
+            - missing-tests
+
+  - id: done
+    kind: terminal
+    native_state: done
+    transitions: []
+`;
+
+  const AI2595_POLICY_YAML = `
+capabilities:
+  - id: linear:transition
+  - id: human:escalate
+  - id: workflow:break-glass
+  - id: workflow:steward
+  - id: deploy:execute
+  - id: infra:ssh
+
+containers:
+  - id: dev
+    grants: [linear:transition]
+  - id: deployment
+    grants: [linear:transition, deploy:execute]
+  - id: host-deploy
+    grants: [linear:transition, infra:ssh]
+  - id: steward
+    grants: [linear:transition, human:escalate, workflow:break-glass, workflow:steward]
+  - id: test-author-container
+    grants: [linear:transition]
+
+roles:
+  - id: dev
+    requires: [linear:transition]
+  - id: deployment
+    requires: [deploy:execute]
+  - id: host-deploy
+    requires: [infra:ssh]
+  - id: steward
+    requires: [human:escalate]
+  - id: test-author
+    requires: [linear:transition]
+
+bodies:
+  - id: hanzo
+    container: deployment
+    fills_roles: [deployment]
+  - id: grover
+    container: host-deploy
+    fills_roles: [host-deploy]
+  - id: charles
+    container: dev
+    fills_roles: [dev]
+  - id: tdd
+    container: test-author-container
+    fills_roles: [test-author]
+  - id: astrid
+    container: steward
+    fills_roles: [steward]
+`;
+
+  beforeAll(() => {
+    ai2595Dir = fs.mkdtempSync(path.join(os.tmpdir(), "ai2595-test-"));
+
+    const policyFile = path.join(ai2595Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, AI2595_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    const workflowFile = path.join(ai2595Dir, "dev-impl.yaml");
+    fs.writeFileSync(workflowFile, AI2595_WORKFLOW_YAML, "utf8");
+    originalPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = workflowFile;
+
+    // Isolate implementer store to a suite-specific temp file so prior
+    // test runs can't poison the prior-implementer lookup (AI-2595 AC1).
+    process.env.IMPLEMENTER_STORE_PATH = path.join(ai2595Dir, "implementer-store.json");
+
+    const agentsFile = path.join(ai2595Dir, "agents.json");
+    fs.writeFileSync(agentsFile, JSON.stringify({
+      agents: [
+        { name: "charles", linearUserId: "charles-linear-uuid", clientId: "c-client", clientSecret: "c-secret", accessToken: "c-token", refreshToken: "c-refresh" },
+        { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-client", clientSecret: "h-secret", accessToken: "h-token", refreshToken: "h-refresh" },
+        { name: "grover", linearUserId: "grover-linear-uuid", clientId: "g-client", clientSecret: "g-secret", accessToken: "g-token", refreshToken: "g-refresh" },
+        { name: "tdd", linearUserId: "tdd-linear-uuid", clientId: "t-client", clientSecret: "t-secret", accessToken: "t-token", refreshToken: "t-refresh" },
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+        { name: "igor", linearUserId: "igor-linear-uuid", clientId: "i-client", clientSecret: "i-secret", accessToken: "i-token", refreshToken: "i-refresh" },
+        { name: "felix", linearUserId: "felix-linear-uuid", clientId: "f-client", clientSecret: "f-secret", accessToken: "f-token", refreshToken: "f-refresh" },
+        { name: "noah", linearUserId: "noah-linear-uuid", clientId: "n-client", clientSecret: "n-secret", accessToken: "n-token", refreshToken: "n-refresh" },
+        { name: "sage", linearUserId: "sage-linear-uuid", clientId: "s-client", clientSecret: "s-secret", accessToken: "s-token", refreshToken: "s-refresh" },
+      ],
+    }, null, 2), "utf8");
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+  });
+
+  afterAll(() => {
+    if (originalPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+  });
+
+  beforeEach(() => {
+    resetWorkflowCache();
+    resetPolicyCache();
+    clearImplementerStore();
+    fs.rmSync(defStateSnapshotPath(), { force: true });
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  // ── AC1: Gate bounce attaches prior implementer ───────────────────────
+  //
+  // The `reject` transitions on `merge` and `deploy` states in the canonical
+  // dev-impl workflow def do NOT have `assign: { default: prior-implementer }`,
+  // unlike `request-changes` on `code-review`. This means a gate bounce from
+  // merge/deploy → implementation does not re-attach the implementing delegate.
+  //
+  // Fix: add `assign: { default: prior-implementer }` to both `reject`
+  // transitions in the production dev-impl workflow YAML.
+
+  it("AC1: merge reject transition must declare assign.default: prior-implementer", async () => {
+    // Load the test workflow def and verify the merge state's reject transition
+    // is declared with assign.default: prior-implementer (matching request-changes).
+    const def = await loadWorkflowDef();
+    const mergeState = def.states.find((s) => s.id === "merge");
+    expect(mergeState).toBeDefined();
+
+    const rejectTransition = mergeState!.transitions?.find((t) => t.command === "reject");
+    expect(rejectTransition).toBeDefined();
+
+    // FAILS: reject on merge has no assign block — the prior implementer is
+    // never consulted when the gate bounces.
+    expect(rejectTransition!.assign?.default).toBe("prior-implementer");
+  });
+
+  it("AC1: deploy reject transition must declare assign.default: prior-implementer", async () => {
+    const def = await loadWorkflowDef();
+    const deployState = def.states.find((s) => s.id === "deploy");
+    expect(deployState).toBeDefined();
+
+    const rejectTransition = deployState!.transitions?.find((t) => t.command === "reject");
+    expect(rejectTransition).toBeDefined();
+
+    // FAILS: reject on deploy has no assign block — same bug as merge state.
+    expect(rejectTransition!.assign?.default).toBe("prior-implementer");
+  });
+
+  // ── AC2: handoff-work (same-state self-loop) writes delegate ──────────
+  //
+  // FAILS because applyStateTransition has an idempotency short-circuit at
+  // the top of the target-state block: when currentStateName === toStateName
+  // AND the target label is present, it immediately returns
+  // { status: "noop", code: "already-in-state" } — skipping delegate resolution
+  // and the atomic write entirely. A stranded implementation-state ticket
+  // with delegate=null cannot be recovered via handoff-work because the
+  // self-loop never reaches Step 2 delegate resolution.
+  //
+  // Fix: in the same-state (self-loop) case where the transition carries
+  // delegate semantics (assign.default or a re-route verb), resolve and
+  // write the delegate before returning from the idempotency check.
+  //
+  // This test uses a workflow YAML where `implementation` has a
+  // `handoff-work` → `implementation` self-loop transition with
+  // assign: { default: prior-implementer }.
+
+  it("AC2: handoff-work self-loop writes delegate even when state label unchanged", async () => {
+    const { recordImplementer: doRecord } = await import("./implementer-store.js");
+    await doRecord("issue-ai2595-ac2", "charles", "dev-impl");
+
+    const { fetch: mock, calls } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "impl-lbl", name: "state:implementation" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock;
+
+    const result = await applyStateTransition("handoff-work", "issue-ai2595-ac2", "Bearer tok");
+
+    // FAILS: returns { status: "noop", code: "already-in-state" } because
+    // the idempotency check fires before delegate resolution runs.
+    expect(result.status).toBe("applied");
+    expect(result.code).not.toBe("noop");
+    expect(result.from).toBe("implementation");
+    expect(result.to).toBe("implementation");
+
+    const updateCall = calls.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall).toBeDefined();
+    const vars = updateCall!.body.variables as { delegateId?: string };
+    // The prior implementer must be written as delegate even though state didn't change
+    expect(vars.delegateId).toBe("charles-linear-uuid");
+  });
+
+  // ── AC3: Full regression — bounce + rescue via handoff ───────────────
+  //
+  // FAILS because AC3 composes both bugs: even if AC1 is fixed (delegate
+  // set on bounce), AC2 would block the recovery handoff-work. The
+  // two-phase test proves neither bug is fully fixed without the other.
+  //
+  // Phase 1: Gate bounce (merge reject → implementation) records the
+  //   implementer and transitions. Delegate should be set by AC1's fix.
+  //
+  // Phase 2: handoff-work (self-loop) re-routes to a different dev body
+  //   within implementation without changing state. Should work by AC2's fix.
+  //
+  // Without AC1 fix: delegate is null after Phase 1 → Phase 2 has nothing to
+  //   re-route → handoff can't target the intended dev.
+  // Without AC2 fix: Phase 1 works but Phase 2 no-ops (already-in-state).
+
+  it("AC3: regression — gate bounce + handoff rescue succeeds without escape", async () => {
+    const { recordImplementer: doRecord, getImplementer: doGet } = await import("./implementer-store.js");
+    const issueId = "issue-ai2595-ac3-regression";
+    await doRecord(issueId, "charles", "dev-impl");
+
+    // Phase 1: Gate bounce — merge reject → implementation
+    const { fetch: mock1, calls: calls1 } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "merge-lbl", name: "state:merge" },
+        { id: "other-lbl", name: "priority:high" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock1;
+
+    const result1 = await applyStateTransition("reject", issueId, "Bearer tok");
+
+    // Phase 1 must succeed — delegate must be non-null after the bounce
+    expect(result1.status).toBe("applied");
+    expect(result1.from).toBe("merge");
+    expect(result1.to).toBe("implementation");
+    expect(result1.code).not.toBe("delegate-unresolved");
+
+    const updateCall1 = calls1.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall1).toBeDefined();
+    const vars1 = updateCall1!.body.variables as { delegateId?: string };
+    expect(vars1.delegateId).not.toBeNull();
+    expect(vars1.delegateId).toBe("charles-linear-uuid");
+
+    // Phase 2: Handoff to igor within implementation (self-loop)
+    // The implementer store still has charles recorded, but we pass a
+    // cliTarget of "igor" to override — simulating handoff-work to igor.
+    const { fetch: mock2, calls: calls2 } = makeTransitionFetch({
+      issueLabels: [
+        { id: "wf-lbl", name: "wf:dev-impl" },
+        { id: "impl-lbl", name: "state:implementation" },
+      ],
+      teamLabels: [{ id: "impl-lbl", name: "state:implementation" }],
+    });
+    globalThis.fetch = mock2;
+
+    const result2 = await applyStateTransition(
+      "handoff-work", issueId, "Bearer tok",
+      { cliTarget: "igor" },
+    );
+
+    // FAILS: returns { status: "noop", code: "already-in-state" }
+    // because the idempotency check fires before the delegate is written.
+    expect(result2.status).toBe("applied");
+    expect(result2.code).not.toBe("noop");
+    expect(result2.from).toBe("implementation");
+    expect(result2.to).toBe("implementation");
+
+    const updateCall2 = calls2.find((c) => (c.body.query ?? "").includes("ApplyAtomicTransition"));
+    expect(updateCall2).toBeDefined();
+    const vars2 = updateCall2!.body.variables as { delegateId?: string };
+    // handoff routed to igor — delegate must be igor's Linear user ID
+    expect(vars2.delegateId).toBe("igor-linear-uuid");
+  });
+});
+
+// INF-148: cycle-roll resilience — escape from retrospecting on sprint-spawner requires explicit break-glass override
+describe("checkWorkflowRules — sprint-spawner cycle-roll guard (INF-148)", () => {
+  let originalWorkflowPath: string | undefined;
+  let originalPolicyPath: string | undefined;
+  let inf148Dir: string;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeAll(() => {
+    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    originalPolicyPath = process.env.CAPABILITY_POLICY_PATH;
+
+    inf148Dir = fs.mkdtempSync(path.join(os.tmpdir(), "inf148-test-"));
+    const policyFile = path.join(inf148Dir, "capability-policy.yaml");
+    fs.writeFileSync(policyFile, SPRINT_POLICY_YAML, "utf8");
+    process.env.CAPABILITY_POLICY_PATH = policyFile;
+
+    process.env.WORKFLOW_DEF_PATH = path.resolve(process.cwd(), "src/registered-defs/sprint-spawner.yaml");
+
+    const agentsFile = path.join(inf148Dir, "agents.json");
+    fs.writeFileSync(
+      agentsFile,
+      JSON.stringify({ agents: [
+        { name: "hanzo", linearUserId: "hanzo-linear-uuid", clientId: "h-client", clientSecret: "h-secret", accessToken: "h-token", refreshToken: "h-refresh" },
+        { name: "astrid", linearUserId: "astrid-linear-uuid", clientId: "a-client", clientSecret: "a-secret", accessToken: "a-token", refreshToken: "a-refresh" },
+      ] }),
+      "utf8",
+    );
+    process.env.AGENTS_FILE = agentsFile;
+
+    resetPolicyCache();
+    resetWorkflowCache();
+  });
+
+  afterAll(() => {
+    if (originalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    if (originalPolicyPath !== undefined) process.env.CAPABILITY_POLICY_PATH = originalPolicyPath;
+    delete process.env.AGENTS_FILE;
+    resetPolicyCache();
+    resetWorkflowCache();
+  });
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("INF-148: blocks escape from retrospecting without break-glass override", async () => {
+    resetWorkflowCache();
+    globalThis.fetch = makeLabelFetch(["wf:sprint-spawner", "state:retrospecting"]);
+    const blocked = await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "astrid");
+    expect(blocked).not.toBeNull();
+    expect(blocked).toContain("cycle-roll");
+    expect(blocked).toContain("break-glass");
+  });
+
+  it("INF-148: allows escape with explicit break-glass override", async () => {
+    resetWorkflowCache();
+    globalThis.fetch = makeLabelFetch(["wf:sprint-spawner", "state:retrospecting"]);
+    const allowed = await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "astrid", null, null, null, true);
+    expect(allowed).toBeNull();
+  });
+
+  it("INF-148: does not block escape from non-retrospecting states", async () => {
+    const safeStates = ["evaluating", "scanning", "determining-scope", "spawning-scope", "scoping", "launching", "managing", "releasing"];
+    for (const state of safeStates) {
+      resetWorkflowCache();
+      globalThis.fetch = makeLabelFetch(["wf:sprint-spawner", `state:${state}`]);
+      const result = await checkWorkflowRules("escape", "issue-uuid", "Bearer tok", "astrid");
+      expect(result).toBeNull(); // state: ${state}
+    }
+  });
+});
+

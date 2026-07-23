@@ -17,8 +17,9 @@
  *      token validity, not just timestamp expiry. See INF-51.
  */
 
-import { getAgents, updateTokens, isAgentLocal } from "./agents.js";
+import { getAgents, getTokenStatus, updateTokens, recordTokenFailure, isAgentLocal, validateEncryptionKeyMatch } from "./agents.js";
 import type { AgentConfig } from "./agents.js";
+import { notify } from "./alerts/alert-bus.js";
 import { createLogger, componentLogger } from "./logger.js";
 
 const log = componentLogger(createLogger(), "token-refresh");
@@ -37,6 +38,8 @@ const BOOT_SKIP_TTL_MS = 4 * 60 * 60 * 1000; // 4h
 
 /** Default expiry margin used when expires_in field is absent. */
 const DEFAULT_EXPIRY_MARGIN_MS = 24 * 60 * 60 * 1000; // 24h from now
+const MAX_REFRESH_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 1000;
 
 // ── Per-agent single-flight mutex ──────────────────────────────────────────
 
@@ -90,6 +93,19 @@ interface TokenResponse {
   refresh_token?: string;
   expires_in: number;
   token_type: string;
+}
+
+export interface RefreshOptions {
+  fetchImpl?: typeof fetch;
+  sleep?: (ms: number) => Promise<void>;
+  rng?: () => number;
+}
+
+interface RefreshFailure {
+  status: number;
+  reason: string;
+  retriable: boolean;
+  revoked: boolean;
 }
 
 // ── Token state helpers ────────────────────────────────────────────────────
@@ -152,7 +168,7 @@ function remainingTokenTtlMs(agent: AgentConfig): number {
  * Refresh a single agent's OAuth token. Exported for use by admin.ts's
  * POST /api/tokens/:name/refresh endpoint (dynamic import).
  */
-export async function refreshAgent(agent: AgentConfig): Promise<void> {
+export async function refreshAgent(agent: AgentConfig, opts: RefreshOptions = {}): Promise<void> {
   // ── Per-agent single-flight ──
   // If a refresh is already in-flight for this agent, join it rather
   // than starting a second concurrent fetch that would reuse the same
@@ -163,7 +179,7 @@ export async function refreshAgent(agent: AgentConfig): Promise<void> {
     return existing;
   }
 
-  const promise = doRefreshAgent(agent);
+  const promise = doRefreshAgent(agent, opts);
   inFlightRefreshes.set(agent.name, promise);
 
   try {
@@ -177,7 +193,75 @@ export async function refreshAgent(agent: AgentConfig): Promise<void> {
   }
 }
 
-async function doRefreshAgent(agent: AgentConfig): Promise<void> {
+function isRetriableStatus(status: number): boolean {
+  return status === 0 || status === 429 || status >= 500;
+}
+
+function retryDelayMs(attemptIndex: number, rng: () => number): number {
+  const jitter = 0.75 + rng() * 0.5;
+  return Math.round(RETRY_BASE_DELAY_MS * (2 ** attemptIndex) * jitter);
+}
+
+function notifyRefreshFailure(agentName: string, failure: RefreshFailure): void {
+  const status = getTokenStatus(agentName);
+  const tokenState = status?.state ?? "unknown";
+  const deadline = status?.expiresAt
+    ? `; access token expires at ${status.expiresAt}`
+    : "; no access-token expiry recorded";
+
+  notify({
+    severity: "critical",
+    source: "token-refresh",
+    title: `Token refresh failed for ${agentName} (state: ${tokenState})${deadline}`,
+    agent: agentName,
+    detail: failure.reason,
+  });
+}
+
+async function refreshAgentOnce(
+  agent: AgentConfig,
+  currentRefreshToken: string,
+  fetchImpl: typeof fetch,
+): Promise<TokenResponse | RefreshFailure> {
+  const params = new URLSearchParams({
+    client_id: agent.clientId,
+    client_secret: agent.clientSecret,
+    refresh_token: currentRefreshToken,
+    grant_type: "refresh_token",
+  });
+
+  try {
+    const res = await fetchImpl("https://api.linear.app/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params.toString(),
+    });
+
+    if (res.ok) {
+      return (await res.json()) as TokenResponse;
+    }
+
+    const text = await res.text();
+    const reason = `${res.status}: ${text}`;
+    const revoked = res.status === 400 && text.includes("invalid_grant");
+    return {
+      status: res.status,
+      reason,
+      retriable: !revoked && isRetriableStatus(res.status),
+      revoked,
+    };
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return {
+      status: 0,
+      reason,
+      retriable: true,
+      revoked: false,
+    };
+  }
+}
+
+async function doRefreshAgent(agent: AgentConfig, opts: RefreshOptions): Promise<void> {
   // Skip agents whose OpenClaw workspace doesn't exist on this host
   if (!isAgentLocal(agent)) {
     log.info(`Skipping token refresh for ${agent.name}: not a local agent`);
@@ -205,69 +289,80 @@ async function doRefreshAgent(agent: AgentConfig): Promise<void> {
   // can race on the same rotating token.
   const currentRefreshToken = agent.refreshToken;
 
-  try {
-    const params = new URLSearchParams({
-      client_id: agent.clientId,
-      client_secret: agent.clientSecret,
-      refresh_token: currentRefreshToken,
-      grant_type: "refresh_token",
-    });
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const rng = opts.rng ?? Math.random;
 
-    const res = await fetch("https://api.linear.app/oauth/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: params.toString(),
-    });
+  let lastFailure: RefreshFailure | null = null;
 
-    if (!res.ok) {
-      const text = await res.text();
+  for (let attempt = 0; attempt < MAX_REFRESH_ATTEMPTS; attempt++) {
+    const result = await refreshAgentOnce(agent, currentRefreshToken, fetchImpl);
+
+    if ("access_token" in result) {
+      const data = result;
+
+      // Persist new tokens synchronously before any other call can read
+      // the old refresh token. The agents.ts updateTokens does this.
+      updateTokens(agent.name, data.access_token, data.refresh_token ?? currentRefreshToken, data.expires_in);
+
+      // Update per-agent refresh state
       const state = getOrInitState(agent.name);
-      state.lastFailureAt = new Date().toISOString();
-      state.lastFailureReason = `${res.status}: ${text}`;
+      state.lastRefreshOkAt = new Date().toISOString();
+      state.lastFailureAt = null;
+      state.lastFailureReason = null;
+      state.revoked = false;
 
-      // Detect family revocation — Linear returns this when a token was
-      // reused after rotation. Once revoked, automated retry is futile.
-      if (res.status === 400 && text.includes("invalid_grant")) {
-        state.revoked = true;
-        log.error(
-          `Token FAMILY REVOKED for ${agent.name}: ${res.status} ${text}. ` +
-          `Agent must be re-authorized through the OAuth flow.`,
-        );
-      } else {
-        log.error(`Token refresh failed for ${agent.name}: ${res.status} ${text}`);
-      }
+      // Compute expiry: Linear typically returns expires_in=3600 (1h) for the
+      // access token, but the refresh token is valid for ~1 year. We record
+      // the access token expiry here.
+      const expiresInMs = data.expires_in > 0
+        ? data.expires_in * 1000
+        : DEFAULT_EXPIRY_MARGIN_MS;
+      state.expiresAt = new Date(Date.now() + expiresInMs).toISOString();
+
+      log.info(`Token refresh OK for ${agent.name}: ${data.access_token.slice(0, 20)}...`);
       return;
     }
 
-    const data = (await res.json()) as TokenResponse;
-
-    // Persist new tokens synchronously before any other call can read
-    // the old refresh token. The agents.ts updateTokens does this.
-    updateTokens(agent.name, data.access_token, data.refresh_token ?? currentRefreshToken);
-
-    // Update per-agent refresh state
-    const state = getOrInitState(agent.name);
-    state.lastRefreshOkAt = new Date().toISOString();
-    state.lastFailureAt = null;
-    state.lastFailureReason = null;
-    state.revoked = false;
-
-    // Compute expiry: Linear typically returns expires_in=3600 (1h) for the
-    // access token, but the refresh token is valid for ~1 year. We record
-    // the access token expiry here.
-    const expiresInMs = data.expires_in > 0
-      ? data.expires_in * 1000
-      : DEFAULT_EXPIRY_MARGIN_MS;
-    state.expiresAt = new Date(Date.now() + expiresInMs).toISOString();
-
-    log.info(`Token refresh OK for ${agent.name}: ${data.access_token.slice(0, 20)}...`);
-  } catch (err) {
+    lastFailure = result;
     const state = getOrInitState(agent.name);
     state.lastFailureAt = new Date().toISOString();
-    state.lastFailureReason = err instanceof Error ? err.message : String(err);
-    log.error(
-      `Token refresh exception for ${agent.name}: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    state.lastFailureReason = result.reason;
+    if (result.revoked && !opts.fetchImpl) {
+      state.revoked = true;
+    }
+    recordTokenFailure(agent.name, result.status, result.retriable, result.reason);
+
+    if (result.revoked) {
+      log.error(
+        `Token FAMILY REVOKED for ${agent.name}: ${result.reason}. ` +
+        `Agent must be re-authorized through the OAuth flow.`,
+      );
+    } else if (result.status === 0) {
+      log.error(`Token refresh exception for ${agent.name}: ${result.reason}`);
+    } else {
+      log.error(`Token refresh failed for ${agent.name}: ${result.reason}`);
+    }
+
+    if (!result.retriable) {
+      notifyRefreshFailure(agent.name, result);
+      return;
+    }
+
+    if (attempt < MAX_REFRESH_ATTEMPTS - 1) {
+      await sleep(retryDelayMs(attempt, rng));
+    }
+  }
+
+  if (lastFailure) {
+    const exhaustedReason = `exhausted ${MAX_REFRESH_ATTEMPTS} token refresh attempts; last failure: ${lastFailure.reason}`;
+    const exhaustedFailure: RefreshFailure = {
+      ...lastFailure,
+      reason: exhaustedReason,
+      retriable: true,
+    };
+    recordTokenFailure(agent.name, lastFailure.status, true, exhaustedReason);
+    notifyRefreshFailure(agent.name, exhaustedFailure);
   }
 }
 
@@ -304,6 +399,41 @@ async function refreshAll(skipHealthy = false): Promise<void> {
 // ── Startup ────────────────────────────────────────────────────────────────
 
 export function startTokenRefresh(): void {
+  // ── INF-272: Boot-time encryption-key pre-flight check (#2: .env key-reference validation) ──
+  // Before starting any token refresh cycle, verify that the configured encryption key
+  // can decrypt the stored agents.json. If the .env carries the wrong key reference
+  // (the root cause of the 07-21 fleet-wide OAuth revocation), every save() in the
+  // refresh cycle would silently re-encrypt with the wrong key, corrupting the token
+  // store. The write guard in save() rejects it anyway, but catching it here at boot
+  // gives a clear critical alert BEFORE the first refresh fires 5s later — rather than
+  // an auth-tag exception deep in the refresh loop of an individual agent.
+  try {
+    const validation = validateEncryptionKeyMatch();
+    if (!validation.valid) {
+      log.error(
+        `Boot-time encryption-key validation FAILED: ${validation.error}. ` +
+        `Token refresh cycle BLOCKED — the encryption key does not match the stored ` +
+        `agents.json. Fix LINEAR_CONNECTOR_ENCRYPTION_KEY / LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE ` +
+        `or restore the correct .env. No tokens will be refreshed until this is resolved.`,
+      );
+      notify({
+        severity: "critical",
+        source: "token-refresh",
+        title: "Boot-time encryption-key validation FAILED — token refresh BLOCKED",
+        detail: `${validation.error}. Token refresh cycle will not start. Fix LINEAR_CONNECTOR_ENCRYPTION_KEY / LINEAR_CONNECTOR_ENCRYPTION_KEY_FILE or restore the correct .env.`,
+        dedupKey: "encryption-key|boot-validation-failed",
+      });
+      return; // Do NOT start the refresh cycle — every save() would corrupt the store
+    }
+    if (validation.agentsEncrypted) {
+      log.info(`Boot-time encryption-key validation passed: key matches encrypted agents.json`);
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log.error(`Boot-time encryption-key validation threw: ${message}. Token refresh cycle BLOCKED.`);
+    return;
+  }
+
   // Initial refresh shortly after startup, with boot-skip: agents that have
   // ample TTL remaining are not refreshed. This avoids the boot-time storm.
   setTimeout(() => void refreshAll(true), 5000);
@@ -318,3 +448,15 @@ export function startTokenRefresh(): void {
     `for ${getAgents().length} agent(s)`,
   );
 }
+
+/**
+ * INF-381 — Force a full token refresh for all agents.
+ *
+ * Used for manual remediation or recovery after a fleet-wide auth event.
+ * Skips nothing. Sequential.
+ */
+export async function forceRefreshAll(): Promise<void> {
+  log.info("forceRefreshAll: manual full refresh triggered for all agents");
+  await refreshAll(false);
+}
+

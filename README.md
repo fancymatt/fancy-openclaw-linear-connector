@@ -741,6 +741,64 @@ The gateway has a flawed `symlink-escape` check that compares the symlink target
 
 ---
 
+## linear-cli Version Management
+
+The connector repo stores the canonical linear-cli version in a single source of truth:
+
+| File | Purpose |
+|---|---|
+| `config/linear-cli-version` | Single file containing the exact semver (e.g. `0.4.3`). All container images source their linear-cli version from here. |
+
+### How to Update the linear-cli Version
+
+To change the linear-cli version across all 27 container Dockerfiles:
+
+1. **Edit the version file:**
+   ```bash
+   echo "1.2.3" > config/linear-cli-version
+   ```
+
+2. **Run the update script on the deployment host:**
+   ```bash
+   bash scripts/update-linear-cli-version.sh
+   ```
+
+   The script reads the version from `config/linear-cli-version`, finds all container
+   Dockerfiles under `/srv/containers`, and replaces the pinned tarball URL with the new
+   version. Pass `--dry-run` to preview changes without modifying files.
+
+3. **Rebuild container images** — the new version is baked in at build time.
+
+### CI Enforcement
+
+The `lint-linear-cli-version` CI job runs on every push and PR. It verifies:
+- `config/linear-cli-version` exists and contains a valid semver
+- No Dockerfile in the repository contains a hardcoded linear-cli tarball URL
+
+### Local Lint
+
+Run the same check locally:
+
+```bash
+bash scripts/lint-linear-cli-version.sh
+```
+
+### Container Build
+
+When building container images (`docker build`), pass the version as a build-arg:
+
+```bash
+docker build \
+  --build-arg LINEAR_CLI_VERSION="$(cat config/linear-cli-version)" \
+  -t my-image:latest .
+```
+
+The connector's `Dockerfile` accepts `LINEAR_CLI_VERSION` as a build-arg and records it
+as a Docker label (`linear-cli-version`). All 27 container Dockerfiles should follow the
+same pattern.
+
+---
+
 ## Running with Docker
 
 The connector can run as a Docker container instead of bare systemd + node. This is useful for deploying on cloud hosts, NAS devices, or anywhere you'd rather not manage node/nvm/systemd.
@@ -781,6 +839,7 @@ docker compose up -d
 | Variable | Default | Description |
 |---|---|---|
 | `DATA_DIR` | `/data` | Directory for SQLite database files |
+| `CRON_RUN_STAMP_PATH` | `$DATA_DIR/cron-run-stamps.json` | Optional override for persisted cron last-run stamps used by `/health` readiness |
 | `SECRETS_DIR` | `/secrets` | Directory for per-agent OAuth token files |
 | `AGENTS_FILE` | `/config/agents.json` | Path to agents configuration file |
 | `PORT` | `3000` | HTTP listen port |

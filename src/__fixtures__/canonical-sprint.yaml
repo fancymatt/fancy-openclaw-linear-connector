@@ -5,10 +5,10 @@
 # version history: bump `version` on any state/edge change; in-flight tickets
 #   use the version stamped at their creation time (design.md §12).
 #
-# Verbatim copy of the canonical vault file at:
-#   ai-systems/projects/fleet-orchestration-redesign/workflows/sprint.yaml
-# Used as a test fixture so CI can exercise the canonical schema without
-# depending on the vault being present. Keep in sync with the vault source.
+# This fixture is kept in sync with the deployed workflow definition so CI
+# can exercise the canonical schema without depending on the vault being
+# present. The canonical source is the deployed def under WORKFLOW_DEFS_DIR;
+# fixture drift is detected at /health.fixtureDrift. Keep in sync.
 #
 # Phase 6 / C-1 (AI-1471): definition + validation only — no engine/runtime logic.
 
@@ -19,7 +19,7 @@ entry_state: intake
 
 break_glass:
   command: escape               # x-openclaw-linear-intent value that triggers break-glass (§4.4)
-  to: escape
+  to: intake
   owner_role: steward           # implicit escape edge from EVERY state (design.md §4.4)
 
 states:

@@ -25,11 +25,13 @@ import {
   fetchIssueContext,
   applyBootstrapToIssue,
 } from "./workflow-bootstrap.js";
+import { autoEnrollPlainDelegation } from "./workflow-gate.js";
 import { getAlertBus, type AlertBus } from "./alerts/alert-bus.js";
-import { registerCron, formatIntervalMs } from "./cron/registry.js";
+import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
 import { OperationalEventStore, type OperationalEventStore as OperationalEventStoreType } from "./store/operational-event-store.js";
 import type { SessionTracker } from "./bag/session-tracker.js";
 import type { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
+import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 
 const log = componentLogger(
   createLogger(process.env.LOG_LEVEL ?? "info"),
@@ -43,6 +45,8 @@ const DEFAULT_INTERVAL_MS = 5 * 60 * 1000; // 5 min
 
 /** Grace window: tickets younger than this are given time for the webhook to arrive. */
 const DEFAULT_GRACE_WINDOW_MS = 2 * 60 * 1000; // 2 min
+
+const LINEAR_ISSUES_PAGE_SIZE = 50;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -62,6 +66,8 @@ export interface DelegationReconciliationOptions {
   now?: () => Date;
   /** AI-2350: durable dispatch lease store — prevent re-dispatches. */
   dispatchLeaseStore?: DispatchLeaseStore;
+  /** INF-334: mirror enrollment for plain delegated tickets promoted to wf:task. */
+  enrolledTicketsStore?: EnrolledTicketsStore;
 }
 
 export interface DelegationReconciliationResult {
@@ -81,7 +87,29 @@ interface GovernedTicket {
   delegateId: string | null;
   delegateName: string | null;
   teamId: string;
+  plainDelegation?: boolean;
 }
+
+type LinearIssueNode = {
+  id: string;
+  identifier: string;
+  updatedAt: string;
+  labels: { nodes: Array<{ id: string; name: string }> };
+  delegate: { id: string; name: string } | null;
+  team: { id: string };
+};
+
+type IssuesPageResp = {
+  data?: {
+    issues?: {
+      nodes: LinearIssueNode[];
+      pageInfo?: {
+        hasNextPage?: boolean;
+        endCursor?: string | null;
+      };
+    };
+  };
+};
 
 // ── Terminal state detection ─────────────────────────────────────────────────
 
@@ -98,6 +126,10 @@ function hasStateLabel(labels: Array<{ name: string }>): boolean {
   return labels.some((l) => l.name.startsWith("state:"));
 }
 
+function hasWfLabel(labels: Array<{ name: string }>): boolean {
+  return labels.some((l) => l.name.startsWith("wf:"));
+}
+
 // ── Linear API query ─────────────────────────────────────────────────────────
 
 /**
@@ -112,55 +144,58 @@ async function queryGovernedTickets(
   // Always use the batch query (wf:*) — the mock layer returns
   // data.issues.nodes for any query containing "DelegationReconciliation".
   // Filter by identifier in code if requested.
-  const query = `
-    query DelegationReconciliation {
-      issues(filter: { labels: { some: { name: { startsWith: "wf:" } } } }) {
-        nodes {
-          id
-          identifier
-          updatedAt
-          title
-          labels { nodes { id name } }
-          delegate { id name }
-          team { id }
+  const nodes: LinearIssueNode[] = [];
+  let cursor: string | null = null;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const afterArg = cursor ? `, after: ${JSON.stringify(cursor)}` : "";
+    const query = `
+      query DelegationReconciliation {
+        issues(first: ${LINEAR_ISSUES_PAGE_SIZE}${afterArg}, filter: { labels: { some: { name: { startsWith: "wf:" } } } }) {
+          nodes {
+            id
+            identifier
+            updatedAt
+            title
+            labels { nodes { id name } }
+            delegate { id name }
+            team { id }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
         }
       }
-    }
-  `;
+    `;
 
-  const res = await fetchFn(LINEAR_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: authToken,
-    },
-    body: JSON.stringify({ query, variables: {} }),
-  });
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authToken,
+      },
+      body: JSON.stringify({ query, variables: {} }),
+    });
 
-  type BatchResp = {
-    data?: {
-      issues?: {
-        nodes: Array<{
-          id: string;
-          identifier: string;
-          updatedAt: string;
-          labels: { nodes: Array<{ id: string; name: string }> };
-          delegate: { id: string; name: string } | null;
-          team: { id: string };
-        }>;
-      };
-    };
-  };
-  const data = (await res.json()) as BatchResp;
-  let nodes = data.data?.issues?.nodes ?? [];
+    const data = (await res.json()) as IssuesPageResp;
+    nodes.push(...(data.data?.issues?.nodes ?? []));
 
-  // Filter by identifier if provided (AC5 single-ticket mode)
-  if (ticketIdentifiers && ticketIdentifiers.length > 0) {
-    const ids = new Set(ticketIdentifiers);
-    nodes = nodes.filter((n) => ids.has(n.identifier));
+    const pageInfo = data.data?.issues?.pageInfo;
+    hasNextPage = pageInfo?.hasNextPage === true;
+    cursor = pageInfo?.endCursor ?? null;
+    if (hasNextPage && !cursor) break;
   }
 
-  return nodes.map((n) => ({
+  // Filter by identifier if provided (AC5 single-ticket mode)
+  let filteredNodes = nodes;
+  if (ticketIdentifiers && ticketIdentifiers.length > 0) {
+    const ids = new Set(ticketIdentifiers);
+    filteredNodes = filteredNodes.filter((n) => ids.has(n.identifier));
+  }
+
+  return filteredNodes.map((n) => ({
     id: n.id,
     identifier: n.identifier,
     updatedAt: n.updatedAt,
@@ -168,6 +203,99 @@ async function queryGovernedTickets(
     delegateId: n.delegate?.id ?? null,
     delegateName: n.delegate?.name ?? null,
     teamId: n.team.id,
+    plainDelegation: false,
+  }));
+}
+
+/**
+ * Query Linear for ad-hoc delegated tickets (no wf:* label, has delegate set).
+ * INF-287: catches tickets delegated outside the workflow engine whose
+ * delegate-change webhook was dropped.
+ */
+async function queryAdhocDelegatedTickets(
+  authToken: string,
+  fetchFn: typeof fetch,
+  ticketIdentifiers?: string[],
+): Promise<GovernedTicket[]> {
+  const nodes: LinearIssueNode[] = [];
+  let cursor: string | null = null;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const afterArg = cursor ? `, after: ${JSON.stringify(cursor)}` : "";
+    const query = `
+      query AdhocDelegationReconciliation {
+        issues(first: ${LINEAR_ISSUES_PAGE_SIZE}${afterArg}, filter: { delegate: { isMe: false } }) {
+          nodes {
+            id
+            identifier
+            updatedAt
+            title
+            labels { nodes { id name } }
+            delegate { id name }
+            team { id }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    `;
+
+    const res = await fetchFn(LINEAR_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authToken,
+      },
+      body: JSON.stringify({ query, variables: {} }),
+    });
+
+    const data = (await res.json()) as IssuesPageResp;
+
+    // INF-334: Linear returns 200 with "errors" for invalid filters.
+    if (data.errors && data.errors.length > 0) {
+      const msg = `delegation-reconciliation: AdhocDelegationReconciliation query failed: ${data.errors[0].message}`;
+      log.error(msg);
+      // We don't throw here to avoid killing the whole sweep, but we skip
+      // the adhoc part of this tick.
+      return [];
+    }
+
+    const pageNodes = data.data?.issues?.nodes ?? [];
+
+    // INF-334: The schema-legal query (delegate: { isSet: true }) returns 
+    // BOTH governed and ad-hoc tickets. We must filter out governed tickets 
+    // (those with wf:* labels) client-side to satisfy "adhoc" semantics.
+    const adhocNodes = pageNodes.filter(n => {
+      return !n.labels.nodes.some(l => l.name.startsWith("wf:"));
+    });
+
+    nodes.push(...adhocNodes);
+
+    const pageInfo = data.data?.issues?.pageInfo;
+    hasNextPage = pageInfo?.hasNextPage === true;
+    cursor = pageInfo?.endCursor ?? null;
+    if (hasNextPage && !cursor) break;
+  }
+
+  // Filter by identifier if provided (AC5 single-ticket mode)
+  let filteredNodes = nodes;
+  if (ticketIdentifiers && ticketIdentifiers.length > 0) {
+    const ids = new Set(ticketIdentifiers);
+    filteredNodes = filteredNodes.filter((n) => ids.has(n.identifier));
+  }
+
+  return filteredNodes.map((n) => ({
+    id: n.id,
+    identifier: n.identifier,
+    updatedAt: n.updatedAt,
+    labels: n.labels.nodes,
+    delegateId: n.delegate?.id ?? null,
+    delegateName: n.delegate?.name ?? null,
+    teamId: n.team.id,
+    plainDelegation: true,
   }));
 }
 
@@ -329,11 +457,17 @@ export async function runDelegationReconciliationSweep(
   // ── Query ──────────────────────────────────────────────────────────────
   let tickets: GovernedTicket[];
   try {
-    tickets = await queryGovernedTickets(
+    const governedTickets = await queryGovernedTickets(
       authToken,
       fetchFn,
       opts.ticketIdentifiers,
     );
+    const adhocTickets = await queryAdhocDelegatedTickets(
+      authToken,
+      fetchFn,
+      opts.ticketIdentifiers,
+    );
+    tickets = [...governedTickets, ...adhocTickets];
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     result.errors.push(`query failed: ${msg}`);
@@ -363,7 +497,7 @@ export async function runDelegationReconciliationSweep(
     if (isTerminal(ticket.labels)) continue;
 
     // ── AC2: wf:* but no state:* and no delegate (dropped enrollment) ────
-    if (!hasStateLabel(ticket.labels) && !ticket.delegateId) {
+    if (!hasStateLabel(ticket.labels) && !ticket.delegateId && hasWfLabel(ticket.labels)) {
       try {
         // Re-fetch fresh context for idempotency
         const issue = await fetchIssueContext(ticket.id, authToken);
@@ -496,7 +630,7 @@ export async function runDelegationReconciliationSweep(
     }
 
     // ── AC1: Enrolled ticket with delegate but no dispatch record ───────
-    if (ticket.delegateId && ticket.delegateName && hasStateLabel(ticket.labels)) {
+    if (ticket.delegateId && ticket.delegateName) {
       // Check idempotency (AC4): has this delegate been dispatched since
       // they were set? Use the real delegate-set timestamp from Linear
       // history, NOT ticket.updatedAt (which changes on any mutation).
@@ -513,6 +647,59 @@ export async function runDelegationReconciliationSweep(
         }
       } catch {
         // Fall through to use ticket.updatedAt as before
+      }
+
+      const isPlainDelegation = ticket.plainDelegation || !hasWfLabel(ticket.labels);
+      if (isPlainDelegation) {
+        try {
+          const enrollResult = await autoEnrollPlainDelegation(
+            ticket.id,
+            authToken,
+            (info) => {
+              operationalEventStore.append({
+                outcome: "auto-enrolled",
+                agent: info.delegateAgentName ?? ticket.delegateName,
+                key: `linear-${ticket.identifier}`,
+                detail: {
+                  mode: "plain-delegation-reconciliation",
+                  ticket: ticket.identifier,
+                  workflowId: info.workflowId,
+                  entryState: info.entryState,
+                  delegate: info.delegateAgentName ?? ticket.delegateName,
+                },
+              });
+            },
+            opts.enrolledTicketsStore,
+            ticket.delegateName,
+            delegationTimestamp,
+          );
+          if (enrollResult.enrolled) {
+            log.info(
+              `delegation-reconciliation: auto-enrolled plain delegated ticket ` +
+              `${ticket.identifier} → wf:${enrollResult.workflowId ?? "task"} state:${enrollResult.entryState ?? "doing"}`,
+            );
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          result.errors.push(`plain delegation enrollment failed for ${ticket.identifier}: ${msg}`);
+          operationalEventStore.append({
+            outcome: "delegation-reconciliation-failed",
+            agent: ticket.delegateName,
+            key: `linear-${ticket.identifier}`,
+            errorSummary: msg,
+            detail: {
+              mode: "plain-delegation-enrollment-failure",
+              ticket: ticket.identifier,
+            },
+          });
+          alertBus.notify({
+            severity: "warning",
+            source: "delegation-reconciled",
+            title: `Delegation reconciliation enrollment failed for ${ticket.identifier}`,
+            detail: { error: msg },
+            ticket: ticket.identifier,
+          });
+        }
       }
 
       if (
@@ -654,6 +841,7 @@ export function registerDelegationReconciliationCron(opts: {
   sessionTracker?: SessionTracker;
   fetchFn?: typeof fetch;
   dispatchLeaseStore?: DispatchLeaseStore;
+  enrolledTicketsStore?: EnrolledTicketsStore;
 }): NodeJS.Timeout {
   const intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
   registerCron(
@@ -675,10 +863,13 @@ export function registerDelegationReconciliationCron(opts: {
       sessionTracker: opts.sessionTracker,
       fetchFn: opts.fetchFn,
       dispatchLeaseStore: opts.dispatchLeaseStore,
+      enrolledTicketsStore: opts.enrolledTicketsStore,
     }).catch((err) => {
       log.error(
         `delegation-reconciliation: unexpected sweep failure: ${err instanceof Error ? err.message : String(err)}`,
       );
+    }).finally(() => {
+      markCronRun("delegation-reconciliation-sweep");
     });
   }, intervalMs);
 

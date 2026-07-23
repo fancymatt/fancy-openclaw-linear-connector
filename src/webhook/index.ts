@@ -6,22 +6,30 @@ import type { LinearEvent } from "./schema.js";
 import { EventStore } from "../store/event-store.js";
 import { NudgeStore } from "../store/nudge-store.js";
 import type { OperationalEventInput, OperationalEventStore } from "../store/operational-event-store.js";
+import type { DeadLetterQueueStore } from "../dead-letter-queue.js";
 import type { EnrolledTicketsStore } from "../store/enrolled-tickets-store.js";
 import type { MutationAuditStore } from "../store/mutation-audit-store.js";
 import type { DispatchIdempotencyStore } from "../store/dispatch-idempotency-store.js";
 import type { DispatchLeaseStore } from "../store/dispatch-lease-store.js";
+import type { DispatchInFlightStore } from "../store/dispatch-inflight-store.js";
 import { extractWebhookMutations } from "./mutation-extraction.js";
 import { routeEvent, routeEventAll, unresolvedRoutingCandidates } from "../router.js";
 import { createSessionAndEmitThought, emitResponse } from "../agent-session.js";
 import { deliverToAgent, DeliveryThrottle, type DeliveryConfig, assertDispatchTargetFetchable } from "../delivery/index.js";
 import { markDispatchIntegrityGateActive } from "../dispatch-integrity-state.js";
+import {
+  checkBreaker,
+  recordDispatch,
+  checkCommentFedSuppressionForTicket,
+} from "../dispatch-circuit-breaker.js";
 import type { RouteResult } from "../types.js";
 import { normalizeSessionKey } from "../session-key.js";
 import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgents } from "../agents.js";
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, markAutoEnrollRegistered } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered } from "../workflow-gate.js";
+import { checkLabelSyncForTicket, emitLabelSyncWarning } from "../transition-audit.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
 import { type WakeUpConfig } from "../bag/wake-up.js";
@@ -32,6 +40,9 @@ import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
 import { notify } from "../alerts/alert-bus.js";
 import { loadKnownHumans } from "../known-humans.js";
 import { emitStreamTopic } from "../admin-stream.js";
+import { DelegatePingPongDetector } from "../delegate-ping-pong-detector.js";
+import type { DispatchRecordStore } from "../liveness-channel/dispatch-record-store.js";
+import type { GatewayDispatchAck } from "../liveness-channel/gateway-ack-types.js";
 
 const log = componentLogger(createLogger(), "webhook");
 
@@ -59,6 +70,40 @@ function errorSummary(err: unknown): string {
 function appendOperationalEvent(store: OperationalEventStore | undefined, input: OperationalEventInput): void {
   if (!store) return;
   try { store.append(input); } catch (err) { log.error(`Operational event write failed: ${errorSummary(err)}`); }
+}
+
+async function checkDelegatePingPong(
+  event: LinearEvent,
+  detector: DelegatePingPongDetector,
+): Promise<boolean> {
+  if (event.type !== "Issue" || event.action !== "update") return false;
+  const updatedFrom = (event as { updatedFrom?: Record<string, unknown> }).updatedFrom;
+  if (!updatedFrom || (!("delegateId" in updatedFrom) && !("delegate" in updatedFrom))) return false;
+
+  const data = (event as { data?: Record<string, unknown> }).data;
+  const delegate = data?.delegate as { id?: string; name?: string } | null | undefined;
+  const delegateId = delegate?.id;
+  if (!delegateId) return false;
+
+  const ticketId = issueIdentifierFromEvent(event) ?? (data?.id as string | undefined);
+  if (!ticketId) return false;
+
+  const mappedAgentName = buildAgentMap()[delegateId];
+  const agentName = mappedAgentName ? getOpenclawAgentName(mappedAgentName) : delegate.name ?? delegateId;
+
+  try {
+    const result = await detector.checkAndHandle(ticketId, delegateId, agentName);
+    if (result.suppressDispatch) {
+      log.warn(
+        `Delegate ping-pong cycle detected for ${ticketId}; suppressing dispatch ` +
+        `and escalating to ${result.escalation?.escalatedTo ?? "ai"}`,
+      );
+      return true;
+    }
+  } catch (err) {
+    log.warn(`Delegate ping-pong check failed (fail-open): ${errorSummary(err)}`);
+  }
+  return false;
 }
 
 /**
@@ -138,10 +183,12 @@ async function deliverWithSlot(
   route: RouteResult,
   config: DeliveryConfig,
   throttle?: DeliveryThrottle,
+  dispatchLeaseStore?: DispatchLeaseStore,
+  dispatchInFlightStore?: DispatchInFlightStore,
 ): Promise<Awaited<ReturnType<typeof deliverToAgent>>> {
   if (throttle) await throttle.acquireSlot();
   try {
-    return await deliverToAgent(route, config);
+    return await deliverToAgent(route, config, dispatchLeaseStore, dispatchInFlightStore);
   } finally {
     if (throttle) throttle.releaseSlot();
   }
@@ -155,6 +202,7 @@ export function createWebhookRouter(
   sessionTracker?: SessionTracker,
   throttle?: DeliveryThrottle,
   operationalEventStore?: OperationalEventStore,
+  deadLetterQueue?: DeadLetterQueueStore,
   onDispatched?: (agentId: string, ticketId: string) => void,
   onAgentActivity?: (agentId: string, ticketId: string) => void,
   onDeliveryCommitted?: (agentId: string, ticketId: string) => void,
@@ -162,8 +210,11 @@ export function createWebhookRouter(
   mutationAuditStore?: MutationAuditStore,
   idempotencyStore?: DispatchIdempotencyStore,
   dispatchLeaseStore?: DispatchLeaseStore,
+  livenessDispatchStore?: Pick<DispatchRecordStore, "recordDispatch" | "recordAck" | "getDispatch">,
+  dispatchInFlightStore?: DispatchInFlightStore,
 ): Router {
   const router = Router();
+  const delegatePingPongDetector = new DelegatePingPongDetector(undefined, undefined, operationalEventStore);
 
   // AI-2091 §2/§9 (G2): the delivery-time fetchability gate is wired into the
   // PRIMARY dispatch path (dispatchRoute → checkLinearIssueRouting →
@@ -176,6 +227,10 @@ export function createWebhookRouter(
     "primary webhook dispatch path (dispatchRoute → assertDispatchTargetFetchable)",
   );
   markAutoEnrollRegistered();
+  markDispatchIntegrityGateActive(
+    "deliveryTimeRecipientResolution",
+    "primary webhook dispatch path (dispatchRoute → roster-based recipient validation, AI-2192)",
+  );
 
   if (NUDGE_DEDUP_WINDOW_MS > 0) {
     log.info(`Nudge dedup enabled: ${NUDGE_DEDUP_WINDOW_MS}ms window`);
@@ -335,6 +390,10 @@ export function createWebhookRouter(
             if (leaseIdentifier) {
               const leaseTicketKey = normalizeSessionKey(leaseIdentifier);
               dispatchLeaseStore.renew(leaseAgentId, leaseTicketKey);
+              // INF-413: renew the ticket-level in-flight record on the same
+              // signal so a long-running worker's guard is not lost to TTL
+              // expiry mid-run (which would let a second worker be spawned).
+              dispatchInFlightStore?.renew(leaseTicketKey);
             }
           }
         }
@@ -388,6 +447,61 @@ export function createWebhookRouter(
               log.warn(`autoEnrollByTeam failed for ${enrollIssueId}: ${err instanceof Error ? err.message : String(err)}`);
             });
           }
+
+          // INF-334: plain delegated tickets are still real work. If a ticket
+          // gains a delegate without already being governed, enroll it into the
+          // task worker phase so capacity rearm/rescue paths can see it.
+          const updatedFrom = (event as { updatedFrom?: Record<string, unknown> }).updatedFrom;
+          const delegateChanged =
+            event.action === "update" &&
+            updatedFrom !== undefined &&
+            ("delegateId" in updatedFrom || "delegate" in updatedFrom);
+          const delegate = enrollData?.delegate as { id?: string; name?: string } | null | undefined;
+          const delegateId = delegate?.id;
+          if (delegateChanged && delegateId) {
+            const mappedAgentName = buildAgentMap()[delegateId];
+            const delegateAgentName = mappedAgentName ? getOpenclawAgentName(mappedAgentName) : null;
+            autoEnrollPlainDelegation(enrollIssueId, enrollToken, (info) => {
+              appendOperationalEvent(operationalEventStore, {
+                outcome: "auto-enrolled",
+                type: event.type,
+                key: enrollIdentifier,
+                sessionKey: normalizeSessionKey(enrollIdentifier),
+                detail: {
+                  workflowId: info.workflowId,
+                  entryState: info.entryState,
+                  mode: "plain-delegation",
+                  delegate: info.delegateAgentName ?? null,
+                },
+              });
+            }, enrolledTicketsStore, delegateAgentName).then((result) => {
+              if (result.enrolled) {
+                log.info(
+                  `Plain delegation auto-enrolled: stamped wf:${result.workflowId ?? "task"} + ` +
+                  `state:${result.entryState ?? "doing"} on ${enrollIssueId}`,
+                );
+              }
+            }).catch((err) => {
+              log.warn(`autoEnrollPlainDelegation failed for ${enrollIssueId}: ${err instanceof Error ? err.message : String(err)}`);
+            });
+          }
+
+          // ── AI-2554: On-webhook label-sync audit ──────────────────────────
+          // Lightweight single-ticket check on Issue webhooks: compare proxy-store
+          // recorded state against Linear's current state. Runs in background;
+          // never blocks routing.
+          checkLabelSyncForTicket(enrollIdentifier, enrollToken).then((divergence) => {
+            if (divergence) {
+              emitLabelSyncWarning(divergence);
+              log.warn(
+                `[webhook] label-sync audit: divergence detected for ${enrollIdentifier} ` +
+                `(proxy: ${divergence.proxyState ?? "(none)"}, linear: ${divergence.linearStateLabel ?? "(none)"})`,
+              );
+            }
+          }).catch((auditErr) => {
+            const am = auditErr instanceof Error ? auditErr.message : String(auditErr);
+            log.warn(`[webhook] label-sync audit failed for ${enrollIdentifier}: ${am}`);
+          });
         }
       }
 
@@ -474,7 +588,7 @@ export function createWebhookRouter(
                   await throttle.wait(wakeRoute.agentId);
                   throttle.record(wakeRoute.agentId);
                 }
-                const wakeResult = await deliverWithSlot(wakeRoute, wakeDeliveryConfig, throttle);
+                const wakeResult = await deliverWithSlot(wakeRoute, wakeDeliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore);
                 log.info(
                   `Bootstrap wake delivered to ${bootstrapResult.delegateAgentName} for ${bootstrapResult.ticketIdentifier} (runId=${wakeResult.runId ?? "ok"})`,
                 );
@@ -511,6 +625,10 @@ export function createWebhookRouter(
         } catch (err) {
           log.warn(`Workflow bootstrap failed (fail-safe): ${err instanceof Error ? err.message : String(err)}`);
         }
+      }
+
+      if (await checkDelegatePingPong(event, delegatePingPongDetector)) {
+        return;
       }
 
       await enrichCommentEventForRouting(event);
@@ -552,14 +670,39 @@ export function createWebhookRouter(
         const humans = unresolved.filter((id) => knownHumans.has(id));
         const unknown = unresolved.filter((id) => !knownHumans.has(id));
         const humanOnly = humans.length > 0 && unknown.length === 0;
-        appendOperationalEvent(operationalEventStore, {
-          outcome: humanOnly ? "no-route-human" : "no-route",
-          type: event.type,
-          key: noRouteTicket ? `linear-${noRouteTicket}` : noRouteRawId ? `linear-${noRouteRawId}` : null,
-          errorSummary:
-            `No agent target for ${event.type}${attribution}` +
-            (humans.length > 0 ? ` — known human: ${humans.map((id) => knownHumans.get(id)).join(", ")}` : ""),
-        });
+        const hasDeadLetterTarget = unknown.length > 0 && deadLetterQueue && noRouteTicket;
+
+        if (hasDeadLetterTarget) {
+          // ── INF-217: Dead-letter queue for genuinely unknown agents ──
+          const intendedAgent = unknown[0];
+          deadLetterQueue.append({
+            ticketId: noRouteTicket,
+            intendedAgent,
+            reason: "not in roster",
+            eventPayload: { eventType: event.type, eventAction: "action" in event ? event.action : undefined, unresolved, humans: humans.map((id) => knownHumans.get(id)) },
+          });
+          log.warn(
+            `dead-letter: ${noRouteTicket} targeted agent ${intendedAgent} not in roster - ` +
+            `wrote to DLQ (type=${event.type})`,
+          );
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "dead-letter",
+            type: event.type,
+            key: `linear-${noRouteTicket}`,
+            sessionKey: `linear-${noRouteTicket}`,
+            errorSummary: `Non-roster dispatch for ${noRouteTicket} - ${intendedAgent}`,
+            detail: { ticketId: noRouteTicket, intendedAgent, reason: "not in roster" },
+          });
+        } else {
+          appendOperationalEvent(operationalEventStore, {
+            outcome: humanOnly ? "no-route-human" : "no-route",
+            type: event.type,
+            key: noRouteTicket ? `linear-${noRouteTicket}` : noRouteRawId ? `linear-${noRouteRawId}` : null,
+            errorSummary:
+              `No agent target for ${event.type}${attribution}` +
+              (humans.length > 0 ? ` — known human: ${humans.map((id) => knownHumans.get(id)).join(", ")}` : ""),
+          });
+        }
         if (humans.length > 0) {
           log.info(
             `no-route candidates resolved to known human(s): ${humans.map((id) => `${knownHumans.get(id)} (${id})`).join(", ")}` +
@@ -595,6 +738,25 @@ export function createWebhookRouter(
       // AI-1799 AC2: mint a wake_id at route time so the full dispatch cycle
       // (routed → bag-added → dispatch-accepted → delivered) can be correlated.
       const wakeId = crypto.randomUUID();
+      let livenessDispatchId: string | null = null;
+
+      function recordLivenessDispatch(): string | null {
+        if (!livenessDispatchStore) return null;
+        if (livenessDispatchId) return livenessDispatchId;
+        const record = livenessDispatchStore.recordDispatch({
+          agentId: route.agentId,
+          ticketId: route.sessionKey,
+          sessionKey: route.sessionKey,
+        });
+        livenessDispatchId = record.dispatchId;
+        return livenessDispatchId;
+      }
+
+      function recordLivenessAck(ack: GatewayDispatchAck): void {
+        const dispatchId = recordLivenessDispatch();
+        if (!dispatchId) return;
+        livenessDispatchStore?.recordAck(dispatchId, ack);
+      }
 
       // ── AI-1918: Dispatch idempotency + stale-dispatch guard ───────────
       // Check (ticket, workflowState, agent) against the persistent idempotency
@@ -674,12 +836,151 @@ export function createWebhookRouter(
         }
       }
 
+      // ── AI-2192: Delivery-time recipient resolution ─────────────────────
+      // Check whether the resolved agent is registered in the live roster.
+      // A non-roster agent means the resolution path (delegate/assignee/mention/
+      // department-prefix/steward-escalation) produced a name absent from
+      // agents.json — a half-applied rename, stale cache, or config drift.
+      // Instead of silently attempting delivery (which will fail with retries
+      // into the void), dead-letter immediately with a critical alert naming
+      // the ticket, intended agent, and resolution path.
+      const ticketId = route.sessionKey;
+      const resolvedAgentName = route.agentId;
+      const rosterNames = getAgents().map((a) => a.name);
+      const rosterNameSet = new Set(rosterNames);
+      if (!rosterNameSet.has(resolvedAgentName)) {
+        const detail = {
+          ticket: ticketId.replace(/^linear-/, ""),
+          resolvedAgent: resolvedAgentName,
+          routingReason: route.routingReason,
+          eventType: event.type,
+          rosterAgents: rosterNames,
+        };
+        log.error(
+          `non-roster-agent: ${resolvedAgentName} is not in the agent roster — aborting dispatch for ${ticketId}. ` +
+          `routingReason=${route.routingReason} roster=[${rosterNames.join(", ")}]`,
+        );
+        // Raise a critical alert naming the ticket, agent, and resolution path.
+        notify({
+          severity: "critical",
+          source: "dispatch",
+          title: `Non-roster dispatch target: ${resolvedAgentName} for ${ticketId.replace(/^linear-/, "")}`,
+          detail: JSON.stringify(detail),
+          agent: resolvedAgentName,
+          ticket: ticketId.replace(/^linear-/, ""),
+        });
+        // Write an operational event recording the dead-letter.
+        appendOperationalEvent(operationalEventStore, {
+          outcome: "dispatch-undeliverable",
+          type: event.type,
+          agent: resolvedAgentName,
+          key: ticketId,
+          sessionKey: ticketId,
+          deliveryMode: "non-roster-recipient",
+          attemptCount: 0,
+          errorSummary: `Non-roster dispatch target: ${resolvedAgentName} — routingReason=${route.routingReason}`,
+          detail,
+          wakeId,
+          plane: "connector",
+        });
+        // Zero delivery attempts — return immediately. No retry, no wake.
+        return;
+      }
+
+      // ── AI-2178: Dispatch circuit breaker + comment-fed suppression ─────
+      // Checks run sequentially:
+      //   1. Comment-fed re-wake suppression (pre-wake heuristic) — skip
+      //      without incrementing breaker when the delegate comments on their
+      //      own ticket without advancing state.
+      //   2. Circuit breaker — skip when the breaker is tripped (N
+      //      consecutive no-change wakes).
+      //   3. State comparison — if state hasn't moved since last dispatch,
+      //      increment the breaker counter. If it has, reset.
+      {
+        const cbTicketId = route.sessionKey;
+        const cbData = event.data as Record<string, unknown> | null;
+
+        // Resolve the current state:* label from the event payload.
+        const cbLabels = ((): string[] => {
+          if (Array.isArray(cbData?.labels)) return cbData.labels as string[];
+          const issue = cbData?.issue as Record<string, unknown> | undefined;
+          if (issue && Array.isArray(issue.labels)) return issue.labels as string[];
+          return [];
+        })();
+        const cbStateLabel = cbLabels
+          .filter((l: string) => /^state:/i.test(l))
+          .map((l: string) => l.slice(l.indexOf(":") + 1).toLowerCase())
+          .sort() // deterministic for multi-label edge case
+          .join(",") || null;
+
+        // Feature 2: comment-fed re-wake suppression (pre-wake heuristic).
+        // Runs BEFORE the breaker counter increment so the dominant self-feed
+        // loop never burns a breaker slot.
+        const commentSuppress = checkCommentFedSuppressionForTicket(
+          cbTicketId,
+          event,
+          cbStateLabel,
+          route.agentId,
+        );
+
+        if (commentSuppress.suppressed) {
+          log.info(
+            `Comment-fed suppression: skipping wake for ${route.agentId} [${cbTicketId}] — ${commentSuppress.reason ?? "delegate comment, no state change"}`,
+          );
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "suppressed-comment-fed" as never,
+            type: event.type,
+            agent: route.agentId,
+            key: cbTicketId,
+            sessionKey: cbTicketId,
+            deliveryMode: "circuit-breaker",
+            plane: "connector",
+            detail: { reason: commentSuppress.reason ?? "delegate comment, no state change" },
+          });
+          return;
+        }
+
+        // Feature 1: circuit breaker. First, check if tripped.
+        const breakerCheck = checkBreaker(cbTicketId);
+        if (breakerCheck.blocked) {
+          log.info(
+            `Circuit breaker: blocking dispatch for ${route.agentId} [${cbTicketId}] — tripped at ${breakerCheck.state!.trippedAt} (${breakerCheck.state!.wakeCount} wakes, state=${breakerCheck.state!.lastStateLabel ?? "unknown"})`,
+          );
+          appendOperationalEvent(operationalEventStore, {
+            outcome: "breaked-blocked" as never,
+            type: event.type,
+            agent: route.agentId,
+            key: cbTicketId,
+            sessionKey: cbTicketId,
+            deliveryMode: "circuit-breaker",
+            plane: "connector",
+            detail: { wakeCount: breakerCheck.state!.wakeCount, trippedAt: breakerCheck.state!.trippedAt, stateLabel: breakerCheck.state!.lastStateLabel },
+          });
+          return;
+        }
+
+        // Not blocked and not comment-suppressed. Determine whether this
+        // wake is a repeat on the same state or a state advance (reset).
+        // recordDispatch handles the comparison internally:
+        //   - First dispatch: seed state, counter=0.
+        //   - State changed from last: reset counter to 0.
+        //   - State unchanged: keep existing counter.
+        //
+        // The counter is then incremented by a SUBSEQUENT webhook that
+        // sees the state hasn't changed from THIS dispatch. That increment
+        // happens in the next arrival's dispatchRoute call — when the
+        // state label matches this recording, recordFailedWake fires.
+        //
+        // We record BEFORE the stale-route guard so the state snapshot
+        // reflects THIS event, not a stale previous entry.
+        recordDispatch(cbTicketId, cbStateLabel);
+      }
+
       // ── 9a. Stale-route guard ───────────────────────────────────────────
       // Linear webhook payloads are snapshots. Before waking an agent from a
       // delegate/assignee event, re-check Linear's current issue state so an
       // accidental delegation that was already corrected does not let the old
       // agent take ownership or mutate the ticket later.
-      const ticketId = route.sessionKey;
       const routingCheck = await checkLinearIssueRouting(ticketId, route.agentId, route.routingReason);
 
       // ── AI-2091 §2 (G2): delivery-time fetchability gate on the PRIMARY path.
@@ -768,6 +1069,10 @@ export function createWebhookRouter(
       const agentLivenessCfg = getAgent(route.agentId);
       if (agentLivenessCfg?.hooksUrl) livenessConfig.hooksUrl = agentLivenessCfg.hooksUrl;
       if (agentLivenessCfg?.hooksToken) livenessConfig.hooksToken = agentLivenessCfg.hooksToken;
+      // AI-2515: if the agent has a gatewayUrl configured, pass it as a fallback
+      // for liveness checks. The gateway health endpoint is reachable from the
+      // connector's runtime even when hooksUrl uses a container-only hostname.
+      if (agentLivenessCfg?.gatewayUrl) livenessConfig.gatewayUrl = agentLivenessCfg.gatewayUrl;
 
       const liveness = await checkAgentLiveness(route.agentId, livenessConfig);
       if (!liveness.available) {
@@ -946,7 +1251,7 @@ export function createWebhookRouter(
               await throttle.wait(route.agentId);
               throttle.record(route.agentId);
             }
-            const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle);
+            const sameTicketResult = await deliverWithSlot(route, wakeConfigForAgent(route.agentId), throttle, dispatchLeaseStore, dispatchInFlightStore);
             bag.removeTicket(agentName, normalizedTicketId);
             appendOperationalEvent(operationalEventStore, {
               outcome: sameTicketResult.runId ? "dispatch-accepted" : "delivered",
@@ -997,6 +1302,13 @@ export function createWebhookRouter(
         }
         if (queueResult.action === "queued") {
           log.info(`Agent queue: queued event for ${route.agentId} [${ticketId}] (active task for different ticket)`);
+          recordLivenessAck({
+            delivered: true,
+            target_identity: route.agentId,
+            status: "queued",
+            queue_depth: 1,
+            queue_age: 0,
+          });
           appendOperationalEvent(operationalEventStore, { outcome: "queued", type: event.type, agent: route.agentId, key: ticketId, sessionKey: ticketId, deliveryMode: "agent-queue" });
           return;
         }
@@ -1025,7 +1337,7 @@ export function createWebhookRouter(
           await throttle.wait(route.agentId);
           throttle.record(route.agentId);
         }
-        const directResult = await deliverWithSlot(route, deliveryConfig, throttle);
+        const directResult = await deliverWithSlot(route, deliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore);
         appendOperationalEvent(operationalEventStore, { outcome: directResult.runId ? "dispatch-accepted" : "delivered", type: event.type, agent: agentName, key: ticketId, sessionKey: ticketId, deliveryMode: "direct", attemptCount: 1, runId: directResult.runId ?? null, wakeId, plane: "connector", detail: directResult.canonVersion ? { canonVersion: directResult.canonVersion } : undefined });
         // Direct deliveries (incl. comment-routed wakes into an existing
         // session) must register the dispatch and flip engagement → Thinking
@@ -1047,7 +1359,7 @@ export function createWebhookRouter(
                 await throttle.wait(route.agentId);
                 throttle.record(route.agentId);
               }
-              const drainResult = await deliverWithSlot(next, deliveryConfig, throttle);
+              const drainResult = await deliverWithSlot(next, deliveryConfig, throttle, dispatchLeaseStore, dispatchInFlightStore);
               appendOperationalEvent(operationalEventStore, { outcome: drainResult.runId ? "dispatch-accepted" : "delivered", type: next.event.type, agent: route.agentId, key: next.sessionKey, sessionKey: next.sessionKey, deliveryMode: "agent-queue-drain", attemptCount: 1, runId: drainResult.runId ?? null, detail: drainResult.canonVersion ? { canonVersion: drainResult.canonVersion } : undefined });
             } catch (err) {
               log.error(`Agent queue: failed to deliver promoted task for ${route.agentId}: ${err instanceof Error ? err.message : String(err)}`);

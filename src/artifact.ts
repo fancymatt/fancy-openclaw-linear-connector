@@ -94,7 +94,7 @@ export function shasMatch(a: string, b: string): boolean {
 }
 
 export function sameArtifact(a: CodeArtifact, b: CodeArtifact): boolean {
-  return a.branch === b.branch && shasMatch(a.sha, b.sha);
+  return a.branch.toLowerCase() === b.branch.toLowerCase() && shasMatch(a.sha, b.sha);
 }
 
 export function formatCodeArtifact(a: CodeArtifact): string {

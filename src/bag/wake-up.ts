@@ -150,7 +150,7 @@ export async function sendWakeUpSignal(
 
   if (ticketIds.length === 1 && config.linearAuthToken) {
     const plainId = ticketIds[0].replace(/^linear-/i, "");
-    const rich = await buildWorkflowAwareDeliveryMessage(plainId, config.linearAuthToken);
+    const rich = await buildWorkflowAwareDeliveryMessage(plainId, config.linearAuthToken, agentId);
     if (rich) {
       // buildWorkflowAwareDeliveryMessage already injects the canon via withCanonBlock.
       message = rich;

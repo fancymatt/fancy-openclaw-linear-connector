@@ -23,6 +23,16 @@ export type LivenessResult =
 export interface LivenessConfig {
   hooksUrl?: string;
   hooksToken?: string;
+  /**
+   * Gateway OpenAI-compatible API URL (e.g.
+   * "http://host:port/v1/chat/completions").
+   * Used as a fallback liveness check when hooksUrl is unreachable — the
+   * gateway's health endpoint is at the same host:port, and a response from
+   * it proves the gateway is alive even if the hooks endpoint DNS doesn't
+   * resolve from this runtime context (e.g. host.docker.internal in host vs
+   * container).
+   */
+  gatewayUrl?: string;
   /** Override timeout (default 60 000 ms). */
   timeoutMs?: number;
 }
@@ -42,8 +52,28 @@ export async function checkAgentLiveness(
 ): Promise<LivenessResult> {
   const timeoutMs = config.timeoutMs ?? DEFAULT_LIVENESS_TIMEOUT_MS;
 
+  // Primary path: hooks-based liveness check.
   if (config.hooksUrl && config.hooksToken) {
-    return checkHooksLiveness(agentName, config.hooksUrl, config.hooksToken, timeoutMs);
+    const hooksResult = await checkHooksLiveness(agentName, config.hooksUrl, config.hooksToken, timeoutMs);
+    if (hooksResult.available) return hooksResult;
+
+    // Hooks check failed — if the agent has a gatewayUrl, try a gateway health
+    // probe before declaring the agent unreachable. The hooksUrl may use a
+    // hostname that resolves in the agent's container but not from the
+    // connector's runtime context (e.g. host.docker.internal).
+    if (config.gatewayUrl) {
+      log.warn(
+        `Liveness check via hooksUrl failed for ${agentName} (${hooksResult.reason}: ${hooksResult.detail ?? "unknown"}) — ` +
+        `falling back to gateway health check at ${config.gatewayUrl}`,
+      );
+      const gatewayResult = await checkGatewayHealth(agentName, config.gatewayUrl, timeoutMs);
+      if (gatewayResult.available) {
+        log.info(`Liveness check passed for ${agentName} (gateway health fallback)`);
+        return gatewayResult;
+      }
+    }
+
+    return hooksResult;
   }
 
   // CLI mode — best-effort provisioning check.
@@ -116,6 +146,86 @@ async function checkHooksLiveness(
     const msg = err instanceof Error ? err.message : String(err);
     log.error(`Liveness check for ${agentName}: ${msg}`);
     return { available: false, reason: "error", detail: msg };
+  }
+}
+
+// ── Gateway health fallback ─────────────────────────────────────────────────
+
+/**
+ * Check agent liveness by probing the gateway's health endpoint.
+ *
+ * Derives the gateway base URL from the gateway API URL
+ * ("http://host:port/v1/chat/completions" → "http://host:port") and performs
+ * a GET to the /health endpoint. A 2xx response proves the gateway process is
+ * alive and reachable from this runtime context, even though the hooksUrl may
+ * use a hostname that doesn't resolve here.
+ */
+async function checkGatewayHealth(
+  agentName: string,
+  gatewayUrl: string,
+  timeoutMs: number,
+): Promise<LivenessResult> {
+  try {
+    // Derive the gateway base URL from the API URL.
+    // e.g. "http://host:port/v1/chat/completions" → "http://host:port"
+    const baseUrl = deriveGatewayBase(gatewayUrl);
+    if (!baseUrl) {
+      return { available: false, reason: "error", detail: `Cannot derive base URL from gatewayUrl: ${gatewayUrl}` };
+    }
+
+    const healthUrl = `${baseUrl}/health`;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    const response = await fetch(healthUrl, {
+      method: "GET",
+      signal: controller.signal,
+    });
+
+    clearTimeout(timer);
+
+    if (response.ok) {
+      log.info(`Gateway health check passed for ${agentName} (HTTP ${response.status} from ${healthUrl})`);
+      return { available: true };
+    }
+
+    // A non-auth 4xx is still a response from a live gateway.
+    if (response.status >= 400 && response.status < 500 && response.status !== 401 && response.status !== 403) {
+      log.info(`Gateway health check for ${agentName}: HTTP ${response.status} (gateway responded) — treating as alive`);
+      return { available: true };
+    }
+
+    const body = await response.text().catch(() => "");
+    log.warn(`Gateway health check for ${agentName}: HTTP ${response.status} — ${body.slice(0, 200)}`);
+    return {
+      available: false,
+      reason: response.status >= 500 ? "unreachable" : "error",
+      detail: `Gateway health HTTP ${response.status}: ${body.slice(0, 200)}`,
+    };
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      log.warn(`Gateway health check for ${agentName}: timed out after ${timeoutMs}ms`);
+      return { available: false, reason: "timeout", detail: `${timeoutMs}ms timeout` };
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    log.error(`Gateway health check for ${agentName}: ${msg}`);
+    return { available: false, reason: "error", detail: msg };
+  }
+}
+
+/**
+ * Derive the gateway base URL (scheme + host + port) from a gateway API URL.
+ *
+ * "http://host:port/v1/chat/completions" → "http://host:port"
+ * Returns null for unparseable URLs.
+ */
+function deriveGatewayBase(gatewayUrl: string): string | null {
+  try {
+    const url = new URL(gatewayUrl);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return null;
   }
 }
 
