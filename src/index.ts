@@ -3,7 +3,7 @@ import express, { Request, Response, NextFunction } from "express";
 import { createWebhookRouter } from "./webhook/index.js";
 import { handleProxyRequest } from "./proxy.js";
 import { handleProxyUploadRequest } from "./proxy-upload.js";
-import { startTokenRefresh } from "./token-refresh.js";
+import { startTokenRefresh, forceRefreshAll } from "./token-refresh.js";
 import { getAgents, watchAgentsFile, getEncryptionKeyValidation } from "./agents.js";
 import { createLogger, componentLogger } from "./logger.js";
 import { handleOAuthCallback } from "./oauth-callback.js";
@@ -2145,7 +2145,7 @@ if (isEntryPoint) {
   // output and routes findings through the AlertBus with stable dedup keys
   // (git-remote-liveness PUSH-DEAD keyed on AI-2189 root-cause ticket).
   registerConfigSanityAlertCron();
-  registerTokenWatchdogCron();
+  // registerTokenWatchdogCron(); // INF-446: Disabled — function is undefined.
 
   // INF-192: Matrix approval gate — register at bootstrap so the component
   // is armed (observable via /health.matrixApprovalGate). Derives config from
