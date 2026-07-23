@@ -67,6 +67,7 @@ import { getDetectorState } from "./done-ticket-detector-state.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
 import { getFirstActionWatchdogState } from "./first-action-watchdog-state.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
+import { assertNoLinearGraphqlErrors, resolveAiLinearAuthToken, type LinearGraphqlResponse } from "./linear-auth.js";
 import { getCapabilityPolicy } from "./escalation-gate.js";
 import { notify, type AlertSeverity } from "./alerts/alert-bus.js";
 import { onAlert as onConfigHealthAlert } from "./config-health.js";
@@ -90,6 +91,10 @@ import { resolveStatePath } from "./state-dir.js";
 const log = componentLogger(createLogger(), "server");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3100;
 const DEPLOYMENT_NAME = process.env.DEPLOYMENT_NAME ?? "fancymatt";
+
+export function resolveAiLinearAuthToken(): string {
+  return getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+}
 
 // ── Startup commit (exposed via /health for deploy verification) ─────
 let startupCommit: string = "unknown";
@@ -1522,8 +1527,6 @@ export function createApp(options?: CreateAppOptions) {
   // reachable from the production entry point (createApp), with load-time
   // liveness surfaced at /health.workflowMigrations. Fetches nothing unless a
   // registered def actually declares a migration map.
-  const migrationAuthToken =
-    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
   const migrationWakeFn = async (agentName: string, ticketIdentifier: string) => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
     // AI-2313: guard against re-dispatch when a session is already live for this (agent, ticket).
@@ -1545,13 +1548,14 @@ export function createApp(options?: CreateAppOptions) {
       gatewayToken: agentCfg?.gatewayToken,
     };
     const actionText = `${ticketIdentifier} was migrated to a new workflow state (its previous state was removed by a def change)`;
+    const authToken = resolveAiLinearAuthToken();
     const message =
-      (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, migrationAuthToken, actionText)) ??
+      (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, authToken, actionText)) ??
       actionText;
     await deliverMessageToAgent(agentName, sessionKey, message, deliveryConfig);
   };
   registerDefStateMigrationRunner({
-    authToken: migrationAuthToken,
+    authToken: resolveAiLinearAuthToken,
     loadRegistry: () => loadWorkflowRegistry(),
     operationalEventStore,
     wakeFn: migrationWakeFn,
@@ -1703,8 +1707,6 @@ if (isEntryPoint) {
   // same delivery primitive the webhook bootstrap path uses (buildWorkflowAware
   // DeliveryMessage + deliverMessageToAgent), so a healed ticket is not just
   // labeled-and-delegated but actually surfaced to its owner.
-  const reconciliationAuthToken =
-    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
   const reconciliationWakeFn = async (agentName: string, ticketIdentifier: string) => {
     const sessionKey = normalizeSessionKey(ticketIdentifier);
     // AI-2313: guard against re-dispatch when a session is already live for this (agent, ticket).
@@ -1724,8 +1726,9 @@ if (isEntryPoint) {
       gatewayToken: agentCfg?.gatewayToken,
     };
     const actionText = `You were delegated ${ticketIdentifier}`;
+    const authToken = resolveAiLinearAuthToken();
     const message =
-      (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, reconciliationAuthToken, actionText)) ??
+      (await buildWorkflowAwareDeliveryMessage(ticketIdentifier, authToken, actionText)) ??
       actionText;
 
     // INF-282: Wire DispatchLeaseStore check into reconciliation wake path.
@@ -1744,7 +1747,7 @@ if (isEntryPoint) {
   };
 
   registerBootstrapReconciliationCron({
-    authToken: reconciliationAuthToken,
+    authToken: resolveAiLinearAuthToken,
     wakeFn: reconciliationWakeFn,
   });
 
@@ -1752,7 +1755,7 @@ if (isEntryPoint) {
   // delegation wakes caused by webhook-ingress gaps. Complements AI-1775
   // (bootstrap sweep) and the rescue/stuck-delegate/no-activity detectors.
   registerDelegationReconciliationCron({
-    authToken: reconciliationAuthToken,
+    authToken: resolveAiLinearAuthToken,
     operationalEventStore,
     wakeFn: reconciliationWakeFn,
     dispatchLeaseStore,
@@ -1763,7 +1766,7 @@ if (isEntryPoint) {
   // (non-wf) tickets with a delegate set that have been sitting in Thinking/
   // Doing/To Do with zero progress beyond the staleness threshold.
   registerStalePlainDelegateCron({
-    authToken: reconciliationAuthToken,
+    authToken: resolveAiLinearAuthToken,
     operationalEventStore,
     alertBus: getAlertBus(),
     wakeFn: reconciliationWakeFn,
@@ -1786,7 +1789,7 @@ if (isEntryPoint) {
     .catch(() => undefined);
   const firstActionAgentNames = new Set(getAgents().map((a) => a.name.toLowerCase()));
   registerFirstActionWatchdogCron({
-    authToken: reconciliationAuthToken,
+    authToken: resolveAiLinearAuthToken,
     workflowDefPath: process.env.WORKFLOW_DEFS_DIR ?? process.env.WORKFLOW_DEF_DIR,
     capabilityPolicy: firstActionCapabilityPolicy,
     listTickets: async () => {
@@ -1850,12 +1853,14 @@ if (isEntryPoint) {
       const query = `query($id: String!) { issue(id: $id) { id state { type } labels { nodes { name } } } }`;
       let issue: { state?: { type?: string } | null; labels?: { nodes?: Array<{ name: string }> } } | null;
       try {
+        const authToken = resolveAiLinearAuthToken();
         const res = await fetch(LINEAR_API_URL, {
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: reconciliationAuthToken },
+          headers: { "Content-Type": "application/json", Authorization: authToken },
           body: JSON.stringify({ query, variables: { id: t.ticket } }),
         });
-        const data = (await res.json()) as { data?: { issue?: typeof issue } };
+        const data = (await res.json()) as LinearGraphqlResponse<{ issue?: typeof issue }>;
+        assertNoLinearGraphqlErrors(data);
         if (data.data === undefined) return "unknown"; // auth/transport error — fail open
         issue = data.data?.issue ?? null;
       } catch {
@@ -1927,7 +1932,7 @@ if (isEntryPoint) {
 
     try {
       const result = await runDelegationReconciliationSweep({
-        authToken: reconciliationAuthToken,
+        authToken: resolveAiLinearAuthToken(),
         operationalEventStore,
         alertBus: getAlertBus(),
         wakeFn: reconciliationWakeFn,
@@ -1952,12 +1957,9 @@ if (isEntryPoint) {
   const slaWorkflowDefPath = process.env.WORKFLOW_DEFS_DIR ?? process.env.WORKFLOW_DEF_PATH ?? defaultWorkflowDefPath;
   const slaDataDir = process.env.DATA_DIR ?? resolveStatePath("data");
   const slaBreachStorePath = process.env.SLA_BREACH_STORE_PATH ?? path.join(slaDataDir, "sla-breaches.db");
-  const resolveCronAuthToken = () =>
-    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
-  const slaAuthToken = resolveCronAuthToken();
   const slaCadenceMs = process.env.SLA_SWEEP_CADENCE_MS ? parseInt(process.env.SLA_SWEEP_CADENCE_MS, 10) : undefined;
 
-  if (slaAuthToken) {
+  if (resolveAiLinearAuthToken()) {
     const slaWakeAgent = async (identifier: string) => {
       const sessionKey = normalizeSessionKey(identifier);
       const agentCfg = getAgent("ai");
@@ -1972,14 +1974,15 @@ if (isEntryPoint) {
         gatewayToken: agentCfg?.gatewayToken,
       };
       const actionText = `SLA breach detected for ${identifier}`;
+      const authToken = resolveAiLinearAuthToken();
       const message =
-        (await buildWorkflowAwareDeliveryMessage(identifier, resolveCronAuthToken(), actionText)) ??
+        (await buildWorkflowAwareDeliveryMessage(identifier, authToken, actionText)) ??
         actionText;
       await deliverMessageToAgent("ai", sessionKey, message, deliveryConfig);
     };
 
     const slaTimer = registerSlaSweepCron({
-      authToken: resolveCronAuthToken,
+      authToken: resolveAiLinearAuthToken,
       workflowDefPath: slaWorkflowDefPath,
       breachStorePath: slaBreachStorePath,
       cadenceMs: slaCadenceMs,
@@ -1998,14 +2001,6 @@ if (isEntryPoint) {
 
   // INF-105: validation SLA watchdog — check validation-state tickets for >15 min stalls
   // and post an automated nudge + re-dispatch to the validator.
-  // INF-333: resolve the token PER SWEEP, not once at boot. The token-refresh
-  // cycle (boot + every 20h) rotates agent OAuth tokens and revokes the old
-  // ones; a token captured here by value is dead minutes after registration.
-  // This was the actual root cause of the validation-watchdog auth failures
-  // (every tick since INF-105 shipped), misdiagnosed as repo drift.
-  const resolveValidationAuthToken = () =>
-    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
-  const validationAuthToken = resolveValidationAuthToken();
   const validationDataDir = process.env.DATA_DIR ?? resolveStatePath("data");
   const validationNudgeStorePath = process.env.VALIDATION_NUDGE_STORE_PATH ?? path.join(validationDataDir, "validation-nudges.db");
   const validationCadenceMs = process.env.VALIDATION_WATCHDOG_CADENCE_MS ? parseInt(process.env.VALIDATION_WATCHDOG_CADENCE_MS, 10) : undefined;
@@ -2017,7 +2012,7 @@ if (isEntryPoint) {
     process.env.VALIDATION_VALIDATOR_LINEAR_USER_ID ??
     "";
 
-  if (validationAuthToken && validationValidatorUserId) {
+  if (resolveAiLinearAuthToken() && validationValidatorUserId) {
     const validationWakeAgent = async (identifier: string) => {
       const sessionKey = normalizeSessionKey(identifier);
       const agentCfg = getAgent("ai");
@@ -2031,14 +2026,15 @@ if (isEntryPoint) {
         gatewayToken: agentCfg?.gatewayToken,
       };
       const actionText = `Validation SLA nudge for ${identifier}`;
+      const authToken = resolveAiLinearAuthToken();
       const message =
-        (await buildWorkflowAwareDeliveryMessage(identifier, validationAuthToken, actionText)) ??
+        (await buildWorkflowAwareDeliveryMessage(identifier, authToken, actionText)) ??
         actionText;
       await deliverMessageToAgent("ai", sessionKey, message, deliveryConfig);
     };
 
     const validationTimer = registerValidationWatchdogCron({
-      authToken: resolveValidationAuthToken,
+      authToken: resolveAiLinearAuthToken,
       validatorLinearUserId: validationValidatorUserId,
       wakeValidator: validationWakeAgent,
       nudgeStorePath: validationNudgeStorePath,
@@ -2056,16 +2052,15 @@ if (isEntryPoint) {
     );
   } else {
     const missing = [];
-    if (!validationAuthToken) missing.push("auth token");
+    if (!resolveAiLinearAuthToken()) missing.push("auth token");
     if (!validationValidatorUserId) missing.push("validator Linear user ID");
     log.warn(`INF-105: Validation watchdog NOT registered — missing: ${missing.join(", ")}`);
   }
 
   // AI-2554: label-sync audit cron — periodic check for proxy-store vs Linear state divergence.
-  const labelSyncAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY;
-  if (labelSyncAuthToken) {
+  if (resolveAiLinearAuthToken()) {
     registerLabelSyncAuditCron({
-      authToken: labelSyncAuthToken,
+      authToken: resolveAiLinearAuthToken,
       enrolledTicketsStore,
     });
     log.info("AI-2554: label-sync audit cron registered (interval=15m)");
@@ -2103,9 +2098,8 @@ if (isEntryPoint) {
   // INF-122: periodic anti-entropy reconciliation (G-7/G-17).
   // AC1 — native state desync heal; AC2 — missed barrier webhook auto-advance.
   // Uses the same auth token and workflow def path as the SLA sweep.
-  const antiEntropyAuthToken = resolveCronAuthToken();
-  if (antiEntropyAuthToken) {
-    registerAntiEntropyCron({ authToken: resolveCronAuthToken });
+  if (resolveAiLinearAuthToken()) {
+    registerAntiEntropyCron({ authToken: resolveAiLinearAuthToken });
     const intervalMs = process.env.ANTI_ENTROPY_INTERVAL
       ? parseInt(process.env.ANTI_ENTROPY_INTERVAL, 10)
       : 15 * 60 * 1000;
