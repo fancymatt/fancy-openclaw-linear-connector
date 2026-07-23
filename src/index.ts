@@ -43,6 +43,7 @@ import { registerStallSweepCron } from "./cron/stall-sweep-cron.js";
 import { getStallDetectionState, DEFAULT_STALL_CONFIG } from "./stall-detection-state.js";
 import { registerG20CanaryCron } from "./cron/g20-canary-runner.js";
 import { registerDoneDetectorCron } from "./cron/done-ticket-detector-cron.js";
+import { registerMergedEvidenceReconcilerCron } from "./cron/merged-evidence-reconciler-cron.js";
 import { registerBootstrapReconciliationCron } from "./bootstrap-reconciliation-sweep.js";
 import { registerDelegationReconciliationCron, runDelegationReconciliationSweep } from "./delegation-reconciliation-sweep.js";
 import { registerStalePlainDelegateCron } from "./stale-plain-delegate-sweep.js";
@@ -2168,6 +2169,11 @@ if (isEntryPoint) {
     approvalPatterns: _matrixApprovalPatterns,
     designatedApprovers: _matrixApprovalApprovers,
   });
+
+  // INF-440: merged-PR/branch evidence reconciler — recognizes merged GitHub
+  // PR attachments and branches already merged into main as implementation
+  // evidence, overriding bounce-to-intake/write-tests transitions.
+  registerMergedEvidenceReconcilerCron();
 
   // Config-health healthy→unhealthy is the loudest structural signal we have
   // (bad policy/workflow/agents.json = engine fail-closed for workflow tickets).
