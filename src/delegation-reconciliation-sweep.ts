@@ -225,7 +225,7 @@ async function queryAdhocDelegatedTickets(
     const afterArg = cursor ? `, after: ${JSON.stringify(cursor)}` : "";
     const query = `
       query AdhocDelegationReconciliation {
-        issues(first: ${LINEAR_ISSUES_PAGE_SIZE}${afterArg}, filter: { labels: { none: { name: { startsWith: "wf:" } } }, delegate: { isSet: true } }) {
+        issues(first: ${LINEAR_ISSUES_PAGE_SIZE}${afterArg}, filter: { delegate: { isMe: false } }) {
           nodes {
             id
             identifier
@@ -253,7 +253,26 @@ async function queryAdhocDelegatedTickets(
     });
 
     const data = (await res.json()) as IssuesPageResp;
-    nodes.push(...(data.data?.issues?.nodes ?? []));
+
+    // INF-334: Linear returns 200 with "errors" for invalid filters.
+    if (data.errors && data.errors.length > 0) {
+      const msg = `delegation-reconciliation: AdhocDelegationReconciliation query failed: ${data.errors[0].message}`;
+      log.error(msg);
+      // We don't throw here to avoid killing the whole sweep, but we skip
+      // the adhoc part of this tick.
+      return [];
+    }
+
+    const pageNodes = data.data?.issues?.nodes ?? [];
+
+    // INF-334: The schema-legal query (delegate: { isSet: true }) returns 
+    // BOTH governed and ad-hoc tickets. We must filter out governed tickets 
+    // (those with wf:* labels) client-side to satisfy "adhoc" semantics.
+    const adhocNodes = pageNodes.filter(n => {
+      return !n.labels.nodes.some(l => l.name.startsWith("wf:"));
+    });
+
+    nodes.push(...adhocNodes);
 
     const pageInfo = data.data?.issues?.pageInfo;
     hasNextPage = pageInfo?.hasNextPage === true;
