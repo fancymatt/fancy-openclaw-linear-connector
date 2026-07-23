@@ -136,6 +136,18 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
 
     // Ad-hoc delegated-tickets query (non-wf:* tickets with delegate set)
     if (body.includes("AdhocDelegationReconciliation")) {
+      // INF-334: Simulate GraphQL validation error for schema-illegal filters.
+      // Re-enable this check to verify the production code no longer sends these fields.
+      if (body.includes("none:") || body.includes("isSet:")) {
+        return new Response(
+          JSON.stringify({
+            data: null,
+            errors: [{ message: "Field 'none' is not defined by type 'IssueLabelCollectionFilter'" }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
       const nodes = adhocDelegatedTickets.map((t) => ({
         id: t.id,
         identifier: t.identifier,
@@ -146,7 +158,7 @@ function makeReconciliationFetch(scenario: FetchScenario): typeof fetch {
         team: { id: t.teamId },
       }));
       return new Response(
-        JSON.stringify({ data: { issues: { nodes } } }),
+        JSON.stringify({ data: { issues: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }

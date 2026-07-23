@@ -24,6 +24,7 @@ import {
 } from "../dispatch-circuit-breaker.js";
 import type { RouteResult } from "../types.js";
 import { normalizeSessionKey } from "../session-key.js";
+import { parseMergeGateOutcome, resolveNextRoleRoute } from "../merge-gate-dispatch.js";
 import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgents } from "../agents.js";
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
@@ -632,6 +633,34 @@ export function createWebhookRouter(
       }
 
       await enrichCommentEventForRouting(event);
+
+      // ── INF-400: Merge-gate outcome dispatch ──────────────────────────
+      // If this is a comment from Hanzo (merge gate) carrying an outcome,
+      // map it to the next role (held -> reviewer, fail -> implementer)
+      // so PR-stage tickets don't stall.
+      if (event.type === "Comment" && event.action === "create") {
+        const commentData = (event as { data: Record<string, unknown> }).data;
+        const commentBody = (commentData.body as string) ?? "";
+        const outcome = parseMergeGateOutcome(commentBody);
+
+        if (outcome) {
+          const ticketId = (commentData.issueIdentifier as string) ||
+                          ((commentData.issue as any)?.identifier as string);
+
+          if (ticketId) {
+            const nextRoute = await resolveNextRoleRoute({ outcome, ticketId }, event);
+            if (nextRoute) {
+              log.info(`Merge gate outcome detected: ${outcome} for ${ticketId} -> waking ${nextRoute.agentId}`);
+              try {
+                await dispatchRoute(nextRoute);
+              } catch (err) {
+                log.error(`Merge gate dispatch failed for ${nextRoute.agentId} [${ticketId}]: ${errorSummary(err)}`);
+              }
+            }
+          }
+        }
+      }
+
       const routes = routeEventAll(event);
       if (routes.length === 0) {
         log.info(`No agent target for event type=${event.type} action=${"action" in event ? event.action : "?"}`);
