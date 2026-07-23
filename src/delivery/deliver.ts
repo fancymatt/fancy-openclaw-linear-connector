@@ -7,6 +7,7 @@ import { getActiveCanonVersion } from "../policy/universal-canon.js";
 import { resolveCanonicalIdentifierFromEvent } from "../canonical-identifier.js";
 import { normalizeSessionKey } from "../session-key.js";
 import type { DispatchLeaseStore } from "../store/dispatch-lease-store.js";
+import type { DispatchInFlightStore } from "../store/dispatch-inflight-store.js";
 
 const log = componentLogger(createLogger(), "delivery");
 
@@ -126,13 +127,36 @@ export async function deliverToAgent(
   route: RouteResult,
   config: DeliveryConfig,
   dispatchLeaseStore?: DispatchLeaseStore,
+  inFlightStore?: DispatchInFlightStore,
 ): Promise<DeliveryResult> {
+  const updatedAt =
+    (route.event.data as Record<string, string> | undefined)?.updatedAt;
+
+  // INF-413: Ticket-level in-flight guard, checked BEFORE the agent-scoped
+  // lease. The lease keys on (agentId, ticketKey), so it cannot catch the same
+  // TICKET being dispatched to two concurrent workers on different agents or
+  // sessions (the INF-400 double-spawn class). This guard keys on the ticket
+  // identifier alone — route.sessionKey is the per-ticket `linear-<id>` key and
+  // is agent-agnostic — so at most one active run exists per ticket at a time.
+  // Checked first so a cross-agent duplicate is refused before we touch the
+  // lease (no rollback needed). A genuinely newer ticket state supersedes a
+  // stale in-flight record, mirroring the lease's supersede semantics.
+  if (inFlightStore) {
+    const holder = `${route.agentId}:${route.sessionKey}`;
+    const guard = inFlightStore.tryAcquire(route.sessionKey, holder, { updatedAt });
+    if (!guard.acquired && guard.refused) {
+      log.info(
+        `dispatch in-flight guard: ticket ${route.sessionKey} already has an active run ` +
+        `(holder=${guard.existing?.holder ?? "?"}); refusing duplicate for ${route.agentId}`,
+      );
+      return { dispatched: false };
+    }
+  }
+
   // AI-2564: Check the dispatch lease before spawning. If an unexpired lease
   // exists for this (agentId, ticketKey) and the incoming state is not newer,
   // refuse the dispatch as a duplicate.
   if (dispatchLeaseStore) {
-    const updatedAt =
-      (route.event.data as Record<string, string> | undefined)?.updatedAt;
     const leaseResult = dispatchLeaseStore.acquire(
       route.agentId,
       route.sessionKey,
@@ -142,6 +166,10 @@ export async function deliverToAgent(
       log.info(
         `dispatch deduped: live session exists for ${route.agentId} [${route.sessionKey}]`,
       );
+      // INF-413: this agent already holds the ticket via the lease; release the
+      // in-flight record we just acquired above so it is not left dangling for
+      // an agent whose dispatch we are refusing.
+      inFlightStore?.release(route.sessionKey, { holder: `${route.agentId}:${route.sessionKey}` });
       return { dispatched: false };
     }
   }
