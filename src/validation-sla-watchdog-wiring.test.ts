@@ -61,3 +61,38 @@ describe("INF-105: validation watchdog cron is wired in index.ts", () => {
     expect(INDEX_TS.includes("normalizeSessionKey")).toBe(true);
   });
 });
+
+describe("INF-333: watchdog resolves auth token per sweep (not captured at boot)", () => {
+  it("passes a token resolver function, not a boot-captured string", () => {
+    expect(INDEX_TS.includes("authToken: resolveValidationAuthToken,")).toBe(true);
+  });
+
+  it("defines the resolver reading the live token store", () => {
+    expect(INDEX_TS.includes("const resolveValidationAuthToken = () =>")).toBe(true);
+  });
+
+  it("runValidationWatchdog resolves function-form authToken per call", async () => {
+    const { runValidationWatchdog } = await import("./validation-sla-watchdog.js");
+    const seen: string[] = [];
+    const fetchFn = async (_url: string | URL, init?: RequestInit) => {
+      seen.push(String((init?.headers as Record<string, string>)?.Authorization));
+      return new Response(JSON.stringify({ data: { issues: { nodes: [] } } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+    let current = "token-A";
+    const opts = {
+      authToken: () => current,
+      validatorLinearUserId: "validator-1",
+      fetchFn,
+      wakeValidator: async () => {},
+      nudgeStorePath: ":memory:",
+    };
+    await runValidationWatchdog(opts);
+    current = "token-B"; // simulate token rotation between sweeps
+    await runValidationWatchdog(opts);
+    expect(seen[0]).toBe("token-A");
+    expect(seen[1]).toBe("token-B");
+  });
+});

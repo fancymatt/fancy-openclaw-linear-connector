@@ -1983,7 +1983,14 @@ if (isEntryPoint) {
 
   // INF-105: validation SLA watchdog — check validation-state tickets for >15 min stalls
   // and post an automated nudge + re-dispatch to the validator.
-  const validationAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  // INF-333: resolve the token PER SWEEP, not once at boot. The token-refresh
+  // cycle (boot + every 20h) rotates agent OAuth tokens and revokes the old
+  // ones; a token captured here by value is dead minutes after registration.
+  // This was the actual root cause of the validation-watchdog auth failures
+  // (every tick since INF-105 shipped), misdiagnosed as repo drift.
+  const resolveValidationAuthToken = () =>
+    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const validationAuthToken = resolveValidationAuthToken();
   const validationDataDir = process.env.DATA_DIR ?? resolveStatePath("data");
   const validationNudgeStorePath = process.env.VALIDATION_NUDGE_STORE_PATH ?? path.join(validationDataDir, "validation-nudges.db");
   const validationCadenceMs = process.env.VALIDATION_WATCHDOG_CADENCE_MS ? parseInt(process.env.VALIDATION_WATCHDOG_CADENCE_MS, 10) : undefined;
@@ -2016,7 +2023,7 @@ if (isEntryPoint) {
     };
 
     const validationTimer = registerValidationWatchdogCron({
-      authToken: validationAuthToken,
+      authToken: resolveValidationAuthToken,
       validatorLinearUserId: validationValidatorUserId,
       wakeValidator: validationWakeAgent,
       nudgeStorePath: validationNudgeStorePath,

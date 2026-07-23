@@ -46,8 +46,14 @@ const DEFAULT_WATCHED_STATES = "ac-validate,review";
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface ValidationWatchdogOptions {
-  /** Linear API auth token. */
-  authToken: string;
+  /**
+   * Linear API auth token, or a resolver returning the current token.
+   * INF-333: pass a resolver in production — agent OAuth tokens rotate
+   * (boot + every 20h), and a token captured once at registration is
+   * revoked by the first refresh cycle, killing every sweep with
+   * "Authentication required, not authenticated."
+   */
+  authToken: string | (() => string);
   /** Linear user ID of the validator (the agent who validates). */
   validatorLinearUserId: string;
   /** Injectable fetch for testing. */
@@ -235,7 +241,7 @@ export async function runValidationWatchdog(
   opts: ValidationWatchdogOptions,
 ): Promise<ValidationWatchdogResult> {
   const {
-    authToken,
+    authToken: authTokenOpt,
     validatorLinearUserId,
     wakeValidator,
     now = () => Date.now(),
@@ -245,6 +251,9 @@ export async function runValidationWatchdog(
     watchedStates = DEFAULT_WATCHED_STATES,
   } = opts;
   const fetchFn = opts.fetchFn ?? globalThis.fetch;
+  // INF-333: resolve per sweep so token rotation between registration and
+  // tick never leaves the watchdog holding a revoked token.
+  const authToken = typeof authTokenOpt === "function" ? authTokenOpt() : authTokenOpt;
 
   const result: ValidationWatchdogResult = {
     scanned: 0,
