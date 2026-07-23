@@ -82,9 +82,9 @@ describe("AI-1807 AC7: delegation reconciliation sweep is observable via /health
   });
 
   it("/health response includes a crons field", () => {
-    // The /health endpoint returns getRegisteredCrons() — the delegation
-    // reconciliation sweep will appear there once registered
-    const healthMatch = INDEX_TS.match(/crons:\s*getRegisteredCrons/);
+    // The /health endpoint returns registered crons directly or via a local
+    // `crons` variable shared with cron readiness checks.
+    const healthMatch = INDEX_TS.match(/crons:\s*getRegisteredCrons|crons,\s*\n/);
     expect(healthMatch).not.toBeNull();
   });
 });

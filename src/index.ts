@@ -61,6 +61,7 @@ import { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import { ProposalStore } from "./store/proposal-store.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
 import { getCronStalenessMultiplierFromEnv, getRegisteredCrons, getStaleCrons } from "./cron/registry.js";
+import { evaluateCronStartupReadiness, parseCronStartupGraceMs } from "./cron/startup-readiness.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { getDetectorState } from "./done-ticket-detector-state.js";
 import { registerFirstActionWatchdogCron } from "./first-action-watchdog.js";
@@ -251,6 +252,7 @@ export function createApp(options?: CreateAppOptions) {
   clearAcRecordStore();
   const app = express();
   app.set("trust proxy", true);
+  const bootedAt = new Date();
 
   // Create stores early — needed before route registration.
   const observationStore = new ObservationStore(options?.observationsDbPath);
@@ -333,7 +335,15 @@ export function createApp(options?: CreateAppOptions) {
   // and dropped webhooks.
   app.get("/health", async (_req: Request, res: Response) => {
     const agents = getAgents();
-    const healthy = agents.length > 0;
+    const crons = getRegisteredCrons();
+    const cronReadiness = evaluateCronStartupReadiness({
+      crons,
+      bootedAt,
+      now: new Date(),
+      bootGraceMs: parseCronStartupGraceMs(process.env.CRON_STARTUP_GRACE_MS),
+      log,
+    });
+    const healthy = agents.length > 0 && cronReadiness.status === "ok";
 
     // AI-2008 AC3: loud dispatch-undeliverable surfacing. Every dispatch that
     // exhausted its bounded retries is a first-class operational event; project
@@ -382,8 +392,9 @@ export function createApp(options?: CreateAppOptions) {
       // registers at the moment its timer is created; an expected driver
       // missing from this list means it shipped without bootstrap wiring
       // (the AI-1773/AI-1775 dead-code-in-prod failure mode).
-      crons: getRegisteredCrons(),
+      crons,
       staleCrons: getStaleCrons({ stalenessMultiplier: getCronStalenessMultiplierFromEnv() }),
+      cronReadiness,
       // AI-2036 AC1.6: observation write-path liveness. `wired`/`subscribed` are
       // true only because bootstrap called registerObservationWritePath() — never
       // hardcoded — and `rows` is read from the live table, so a broken schema
@@ -1571,7 +1582,7 @@ export function createApp(options?: CreateAppOptions) {
   registerTtlInvalidationCron(ttlCache, 60_000);
   log.info("INF-193: TTL cache invalidation cron registered (every 60s)");
 
-  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, transcriptRedactionHealth: getTranscriptRedactionHealth() });
+  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, transcriptRedactionHealth: getTranscriptRedactionHealth() });
 }
 
 /**
@@ -1938,7 +1949,9 @@ if (isEntryPoint) {
   const slaWorkflowDefPath = process.env.WORKFLOW_DEFS_DIR ?? process.env.WORKFLOW_DEF_PATH ?? defaultWorkflowDefPath;
   const slaDataDir = process.env.DATA_DIR ?? resolveStatePath("data");
   const slaBreachStorePath = process.env.SLA_BREACH_STORE_PATH ?? path.join(slaDataDir, "sla-breaches.db");
-  const slaAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const resolveCronAuthToken = () =>
+    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const slaAuthToken = resolveCronAuthToken();
   const slaCadenceMs = process.env.SLA_SWEEP_CADENCE_MS ? parseInt(process.env.SLA_SWEEP_CADENCE_MS, 10) : undefined;
 
   if (slaAuthToken) {
@@ -1957,13 +1970,13 @@ if (isEntryPoint) {
       };
       const actionText = `SLA breach detected for ${identifier}`;
       const message =
-        (await buildWorkflowAwareDeliveryMessage(identifier, slaAuthToken, actionText)) ??
+        (await buildWorkflowAwareDeliveryMessage(identifier, resolveCronAuthToken(), actionText)) ??
         actionText;
       await deliverMessageToAgent("ai", sessionKey, message, deliveryConfig);
     };
 
     const slaTimer = registerSlaSweepCron({
-      authToken: slaAuthToken,
+      authToken: resolveCronAuthToken,
       workflowDefPath: slaWorkflowDefPath,
       breachStorePath: slaBreachStorePath,
       cadenceMs: slaCadenceMs,
@@ -1982,7 +1995,14 @@ if (isEntryPoint) {
 
   // INF-105: validation SLA watchdog — check validation-state tickets for >15 min stalls
   // and post an automated nudge + re-dispatch to the validator.
-  const validationAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  // INF-333: resolve the token PER SWEEP, not once at boot. The token-refresh
+  // cycle (boot + every 20h) rotates agent OAuth tokens and revokes the old
+  // ones; a token captured here by value is dead minutes after registration.
+  // This was the actual root cause of the validation-watchdog auth failures
+  // (every tick since INF-105 shipped), misdiagnosed as repo drift.
+  const resolveValidationAuthToken = () =>
+    getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const validationAuthToken = resolveValidationAuthToken();
   const validationDataDir = process.env.DATA_DIR ?? resolveStatePath("data");
   const validationNudgeStorePath = process.env.VALIDATION_NUDGE_STORE_PATH ?? path.join(validationDataDir, "validation-nudges.db");
   const validationCadenceMs = process.env.VALIDATION_WATCHDOG_CADENCE_MS ? parseInt(process.env.VALIDATION_WATCHDOG_CADENCE_MS, 10) : undefined;
@@ -2015,7 +2035,7 @@ if (isEntryPoint) {
     };
 
     const validationTimer = registerValidationWatchdogCron({
-      authToken: validationAuthToken,
+      authToken: resolveValidationAuthToken,
       validatorLinearUserId: validationValidatorUserId,
       wakeValidator: validationWakeAgent,
       nudgeStorePath: validationNudgeStorePath,
@@ -2080,9 +2100,9 @@ if (isEntryPoint) {
   // INF-122: periodic anti-entropy reconciliation (G-7/G-17).
   // AC1 — native state desync heal; AC2 — missed barrier webhook auto-advance.
   // Uses the same auth token and workflow def path as the SLA sweep.
-  const antiEntropyAuthToken = getAccessToken("ai") ?? process.env.LINEAR_OAUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? "";
+  const antiEntropyAuthToken = resolveCronAuthToken();
   if (antiEntropyAuthToken) {
-    registerAntiEntropyCron({ authToken: antiEntropyAuthToken });
+    registerAntiEntropyCron({ authToken: resolveCronAuthToken });
     const intervalMs = process.env.ANTI_ENTROPY_INTERVAL
       ? parseInt(process.env.ANTI_ENTROPY_INTERVAL, 10)
       : 15 * 60 * 1000;

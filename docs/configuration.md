@@ -146,3 +146,15 @@ routing:
 ### Session Keys
 
 The `sessionKey` determines which agent session receives the event. The format is typically `agent:<agentId>:main` for the agent's primary session. Check your OpenClaw gateway configuration for available session keys.
+
+## Delivery Rate Throttle
+
+`MAX_CONCURRENT_DISPATCHES` controls how many delivery handoffs may be in flight
+at once across the whole fleet. The default is `6`, tuned for OpenClaw gateway lane saturation:
+the connector releases the slot as soon as the gateway accepts the wake handoff
+and returns a run id.
+
+This is a gateway burst-tolerance setting, not a per-agent session lifecycle cap.
+Use `DISPATCH_THROTTLE_MS` to space consecutive deliveries to the same agent.
+Only set an agent `maxConcurrent` value when that agent must be serialized for a
+correctness-only reason; absent `maxConcurrent` means no per-agent serialize cap.

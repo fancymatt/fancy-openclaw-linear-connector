@@ -1,31 +1,31 @@
 /**
- * Per-agent delivery throttle + global concurrent-dispatch semaphore.
+ * Per-agent delivery spacing + global delivery-rate throttle.
  *
  * Prevents burst-spawned sessions by:
  * 1. Per-agent: enforcing a minimum interval between consecutive deliveries
  *    to the same agent (DISPATCH_THROTTLE_MS, default 2s).
- * 2. Global: capping the number of in-flight deliveries across all agents
- *    (MAX_CONCURRENT_DISPATCHES, default 3).  This prevents a Linear webhook
- *    burst from queuing 20+ sessions on the OpenClaw gateway's lane=main
- *    simultaneously, which caused runtime-plugins bootstrap stalls fleet-wide
- *    when the main lane was saturated (AI-1216).
+ * 2. Global: limiting in-flight delivery handoffs across all agents
+ *    (MAX_CONCURRENT_DISPATCHES, default 6). This protects the OpenClaw gateway's
+ *    lane=main from gateway lane saturation during Linear webhook bursts
+ *    (AI-1216). The slot is released when the wake handoff returns.
  */
 
 const DEFAULT_THROTTLE_MS = 2_000;
-const DEFAULT_MAX_CONCURRENT = 3;
+const DEFAULT_GATEWAY_DELIVERY_BURST_LIMIT = 6;
 
 export class DeliveryThrottle {
   private lastDelivery: Map<string, number> = new Map();
   private intervalMs: number;
-  private maxConcurrent: number;
+  private maxInFlightDeliveries: number;
   private active: number = 0;
   private waitQueue: Array<() => void> = [];
 
-  constructor(intervalMs?: number, maxConcurrent?: number) {
+  constructor(intervalMs?: number, maxInFlightDeliveries?: number) {
     this.intervalMs =
       intervalMs ?? parseInt(process.env.DISPATCH_THROTTLE_MS ?? `${DEFAULT_THROTTLE_MS}`, 10);
-    this.maxConcurrent =
-      maxConcurrent ?? parseInt(process.env.MAX_CONCURRENT_DISPATCHES ?? `${DEFAULT_MAX_CONCURRENT}`, 10);
+    this.maxInFlightDeliveries =
+      maxInFlightDeliveries ??
+      parseInt(process.env.MAX_CONCURRENT_DISPATCHES ?? `${DEFAULT_GATEWAY_DELIVERY_BURST_LIMIT}`, 10);
   }
 
   /**
@@ -54,11 +54,11 @@ export class DeliveryThrottle {
   }
 
   /**
-   * Acquire a global dispatch slot. Waits if MAX_CONCURRENT_DISPATCHES
-   * deliveries are already in flight. Call releaseSlot() when done.
+   * Acquire a global delivery handoff slot. Waits if MAX_CONCURRENT_DISPATCHES
+   * delivery handoffs are already in flight. Call releaseSlot() when done.
    */
   async acquireSlot(): Promise<void> {
-    if (this.active < this.maxConcurrent) {
+    if (this.active < this.maxInFlightDeliveries) {
       this.active++;
       return;
     }
@@ -85,8 +85,8 @@ export class DeliveryThrottle {
     return this.intervalMs;
   }
 
-  /** Return the configured global concurrent dispatch limit. */
+  /** Return the configured global in-flight delivery handoff limit. */
   getMaxConcurrent(): number {
-    return this.maxConcurrent;
+    return this.maxInFlightDeliveries;
   }
 }

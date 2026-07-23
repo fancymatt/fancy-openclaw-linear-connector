@@ -45,6 +45,11 @@ describe("health endpoint — empty-roster guard (AI-1767)", () => {
   let appState: ReturnType<typeof createApp>;
 
   afterEach(() => {
+    appState?.dispatchDeliveryScheduler?.stop();
+    appState?.watchdog?.stop();
+    appState?.noActivityDetector?.stop();
+    appState?.stuckDelegateDetector?.stop();
+    appState?.managingPoller?.stop();
     appState?.bag?.close();
     appState?.sessionTracker?.close();
     appState?.agentQueue?.close();

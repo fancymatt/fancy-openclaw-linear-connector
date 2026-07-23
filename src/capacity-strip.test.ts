@@ -2,8 +2,8 @@
  * AI-1802 AC1 — Per-agent capacity strip: slots used / cap, parked count.
  *
  * AC1: Strip shows, per agent with any live or parked wake: slots used,
- *      cap (from agents.json maxConcurrent or default 3), parked count.
- *      Verified against a fixture with an over-capacity agent.
+ *      cap (from explicit agents.json maxConcurrent or unlimited default),
+ *      parked count. Explicit serialize caps are still surfaced.
  * AC2: Read-only — no actions. Suite green, builds clean.
  *
  * Tests exercise a new read-only endpoint GET /admin/api/capacity that
@@ -19,7 +19,7 @@ import path from "node:path";
 import { createApp } from "./index.js";
 import type { SessionTracker } from "./bag/session-tracker.js";
 import type { PendingWorkBag } from "./bag/pending-work-bag.js";
-import type { AgentConfig } from "./agents.js";
+import { reloadAgents, type AgentConfig } from "./agents.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -40,6 +40,21 @@ function getApp(...dbPaths: string[]) {
   });
 }
 
+function writeAgentsFile(dir: string, caps: Record<string, number> = {}): string {
+  const file = path.join(dir, "agents.json");
+  const agents: AgentConfig[] = ["igor", "ai", "astrid"].map((name) => ({
+    name,
+    linearUserId: `${name}-linear-user`,
+    clientId: `${name}-client`,
+    clientSecret: `${name}-secret`,
+    accessToken: `${name}-access`,
+    refreshToken: `${name}-refresh`,
+    ...(caps[name] !== undefined ? { maxConcurrent: caps[name] } : {}),
+  }));
+  fs.writeFileSync(file, JSON.stringify({ agents }, null, 2));
+  return file;
+}
+
 function getSessionTracker(app: ReturnType<typeof createApp>): SessionTracker {
   const st = (app as unknown as { sessionTracker?: SessionTracker }).sessionTracker;
   if (!st) throw new Error("sessionTracker not exposed on createApp return");
@@ -57,7 +72,7 @@ interface CapacityAgent {
   agentId: string;
   /** Number of currently active/live sessions for this agent. */
   slotsUsed: number;
-  /** Max concurrent sessions (from agents.json maxConcurrent, or default 3). */
+  /** Max concurrent sessions (from explicit agents.json maxConcurrent, or unlimited default). */
   cap: number;
   /** Number of tickets parked in the pending work bag for this agent. */
   parkedCount: number;
@@ -85,6 +100,8 @@ describe("AI-1802 AC1: GET /admin/api/capacity — per-agent capacity strip", ()
     mirrorDbPath = tmpDbPath("mirror");
     eventsDbPath = tmpDbPath("events");
     bagDbPath = tmpDbPath("bag");
+    process.env.AGENTS_FILE = writeAgentsFile(path.dirname(mirrorDbPath));
+    reloadAgents();
     app = getApp(mirrorDbPath, eventsDbPath, bagDbPath);
     sessionTracker = getSessionTracker(app);
     bag = getBag(app);
@@ -93,6 +110,8 @@ describe("AI-1802 AC1: GET /admin/api/capacity — per-agent capacity strip", ()
   afterEach(() => {
     sessionTracker.close();
     delete process.env.ADMIN_SECRET;
+    delete process.env.AGENTS_FILE;
+    reloadAgents();
     fs.rmSync(path.dirname(mirrorDbPath), { recursive: true, force: true });
     fs.rmSync(path.dirname(eventsDbPath), { recursive: true, force: true });
     fs.rmSync(path.dirname(bagDbPath), { recursive: true, force: true });
@@ -124,13 +143,12 @@ describe("AI-1802 AC1: GET /admin/api/capacity — per-agent capacity strip", ()
     expect(igor).toBeDefined();
     expect(igor!.slotsUsed).toBe(2);
     expect(igor!.parkedCount).toBe(5);
-    // cap should be 3 (default AGENT_DEFAULT_MAX_CONCURRENT)
-    expect(igor!.cap).toBe(3);
+    expect(igor!.cap).toBe(Number.MAX_SAFE_INTEGER);
   });
 
   it("uses agents.json maxConcurrent when configured (non-default cap)", async () => {
-    // The agents.json in the repo has no maxConcurrent set, so we rely on the default.
-    // This test verifies the shape is correct for an agent with a live session.
+    process.env.AGENTS_FILE = writeAgentsFile(path.dirname(mirrorDbPath), { ai: 1 });
+    reloadAgents();
     sessionTracker.startSession("ai", "linear-AI-6010");
 
     const res = await request(app.app)
@@ -142,17 +160,18 @@ describe("AI-1802 AC1: GET /admin/api/capacity — per-agent capacity strip", ()
     const ai = body.agents.find((a) => a.agentId === "ai");
     expect(ai).toBeDefined();
     expect(ai!.slotsUsed).toBe(1);
-    expect(typeof ai!.cap).toBe("number");
-    expect(ai!.cap).toBeGreaterThanOrEqual(1);
+    expect(ai!.cap).toBe(1);
     expect(ai!.parkedCount).toBe(0);
   });
 
   // -----------------------------------------------------------------------
-  // AC1 over-capacity fixture: agent has more live sessions than cap
+  // AC1 explicit serialize-cap fixture: agent has more live sessions than cap
   // -----------------------------------------------------------------------
 
-  it("shows over-capacity: slotsUsed exceeds cap for an agent with >cap live sessions", async () => {
-    // Igor: 5 live sessions (default cap = 3), 3 parked
+  it("shows over-capacity only when an explicit maxConcurrent cap is configured", async () => {
+    process.env.AGENTS_FILE = writeAgentsFile(path.dirname(mirrorDbPath), { igor: 3 });
+    reloadAgents();
+    // Igor: 5 live sessions (explicit cap = 3), 3 parked
     sessionTracker.startSession("igor", "linear-AI-6101");
     sessionTracker.startSession("igor", "linear-AI-6102");
     sessionTracker.startSession("igor", "linear-AI-6103");
@@ -277,10 +296,10 @@ describe("AI-1802 AC1: GET /admin/api/capacity — per-agent capacity strip", ()
   });
 
   // -----------------------------------------------------------------------
-  // AC1: cap source is maxConcurrent from agents.json or default 3
+  // AC1: cap source is explicit maxConcurrent from agents.json or unlimited default
   // -----------------------------------------------------------------------
 
-  it("cap defaults to 3 (AGENT_DEFAULT_MAX_CONCURRENT) when agents.json has no maxConcurrent", async () => {
+  it("cap defaults to unlimited when agents.json has no maxConcurrent", async () => {
     // Default: agents.json entries have no maxConcurrent field
     sessionTracker.startSession("igor", "linear-AI-6700");
 
@@ -292,7 +311,7 @@ describe("AI-1802 AC1: GET /admin/api/capacity — per-agent capacity strip", ()
     const body = res.body as CapacityResponse;
     const igor = body.agents.find((a) => a.agentId === "igor");
     expect(igor).toBeDefined();
-    expect(igor!.cap).toBe(3);
+    expect(igor!.cap).toBe(Number.MAX_SAFE_INTEGER);
   });
 
   // -----------------------------------------------------------------------
