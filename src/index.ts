@@ -60,7 +60,7 @@ import { DispatchIdempotencyStore } from "./store/dispatch-idempotency-store.js"
 import { DispatchLeaseStore } from "./store/dispatch-lease-store.js";
 import { ProposalStore } from "./store/proposal-store.js";
 import { clearAcRecordStore } from "./ac-record-store.js";
-import { getRegisteredCrons } from "./cron/registry.js";
+import { getCronStalenessMultiplierFromEnv, getRegisteredCrons, getStaleCrons } from "./cron/registry.js";
 import { evaluateCronStartupReadiness, parseCronStartupGraceMs } from "./cron/startup-readiness.js";
 import { getRescueSweepState } from "./rescue-sweep-state.js";
 import { getDetectorState } from "./done-ticket-detector-state.js";
@@ -393,6 +393,7 @@ export function createApp(options?: CreateAppOptions) {
       // missing from this list means it shipped without bootstrap wiring
       // (the AI-1773/AI-1775 dead-code-in-prod failure mode).
       crons,
+      staleCrons: getStaleCrons({ stalenessMultiplier: getCronStalenessMultiplierFromEnv() }),
       cronReadiness,
       // AI-2036 AC1.6: observation write-path liveness. `wired`/`subscribed` are
       // true only because bootstrap called registerObservationWritePath() — never
@@ -1582,7 +1583,7 @@ export function createApp(options?: CreateAppOptions) {
   registerTtlInvalidationCron(ttlCache, 60_000);
   log.info("INF-193: TTL cache invalidation cron registered (every 60s)");
 
-  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, livenessDispatchStore, transcriptRedactionHealth: getTranscriptRedactionHealth() });
+  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, stuckDelegateDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, livenessDispatchStore, transcriptRedactionHealth: getTranscriptRedactionHealth() });
 }
 
 /**
