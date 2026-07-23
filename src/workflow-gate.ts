@@ -6172,6 +6172,7 @@ export async function autoEnrollByTeam(
   // AI-2542: A governed demote/escape removes wf/state labels, then Linear
   // echoes an Issue webhook. Suppress only that same ticket while its last
   // lifecycle event remains demoted; later genuine enrollment overwrites it.
+  // INF-334: No timestamp bypass in team-auto-enroll (webhook only).
   if (enrolledTicketsStore?.wasDemoted(issue.identifier)) {
     autoEnrollLiveness = {
       ...autoEnrollLiveness,
@@ -6259,6 +6260,7 @@ export async function autoEnrollPlainDelegation(
   onEnroll?: (info: PlainDelegationEnrollInfo) => void,
   enrolledTicketsStore?: EnrolledTicketsStore,
   delegateAgentName?: string | null,
+  delegateSetTimestamp?: string | null,
 ): Promise<{ enrolled: boolean; entryState?: string; workflowId?: string }> {
   const workflowId = "task";
   const entryState = "doing";
@@ -6275,7 +6277,8 @@ export async function autoEnrollPlainDelegation(
     return { enrolled: false };
   }
 
-  if (enrolledTicketsStore?.wasDemoted(issue.identifier)) {
+  // INF-334: A re-delegation timestamp can bypass a stale demoted tombstone.
+  if (enrolledTicketsStore?.wasDemoted(issue.identifier, delegateSetTimestamp ?? undefined)) {
     autoEnrollLiveness = {
       ...autoEnrollLiveness,
       suppressedDemotedCount: autoEnrollLiveness.suppressedDemotedCount + 1,

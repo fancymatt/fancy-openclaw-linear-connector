@@ -141,6 +141,15 @@ describe("AI-1799 AC1: EnrolledTicketsStore — mirror lifecycle", () => {
     expect(store.wasDemoted("AI-1009")).toBe(true);
   });
 
+  it("wasDemoted() ignores stale tombstones superseded by a later delegation", () => {
+    store.demoteEnrolled("INF-334-STUCK");
+
+    const staleTombstoneBypass = new Date(Date.now() + 1000).toISOString();
+
+    expect(store.wasDemoted("INF-334-STUCK")).toBe(true);
+    expect(store.wasDemoted("INF-334-STUCK", staleTombstoneBypass)).toBe(false);
+  });
+
   // ── INF-271: retire() ───────────────────────────────────────────────
 
   it("retire() marks an active ticket as retired (terminal=1, delegate cleared)", () => {

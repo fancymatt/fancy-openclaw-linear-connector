@@ -213,12 +213,26 @@ export class EnrolledTicketsStore {
     }
   }
 
-  /** AI-2542: True when the last lifecycle event was a governed demote/escape. */
-  wasDemoted(ticketId: string): boolean {
+  /**
+   * AI-2542: True when the last lifecycle event was a governed demote/escape.
+   *
+   * INF-334: If sinceTimestamp is provided, the tombstone is only valid if it
+   * occurred AFTER the given timestamp. This allows a fresh re-delegation to
+   * supersede a stale demoted tombstone.
+   */
+  wasDemoted(ticketId: string, sinceTimestamp?: string): boolean {
     const row = this.db
-      .prepare(`SELECT last_event_kind FROM enrolled_tickets WHERE ticket_id = ?`)
-      .get(ticketId) as { last_event_kind: string | null } | undefined;
-    return row?.last_event_kind === "demoted";
+      .prepare(
+        `SELECT last_event_kind, last_event_at FROM enrolled_tickets WHERE ticket_id = ?`,
+      )
+      .get(ticketId) as
+      | { last_event_kind: string | null; last_event_at: string | null }
+      | undefined;
+
+    if (row?.last_event_kind !== "demoted") return false;
+    if (!sinceTimestamp || !row.last_event_at) return true;
+
+    return new Date(row.last_event_at).getTime() > new Date(sinceTimestamp).getTime();
   }
 
   /**

@@ -612,6 +612,24 @@ export async function runDelegationReconciliationSweep(
 
     // ── AC1: Enrolled ticket with delegate but no dispatch record ───────
     if (ticket.delegateId && ticket.delegateName) {
+      // Check idempotency (AC4): has this delegate been dispatched since
+      // they were set? Use the real delegate-set timestamp from Linear
+      // history, NOT ticket.updatedAt (which changes on any mutation).
+      // AI-2350: fixes compounding defect from AI-2313.
+      let delegationTimestamp = ticket.updatedAt;
+      try {
+        const realTimestamp = await queryDelegateSetTimestamp(
+          ticket.id,
+          authToken,
+          fetchFn,
+        );
+        if (realTimestamp) {
+          delegationTimestamp = realTimestamp;
+        }
+      } catch {
+        // Fall through to use ticket.updatedAt as before
+      }
+
       const isPlainDelegation = ticket.plainDelegation || !hasWfLabel(ticket.labels);
       if (isPlainDelegation) {
         try {
@@ -634,6 +652,7 @@ export async function runDelegationReconciliationSweep(
             },
             opts.enrolledTicketsStore,
             ticket.delegateName,
+            delegationTimestamp,
           );
           if (enrollResult.enrolled) {
             log.info(
@@ -662,24 +681,6 @@ export async function runDelegationReconciliationSweep(
             ticket: ticket.identifier,
           });
         }
-      }
-
-      // Check idempotency (AC4): has this delegate been dispatched since
-      // they were set? Use the real delegate-set timestamp from Linear
-      // history, NOT ticket.updatedAt (which changes on any mutation).
-      // AI-2350: fixes compounding defect from AI-2313.
-      let delegationTimestamp = ticket.updatedAt;
-      try {
-        const realTimestamp = await queryDelegateSetTimestamp(
-          ticket.id,
-          authToken,
-          fetchFn,
-        );
-        if (realTimestamp) {
-          delegationTimestamp = realTimestamp;
-        }
-      } catch {
-        // Fall through to use ticket.updatedAt as before
       }
 
       if (
