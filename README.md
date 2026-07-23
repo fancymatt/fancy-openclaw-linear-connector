@@ -839,6 +839,7 @@ docker compose up -d
 | Variable | Default | Description |
 |---|---|---|
 | `DATA_DIR` | `/data` | Directory for SQLite database files |
+| `CRON_RUN_STAMP_PATH` | `$DATA_DIR/cron-run-stamps.json` | Optional override for persisted cron last-run stamps used by `/health` readiness |
 | `SECRETS_DIR` | `/secrets` | Directory for per-agent OAuth token files |
 | `AGENTS_FILE` | `/config/agents.json` | Path to agents configuration file |
 | `PORT` | `3000` | HTTP listen port |

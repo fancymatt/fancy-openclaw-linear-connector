@@ -158,6 +158,7 @@ describe("INF-341 /health startup readiness surface", () => {
     dir = tempDir();
     process.env.AGENTS_FILE = writeAgentsFile(dir);
     process.env.CRON_STARTUP_GRACE_MS = "30000";
+    process.env.CRON_RUN_STAMP_PATH = path.join(dir, "cron-run-stamps.json");
     reloadAgents();
     resetCronRegistryForTest();
     appState = createApp({
@@ -182,6 +183,7 @@ describe("INF-341 /health startup readiness surface", () => {
     resetCronRegistryForTest();
     delete process.env.AGENTS_FILE;
     delete process.env.CRON_STARTUP_GRACE_MS;
+    delete process.env.CRON_RUN_STAMP_PATH;
     reloadAgents();
     fs.rmSync(dir, { recursive: true, force: true });
   });
@@ -243,5 +245,51 @@ describe("INF-341 /health startup readiness surface", () => {
         neverVerifiedCrons: [],
       }),
     );
+  });
+
+  test("INF-351 AC1: /health cron readiness survives a connector restart after a run stamp", async () => {
+    registerCron("inf-351-persisted-driver", "every 1m");
+    markCronRun("inf-351-persisted-driver", new Date(Date.now() - 60_000));
+
+    closeAppState(appState);
+    resetCronRegistryForTest();
+    appState = createApp({
+      bagDbPath: path.join(dir, "pending-bag-restart.db"),
+      agentQueueDbPath: path.join(dir, "agent-queue-restart.db"),
+      operationalEventsDbPath: path.join(dir, "operational-events-restart.db"),
+      observationsDbPath: path.join(dir, "observations-restart.db"),
+      managingStateDbPath: path.join(dir, "managing-state-restart.db"),
+      enrolledTicketsDbPath: path.join(dir, "enrolled-restart.db"),
+      mutationAuditDbPath: path.join(dir, "mutation-audit-restart.db"),
+      idempotencyDbPath: path.join(dir, "idempotency-restart.db"),
+      dispatchLeaseDbPath: path.join(dir, "dispatch-lease-restart.db"),
+      proposalsDbPath: path.join(dir, "proposals-restart.db"),
+      livenessDispatchDbPath: path.join(dir, "liveness-restart.db"),
+      deadLetterQueueDbPath: path.join(dir, "dead-letter-restart.db"),
+    });
+    resetCronRegistryForTest();
+
+    registerCron("inf-351-persisted-driver", "every 1m");
+    ageRegisteredCron(
+      "inf-351-persisted-driver",
+      new Date(Date.now() - 121_000).toISOString(),
+    );
+
+    const res = await request(appState!.app).get("/health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("ok");
+    expect(res.body.cronReadiness).toEqual(
+      expect.objectContaining({
+        status: "ok",
+        neverVerifiedCrons: [],
+      }),
+    );
+    expect(res.body.crons).toEqual([
+      expect.objectContaining({
+        name: "inf-351-persisted-driver",
+        lastRunAt: expect.any(String),
+      }),
+    ]);
   });
 });
