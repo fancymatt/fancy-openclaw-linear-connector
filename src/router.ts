@@ -93,6 +93,19 @@ export function extractAgentTarget(event: LinearEvent): AgentTargetResult {
 
   const data = "data" in event ? (event.data as Record<string, unknown> | undefined) : null;
 
+  if (event.type === "Issue" && event.action === "update") {
+    const upd = (event as { updatedFrom?: Record<string, unknown> }).updatedFrom;
+    if (
+      upd !== undefined &&
+      ("delegateId" in upd || "delegate" in upd) &&
+      !extractId(data?.delegate) &&
+      !extractId(data?.delegateId)
+    ) {
+      log.info("Delegate clear event — skipping dispatch instead of falling through to assignee");
+      return { suppressed: true };
+    }
+  }
+
   // 1. Check delegate first — OAuth app actors are set as delegates, not assignees
   let target: string | null = null;
   let reason: "delegate" | "assignee" | "mention" | "body-mention" = "delegate";

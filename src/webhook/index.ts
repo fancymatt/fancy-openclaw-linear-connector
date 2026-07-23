@@ -27,7 +27,7 @@ import { buildAgentMap, getAgent, getAccessToken, getOpenclawAgentName, getAgent
 import { checkAgentLiveness, type LivenessConfig } from "../liveness.js";
 import { emitDelegateUnavailable } from "../escalation.js";
 import { checkRoleGuardAndBlock, type LinearUserIdResolver } from "../routing-guard.js";
-import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, markAutoEnrollRegistered } from "../workflow-gate.js";
+import { fetchWorkflowLabels, enrollIfMissing, autoEnrollByTeam, autoEnrollPlainDelegation, markAutoEnrollRegistered } from "../workflow-gate.js";
 import { checkLabelSyncForTicket, emitLabelSyncWarning } from "../transition-audit.js";
 import { AgentQueue } from "../queue/index.js";
 import { PendingWorkBag, SessionTracker, resignalPendingTickets } from "../bag/index.js";
@@ -500,6 +500,44 @@ export function createWebhookRouter(
               }
             }).catch((err) => {
               log.warn(`autoEnrollByTeam failed for ${enrollIssueId}: ${err instanceof Error ? err.message : String(err)}`);
+            });
+          }
+
+          // INF-334: plain delegated tickets are still real work. If a ticket
+          // gains a delegate without already being governed, enroll it into the
+          // task worker phase so capacity rearm/rescue paths can see it.
+          const updatedFrom = (event as { updatedFrom?: Record<string, unknown> }).updatedFrom;
+          const delegateChanged =
+            event.action === "update" &&
+            updatedFrom !== undefined &&
+            ("delegateId" in updatedFrom || "delegate" in updatedFrom);
+          const delegate = enrollData?.delegate as { id?: string; name?: string } | null | undefined;
+          const delegateId = delegate?.id;
+          if (delegateChanged && delegateId) {
+            const mappedAgentName = buildAgentMap()[delegateId];
+            const delegateAgentName = mappedAgentName ? getOpenclawAgentName(mappedAgentName) : null;
+            autoEnrollPlainDelegation(enrollIssueId, enrollToken, (info) => {
+              appendOperationalEvent(operationalEventStore, {
+                outcome: "auto-enrolled",
+                type: event.type,
+                key: enrollIdentifier,
+                sessionKey: normalizeSessionKey(enrollIdentifier),
+                detail: {
+                  workflowId: info.workflowId,
+                  entryState: info.entryState,
+                  mode: "plain-delegation",
+                  delegate: info.delegateAgentName ?? null,
+                },
+              });
+            }, enrolledTicketsStore, delegateAgentName).then((result) => {
+              if (result.enrolled) {
+                log.info(
+                  `Plain delegation auto-enrolled: stamped wf:${result.workflowId ?? "task"} + ` +
+                  `state:${result.entryState ?? "doing"} on ${enrollIssueId}`,
+                );
+              }
+            }).catch((err) => {
+              log.warn(`autoEnrollPlainDelegation failed for ${enrollIssueId}: ${err instanceof Error ? err.message : String(err)}`);
             });
           }
 

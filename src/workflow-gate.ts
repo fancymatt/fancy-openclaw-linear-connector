@@ -6064,6 +6064,19 @@ export interface AutoEnrollInfo {
   teamKey: string;
 }
 
+export interface PlainDelegationEnrollInfo {
+  /** Display identifier or UUID passed in. */
+  issueId: string;
+  /** Linear internal issue UUID. */
+  internalId: string;
+  /** Resolved workflow id. */
+  workflowId: string;
+  /** State stamped for the already-delegated worker phase. */
+  entryState: string;
+  /** Delegate agent name that already owns the plain ticket, when resolvable. */
+  delegateAgentName?: string | null;
+}
+
 const DEFAULT_TEAM_ENROLL_CONFIG: TeamEnrollConfig = {
   "AI": "dev-impl",
 };
@@ -6179,6 +6192,97 @@ export async function autoEnrollByTeam(
   }
 
   return { enrolled: true, entryState: def.entry_state };
+}
+
+/**
+ * INF-334: promote an already-delegated ad-hoc ticket into the task workflow.
+ *
+ * Plain ticket delegation already chooses the worker via Linear's delegate
+ * field. Enrolling at task:doing preserves that ownership while making the
+ * ticket visible to governed capacity/rearm/rescue machinery.
+ */
+export async function autoEnrollPlainDelegation(
+  issueId: string,
+  authToken: string,
+  onEnroll?: (info: PlainDelegationEnrollInfo) => void,
+  enrolledTicketsStore?: EnrolledTicketsStore,
+  delegateAgentName?: string | null,
+): Promise<{ enrolled: boolean; entryState?: string; workflowId?: string }> {
+  const workflowId = "task";
+  const entryState = "doing";
+
+  const issue = await fetchIssueWithLabels(issueId, authToken);
+  if (!issue) {
+    log.warn(`workflow-gate: autoEnrollPlainDelegation: failed to fetch labels for ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  const labelNames = issue.labels.map((l) => l.name);
+  const existingWorkflowId = getWorkflowId(labelNames);
+  if (existingWorkflowId) {
+    return { enrolled: false };
+  }
+
+  if (enrolledTicketsStore?.wasDemoted(issue.identifier)) {
+    autoEnrollLiveness = {
+      ...autoEnrollLiveness,
+      suppressedDemotedCount: autoEnrollLiveness.suppressedDemotedCount + 1,
+      lastSuppressedAt: new Date().toISOString(),
+    };
+    log.info(`workflow-gate: autoEnrollPlainDelegation: skipping ${issue.identifier} because last enrolled-ticket event is demoted`);
+    return { enrolled: false };
+  }
+
+  const wfLabelName = `wf:${workflowId}`;
+  const stateLabelName = `state:${entryState}`;
+
+  const wfLabelId = await findOrCreateLabel(issue.teamId, wfLabelName, authToken);
+  if (!wfLabelId) {
+    log.warn(`workflow-gate: autoEnrollPlainDelegation: could not resolve label '${wfLabelName}' for ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  const stateLabelId = await findOrCreateLabel(issue.teamId, stateLabelName, authToken);
+  if (!stateLabelId) {
+    log.warn(`workflow-gate: autoEnrollPlainDelegation: could not resolve label '${stateLabelName}' for ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  const existingIds = issue.labels.map((l) => l.id);
+  const newLabelIds = [...new Set([...existingIds, wfLabelId, stateLabelId])];
+  const success = await issueUpdateLabels(issue.internalId, newLabelIds, authToken);
+  if (!success) {
+    log.warn(`workflow-gate: autoEnrollPlainDelegation: label update failed for ${issueId} — skipping`);
+    return { enrolled: false };
+  }
+
+  enrolledTicketsStore?.enroll({
+    ticketId: issue.identifier,
+    workflow: workflowId,
+    state: entryState,
+    delegate: delegateAgentName ?? null,
+  });
+
+  autoEnrollLiveness = {
+    ...autoEnrollLiveness,
+    enrolledCount: autoEnrollLiveness.enrolledCount + 1,
+    lastEnrolledAt: new Date().toISOString(),
+  };
+
+  try {
+    onEnroll?.({
+      issueId,
+      internalId: issue.internalId,
+      workflowId,
+      entryState,
+      delegateAgentName: delegateAgentName ?? null,
+    });
+  } catch (err) {
+    log.warn(`workflow-gate: autoEnrollPlainDelegation: onEnroll audit hook threw for ${issueId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  log.info(`workflow-gate: autoEnrollPlainDelegation: stamped '${wfLabelName}' + '${stateLabelName}' on ${issueId}`);
+  return { enrolled: true, entryState, workflowId };
 }
 
 // ── AI-1546 / G-6: Steward/human-only atomic set-state ─────────────────────

@@ -147,7 +147,7 @@ export async function buildDeliveryMessage(route: RouteResult, authToken?: strin
   if (reason === "mention" || reason === "body-mention") {
     message = buildMentionMessage(actorName, identifier, title);
   } else {
-    message = await buildDelegationMessage(reason, identifier, title, authToken);
+    message = await buildDelegationMessage(reason, identifier, title, authToken, eventKnowsTicketIsPlain(route));
   }
 
   // Inject the canon block after the hook line (before per-step guidance).
@@ -212,6 +212,7 @@ async function buildDelegationMessage(
   identifier: string,
   title: string,
   authToken: string | undefined,
+  knownPlainTicket = false,
 ): Promise<string> {
   const actionText =
     reason === "delegate"
@@ -219,7 +220,7 @@ async function buildDelegationMessage(
       : `You were assigned ${identifier}`;
 
   // §4.6 mode switch: attempt workflow-aware per-step injection for delegation events.
-  if (authToken) {
+  if (authToken && !knownPlainTicket) {
     const workflowMessage = await tryBuildWorkflowMessage(
       actionText,
       identifier,
@@ -230,6 +231,21 @@ async function buildDelegationMessage(
   }
 
   return buildGenericDelegationMessage(actionText, identifier, title);
+}
+
+function eventKnowsTicketIsPlain(route: RouteResult): boolean {
+  const data = (route.event.data ?? {}) as Record<string, unknown>;
+  const labels = data.labels as { nodes?: Array<{ name?: string | null }> } | undefined;
+  const labelNames = Array.isArray(labels?.nodes)
+    ? labels.nodes.map((label) => label.name).filter((name): name is string => typeof name === "string")
+    : null;
+
+  if (labelNames && !labelNames.some((name) => name.startsWith("wf:"))) return true;
+
+  const labelIds = data.labelIds;
+  if (Array.isArray(labelIds) && labelIds.length === 0) return true;
+
+  return false;
 }
 
 /** Fetch the most recent comment on a ticket. Returns null on any failure. */

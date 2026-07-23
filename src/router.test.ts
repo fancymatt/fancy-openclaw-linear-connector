@@ -414,6 +414,104 @@ describe("routeEvent", () => {
   });
 });
 
+// ── INF-334: plain delegation dispatch ───────────────────────────────────────
+
+describe("INF-334 — plain delegated tickets dispatch without workflow labels", () => {
+  const IGOR_ID = "11111111-2222-3333-4444-555555555555";
+  let agentsFile: string;
+
+  beforeEach(() => {
+    agentsFile = makeTempAgentsFile([
+      ...BASE_AGENTS,
+      { name: "igor", linearUserId: IGOR_ID, openclawAgent: "igor", clientId: "c3", clientSecret: "s3", accessToken: "tok3", refreshToken: "ref3" },
+    ]);
+    process.env.AGENTS_FILE = agentsFile;
+    reloadAgents();
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTS_FILE;
+    fs.rmSync(path.dirname(agentsFile), { recursive: true, force: true });
+  });
+
+  it("AC1: plain ticket delegate change with no wf:* labels routes a dispatch wake to the new delegate", () => {
+    const event = makeIssueEvent({
+      identifier: "DSN-334",
+      delegateId: IGOR_ID,
+      delegateName: "Igor",
+      updatedFrom: { delegateId: null },
+    });
+    (event.data as { labels?: { nodes: Array<{ name: string }> }; labelIds?: string[] }).labels = { nodes: [] };
+    (event.data as { labels?: { nodes: Array<{ name: string }> }; labelIds?: string[] }).labelIds = [];
+
+    const route = routeEvent(event);
+
+    expect(route).not.toBeNull();
+    expect(route).toMatchObject({
+      agentId: "igor",
+      sessionKey: "linear-DSN-334",
+      routingReason: "delegate",
+    });
+  });
+
+  it("AC3: enrolled wf:-labeled ticket delegate change keeps existing workflow dispatch routing semantics", () => {
+    const event = makeIssueEvent({
+      identifier: "AI-334",
+      delegateId: CHARLES_ID,
+      delegateName: "Charles",
+      updatedFrom: { delegateId: ASTRID_ID },
+    });
+    (event.data as { labels?: { nodes: Array<{ name: string }> }; labelIds?: string[] }).labels = {
+      nodes: [{ name: "wf:dev-impl" }, { name: "state:implementation" }],
+    };
+    (event.data as { labels?: { nodes: Array<{ name: string }> }; labelIds?: string[] }).labelIds = ["wf-lbl", "state-lbl"];
+
+    const route = routeEvent(event);
+
+    expect(route).not.toBeNull();
+    expect(route).toMatchObject({
+      agentId: "charles",
+      sessionKey: "linear-AI-334",
+      routingReason: "delegate",
+    });
+  });
+
+  it("AC4: clearing a plain ticket delegate suppresses dispatch even when an assignee remains", () => {
+    const event = makeIssueEvent({
+      identifier: "DSN-335",
+      assigneeId: ASTRID_ID,
+      updatedFrom: { delegateId: IGOR_ID },
+    });
+    (event.data as { delegate?: unknown; delegateId?: unknown; labels?: { nodes: Array<{ name: string }> }; labelIds?: string[] }).delegate = null;
+    (event.data as { delegate?: unknown; delegateId?: unknown; labels?: { nodes: Array<{ name: string }> }; labelIds?: string[] }).delegateId = null;
+    (event.data as { delegate?: unknown; delegateId?: unknown; labels?: { nodes: Array<{ name: string }> }; labelIds?: string[] }).labels = { nodes: [] };
+    (event.data as { delegate?: unknown; delegateId?: unknown; labels?: { nodes: Array<{ name: string }> }; labelIds?: string[] }).labelIds = [];
+
+    expect(routeEventAll(event)).toEqual([]);
+  });
+
+  it("AC4: after delegate clear, re-delegation dispatches only the new delegate", () => {
+    const event = makeIssueEvent({
+      identifier: "DSN-336",
+      assigneeId: ASTRID_ID,
+      delegateId: CHARLES_ID,
+      delegateName: "Charles",
+      updatedFrom: { delegateId: null },
+    });
+    (event.data as { labels?: { nodes: Array<{ name: string }> }; labelIds?: string[] }).labels = { nodes: [] };
+    (event.data as { labels?: { nodes: Array<{ name: string }> }; labelIds?: string[] }).labelIds = [];
+
+    const routes = routeEventAll(event);
+
+    expect(routes).toHaveLength(1);
+    expect(routes[0]).toMatchObject({
+      agentId: "charles",
+      sessionKey: "linear-DSN-336",
+      routingReason: "delegate",
+    });
+  });
+});
+
 // ── routeEventAll — multi-mention fan-out (audit #3) ─────────────────────────
 
 describe("routeEventAll", () => {

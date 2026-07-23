@@ -1347,6 +1347,7 @@ export function createAdminRouter(deps: AdminDeps): Router {
         alertBus: getAlertBus(),
         wakeFn,
         ticketIdentifiers: [ticketId],
+        enrolledTicketsStore: deps.enrolledTicketsStore,
       });
       res.status(200).json({ success: true, ...result });
     } catch (err) {
