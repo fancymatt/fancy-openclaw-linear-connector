@@ -1,0 +1,264 @@
+# sprint-spawner — Continuous-loop workflow definition (v4)
+# owner: steward (evaluating, scanning, determining-scope, scoping, launching,
+#         managing, releasing, retrospecting); engine (spawning-scope, launching)
+# last-updated: 2026-07-16
+# INF-45 (2026-07-16): resolved fanout-before-barrier waiver by repointing deliver-direct→releasing
+#   (Option A). deliver-direct has no dev-sprint child, so managing's barrier would vacuously satisfy.
+#   Releasing is a non-barrier state, so the structural invariant is satisfied without a waiver.
+#   The `invariant_skip: [fanout-before-barrier]` entry on determining-scope was removed.
+# status: v4 — per-sprint scoping child, fresh launch ticket, emoji naming, Ai-signoff
+#
+# INF-30 (Astrid, 2026-07-17): added `fanout:` to `launching` (was missing — root cause of
+# LIF-2 barrier fall-through). The engine now mints wf:dev-sprint from a `## sprint` block the
+# steward writes at launching from the scoping child's finalized brief; the steward no longer
+# hand-creates the ticket. Without fanout, the `managing` barrier counted zero children and
+# vacuously satisfied (AI-1730), falling through to releasing.
+#
+# NOTE: a first pass of this change used `spec_source: structured` (reusing spawning-scope's
+# section). That silently re-arms the same fall-through via content-addressed spec-entry dedup
+# — see the `launching` comment below. The section MUST stay distinct. Not deployed in that
+# form; caught in review before the host deploy.
+#
+# AI-2519 (Grover, 2026-07-16): restored `generic: continue` tags on every forward
+# transition the steward drives. v4 renamed v2's transitions and dropped the tags,
+# making the whole loop undriveable (no CLI verbs for propose-brief/spawn/etc. and
+# no continue-workflow resolution). Tagged: proceed, collect, propose-brief, spawn
+# (spawning-scope), spawn (launching), release, loop. Barrier states (scoping,
+# managing) auto-advance and are intentionally untagged. deliver-direct is left
+# unreachable via continue-workflow (one generic per state) — known limitation.
+#
+# ┌─ WHICH FILE IS CANONICAL ─────────────────────────────────────────────────┐
+# │ THIS FILE IS CANONICAL. It is what deploys to WORKFLOW_DEFS_DIR and what   │
+# │ the engine actually loads. The ```yaml block in sprint-spawning-workflow.md│
+# │ is a documentation MIRROR — never regenerate this file FROM that one.      │
+# └───────────────────────────────────────────────────────────────────────────┘
+#
+# This header previously read "Verbatim copy of the canonical vault file at
+# sprint-spawning-workflow.md ... keep in sync", while that .md simultaneously
+# declared THIS file canonical. Each pointed at the other, so neither was owned
+# and they drifted: AI-2519's `generic: continue` tags landed here and never in
+# the .md, leaving the "canonical" mirror stuck at version 1 describing an
+# undriveable loop. Regenerating this file from it — exactly what the old header
+# instructed — would have silently reverted AI-2519 AND INF-30's fanout.
+# Reconciled and re-synced 2026-07-17 (INF-30, Astrid); direction of truth is now
+# one-way: edit HERE, then mirror into the .md. Drift check:
+#   parse both, compare states/fanout/transitions (see INF-30 for the script).
+#
+# AC1: One scoping child per sprint — no articulation tickets as direct spawner children.
+# AC2: Fresh sprint ticket at launch; scoping ticket closes with pointer.
+# AC3: Ai-signoff approval path encoded (sprint:signoff + designated_approver).
+# AC4: Naming convention enforced by steward procedure (emoji per sprint, not per project).
+# AC5: Migration: active spawners adopt on next cycle; no retrofit of existing children.
+
+id: sprint-spawner
+# Bumped 3 → 4 for INF-30 (the `launching` fanout). Registry activation keys on the
+# def FILE (loadWorkflowRegistry re-reads WORKFLOW_DEFS_DIR) and gates on state
+# REMOVAL, not on this integer — adding a fanout removes no state, so activation is
+# clean and needs no migrations entry. The bump exists to make the deploy VERIFIABLE:
+# /health workflowRegistry reports this number, so `version: 4` is the behavior-level
+# signal that the fanout is actually live. Left at 3, a deployed and an undeployed
+# connector are indistinguishable at /health — the exact trap that let AI-2406 sit
+# "done" while the engine ran the old def.
+version: 4
+archetype: continuous-loop
+entry_state: evaluating
+
+# Def-state migration (AI-2406 deploy, Grover 2026-07-16). v4 renames evaluate→
+# evaluating and drops v2's `dormant`. The connector refuses to activate a def
+# that removes a state present in the last-activated version without a mapping
+# (validateDefStateRemovals, AI-1914) — without this block the v4 def is silently
+# excluded from the registry, stranding every wf:sprint-spawner ticket. Both live
+# spawners (GEN-25, LIF-2) sit at determining-scope, so neither mapping fires
+# today; they are the safety net + the activation gate. dormant→evaluating is the
+# non-lossy choice (v2 dormant was explicitly non-terminal "paused, resumable" —
+# re-entering the loop preserves that; mapping to __terminal_hold__ would close it).
+migrations:
+  evaluate: evaluating
+  dormant: evaluating
+  escape: evaluating         # P2(d) AGI-16: escape → loop entry for recovery
+
+break_glass:
+  command: escape
+  to: evaluating              # P2(d) AGI-16: re-enter the loop instead of terminating
+  owner_role: steward
+
+states:
+
+  - id: evaluating
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    description: >
+      Evaluate current product state against the vision document. Read specialist
+      observations doc. Decide whether to proceed or pause until next heartbeat
+      or manual re-entry.
+    transitions:
+      - command: proceed
+        to: scanning
+        generic: continue          # AI-2519: `linear continue-workflow` resolves here
+      - command: hold
+        to: __terminal_hold__
+      - command: start-cycle
+        to: scanning
+
+  - id: scanning
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    description: >
+      Delegate parallel specialist scans (UX, Design, Engineering, Marketing).
+      Each files structured findings to the project's specialist observations
+      document. Spawner collects outputs.
+    transitions:
+      - command: collect
+        to: determining-scope
+        generic: continue          # AI-2519: `linear continue-workflow` resolves here
+
+  - id: determining-scope
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    description: >
+      Read vision doc + specialist observations. Choose sprint theme and scope
+      boundary. Assign unique emoji (collision-checked vs last 10 sprints).
+      Write brief. Two delivery paths:
+      - propose-brief (full sprint) → spawning-scope
+      - deliver-direct (small scope) → releasing
+    transitions:
+      - command: propose-brief
+        to: spawning-scope
+        generic: continue          # AI-2519: makes `linear continue-workflow` resolve here
+        requires_capability: sprint:signoff   # gate evaluated on the RESOLVED transition — preserved
+        designated_approver: true
+      # deliver-direct is the skip-articulation path. INF-45 (2026-07-16): repointed
+      # to `releasing` to resolve the fanout-before-barrier violation — direct delivery
+      # has no dev-sprint child for `managing` to wait on, so going straight to release
+      # is structurally correct. The waiver (`invariant_skip: fanout-before-barrier`)
+      # was removed; this transition now targets a non-barrier state.
+      - command: deliver-direct
+        to: releasing
+        requires_capability: sprint:signoff
+        designated_approver: true
+
+  - id: spawning-scope
+    owner_role: engine
+    kind: normal
+    native_state: doing
+    description: >
+      Create exactly ONE wf:sprint-scoping child ticket per sprint. All
+      articulation (scope arm, UX/Design/Eng scans, spikes) hang off the
+      scoping ticket as sub-tickets, never directly off this spawner.
+      Naming: <emoji> <Project> <YYYY-MM-DD> Scoping.
+    fanout:
+      spec_source: structured
+      child_workflow: wf:sprint-scoping
+      initial_delegate: astrid
+    transitions:
+      # spawning-scope is engine-owned, but the fanout ONLY fires when the `spawn`
+      # command is actually invoked (shouldTriggerFanout requires the intent) — the
+      # connector has no on-entry auto-driver for fanout states (confirmed AI-2519,
+      # workflow-gate.js:2466 + fanout wiring). `spawn` is not a registered CLI verb,
+      # so without this tag the ticket rests in spawning-scope forever and the
+      # sprint-scoping child is never minted (would fail AC2). generic: continue lets
+      # the steward fire it via `continue-workflow` after propose-brief.
+      - command: spawn
+        to: scoping
+        generic: continue
+
+  - id: scoping
+    owner_role: steward
+    kind: normal
+    native_state: managing
+    barrier: true
+    description: >
+      Barrier state: waits for the wf:sprint-scoping child to reach done.
+      The scoping workflow handles its own internal articulation arms.
+    transitions:
+      - command: launch
+        to: launching
+
+  # spec_source is `sprint` — deliberately DISTINCT from spawning-scope's `structured`.
+  # Do not "simplify" these to match. Spec-entry ids are content-addressed
+  # (deriveFindingId: FNV-1a over title\ndescription — not the state, not the
+  # child_workflow), and dedup reads ALL marker-bearing children of the parent,
+  # unscoped by child_workflow (fetchExistingSpawnChildren -> dedupeSpawnSpec).
+  # Pointing this fanout at `structured` would re-extract the very bullet that already
+  # minted the sprint-scoping child, match its id, empty toSpawn, and return a silent
+  # "legitimate no-op, not a refusal" — zero children into the `managing` barrier, which
+  # then vacuously satisfies (AI-1730) into releasing. That is the exact LIF-2
+  # fall-through this fanout exists to prevent, re-armed and quieter.
+  # A distinct section also carries the RIGHT content: `## structured` holds the
+  # PRE-scoping brief, while the sprint ticket must be minted from the scoping child's
+  # FINALIZED brief. Engine-level fix for the collision class: INF-32.
+  - id: launching
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    description: >
+      Write the finalized sprint brief from the scoping child into a `## sprint`
+      section on THIS ticket, as exactly ONE bullet:
+      `- **<emoji> <Project> <YYYY-MM-DD> Sprint**: <theme, scope boundary, specialist refs>`
+      Then fire spawn — the ENGINE mints the wf:dev-sprint child: correct team,
+      enrolled, parented to this spawner, delegate set. Do NOT hand-create it.
+      After spawn fires: attach the dev-sprint ticket to the project + milestone.
+      Close the scoping ticket with a bidirectional pointer to the launched
+      sprint ticket.
+      Naming (from the `## sprint` bullet): <emoji> <Project> <YYYY-MM-DD> Sprint,
+      same emoji as scoping.
+    fanout:
+      spec_source: sprint
+      child_workflow: wf:dev-sprint
+      initial_delegate: astrid
+    transitions:
+      - command: spawn
+        to: managing
+        generic: continue          # AI-2519: `linear continue-workflow` resolves here
+
+  - id: managing
+    owner_role: steward
+    kind: normal
+    native_state: managing
+    barrier: true
+    description: >
+      Monitor the wf:dev-sprint ticket until done. No cross-layer micro-
+      management. Nudge only if stalled. On done → releasing.
+    transitions:
+      - command: complete
+        to: releasing
+
+  - id: releasing
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    description: >
+      Read sprint validation. Verify live (not just merged). Run final deploy
+      if pending. Archive remnants. Write release note / changelog entry.
+    transitions:
+      - command: release
+        to: retrospecting
+        generic: continue          # AI-2519: `linear continue-workflow` resolves here
+
+  - id: retrospecting
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    description: >
+      Compare scoped vs delivered. Record velocity. Note wins and misses.
+      Write findings to project retro document. Loop back to evaluating.
+    transitions:
+      - command: loop
+        to: evaluating
+        generic: continue          # AI-2519: `linear continue-workflow` resolves here
+      - command: hold
+        to: __terminal_hold__
+
+  - id: done
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true
+
+  # escape terminal state removed in P2(d) AGI-16 — break_glass now re-enters at evaluating
+
+  - id: __terminal_hold__
+    kind: terminal
+    native_state: invalid

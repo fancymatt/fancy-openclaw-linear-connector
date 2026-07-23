@@ -1,0 +1,66 @@
+# sprint-arm-design — dev-sprint shaping-arm archetype (design)
+# spec of record: life-os/project-management/dev-sprint-workflow-spec.md (vault,
+#   approved by Matt 2026-07-08). AI-1993.
+# owner: ui-designer (Penny/Laren) does the design shaping; the steward completes it.
+#
+# One of the four shaping arms fanned out by dev-sprint at spawn-arms. Uniform
+# doing → review → done shape; done carries satisfies_parent_barrier: true so
+# the parent managing-arms barrier auto-advances only when all four arms
+# terminate cleanly (AI-1992 engine).
+#
+# Originally registered as v0 stubs (INF-45, 2026-07-16). Updated to v1
+# (INF-111, 2026-07-19) to match the live workflow defs in linear-connector/workflows/.
+# Key change from v0: entry_state: intake → entry_state: doing.
+#
+# Authority (spec table): review.owner_role: steward resolves to astrid.
+
+id: sprint-arm-design
+version: 1
+archetype: single-task
+entry_state: doing
+
+break_glass:
+  command: escape
+  to: doing
+  owner_role: steward
+
+states:
+
+  - id: doing
+    owner_role: ui-designer
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: submit
+        to: review
+        assign: { mode: auto }
+        generic: continue
+
+  - id: review
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: accept
+        to: done
+        generic: continue
+      - command: request-changes
+        to: doing
+        assign: { mode: auto }
+        generic: revision
+        feedback:
+          required: true
+          category_enum:
+            - incomplete
+            - off-brief
+            - scope-creep
+            - correctness
+
+  - id: done
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true
+
+  - id: escape
+    kind: terminal
+    native_state: invalid

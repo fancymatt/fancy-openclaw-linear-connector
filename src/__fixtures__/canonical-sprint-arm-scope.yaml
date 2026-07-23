@@ -1,0 +1,70 @@
+# sprint-arm-scope — dev-sprint shaping-arm archetype (scope)
+# spec of record: life-os/project-management/dev-sprint-workflow-spec.md (vault,
+#   approved by Matt 2026-07-08). AI-1993.
+# owner: sprint-owner (Astrid) does the scoping; cra reviews the scope artifact.
+#
+# One of the four shaping arms fanned out by dev-sprint at spawn-arms. Every arm
+# is a uniform doing → review → done shape whose `done` terminal carries
+# satisfies_parent_barrier: true, so the parent managing-arms barrier
+# auto-advances only when all four arms terminate cleanly (AI-1992 engine).
+#
+# Originally registered as v0 stubs (INF-45, 2026-07-16). Updated to v1
+# (INF-111, 2026-07-19) to match the live workflow defs in linear-connector/workflows/.
+# The v0 defs had entry_state: intake which created a def-skew bug: the fanout
+# mint path created children at "state:intake" while the live proxy validated
+# against the v1 entering state "doing", causing the proxy to auto-migrate
+# all children to escape (terminal stranded).
+#
+# Archetype: single-task — doing → review → done, no fanout or barrier.
+# Authority: code-review (cra) owns review gate.
+
+id: sprint-arm-scope
+version: 1
+archetype: single-task
+entry_state: doing
+
+break_glass:
+  command: escape
+  to: doing
+  owner_role: steward
+
+states:
+
+  - id: doing
+    owner_role: sprint-owner
+    kind: normal
+    native_state: doing
+    transitions:
+      - command: submit
+        to: review
+        assign: { mode: auto }
+        generic: continue
+
+  - id: review
+    owner_role: code-review
+    kind: normal
+    native_state: todo
+    transitions:
+      - command: approve
+        to: done
+        generic: continue
+      - command: request-changes
+        to: doing
+        assign: { mode: auto }
+        generic: revision
+        feedback:
+          required: true
+          category_enum:
+            - incomplete
+            - off-brief
+            - scope-creep
+            - correctness
+
+  - id: done
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true
+
+  - id: escape
+    kind: terminal
+    native_state: invalid
