@@ -3242,8 +3242,7 @@ export async function checkWorkflowRules(
         return (
           `[Proxy] '${intent}' requires the '${match.requires_capability}' capability ` +
           `(designated approver: ${approverNames}). ` +
-          `Use \`linear handoff-work ${issueId} ${approverBodies[0] ?? "<approver>"}\` to route ` +
-          `the ticket to the approver for sign-off, then the approver re-runs '${intent}'. ` +
+          `The designated approver must run '${intent}' directly to proceed. ` +
           `Legal moves: ${legalMoves}.`
         );
       }
