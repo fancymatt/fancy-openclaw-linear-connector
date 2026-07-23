@@ -24,11 +24,17 @@ import { getWorkflowId, getCurrentState, type WorkflowDef } from "./workflow-gat
 import { isManagedBarrierFromLabels } from "./barrier.js";
 import { LINEAR_API_URL } from "./linear-helpers.js";
 import { registerCron, formatIntervalMs, markCronRun } from "./cron/registry.js";
+import {
+  assertNoLinearGraphqlErrors,
+  resolveAuthToken,
+  type AuthTokenSource,
+  type LinearGraphqlResponse,
+} from "./linear-auth.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface SlaSweepOptions {
-  authToken: string | (() => string);
+  authToken: AuthTokenSource;
   /** Path to a single YAML file or a directory of *.yaml files containing workflow defs.
    *  In directory mode (production WORKFLOW_DEFS_DIR), all *.yaml files are loaded. */
   workflowDefPath: string;
@@ -160,22 +166,6 @@ interface GovernedTicketNode {
   } | null;
 }
 
-function resolveAuthToken(authToken: SlaSweepOptions["authToken"]): string {
-  return typeof authToken === "function" ? authToken() : authToken;
-}
-
-function formatGraphQlErrors(errors: unknown): string {
-  if (!Array.isArray(errors) || errors.length === 0) return "none";
-  return errors
-    .map((err) => {
-      if (err && typeof err === "object" && "message" in err) {
-        return String((err as { message?: unknown }).message);
-      }
-      return JSON.stringify(err);
-    })
-    .join("; ");
-}
-
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
@@ -236,15 +226,13 @@ export async function runSlaSweep(opts: SlaSweepOptions): Promise<SlaSweepResult
       headers: { "Content-Type": "application/json", Authorization: authToken },
       body: JSON.stringify({ query }),
     });
-    type Resp = {
-      data?: { issues?: { nodes?: GovernedTicketNode[] } };
-      errors?: unknown[];
-    };
+    type Resp = LinearGraphqlResponse<{ issues?: { nodes?: GovernedTicketNode[] } }>;
     const data = (await res.json()) as Resp;
-    if (Array.isArray(data.errors) && data.errors.length > 0) {
-      throw new Error(`Linear GraphQL errors: ${formatGraphQlErrors(data.errors)}`);
+    assertNoLinearGraphqlErrors(data);
+    if (!data.data?.issues?.nodes) {
+      throw new Error("Linear API response missing data.issues.nodes");
     }
-    nodes = data.data?.issues?.nodes ?? [];
+    nodes = data.data.issues.nodes;
   } catch (err) {
     result.errors.push(err);
     return result;
@@ -333,7 +321,15 @@ export function registerSlaSweepCron(opts: SlaSweepOptions): ReturnType<typeof s
   const cadenceMs = opts.cadenceMs ?? DEFAULT_CADENCE_MS;
   registerCron("sla-sweep", `every ${formatIntervalMs(cadenceMs)}`);
   const timer = setInterval(() => {
-    runSlaSweep(opts).catch((err) => {
+    runSlaSweep(opts).then((result) => {
+      if (result.errors.length > 0) {
+        console.error(
+          `[sla-sweep] sweep completed with errors: ${result.errors
+            .map((err) => (err instanceof Error ? err.message : String(err)))
+            .join("; ")}`,
+        );
+      }
+    }).catch((err) => {
       // Sweep errors are non-fatal (result.errors captures per-ticket issues),
       // but a whole-sweep failure (e.g. unreadable workflowDefPath) must not
       // be silent — that would be dead-code-in-prod with a registry entry.
