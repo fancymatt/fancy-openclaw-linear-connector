@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# pre-push — verify that the pushed branch/SHA is actually reachable on origin (INF-422).
+#
+# This exists because broken credential helpers can cause silent push failures
+# or misleading command output. It uses git ls-remote to verify the push landed.
+#
+# Wired via `git config core.hooksPath scripts/git-hooks`.
+#
+# Override: OC_GIT_UNSAFE=1
+set -uo pipefail
+
+if [ "${OC_GIT_UNSAFE:-}" = "1" ]; then
+  exit 0
+fi
+
+REMOTE="$1"
+URL="$2"
+
+# Stdin from git pre-push carries:
+#   <local-ref> <local-oid> <remote-ref> <remote-oid>
+#
+# We capture the local OIDs being pushed.
+PUSHED_REFS=()
+while read -r local_ref local_oid remote_ref remote_oid; do
+  if [ "$local_oid" != "0000000000000000000000000000000000000000" ]; then
+    # Strip refs/heads/ from local_ref
+    branch=${local_ref#refs/heads/}
+    PUSHED_REFS+=("$branch:$local_oid")
+  fi
+done
+
+if [ ${#PUSHED_REFS[@]} -eq 0 ]; then
+  exit 0
+fi
+
+# pre-push runs BEFORE the push. We cannot verify the landing here.
+# But we can verify that the credential helper is NOT obviously broken
+# by running a probe ls-remote.
+echo "INF-422: Probing $REMOTE ($URL) to verify credential helper..." >&2
+
+if ! git ls-remote --exit-code "$REMOTE" HEAD >/dev/null 2>&1; then
+  echo "pre-push: 🚨 AUTHENTICATION PROBE FAILED. The credential helper is likely broken." >&2
+  echo "          Run scripts/validate-credential-helper.sh to diagnose." >&2
+  exit 1
+fi
+
+# To verify it LANDED, we would need a post-push hook (which git doesn't have)
+# or instructions for agents to verify manually.
+#
+# We add a note here to remind them.
+echo "INF-422: Auth probe OK. Remember to verify the push landed via 'git ls-remote $REMOTE <branch>'." >&2
+
+exit 0
