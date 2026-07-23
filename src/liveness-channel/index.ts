@@ -20,6 +20,8 @@ export interface LivenessSnapshot {
     agentId?: string;
     sessionKey?: string;
     status?: DispatchRecord["status"];
+    createdAt?: string;
+    ackedAt?: string;
     ack: GatewayDispatchAck | null;
     wrongTarget?: DispatchRecord["wrongTarget"];
   };
@@ -65,6 +67,8 @@ export class LivenessChannelEndpoint {
           agentId: record.agentId,
           sessionKey: record.sessionKey,
           status: record.status,
+          createdAt: record.createdAt,
+          ackedAt: record.ackedAt,
           ack: record.ack,
           wrongTarget: record.wrongTarget,
         }

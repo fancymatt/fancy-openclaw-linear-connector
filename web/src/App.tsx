@@ -16,6 +16,7 @@ import { StallsPage } from "./pages/StallsPage";
 import { TicketDetailView } from "./pages/TicketDetailView";
 import { WebhooksPage, type WebhookRow, type WebhookAddInput } from "./pages/WebhooksPage";
 import { ProposalsPage, isPendingQueue, type Proposal, type ProposalDiff } from "./pages/ProposalsPage";
+import { ConnectorHealthPage } from "./pages/ConnectorHealthPage";
 import { apiGet, apiPost, apiDelete } from "./api";
 
 type AuthState = "checking" | "authenticated" | "anonymous";
@@ -236,6 +237,7 @@ export function App() {
           />
           <Route path="/dead-letters" element={<DeadLettersPage />} />
           <Route path="/stalls" element={<StallsPage />} />
+          <Route path="/connector-health" element={<ConnectorHealthPage />} />
           <Route path="/webhooks" element={<WebhooksRoute />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

@@ -536,12 +536,6 @@ export function createApp(options?: CreateAppOptions) {
     });
   });
 
-  // INF-322: health snapshot endpoint — registered at bootstrap so GET
-  // /health/snapshot returns 200 immediately. Mark the route active so
-  // /health.healthSnapshot.active === true proves the wiring.
-  app.use("/health", createHealthSnapshotRouter());
-  registerSnapshot();
-
   // AI-1849 (Pillar 2 D2): docs endpoint — serves instance-config docs to
   // authenticated agents using their lpx proxy token (read-only, no admin secret).
   app.use("/docs", createGuidanceRouter());
@@ -778,6 +772,13 @@ export function createApp(options?: CreateAppOptions) {
     turnLivenessProbe: new TurnLivenessProbe({ sessionTracker }),
     config: livenessDispatchStore.config,
   });
+
+  // INF-322/INF-356: health snapshot endpoint — registered at bootstrap and
+  // wired to the live liveness channel so GET /health/snapshot reflects real
+  // delegated tickets instead of the original empty stub.
+  app.use("/health", createHealthSnapshotRouter({ livenessEndpoint }));
+  registerSnapshot();
+
   const throttle = new DeliveryThrottle();
 
   // ── AI-2091 §9 (AI-1808 addendum): dispatch-integrity gate liveness ──────────
@@ -1581,7 +1582,7 @@ export function createApp(options?: CreateAppOptions) {
   registerTtlInvalidationCron(ttlCache, 60_000);
   log.info("INF-193: TTL cache invalidation cron registered (every 60s)");
 
-  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, transcriptRedactionHealth: getTranscriptRedactionHealth() });
+  return bindReturnedCloseMethods({ app, agentQueue, backlogController, bag, sessionTracker, operationalEventStore, deadLetterQueue, enrolledTicketsStore, observationStore, wakeConfig, wakeConfigForAgent, resignalOptions, ackTracker, dispatchDeliveryScheduler, watchdog, noActivityDetector, holdRetryTracker, managingPoller, managingStateStore, mutationAuditStore, idempotencyStore, proposalStore, dispatchLeaseStore, livenessDispatchStore, transcriptRedactionHealth: getTranscriptRedactionHealth() });
 }
 
 /**
