@@ -104,6 +104,20 @@ For reference or when the wizard isn't available. The wizard above automates mos
 
    Restart the connector so it picks up the secret.
 
+### Phase 2.5: Verify Pushes (INF-422)
+
+Broken credential helpers can cause silent git push failures. After any `git push` to `github.com`, verify that the branch actually reached the remote:
+
+```bash
+# Verify the current branch landed on origin
+./scripts/verify-push.sh
+
+# Or specify branch and remote
+./scripts/verify-push.sh my-fix-branch origin
+```
+
+If verification fails, do NOT report the work as "pushed" or open a PR. Fix the credential helper first (`./scripts/validate-credential-helper.sh`).
+
 ### Phase 3: Create OAuth App (Per Agent)
 
 Repeat this phase for each agent you want to connect.
