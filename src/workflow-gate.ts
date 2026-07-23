@@ -118,6 +118,10 @@ export interface WorkflowTransition {
   command: string;
   to: string;
   requires_capability?: string;
+  /** INF-359: cheap product-definition gate; ticket description must carry a capability statement section/marker. */
+  requires_capability_statement?: boolean;
+  /** INF-359: validation approval gate; ticket description must carry passed demonstration-walk evidence. */
+  requires_demonstration_walk?: boolean;
   /** Matt directive 2026-07-12: opt-in designated-approver semantics. When true
    *  (and requires_capability is set), a caller holding that capability may fire
    *  THIS transition without being the ticket's delegate — how a def nominates a
@@ -193,6 +197,20 @@ export interface FanoutConfig {
    *  reviews/edits it before running the spawn command. Human-authored content
    *  always wins: an existing non-empty spec section is never overwritten. */
   auto_derive_from?: string;
+  /** INF-359: require each spec entry to classify its relationship to a capability. */
+  classification_required?: boolean;
+  /** INF-359: metadata field name used for classification, defaults to "classification". */
+  classification_field?: string;
+  /** INF-359: allowed classification values. */
+  allowed_classifications?: string[];
+  /** INF-359: warn/nudge when standalone entries exceed this share; does not block. */
+  standalone_share_nudge_above?: number;
+  /** INF-359: optional verification child fanout per capability. */
+  integration_verify?: {
+    child_workflow: string;
+    per_capability: boolean;
+    blocked_by: "capability-components" | string;
+  };
 }
 
 export interface WorkflowState {
@@ -872,6 +890,44 @@ export function validateFanoutBarrierConfig(def: WorkflowDef): string[] {
         }
         if (cfg.block_siblings !== undefined && typeof cfg.block_siblings !== "boolean") {
           errors.push(`Workflow state '${state.id}' fanout block_siblings must be a boolean when present.`);
+        }
+        if (cfg.classification_required !== undefined && typeof cfg.classification_required !== "boolean") {
+          errors.push(`Workflow state '${state.id}' fanout classification_required must be a boolean when present.`);
+        }
+        if (cfg.classification_field !== undefined && (typeof cfg.classification_field !== "string" || cfg.classification_field.trim() === "")) {
+          errors.push(`Workflow state '${state.id}' fanout classification_field must be a non-empty string when present.`);
+        }
+        if (
+          cfg.allowed_classifications !== undefined &&
+          (!Array.isArray(cfg.allowed_classifications) ||
+            cfg.allowed_classifications.some((v) => typeof v !== "string" || v.trim() === ""))
+        ) {
+          errors.push(`Workflow state '${state.id}' fanout allowed_classifications must be a non-empty string array when present.`);
+        }
+        if (
+          cfg.standalone_share_nudge_above !== undefined &&
+          (typeof cfg.standalone_share_nudge_above !== "number" ||
+            cfg.standalone_share_nudge_above < 0 ||
+            cfg.standalone_share_nudge_above > 1)
+        ) {
+          errors.push(`Workflow state '${state.id}' fanout standalone_share_nudge_above must be a number between 0 and 1 when present.`);
+        }
+        if (cfg.integration_verify !== undefined) {
+          const iv = cfg.integration_verify as unknown;
+          if (iv === null || typeof iv !== "object") {
+            errors.push(`Workflow state '${state.id}' fanout integration_verify must be an object when present.`);
+          } else {
+            const ivCfg = iv as Record<string, unknown>;
+            if (typeof ivCfg.child_workflow !== "string" || !wfLabelPattern.test(ivCfg.child_workflow)) {
+              errors.push(`Workflow state '${state.id}' fanout integration_verify.child_workflow must be a wf:* label.`);
+            }
+            if (ivCfg.per_capability !== true) {
+              errors.push(`Workflow state '${state.id}' fanout integration_verify.per_capability must be true.`);
+            }
+            if (ivCfg.blocked_by !== "capability-components") {
+              errors.push(`Workflow state '${state.id}' fanout integration_verify.blocked_by must be "capability-components".`);
+            }
+          }
         }
 
         // AI-2523: spawn_if validation
@@ -2374,6 +2430,22 @@ async function fetchIssueDescription(issueId: string, authToken: string): Promis
   }
 }
 
+export function hasCapabilityStatementEvidence(description: string | null | undefined): boolean {
+  if (!description) return false;
+  return (
+    /<!--\s*capability-statement\b[\s\S]*?-->/i.test(description) ||
+    /^#{1,6}\s+capability statements?\b/im.test(description)
+  );
+}
+
+export function hasPassedDemonstrationWalkEvidence(description: string | null | undefined): boolean {
+  if (!description) return false;
+  return (
+    /<!--\s*demonstration-walk:\s*pass(?:ed)?\s*-->/i.test(description) ||
+    /^#{1,6}\s+demonstration walk\b[\s\S]*?\b(pass|passed)\b/im.test(description)
+  );
+}
+
 /**
  * AI-1776 AC2: Post a fail-visible warning comment when a capture_ac: true
  * transition captures nothing (null extraction or description fetch failure).
@@ -3148,6 +3220,31 @@ export async function checkWorkflowRules(
       `Provide a sprint-plan doc reference via the --artifact-ref flag (or X-Openclaw-Artifact-Ref header). ` +
       `Example: ai-systems/projects/<project>/sprints/<sprint-plan>.md`
     );
+  }
+
+  if ((match.requires_capability_statement || match.requires_demonstration_walk) && !breakGlassOverride) {
+    const { description, fetchFailed } = await fetchIssueDescription(issueId, authToken);
+    if (fetchFailed) {
+      log.warn(`workflow-gate: v8 evidence gate: ${intent} on ${issueId} could not fetch description`);
+      return (
+        `[Proxy] '${intent}' blocked: unable to fetch the ticket description to verify required sprint evidence. ` +
+        `Retry once Linear is readable, or use break-glass if a steward intentionally needs to override.`
+      );
+    }
+    if (match.requires_capability_statement && !hasCapabilityStatementEvidence(description)) {
+      log.warn(`workflow-gate: capability-statement gate: ${intent} on ${issueId} requires a capability statement`);
+      return (
+        `[Proxy] '${intent}' requires at least one capability statement in the ticket description. ` +
+        `Add a '## Capability Statement' or '## Capability Statements' section, then retry.`
+      );
+    }
+    if (match.requires_demonstration_walk && !hasPassedDemonstrationWalkEvidence(description)) {
+      log.warn(`workflow-gate: demonstration-walk gate: ${intent} on ${issueId} requires passed demonstration evidence`);
+      return (
+        `[Proxy] '${intent}' requires passed demonstration-walk evidence in the ticket description. ` +
+        `Add a '## Demonstration Walk' section showing the walk passed, then retry.`
+      );
+    }
   }
 
   // Phase 6.5 / H-7 (AI-1482): Stakes-threshold sign-off gate.

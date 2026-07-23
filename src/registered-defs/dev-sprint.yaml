@@ -1,7 +1,7 @@
-# dev-sprint — Sprint Execution Workflow (v7)
+# dev-sprint — Sprint Execution Workflow (v8)
 # owner: steward (Astrid), engine (spawn-arms, spawn-impl)
-# last-updated: 2026-07-21
-# status: v7 deployed to production (INF-258 fix, 2026-07-21)
+# last-updated: 2026-07-22
+# status: v8 deployed to production (INF-359 sprint coherence)
 #
 # v5 (2026-07-21): added `cancelled` terminal state — explicit sprint
 #   termination path without completing (break-glass, not normal).
@@ -11,6 +11,10 @@
 #   not hand-author it (INF-258).
 # v7 (2026-07-21): incremental re-entry fix — re-running spawn after
 #   children exist uses the dedup path (AI-1994) instead of re-creating.
+# v8 (2026-07-22): sprint coherence gates — product-definition requires
+#   capability statements; implementation fanout requires classification and
+#   adds per-capability integration-verify children; validation approval
+#   requires passed demonstration-walk evidence.
 #
 # Registered-def copy for CI conformance validation (INF-42). The canonical
 # source is the vault markdown spec at:
@@ -66,6 +70,7 @@ states:
       - command: continue
         to: spawn-arms
         generic: continue
+        requires_capability_statement: true
 
   - id: spawn-arms
     owner_role: engine
@@ -123,6 +128,16 @@ states:
       spec_source: findings
       child_workflow: wf:dev-impl
       initial_delegate: astrid
+      classification_required: true
+      classification_field: classification
+      allowed_classifications:
+        - traces-to-capability
+        - declared-standalone
+      standalone_share_nudge_above: 0.5
+      integration_verify:
+        child_workflow: wf:integration-verify
+        per_capability: true
+        blocked_by: capability-components
     transitions:
       - command: spawn
         to: managing-impl
@@ -155,6 +170,7 @@ states:
         to: post-validation
         generic: continue
         requires_human_signoff_above_stakes: true
+        requires_demonstration_walk: true
       - command: reject
         to: ac-definition
         generic: revision

@@ -1,0 +1,54 @@
+# integration-verify — Behavior-level capability verification child workflow (v1)
+# owner: steward
+# last-updated: 2026-07-22
+# status: v1 registered for dev-sprint v8 (INF-359)
+#
+# Spawned by dev-sprint spawn-impl, one child per capability. Component
+# implementation children block this ticket; the verifier records a
+# demonstration walk before completion.
+
+id: integration-verify
+version: 1
+archetype: single-task
+entry_state: intake
+
+break_glass:
+  command: escape
+  to: intake
+  owner_role: steward
+
+states:
+
+  - id: intake
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    description: >
+      Receive the capability verification brief and confirm the blocking
+      component tickets represent the capability surface to demonstrate.
+    transitions:
+      - command: accept
+        to: verification
+        generic: continue
+
+  - id: verification
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    description: >
+      Run the behavior-level demonstration walk for the capability and record
+      evidence on the sprint parent.
+    transitions:
+      - command: complete
+        to: done
+        generic: continue
+        requires_comment: true
+      - command: request-changes
+        to: verification
+        generic: revision
+        requires_comment: true
+
+  - id: done
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true

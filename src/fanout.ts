@@ -84,6 +84,10 @@ export interface Finding {
    * Parsed from the `[wf:sprint-arm-ux → signe]` marker (the part after →).
    */
   delegate?: string;
+  /** INF-359: classification of this implementation entry. */
+  classification?: string;
+  /** INF-359: capability this entry traces to, when classification requires one. */
+  capability?: string;
 }
 
 /**
@@ -224,6 +228,21 @@ function withStableIds(findings: Finding[]): Finding[] {
   return findings.map((f) => ({ ...f, id: deriveFindingId(f.title, f.description) }));
 }
 
+function extractMetadataValue(material: string, field: string): string | undefined {
+  const escaped = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`(?:^|[;\\n])\\s*${escaped}\\s*:\\s*([^;\\n]+)`, "i").exec(material);
+  return match?.[1]?.trim();
+}
+
+function withFindingMetadata(finding: Finding): Finding {
+  const material = `${finding.title}\n${finding.description ?? ""}`;
+  return {
+    ...finding,
+    classification: finding.classification ?? extractMetadataValue(material, "classification"),
+    capability: finding.capability ?? extractMetadataValue(material, "capability"),
+  };
+}
+
 // ── Finding extraction ────────────────────────────────────────────────────
 
 /**
@@ -288,10 +307,12 @@ export function extractFindings(description: string | null | undefined, fallback
           for (const item of parsed) {
             if (typeof item === "string" && item.trim()) {
               findings.push({ title: item.trim() });
-            } else if (typeof item === "object" && item.title) {
+            } else if (item && typeof item === "object" && "title" in item && item.title) {
               findings.push({
                 title: String(item.title).trim(),
-                description: item.description ? String(item.description).trim() : undefined,
+                description: "description" in item && item.description ? String(item.description).trim() : undefined,
+                classification: "classification" in item && item.classification ? String(item.classification).trim() : undefined,
+                capability: "capability" in item && item.capability ? String(item.capability).trim() : undefined,
               });
             }
           }
@@ -393,6 +414,8 @@ export function extractSpecFindings(
               findings.push({
                 title: String(item.title).trim(),
                 description: item.description ? String(item.description).trim() : undefined,
+                classification: item.classification ? String(item.classification).trim() : undefined,
+                capability: item.capability ? String(item.capability).trim() : undefined,
               });
             }
           }
@@ -405,7 +428,7 @@ export function extractSpecFindings(
 
   // AI-1994: every extracted entry carries a stable, engine-derived id so the
   // fan-out can dedup against already-spawned children on re-entry.
-  return withStableIds(findings);
+  return withStableIds(findings.map(withFindingMetadata));
 }
 
 // ── INF-123: Auto-derive Findings from completed arm children ──────────────
@@ -752,6 +775,36 @@ export function validateFanoutSpec(
         `fan-out spec is empty or unparseable: no '${config.spec_source}' entries found in the ticket description. ` +
         `Add a '## ${config.spec_source}' section with at least one bullet (e.g. "- **Title**: detail") and retry the spawn.`,
     };
+  }
+  if (config.classification_required) {
+    const field = config.classification_field?.trim() || "classification";
+    const allowed = new Set(config.allowed_classifications ?? []);
+    for (const f of findings) {
+      const classification = f.classification ?? extractMetadataValue(`${f.title}\n${f.description ?? ""}`, field);
+      if (!classification) {
+        return {
+          ok: false,
+          reason: `fan-out spec entry "${f.title}" is unclassified — add '${field}: traces-to-capability' or '${field}: declared-standalone'.`,
+        };
+      }
+      if (allowed.size > 0 && !allowed.has(classification)) {
+        return {
+          ok: false,
+          reason: `fan-out spec entry "${f.title}" has unsupported ${field} '${classification}'. Allowed values: ${[...allowed].join(", ")}.`,
+        };
+      }
+    }
+    const standaloneCount = findings.filter((f) => (f.classification ?? "") === "declared-standalone").length;
+    const standaloneShare = standaloneCount / findings.length;
+    if (
+      typeof config.standalone_share_nudge_above === "number" &&
+      standaloneShare > config.standalone_share_nudge_above
+    ) {
+      log.warn(
+        `fanout: standalone share ${standaloneCount}/${findings.length} (${standaloneShare.toFixed(2)}) ` +
+        `exceeds nudge threshold ${config.standalone_share_nudge_above}; allowing classified spec`,
+      );
+    }
   }
   // AI-2199: validate per-entry child workflow ids against the registry.
   // When registeredWorkflows is provided, every finding with child_workflow
@@ -1278,7 +1331,8 @@ export async function executeFanout(
 
   // 2. Extract findings from the config-named spec source (AC5 strict — no
   //    title fallback). A pre-flight validated caller may pass findingsOverride.
-  const findings = options?.findingsOverride ?? extractSpecFindings(parentCtx.description, config.spec_source);
+  const findings = (options?.findingsOverride ?? extractSpecFindings(parentCtx.description, config.spec_source))
+    .map(withFindingMetadata);
   log.info(`fanout: extracted ${findings.length} finding(s) from parent ${parentIssueId} (spec_source=${config.spec_source})`);
 
   if (findings.length === 0) {
@@ -1443,6 +1497,9 @@ export async function executeFanout(
   // whole fan-out before any mint if the target team lacks any referenced wf:*.
   const workflowLabelIds = new Map<string, string>();
   const distinctWorkflowLabels = [...new Set(toSpawn.map((f) => f.child_workflow ?? childWorkflowLabel))];
+  if (config.integration_verify?.child_workflow) {
+    distinctWorkflowLabels.push(config.integration_verify.child_workflow);
+  }
   for (const labelName of distinctWorkflowLabels) {
     const labelId = await findLabel(parentCtx.teamId, labelName, authToken);
     if (labelId) {
@@ -1481,6 +1538,7 @@ export async function executeFanout(
   }
 
   const createdInternalIds: string[] = [];
+  const createdComponents: Array<{ internalId: string; identifier: string; finding: Finding }> = [];
 
   // AI-1994: only the deduped `toSpawn` set is minted — existing children are
   // left untouched.
@@ -1573,6 +1631,7 @@ export async function executeFanout(
       result.created++;
       result.childIdentifiers.push(child.identifier);
       createdInternalIds.push(child.internalId);
+      createdComponents.push({ ...child, finding });
       log.info(`fanout: created child ${child.identifier} — "${childTitle}" (finding ${i + 1}/${toSpawn.length})`);
     } else {
       result.errors.push({
@@ -1586,6 +1645,86 @@ export async function executeFanout(
   // INF-28: append newly created children to the spec-matched set so the barrier
   // waits on all children that match the current spec — both existing and minted.
   result.specMatchedChildren.push(...result.childIdentifiers);
+
+  if (
+    config.integration_verify?.per_capability === true &&
+    config.integration_verify.blocked_by === "capability-components" &&
+    createdComponents.length > 0
+  ) {
+    const verifyWorkflow = config.integration_verify.child_workflow;
+    const verifyWfLabelId = workflowLabelIds.get(verifyWorkflow);
+    if (!verifyWfLabelId) {
+      result.errors.push({
+        findingIndex: -1,
+        message: `Failed to resolve integration verification workflow label '${verifyWorkflow}'`,
+      });
+    } else {
+      const groups = new Map<string, Array<{ internalId: string; identifier: string; finding: Finding }>>();
+      for (const component of createdComponents) {
+        if (component.finding.classification !== "traces-to-capability") continue;
+        const capability = component.finding.capability?.trim();
+        if (!capability) continue;
+        const existing = groups.get(capability) ?? [];
+        existing.push(component);
+        groups.set(capability, existing);
+      }
+
+      for (const [capability, components] of groups) {
+        const entryStateLabel = options?.lookupEntryState
+          ? await options.lookupEntryState(verifyWorkflow)
+          : undefined;
+        const stateLabelName = entryStateLabel ?? "state:intake";
+        let entryStateLabelId: string | undefined | null = stateLabelCache.get(stateLabelName);
+        if (!entryStateLabelId) {
+          entryStateLabelId = await findOrCreateLabel(parentCtx.teamId, stateLabelName, authToken);
+          if (entryStateLabelId) {
+            stateLabelCache.set(stateLabelName, entryStateLabelId);
+          }
+        }
+        if (!entryStateLabelId) {
+          result.errors.push({
+            findingIndex: -1,
+            message: `Failed to resolve required label ${stateLabelName} for integration verification workflow '${verifyWorkflow}'`,
+          });
+          continue;
+        }
+
+        const verifyDescription = [
+          `Parent: ${parentIssueId}`,
+          `Capability: ${capability}`,
+          "",
+          "Blocked by component tickets:",
+          ...components.map((c) => `- ${c.identifier}: ${c.finding.title}`),
+        ].join("\n");
+        const verifyChild = await createChildIssue(
+          parentCtx.teamId,
+          `Integration verify: ${capability}`,
+          verifyDescription,
+          parentCtx.internalId,
+          [verifyWfLabelId, entryStateLabelId],
+          authToken,
+          configDelegateId,
+        );
+        if (!verifyChild) {
+          result.errors.push({
+            findingIndex: -1,
+            message: `Failed to create integration verification child for capability '${capability}'`,
+          });
+          continue;
+        }
+        result.created++;
+        result.childIdentifiers.push(verifyChild.identifier);
+        result.specMatchedChildren.push(verifyChild.identifier);
+        for (const component of components) {
+          await createBlockingRelation(component.internalId, verifyChild.internalId, authToken);
+        }
+        log.info(
+          `fanout: created integration verification child ${verifyChild.identifier} for capability '${capability}' ` +
+          `blocked by ${components.map((c) => c.identifier).join(", ")}`,
+        );
+      }
+    }
+  }
 
   // AI-1992: optional sibling blocking relations (config-driven) — each sibling
   // blocks the next so the managed children run in a defined order. Fail-open:
