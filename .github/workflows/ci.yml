@@ -34,6 +34,9 @@ jobs:
       - name: Build (tsc)
         run: npm run build
 
+      - name: Smoke Test (dist-boot)
+        run: npm run test:smoke
+
       - name: Test (jest)
         run: npm test
         env:
