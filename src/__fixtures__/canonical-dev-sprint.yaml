@@ -180,10 +180,9 @@ states:
     kind: normal
     native_state: doing
     description: >
-      AI-2524: conditional visual-audit gate at milestone close. Fans out into a
-      wf:ui-audit child ONLY when a closed impl child carries the `ui-impact`
-      label (spawn_if, AI-2523); otherwise the gate is a no-op and the sprint
-      continues to done. The human sign-off was already captured at
+      v5 (INF-176): visual-audit gate with design-provenance awareness. Spawns
+      a wf:ui-audit child when the sprint itself carries `wf:design-provenance`
+      OR when a closed child carries `ui-impact`. The human sign-off was already captured at
       validation→approve, so this transition is mechanical (no signoff). The
       milestone-close verification comment carries the Visual Audit breakpoint
       table + sign-off checkbox (see dev-sprint-milestone-close-template.ts).

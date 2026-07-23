@@ -1,18 +1,17 @@
 # sprint-arm-design — dev-sprint shaping-arm archetype (design)
 # spec of record: life-os/project-management/dev-sprint-workflow-spec.md (vault,
 #   approved by Matt 2026-07-08). AI-1993.
-# owner: ui-designer (Penny/Laren) does the design shaping; the steward completes it.
+# owner: ui-designer (Penny/Laren) does the design shaping; the steward
+#   completes it.
 #
 # One of the four shaping arms fanned out by dev-sprint at spawn-arms. Uniform
 # doing → review → done shape; done carries satisfies_parent_barrier: true so
 # the parent managing-arms barrier auto-advances only when all four arms
 # terminate cleanly (AI-1992 engine).
 #
-# Originally registered as v0 stubs (INF-45, 2026-07-16). Updated to v1
-# (INF-111, 2026-07-19) to match the live workflow defs in linear-connector/workflows/.
-# Key change from v0: entry_state: intake → entry_state: doing.
-#
-# Authority (spec table): review.owner_role: steward resolves to astrid.
+# Authority (spec table): the design shaping is COMPLETED by the steward
+# (Astrid) — review.owner_role: steward resolves to astrid. No code-review gate;
+# the steward accepts the design direction into the sprint or bounces it.
 
 id: sprint-arm-design
 version: 1
@@ -21,25 +20,29 @@ entry_state: doing
 
 break_glass:
   command: escape
-  to: doing
+  to: escape
   owner_role: steward
 
 states:
 
   - id: doing
-    owner_role: ui-designer
+    owner_role: ui-designer           # resolves to penny/laren
     kind: normal
     native_state: doing
+    # Produce the design shaping: direction, key screens/specs, assets. Hand to
+    # the steward for completion.
     transitions:
       - command: submit
         to: review
-        assign: { mode: auto }
+        assign: { mode: auto }        # review/completion is the steward (singleton astrid)
         generic: continue
 
   - id: review
-    owner_role: steward
+    owner_role: steward               # resolves to astrid — completes the arm
     kind: normal
     native_state: todo
+    # The steward accepts the design shaping into the sprint (done) or bounces
+    # it back to doing for revision.
     transitions:
       - command: accept
         to: done
@@ -59,8 +62,8 @@ states:
   - id: done
     kind: terminal
     native_state: done
-    satisfies_parent_barrier: true
+    satisfies_parent_barrier: true   # signals the parent managing-arms barrier
 
   - id: escape
     kind: terminal
-    native_state: invalid
+    native_state: invalid            # abnormal termination → Canceled column

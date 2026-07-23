@@ -8,12 +8,9 @@
 # the parent managing-arms barrier auto-advances only when all four arms
 # terminate cleanly (AI-1992 engine).
 #
-# Originally registered as v0 stubs (INF-45, 2026-07-16). Updated to v1
-# (INF-111, 2026-07-19) to match the live workflow defs in linear-connector/workflows/.
-# Key change from v0: entry_state: intake → entry_state: doing.
-#
 # Authority (spec table): the UX shaping is COMPLETED by the steward (Astrid) —
-# review.owner_role: steward resolves to astrid. No code-review gate.
+# review.owner_role: steward resolves to astrid. There is no code-review gate on
+# UX shaping; the steward accepts the shaping into the sprint or bounces it.
 
 id: sprint-arm-ux
 version: 1
@@ -22,25 +19,29 @@ entry_state: doing
 
 break_glass:
   command: escape
-  to: doing
+  to: escape
   owner_role: steward
 
 states:
 
   - id: doing
-    owner_role: ux-researcher
+    owner_role: ux-researcher         # resolves to signe
     kind: normal
     native_state: doing
+    # Produce the UX shaping: user flows, usability considerations, open
+    # questions. Hand to the steward for completion.
     transitions:
       - command: submit
         to: review
-        assign: { mode: auto }
+        assign: { mode: auto }        # review/completion is the steward (singleton astrid)
         generic: continue
 
   - id: review
-    owner_role: steward
+    owner_role: steward               # resolves to astrid — completes the arm
     kind: normal
     native_state: todo
+    # The steward accepts the UX shaping into the sprint (done) or bounces it
+    # back to doing for revision.
     transitions:
       - command: accept
         to: done
@@ -60,8 +61,8 @@ states:
   - id: done
     kind: terminal
     native_state: done
-    satisfies_parent_barrier: true
+    satisfies_parent_barrier: true   # signals the parent managing-arms barrier
 
   - id: escape
     kind: terminal
-    native_state: invalid
+    native_state: invalid            # abnormal termination → Canceled column

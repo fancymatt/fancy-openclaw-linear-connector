@@ -1,22 +1,19 @@
 # sprint-arm-scope — dev-sprint shaping-arm archetype (scope)
 # spec of record: life-os/project-management/dev-sprint-workflow-spec.md (vault,
 #   approved by Matt 2026-07-08). AI-1993.
-# owner: sprint-owner (Astrid) does the scoping; cra reviews the scope artifact.
+# owner: sprint-owner (Astrid) does the scoping; charles reviews the scope artifact.
 #
 # One of the four shaping arms fanned out by dev-sprint at spawn-arms. Every arm
 # is a uniform doing → review → done shape whose `done` terminal carries
 # satisfies_parent_barrier: true, so the parent managing-arms barrier
 # auto-advances only when all four arms terminate cleanly (AI-1992 engine).
 #
-# Originally registered as v0 stubs (INF-45, 2026-07-16). Updated to v1
-# (INF-111, 2026-07-19) to match the live workflow defs in linear-connector/workflows/.
-# The v0 defs had entry_state: intake which created a def-skew bug: the fanout
-# mint path created children at "state:intake" while the live proxy validated
-# against the v1 entering state "doing", causing the proxy to auto-migrate
-# all children to escape (terminal stranded).
+# Authority (spec table): the scope artifact is REVIEWED by charles (the code-review
+# functionary) — review.owner_role: code-review resolves to charles.
 #
-# Archetype: single-task — doing → review → done, no fanout or barrier.
-# Authority: code-review (cra) owns review gate.
+# native_state (AI-1498): work-phases project to `doing`/`todo`; done → done,
+# escape → invalid (Canceled column). Terminal states still carry native_state
+# or the registry loader fails the def closed.
 
 id: sprint-arm-scope
 version: 1
@@ -25,7 +22,7 @@ entry_state: doing
 
 break_glass:
   command: escape
-  to: doing
+  to: escape
   owner_role: steward
 
 states:
@@ -34,16 +31,20 @@ states:
     owner_role: sprint-owner
     kind: normal
     native_state: doing
+    # Produce the scope artifact: what's in, what's out, boundaries, the debt
+    # candidates. Hand to charles for review.
     transitions:
       - command: submit
         to: review
-        assign: { mode: auto }
+        assign: { mode: auto }        # review is charles (singleton code-review)
         generic: continue
 
   - id: review
-    owner_role: code-review
+    owner_role: code-review           # resolves to charles
     kind: normal
     native_state: todo
+    # charles reviews the scope artifact for completeness/coherence, then completes
+    # the arm (done) or bounces it back to doing for revision.
     transitions:
       - command: approve
         to: done
@@ -63,8 +64,8 @@ states:
   - id: done
     kind: terminal
     native_state: done
-    satisfies_parent_barrier: true
+    satisfies_parent_barrier: true   # signals the parent managing-arms barrier
 
   - id: escape
     kind: terminal
-    native_state: invalid
+    native_state: invalid            # abnormal termination → Canceled column

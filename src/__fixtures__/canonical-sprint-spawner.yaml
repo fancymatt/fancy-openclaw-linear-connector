@@ -1,12 +1,18 @@
-# sprint-spawner — Continuous-loop workflow definition (v4)
+# sprint-spawner — Continuous-loop workflow definition (v5)
 # owner: steward (evaluating, scanning, determining-scope, scoping, launching,
 #         managing, releasing, retrospecting); engine (spawning-scope, launching)
-# last-updated: 2026-07-16
+# last-updated: 2026-07-19
+# INF-136 (2026-07-19): max_findings: 1 guard on launching's fanout — a multi-bullet
+#   `## sprint` section is refused instead of silently spawning parallel dev-sprint
+#   children. The engine-level guard (validateFanoutSpec) catches the violation;
+#   a loud alert posts to the ticket and fires the notify bus. Bumped to v5 for
+#   deploy verifiability.
 # INF-45 (2026-07-16): resolved fanout-before-barrier waiver by repointing deliver-direct→releasing
 #   (Option A). deliver-direct has no dev-sprint child, so managing's barrier would vacuously satisfy.
 #   Releasing is a non-barrier state, so the structural invariant is satisfied without a waiver.
 #   The `invariant_skip: [fanout-before-barrier]` entry on determining-scope was removed.
-# status: v4 — per-sprint scoping child, fresh launch ticket, emoji naming, Ai-signoff
+# status: v5 — max_findings guard on launching, per-sprint scoping child, fresh launch ticket,
+#   emoji naming, Ai-signoff
 #
 # INF-30 (Astrid, 2026-07-17): added `fanout:` to `launching` (was missing — root cause of
 # LIF-2 barrier fall-through). The engine now mints wf:dev-sprint from a `## sprint` block the
@@ -59,7 +65,8 @@ id: sprint-spawner
 # signal that the fanout is actually live. Left at 3, a deployed and an undeployed
 # connector are indistinguishable at /health — the exact trap that let AI-2406 sit
 # "done" while the engine ran the old def.
-version: 4
+# INF-136: bumped 4 → 5 for max_findings guard on launching fanout.
+version: 6
 archetype: continuous-loop
 entry_state: evaluating
 
@@ -75,11 +82,12 @@ entry_state: evaluating
 migrations:
   evaluate: evaluating
   dormant: evaluating
-  escape: evaluating         # P2(d) AGI-16: escape → loop entry for recovery
+  escape: evaluating
 
+# AI-1710 pattern (INF-178): escape re-enters at evaluating (loop entry), not a terminal
 break_glass:
   command: escape
-  to: evaluating              # P2(d) AGI-16: re-enter the loop instead of terminating
+  to: evaluating
   owner_role: steward
 
 states:
@@ -209,6 +217,9 @@ states:
       spec_source: sprint
       child_workflow: wf:dev-sprint
       initial_delegate: astrid
+      # INF-136: exactly one sprint child per cycle — a multi-bullet ## sprint
+      # section is refused, not parallel-spawned.
+      max_findings: 1
     transitions:
       - command: spawn
         to: managing
@@ -257,7 +268,8 @@ states:
     native_state: done
     satisfies_parent_barrier: true
 
-  # escape terminal state removed in P2(d) AGI-16 — break_glass now re-enters at evaluating
+  # escape removed (INF-178): break_glass.to now points to evaluating
+  # Migration: escape → evaluating added above
 
   - id: __terminal_hold__
     kind: terminal
