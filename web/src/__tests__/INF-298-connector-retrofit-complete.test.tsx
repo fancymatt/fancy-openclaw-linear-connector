@@ -168,8 +168,6 @@ describe("INF-298 AC2 — theme.css contains zero bespoke hex color values", () 
       // Skip font-family, margin, padding, box-sizing, color-scheme, etc.
       // We're checking ONLY color-value assignments — values that represent colors.
       const value = decl.split(/:\s*/)[1]?.replace(/;$/, "").trim() || "";
-      const key = decl.split(/:\s*/)[0]?.trim() || "";
-
       // If the value looks like a color (starts with # or rgb), it must be a var() reference
       if (value.startsWith("#") || value.startsWith("rgb")) {
         expect(value).toMatch(/var\(--ff-/);
