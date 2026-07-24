@@ -51,6 +51,7 @@ import { registerRegistryIntegrityCron } from "./registry-integrity-cron.js";
 import { getAlertBus } from "./alerts/alert-bus.js";
 import { registerSlaSweepCron } from "./sla-sweep.js";
 import { registerValidationWatchdogCron } from "./validation-sla-watchdog.js";
+import { registerIntakeAckWatchdogCron } from "./intake-ack-watchdog.js";
 import { registerLabelSyncAuditCron } from "./cron/label-sync-audit.js";
 import { registerAntiEntropyCron } from "./cron/anti-entropy.js";
 import { registerOobReconcileCron } from "./oob-reconcile-sweep.js";
@@ -2083,6 +2084,47 @@ if (isEntryPoint) {
     if (!validationAuthToken) missing.push("auth token");
     if (!validationValidatorUserId) missing.push("validator Linear user ID");
     log.warn(`INF-105: Validation watchdog NOT registered — missing: ${missing.join(", ")}`);
+  }
+
+  const intakeAckAuthToken = resolveValidationAuthToken();
+  const intakeAckDataDir = process.env.DATA_DIR ?? resolveStatePath("data");
+  const intakeAckNudgeStorePath =
+    process.env.INTAKE_ACK_NUDGE_STORE_PATH ?? path.join(intakeAckDataDir, "intake-ack-nudges.db");
+  const intakeAckAgentLinearUserIds = new Set(
+    getAgents()
+      .map((agent) => agent.linearUserId)
+      .filter((id): id is string => Boolean(id)),
+  );
+
+  if (intakeAckAuthToken && intakeAckAgentLinearUserIds.size > 0) {
+    registerIntakeAckWatchdogCron({
+      authToken: resolveValidationAuthToken,
+      agentLinearUserIds: intakeAckAgentLinearUserIds,
+      wakeAgent: async (identifier, agentName) => {
+        const sessionKey = normalizeSessionKey(identifier);
+        if (sessionTracker.isActiveForTicket(agentName, sessionKey)) {
+          log.info(`INF-473 re-dispatch skipped for ${agentName} [${sessionKey}]: session already active`);
+          return;
+        }
+        const agentCfg = getAgent(agentName);
+        const deliveryConfig: DeliveryConfig = {
+          nodeBin: process.execPath,
+          hooksUrl: agentCfg?.hooksUrl ?? process.env.OPENCLAW_HOOKS_URL,
+          hooksToken: agentCfg?.hooksToken ?? process.env.OPENCLAW_HOOKS_TOKEN,
+          hooksThinking: process.env.OPENCLAW_HOOKS_THINKING,
+          hooksModel: process.env.OPENCLAW_HOOKS_MODEL,
+          gatewayUrl: agentCfg?.gatewayUrl,
+          gatewayToken: agentCfg?.gatewayToken,
+        };
+        const actionText = `Intake-ack timeout for ${identifier}`;
+        const message =
+          (await buildWorkflowAwareDeliveryMessage(identifier, intakeAckAuthToken, actionText)) ??
+          actionText;
+        await deliverMessageToAgent(agentName, sessionKey, message, deliveryConfig);
+      },
+      nudgeStorePath: intakeAckNudgeStorePath,
+    });
+    log.info(`INF-473: Intake-ack watchdog cron registered with ${intakeAckAgentLinearUserIds.size} agent user IDs`);
   }
 
   // AI-2554: label-sync audit cron — periodic check for proxy-store vs Linear state divergence.
