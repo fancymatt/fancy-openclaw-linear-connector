@@ -74,7 +74,8 @@ export type RoutingReason =
   | "mention"
   | "body-mention"
   | "department-prefix"
-  | "steward-escalation";
+  | "steward-escalation"
+  | "manual-hold";
 
 /**
  * Routing reasons that carry a delegate/assignee ownership claim on the ticket,
@@ -90,7 +91,14 @@ const OWNERSHIP_REASONS = new Set<RoutingReason>(["delegate", "assignee"]);
  * mention / body-mention — a genuine @mention on a human-assigned ticket is a
  * legitimate wake (someone explicitly pinged the agent) and must still land.
  */
-const ROSTER_FANOUT_REASONS = new Set<RoutingReason>(["department-prefix", "steward-escalation"]);
+const ROSTER_FANOUT_REASONS = new Set<RoutingReason>(["department-prefix", "steward-escalation", "manual-hold"]);
+
+/**
+ * INF-476: Manual dispatch hold.
+ * Tickets in this list are blocked from dispatch regardless of state or delegate.
+ * Used when a workflow loop needs to be frozen without a governed 'park' move.
+ */
+const DISPATCH_HOLD_TICKETS = new Set<string>(["INF-196", "LIF-45"]);
 
 /**
  * Is this Linear user a human rather than one of our agents?
@@ -269,6 +277,12 @@ export async function checkLinearIssueRouting(
 
     const issue = body.data?.issue;
 
+    // ── Gate 0: INF-476 MANUAL HOLD ─────────────────────────────────────
+    if (DISPATCH_HOLD_TICKETS.has(identifier)) {
+      log.info(`Dropping ${routingReason ?? "unrouted"} event for ${identifier}: ticket is on MANUAL DISPATCH HOLD (INF-476)`);
+      return { actionable: false, failOpen: false };
+    }
+
     // ── Gate 1: LIVENESS (all routing reasons, AI-2295) ──────────────────
     // AI-2091 §2 (G2): an OK response with no errors and a null issue is a
     // DEFINITIVE not-found — the ticket does not exist (dead identifier /
@@ -435,6 +449,12 @@ export async function isLinearIssueActionable(ticketId: string, agentId: string)
     // commentCreate with "Entity not found: Issue". Treat as non-actionable.
     if (issue.trashed || issue.archivedAt) {
       log.info(`Dropping pending Linear ticket ${identifier}: ticket is ${issue.trashed ? "trashed" : "archived"}`);
+      return false;
+    }
+
+    // INF-476: Manual hold guard
+    if (DISPATCH_HOLD_TICKETS.has(identifier)) {
+      log.info(`Dropping pending Linear ticket ${identifier}: ticket is on MANUAL DISPATCH HOLD (INF-476)`);
       return false;
     }
 
