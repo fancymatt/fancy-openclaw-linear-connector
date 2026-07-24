@@ -555,6 +555,10 @@ states:
       "charles",
       null,
       "user-charles",
+      undefined,
+      false,
+      false,
+      true, // INF-443: refuse-work now requires a comment
     );
 
     expect(result).toBeNull();

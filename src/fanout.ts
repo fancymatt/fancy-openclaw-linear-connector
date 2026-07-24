@@ -1579,7 +1579,9 @@ export async function executeFanout(
     const entryStateLabel = options?.lookupEntryState
       ? await options.lookupEntryState(findingWorkflow)
       : undefined;
-    const stateLabelName = entryStateLabel ?? "state:intake";
+    // INF-441: default to 'state:todo' (To Do) instead of 'state:intake' (Backlog)
+    // for all spawned children to ensure they are dispatched and not silently inert.
+    const stateLabelName = entryStateLabel ?? "state:todo";
     let entryStateLabelId: string | undefined | null = stateLabelCache.get(stateLabelName);
     if (!entryStateLabelId) {
       entryStateLabelId = await findOrCreateLabel(parentCtx.teamId, stateLabelName, authToken);

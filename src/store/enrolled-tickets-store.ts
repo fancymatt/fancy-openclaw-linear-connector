@@ -22,6 +22,7 @@ export interface EnrollInput {
   state: string;
   delegate: string | null;
   designatedApprover?: string | null;
+  entryStateLabel?: string;
 }
 
 export interface TransitionInput {

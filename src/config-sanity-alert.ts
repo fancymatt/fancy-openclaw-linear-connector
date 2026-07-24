@@ -84,6 +84,8 @@ export interface ConfigSanityAlertLiveness {
   lastFindingCount: number | null;
   /** ISO timestamp of the last alert fired, or null. */
   lastAlertAt: string | null;
+  /** Top 10 findings from the last read (AI-2633). */
+  topFindings?: WatchdogFinding[];
 }
 
 // ── Singleton state ─────────────────────────────────────────────────────
@@ -92,6 +94,7 @@ let scheduled = false;
 let lastReadAt: string | null = null;
 let lastFindingCount: number | null = null;
 let lastAlertAt: string | null = null;
+let lastTopFindings: WatchdogFinding[] = [];
 
 // ── Dedup key computation ───────────────────────────────────────────────
 
@@ -108,6 +111,12 @@ let lastAlertAt: string | null = null;
 export function dedupKeyForFinding(finding: WatchdogFinding): string {
   if (finding.check === "git-remote-liveness" && finding.severity === "critical") {
     return GIT_REMOTE_LIVENESS_DEDUP_KEY;
+  }
+  // AI-2633: use persistent noise deduplication for known benign classes.
+  // We include severity in the noise key so a benign finding that escalates
+  // to critical (e.g. from a threshold change) breaks deduplication.
+  if (finding.dedupe) {
+    return `config-sanity:noise:${finding.check}:${finding.severity}:${finding.dedupe}`;
   }
   return `${finding.check}:${finding.severity}`;
 }
@@ -158,6 +167,8 @@ export function processWatchdogOutput(output: WatchdogOutput, now = new Date()):
   lastReadAt = nowIso;
   lastFindingCount = findings.length;
 
+  lastTopFindings = findings.slice(0, 10);
+
   for (const finding of findings) {
     const dedupKey = dedupKeyForFinding(finding);
     const severity = finding.severity === "critical" || finding.severity === "warning"
@@ -172,8 +183,8 @@ export function processWatchdogOutput(output: WatchdogOutput, now = new Date()):
       ticket: finding.ticket ?? undefined,
       dedupKey,
       // git-remote-liveness critical uses a 6h suppression window (AI-2620)
-      // so the 30-min cron cadence doesn't create fresh pushes every cycle.
-      suppressWindowMs: finding.check === "git-remote-liveness" && severity === "critical"
+      // AI-2633: findings with a 'dedupe' hint (persistent noise) also use 6h.
+      suppressWindowMs: (finding.check === "git-remote-liveness" && severity === "critical") || finding.dedupe
         ? 6 * 60 * 60_000
         : undefined,
     });
@@ -205,6 +216,7 @@ export function getConfigSanityAlertLiveness(): ConfigSanityAlertLiveness {
     lastReadAt,
     lastFindingCount,
     lastAlertAt,
+    topFindings: lastTopFindings,
   };
 }
 
@@ -215,6 +227,7 @@ export function _resetConfigSanityAlertForTests(): void {
   lastReadAt = null;
   lastFindingCount = null;
   lastAlertAt = null;
+  lastTopFindings = [];
 }
 
 // ── Cron registration ───────────────────────────────────────────────────

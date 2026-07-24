@@ -38,6 +38,7 @@
 import { componentLogger, createLogger } from "./logger.js";
 import { loadWorkflowDef, loadWorkflowDefById, loadWorkflowRegistry, getWorkflowId, getCurrentState, type WorkflowDef, type WorkflowState } from "./workflow-gate.js";
 import { getFanoutOutcome } from "./fanout-outcome-store.js";
+import { getAppliedState } from "./store/applied-state-store.js";
 import {
   LINEAR_API_URL,
   findOrCreateLabel,
@@ -683,7 +684,7 @@ export async function attemptBarrierTransition(
         childFilter = outcome.childIdentifiers;
         log.info(
           `barrier: INF-28 attemptBarrierTransition scoped to recorded set for ${parentIdentifier}: ` +
-          `${childFilter.join(", ")}`,
+          `${childFilter?.join(", ") ?? "none"}`,
         );
       }
     }
@@ -1049,12 +1050,25 @@ export async function onChildTerminal(
   const parentState = await fetchParentState(parentIdentifier, authToken);
   if (!parentState) return null;
 
+  // INF-424: Use applied-state-store to reconcile laggy live reads.
+  // If we just applied a transition to this parent, the live labels may still
+  // reflect the old state.
+  const appliedState = getAppliedState(parentIdentifier);
+  const liveState = getCurrentState(parentState.labels);
+  const currentState = appliedState ?? liveState;
+
   const workflowId = getWorkflowId(parentState.labels);
   if (!workflowId) return null;
 
   // AI-1992: config-driven — the parent's current state must declare barrier:true.
-  const currentState = getCurrentState(parentState.labels);
   if (!currentState) return null;
+
+  if (appliedState && appliedState !== liveState) {
+    log.info(
+      `barrier: parent ${parentIdentifier} live read lagged at '${liveState}' — ` +
+      `using authoritative appliedState '${appliedState}'`,
+    );
+  }
   let wfDef: WorkflowDef | null = null;
   try {
     wfDef = await loadWorkflowDefById(workflowId);

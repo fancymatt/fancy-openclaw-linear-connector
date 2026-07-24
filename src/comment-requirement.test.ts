@@ -7,8 +7,18 @@
  * like `request-changes`, `reject`, `ac-fail`) and any transition marked
  * `requires_comment: true` in the workflow definition.
  *
+ * INF-443 amendment: routine forward-progress transitions (continue, begin,
+ * accept, submit, complete) are now EXEMPT from requires_comment, even when
+ * the workflow def marks them requires_comment: true — that flag is meant for
+ * human-reasoned transitions (request-changes, block, reject, ac-fail), not
+ * ordinary spine progress. `submit` is one of the exempted commands, so the
+ * AC1/AC2/AI-1769 tests below that used to pin "submit requires a comment"
+ * now pin the opposite (submit is exempt) and the general
+ * requires_comment/satisfied-by mechanism is instead exercised against
+ * `reject` (still requires_comment: true, not in the routine set).
+ *
  * AC mapping:
- *   AC1: submit at implementation without comment → rejected
+ *   AC1: submit at implementation without comment → allowed (INF-443: routine, exempt)
  *   AC2: submit at implementation with comment → allowed
  *   AC3: no regression on other states (intake, write-tests, code-review approve, deployment deploy)
  *   AC4: request-revision transitions also enforce comment requirement
@@ -263,9 +273,9 @@ describe("proxy — AI-1731 comment requirement integration", () => {
     appState.managingPoller.stop();
   });
 
-  // ── AC1: submit at implementation without comment → rejected ──────────
+  // ── AC1 (INF-443): submit at implementation without comment → allowed (routine, exempt) ──
 
-  it("AC1: rejects submit at implementation when the request body is an issueUpdate (no commentCreate)", async () => {
+  it("INF-443 AC1: allows submit at implementation when the request body is an issueUpdate (no commentCreate) — routine transition, exempt from requires_comment", async () => {
     globalThis.fetch = makeProxyFetch(IMPLEMENTATION_RESPONSE);
 
     const res = await request(appState.app)
@@ -280,26 +290,31 @@ describe("proxy — AI-1731 comment requirement integration", () => {
       });
 
     expect(res.status).toBe(200);
-    expect(res.body.errors).toBeDefined();
-    expect(res.body.errors[0].message).toContain("comment");
-    expect(res.body.errors[0].message).toContain("--comment-file");
+    if (res.body.errors) {
+      for (const err of res.body.errors) {
+        expect(err.message).not.toContain("comment");
+        expect(err.message).not.toContain("--comment-file");
+      }
+    }
   });
 
-  // AC1: rejection message quality
+  // AC1 (INF-443): rejection message quality — now exercised against `reject`
+  // (still requires_comment: true, not in the INF-443 routine-command set).
   it("AC1: rejection message names --comment-file and the transition", async () => {
-    globalThis.fetch = makeProxyFetch(IMPLEMENTATION_RESPONSE);
+    globalThis.fetch = makeProxyFetch(DEPLOYMENT_RESPONSE);
 
     const res = await request(appState.app)
       .post("/proxy/graphql")
       .set("Authorization", "Bearer test-token")
-      .set("X-Openclaw-Agent", "charles")
-      .set("X-Openclaw-Linear-Intent", "submit")
+      .set("X-Openclaw-Agent", "hanzo")
+      .set("X-Openclaw-Linear-Intent", "reject")
+      .set("X-Openclaw-Feedback-Category", "missing-tests")
       .send({
         query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }",
         variables: { id: "issue-uuid" },
       });
 
-    expect(res.body.errors[0].message).toMatch(/submit.*comment|--comment-file.*submit/i);
+    expect(res.body.errors[0].message).toMatch(/reject.*comment|--comment-file.*reject/i);
   });
 
   // ── AC2: submit at implementation with comment → allowed ──────────────
@@ -331,16 +346,17 @@ describe("proxy — AI-1731 comment requirement integration", () => {
     }
   });
 
-  // AC2: empty comment body does NOT satisfy the requirement
-  it("AC2: rejects submit when commentCreate body is empty string", async () => {
-    globalThis.fetch = makeProxyFetch(IMPLEMENTATION_RESPONSE);
+  // AC2 (INF-443): empty comment body does NOT satisfy the requirement — now
+  // exercised against `reject` since `submit` is exempt from requires_comment.
+  it("AC2: rejects reject at deployment when commentCreate body is empty string", async () => {
+    globalThis.fetch = makeProxyFetch(DEPLOYMENT_RESPONSE);
 
     const res = await request(appState.app)
       .post("/proxy/graphql")
       .set("Authorization", "Bearer test-token")
-      .set("X-Openclaw-Agent", "charles")
-      .set("X-Openclaw-Linear-Intent", "submit")
-      .set("X-Openclaw-Linear-Target", "reviewer")
+      .set("X-Openclaw-Agent", "hanzo")
+      .set("X-Openclaw-Linear-Intent", "reject")
+      .set("X-Openclaw-Feedback-Category", "missing-tests")
       .send({
         query: `mutation commentCreate($issueId: String!, $body: String!) {
           commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
@@ -589,20 +605,25 @@ describe("proxy — AI-1731 comment requirement integration", () => {
     };
   }
 
+  // INF-443: `submit` is now exempt from requires_comment (routine transition),
+  // so the satisfied-by fail-closed mechanics below are exercised against
+  // `reject` (still requires_comment: true, at deployment, caller hanzo/u2)
+  // instead — the general satisfied-by verification logic is unrelated to
+  // which specific transition triggered the comment requirement.
   const VALID_SATISFIED_COMMENT = {
     id: "comment-dup-1",
     createdAt: new Date(Date.now() - 20_000).toISOString(), // 20s old
-    user: { id: "u1" }, // charles
+    user: { id: "u2" }, // hanzo
     issue: { id: "issue-uuid", identifier: "AI-999" },
   };
 
-  function satisfiedBySubmit() {
+  function satisfiedByReject() {
     return request(appState.app)
       .post("/proxy/graphql")
       .set("Authorization", "Bearer test-token")
-      .set("X-Openclaw-Agent", "charles")
-      .set("X-Openclaw-Linear-Intent", "submit")
-      .set("X-Openclaw-Linear-Target", "reviewer")
+      .set("X-Openclaw-Agent", "hanzo")
+      .set("X-Openclaw-Linear-Intent", "reject")
+      .set("X-Openclaw-Feedback-Category", "missing-tests")
       .set("X-Openclaw-Comment-Satisfied-By", "comment-dup-1")
       .send({
         query: "mutation M($id: String!) { issueUpdate(id: $id, input: {}) { success } }",
@@ -610,10 +631,10 @@ describe("proxy — AI-1731 comment requirement integration", () => {
       });
   }
 
-  it("AI-1769: allows submit without commentCreate when a verified satisfied-by comment is referenced", async () => {
-    globalThis.fetch = makeSatisfiedByFetch(IMPLEMENTATION_RESPONSE, VALID_SATISFIED_COMMENT);
+  it("AI-1769: allows reject without commentCreate when a verified satisfied-by comment is referenced", async () => {
+    globalThis.fetch = makeSatisfiedByFetch(DEPLOYMENT_RESPONSE, VALID_SATISFIED_COMMENT);
 
-    const res = await satisfiedBySubmit();
+    const res = await satisfiedByReject();
     expect(res.status).toBe(200);
     if (res.body.errors) {
       for (const err of res.body.errors) {
@@ -624,45 +645,45 @@ describe("proxy — AI-1731 comment requirement integration", () => {
   });
 
   it("AI-1769: rejects satisfied-by pointing at a comment on a DIFFERENT issue (fail-closed)", async () => {
-    globalThis.fetch = makeSatisfiedByFetch(IMPLEMENTATION_RESPONSE, {
+    globalThis.fetch = makeSatisfiedByFetch(DEPLOYMENT_RESPONSE, {
       ...VALID_SATISFIED_COMMENT,
       issue: { id: "other-issue-uuid", identifier: "AI-111" },
     });
 
-    const res = await satisfiedBySubmit();
+    const res = await satisfiedByReject();
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeDefined();
     expect(res.body.errors[0].message).toContain("comment");
   });
 
   it("AI-1769: rejects a stale satisfied-by comment (older than 1h, fail-closed)", async () => {
-    globalThis.fetch = makeSatisfiedByFetch(IMPLEMENTATION_RESPONSE, {
+    globalThis.fetch = makeSatisfiedByFetch(DEPLOYMENT_RESPONSE, {
       ...VALID_SATISFIED_COMMENT,
       createdAt: new Date(Date.now() - 2 * 3_600_000).toISOString(),
     });
 
-    const res = await satisfiedBySubmit();
+    const res = await satisfiedByReject();
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeDefined();
     expect(res.body.errors[0].message).toContain("comment");
   });
 
   it("AI-1769: rejects a satisfied-by comment authored by someone else (fail-closed)", async () => {
-    globalThis.fetch = makeSatisfiedByFetch(IMPLEMENTATION_RESPONSE, {
+    globalThis.fetch = makeSatisfiedByFetch(DEPLOYMENT_RESPONSE, {
       ...VALID_SATISFIED_COMMENT,
       user: { id: "u9" },
     });
 
-    const res = await satisfiedBySubmit();
+    const res = await satisfiedByReject();
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeDefined();
     expect(res.body.errors[0].message).toContain("comment");
   });
 
   it("AI-1769: rejects satisfied-by when the comment lookup returns null (fail-closed)", async () => {
-    globalThis.fetch = makeSatisfiedByFetch(IMPLEMENTATION_RESPONSE, null);
+    globalThis.fetch = makeSatisfiedByFetch(DEPLOYMENT_RESPONSE, null);
 
-    const res = await satisfiedBySubmit();
+    const res = await satisfiedByReject();
     expect(res.status).toBe(200);
     expect(res.body.errors).toBeDefined();
     expect(res.body.errors[0].message).toContain("comment");

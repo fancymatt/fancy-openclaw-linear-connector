@@ -521,7 +521,9 @@ describe("checkWorkflowRules — AI-1460: refuse-work meta-command", () => {
   for (const state of allStates) {
     it(`refuse-work is legal from state '${state}' for a known caller`, async () => {
       globalThis.fetch = makeLabelFetch(["wf:dev-impl", `state:${state}`]);
-      expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles")).toBeNull();
+      // INF-443: refuse-work now requires a comment — pass hasComment=true so
+      // this test still exercises only the state/caller legality it's named for.
+      expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, undefined, undefined, false, false, true)).toBeNull();
     });
   }
 
@@ -565,13 +567,15 @@ describe("checkWorkflowRules — AI-1574: refuse-work caller-gating", () => {
   // AC1: the current delegate can always refuse their own work.
   it("AC1: refuse-work by the current delegate (callerLinearUserId === delegateId) passes through", async () => {
     globalThis.fetch = makeDelegateFetch(["wf:dev-impl", "state:write-tests"], "delegate-uid");
-    expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "delegate-uid")).toBeNull();
+    // INF-443: refuse-work now requires a comment — hasComment=true keeps this
+    // test scoped to the delegate-authorization behavior it's named for.
+    expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "delegate-uid", undefined, false, false, true)).toBeNull();
   });
 
   it("AC1: delegate can refuse from every governed state", async () => {
     for (const state of ["intake", "write-tests", "implementation", "code-review", "deployment", "done"]) {
       globalThis.fetch = makeDelegateFetch(["wf:dev-impl", `state:${state}`], "delegate-uid");
-      expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "delegate-uid")).toBeNull();
+      expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "charles", null, "delegate-uid", undefined, false, false, true)).toBeNull();
     }
   });
 
@@ -588,7 +592,9 @@ describe("checkWorkflowRules — AI-1574: refuse-work caller-gating", () => {
   it("refuse-work by the workflow steward passes through even when not the delegate", async () => {
     globalThis.fetch = makeDelegateFetch(["wf:dev-impl", "state:implementation"], "real-delegate-uid");
     // astrid fills the steward role in TEST_POLICY_YAML
-    expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "astrid", null, "astrid-uid")).toBeNull();
+    // INF-443: refuse-work now requires a comment — hasComment=true keeps this
+    // test scoped to the steward-authorization behavior it's named for.
+    expect(await checkWorkflowRules("refuse-work", "issue-uuid", "Bearer tok", "astrid", null, "astrid-uid", undefined, false, false, true)).toBeNull();
   });
 
   // AC3 regression: ad-hoc (ungoverned) tickets — refuse-work is a transition verb

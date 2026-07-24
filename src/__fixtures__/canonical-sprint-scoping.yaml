@@ -1,0 +1,86 @@
+# sprint-scoping — Sprint Articulation Child Workflow (v1)
+# owner: steward (intake, articulating, finalizing)
+# last-updated: 2026-07-16
+# status: v1 — per-sprint scoping child for sprint-spawner v4
+#
+# Verbatim copy of the canonical vault file at:
+#   life-os/project-management/workflows/sprint-scoping/sprint-scoping.yaml
+# Used as a test fixture so CI can exercise the canonical schema without
+# depending on the vault being present. Keep in sync with the vault source.
+#
+# INF-45 (2026-07-16): added to registered-defs as child_workflow target
+# for sprint-spawner's spawning-scope state (fanout: wf:sprint-scoping).
+#
+# AI-2519 (Grover, 2026-07-16): added `generic: continue` to begin/collect/finalize.
+# As shipped it had zero generic tags and its verbs (begin/collect/finalize) are not
+# registered CLI commands, so a spawned scoping child would have stranded at intake
+# with no driveable forward transition. continue-workflow now walks it to done.
+#
+# Created for AI-2406 AC1: one scoping child per sprint, all articulation
+# hangs off the scoping ticket as sub-tickets, never directly off the spawner.
+#
+# The spawner's spawning-scope state creates exactly one wf:sprint-scoping
+# child per sprint. On done (satisfies_parent_barrier: true), the spawner's
+# scoping barrier unblocks, proceeds to launching.
+
+id: sprint-scoping
+version: 1
+archetype: linear
+entry_state: intake
+
+break_glass:
+  command: escape
+  to: intake
+  owner_role: steward
+
+states:
+
+  - id: intake
+    owner_role: steward
+    kind: normal
+    native_state: todo
+    description: >
+      Receive sprint brief from spawner. Sanity-check: scope is sprint-shaped,
+      emoji is unique, theme is coherent. Confirm the brief is actionable.
+    transitions:
+      - command: begin
+        to: articulating
+        generic: continue          # AI-2519: `linear continue-workflow` resolves here
+      - command: retire
+        to: done
+        owner_role: steward        # INF-307 AC2: retire path for junk/errant intake tickets
+
+  - id: articulating
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    description: >
+      Delegate parallel specialist scans as sub-tickets. Arm composition
+      selected based on sprint brief: scope arm (Igor), UX (Signe),
+      Design (Laren), Engineering (Igor), optional Spike (Igor).
+      Collect findings into the sprint brief description.
+    transitions:
+      - command: collect
+        to: finalizing
+        generic: continue          # AI-2519: `linear continue-workflow` resolves here
+
+  - id: finalizing
+    owner_role: steward
+    kind: normal
+    native_state: doing
+    description: >
+      Synthesize specialist findings. Finalize scope boundary, theme wording,
+      specialist references. Complete sprint brief is ready for launch.
+    transitions:
+      - command: finalize
+        to: done
+        generic: continue          # AI-2519: `linear continue-workflow` resolves here
+
+  - id: done
+    kind: terminal
+    native_state: done
+    satisfies_parent_barrier: true
+
+  - id: escape
+    kind: terminal
+    native_state: invalid

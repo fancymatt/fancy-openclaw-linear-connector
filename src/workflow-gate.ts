@@ -2511,6 +2511,16 @@ export function resolveStakesLevel(labels: string[], stakesConfig: StakesLevel):
 // ── Public enforcement API ─────────────────────────────────────────────────
 
 /**
+ * INF-443: routine forward-progress commands that never require a comment,
+ * even when the matched transition sets requires_comment: true in the
+ * workflow def. These are ordinary spine-progress verbs (resolved command
+ * names, post meta-intent resolution) — distinct from human-reasoned
+ * transitions (request-changes, block, refuse-work, needs-human) which must
+ * keep requiring one.
+ */
+const ROUTINE_FORWARD_COMMANDS = new Set(["continue", "begin", "accept", "submit", "complete"]);
+
+/**
  * Resolve a meta-intent (`continue-workflow` or `request-revision`) to the actual
  * workflow transition command name for the ticket's current state.
  *
@@ -2530,7 +2540,11 @@ export async function resolveMetaIntent(
   // (the AI-1872 "no continue transition in state 'done'" repro).
   snapshotState?: string | null,
 ): Promise<{ resolved: string } | { error: string }> {
-  if (intent !== 'continue-workflow' && intent !== 'request-revision') {
+  // INF-443: `begin-workflow` is a new meta-intent — the entry-state counterpart
+  // to `continue-workflow`. It resolves to whatever forward transition is
+  // available at the ticket's entry_state, so an agent enrolling/kicking off a
+  // ticket doesn't need to know the def's literal command name.
+  if (intent !== 'continue-workflow' && intent !== 'request-revision' && intent !== 'begin-workflow') {
     return { resolved: intent };
   }
 
@@ -2571,13 +2585,25 @@ export async function resolveMetaIntent(
   }
 
   const genericRole: 'continue' | 'revision' = intent === 'continue-workflow' ? 'continue' : 'revision';
-  const transition = stateNode.transitions?.find((t) => t.generic === genericRole);
+  let transition = intent === 'begin-workflow'
+    ? undefined
+    : stateNode.transitions?.find((t) => t.generic === genericRole);
+
+  // INF-443: begin-workflow has no dedicated `generic` tag in existing defs — it
+  // is only ever legal at entry_state, where the conventional forward command is
+  // named `accept` (dev-impl.yaml and every registered def use this name for the
+  // steward's entry-state transition). Fall back to that literal command name
+  // when resolving begin-workflow, rather than requiring defs to be re-tagged.
+  if (!transition && intent === 'begin-workflow' && currentState === def.entry_state) {
+    transition = stateNode.transitions?.find((t) => t.command === 'accept');
+  }
 
   if (!transition) {
     const available = stateNode.transitions?.map((t) => t.command).join(', ') ?? 'none';
+    const role = intent === 'begin-workflow' ? 'begin' : genericRole;
     return {
       error:
-        `[Proxy] '${intent}' has no ${genericRole} transition in state '${currentState}' ` +
+        `[Proxy] '${intent}' has no ${role} transition in state '${currentState}' ` +
         `(wf:${workflowId}). Available named commands: ${available}.`,
     };
   }
@@ -2916,19 +2942,36 @@ export async function checkWorkflowRules(
   // the workflow steward (break_glass.owner_role) may refuse on a governed
   // ticket. A non-delegate, non-steward caller is blocked to prevent third-party
   // rerouting. When no delegate is set, fail-open (nothing to protect).
+  //
+  // INF-443: refuse-work is a human-reasoned transition — it carries a reason a
+  // human/steward needs to see. It bypasses the def-matched requires_comment gate
+  // entirely (it returns before ever reaching it), so the comment requirement is
+  // enforced explicitly here, after authorization passes.
   if (intent === "refuse-work") {
-    if (!delegateId) return null;
-    if (callerLinearUserId && callerLinearUserId === delegateId) return null;
-    const stewardRole = def.break_glass?.owner_role;
-    if (stewardRole) {
-      const stewards = await resolveBodiesForRole(stewardRole);
-      if (stewards.includes(bodyId)) return null;
+    let authorized = !delegateId;
+    if (!authorized && callerLinearUserId && callerLinearUserId === delegateId) authorized = true;
+    if (!authorized) {
+      const stewardRole = def.break_glass?.owner_role;
+      if (stewardRole) {
+        const stewards = await resolveBodiesForRole(stewardRole);
+        if (stewards.includes(bodyId)) authorized = true;
+      }
     }
-    log.warn(`workflow-gate: refuse-work blocked agent=${bodyId} ticket=${issueId} (not delegate or steward)`);
-    return (
-      `[Proxy] 'refuse-work' blocked: '${bodyId}' is not the current delegate or the workflow steward. ` +
-      `Only the assigned delegate or workflow steward may refuse work on a governed ticket.`
-    );
+    if (!authorized) {
+      log.warn(`workflow-gate: refuse-work blocked agent=${bodyId} ticket=${issueId} (not delegate or steward)`);
+      return (
+        `[Proxy] 'refuse-work' blocked: '${bodyId}' is not the current delegate or the workflow steward. ` +
+        `Only the assigned delegate or workflow steward may refuse work on a governed ticket.`
+      );
+    }
+    if (!hasComment && !breakGlassOverride) {
+      log.warn(`workflow-gate: comment gate: 'refuse-work' on ${issueId} requires a comment — none provided`);
+      return (
+        `[Proxy] 'refuse-work' requires a comment explaining the transition. ` +
+        `Use --comment-file (or the X-Openclaw-Comment header) to attach a comment to 'refuse-work'.`
+      );
+    }
+    return null;
   }
 
   // AI-1576 AC3: demote guard — block demote when ticket has in-flight or merged work.
@@ -3152,6 +3195,22 @@ export async function checkWorkflowRules(
     // Name the sanctioned exit: break-glass hands the ticket to the steward, who owns
     // the human escalation from there.
     if (intent === "needs-human") {
+      // INF-443: needs-human is a human-reasoned escalation — it must carry a
+      // comment explaining why human input is needed, same as refuse-work.
+      // Since it is never a def transition, this "not a legal command" branch is
+      // the only gate it ever reaches, so the comment requirement is folded into
+      // this message rather than duplicating the not-a-legal-command text.
+      if (!hasComment && !breakGlassOverride) {
+        return (
+          `[Proxy] 'needs-human' is not a legal command in state '${currentState}' — governed tickets ` +
+          `escalate by exiting the workflow, not by clearing the delegate. 'needs-human' also requires a ` +
+          `comment explaining why human input is needed. ` +
+          `Use --comment-file (or the X-Openclaw-Comment header) to attach one, then ` +
+          `run \`linear ${breakGlassCommand} ${issueId} --comment-file <path>\` to hand it to the ` +
+          `workflow steward (re-enters at '${def.break_glass?.to ?? "intake"}'), who owns the human escalation. ` +
+          `Legal moves: ${legalMoves}.`
+        );
+      }
       return (
         `[Proxy] 'needs-human' is not a legal command in state '${currentState}' — governed tickets ` +
         `escalate by exiting the workflow, not by clearing the delegate. ` +
@@ -3183,8 +3242,7 @@ export async function checkWorkflowRules(
         return (
           `[Proxy] '${intent}' requires the '${match.requires_capability}' capability ` +
           `(designated approver: ${approverNames}). ` +
-          `Use \`linear handoff-work ${issueId} ${approverBodies[0] ?? "<approver>"}\` to route ` +
-          `the ticket to the approver for sign-off, then the approver re-runs '${intent}'. ` +
+          `The designated approver must run '${intent}' directly to proceed. ` +
           `Legal moves: ${legalMoves}.`
         );
       }
@@ -3196,11 +3254,24 @@ export async function checkWorkflowRules(
     }
   }
 
-  // AI-1731: Comment requirement gate.
+  // AI-1731 / INF-443: Comment requirement gate.
   // Transitions marked requires_comment: true must be accompanied by a non-empty
   // comment body (posted via commentCreate in the same request). This ensures
   // review feedback and rejection reasons are never lost. Break-glass is exempt.
-  if (match.requires_comment && !hasComment && !breakGlassOverride) {
+  //
+  // INF-443: routine forward-progress moves (continue, begin, accept, submit,
+  // complete-work) never require a comment, even when the workflow def marks
+  // the transition requires_comment: true — that flag is meant for
+  // human-reasoned transitions (request-changes, block, etc.), not ordinary
+  // spine progress. Using `resolvedIntent` (not the raw `intent`) so a
+  // continue-workflow/request-revision meta-intent that resolved to a routine
+  // command (e.g. `submit`) is correctly exempted too.
+  if (
+    match.requires_comment &&
+    !hasComment &&
+    !breakGlassOverride &&
+    !ROUTINE_FORWARD_COMMANDS.has(resolvedIntent)
+  ) {
     log.warn(`workflow-gate: comment gate: '${intent}' on ${issueId} requires a comment — none provided`);
     return (
       `[Proxy] '${intent}' requires a comment explaining the transition. ` +
@@ -5236,6 +5307,7 @@ export async function applyStateTransition(
     resolvedDelegateId,
     resolvedNativeStateId,
     toStateName,
+    issue.identifier,
   );
   const applied = writeOutcome.ok;
 
@@ -5803,6 +5875,7 @@ async function issueUpdateAtomicVerified(
   delegateId: string | null | undefined,
   nativeStateId: string | null | undefined,
   expectedStateName: string,
+  issueIdentifier?: string | null,
 ): Promise<VerifiedWriteOutcome> {
   const { maxAttempts, retryDelayMs } = transitionWritePolicy;
   let failureKind: "mutation" | "verification" = "mutation";
@@ -5819,6 +5892,15 @@ async function issueUpdateAtomicVerified(
       log.warn(`workflow-gate: AI-1762: atomic mutation attempt ${attempt}/${maxAttempts} failed for ${internalId}${attempt < maxAttempts ? " — retrying" : ""}`);
       continue;
     }
+
+    if (issueIdentifier) {
+      // INF-424: record applied state immediately after a successful mutation
+      // but BEFORE verification. This ensures that any re-entrant reads
+      // (e.g. from child-creation webhooks during a fan-out) see the
+      // destination state even if verification has not yet completed.
+      recordAppliedState(issueIdentifier, expectedStateName);
+    }
+
     const verification = await verifyTransitionWritePersisted(
       internalId,
       { stateName: expectedStateName, delegateId, nativeStateId },
@@ -5834,6 +5916,28 @@ async function issueUpdateAtomicVerified(
     failureKind = "verification";
     divergent = verification;
     log.warn(`workflow-gate: AI-1762: write attempt ${attempt}/${maxAttempts} for ${internalId} reported success but did NOT fully persist — ${verification.join("; ")}${attempt < maxAttempts ? " — retrying" : ""}`);
+  }
+
+  // INF-424: a state-label read can stay lagged behind a genuinely-applied mutation
+  // (Linear's read replica catching up — the exact race that desynced INF-196's label).
+  // The applied-state-store already recorded the destination state right after the
+  // mutation succeeded (above), and every consumer of transition state (barrier
+  // checks, outbound delivery, fan-out) is required to prefer that authoritative
+  // record over a live label read. So when retries exhaust with ONLY the label
+  // still divergent — no delegate or native-state facet dropped — accept the write
+  // instead of failing the whole transition (and blocking its fan-out) on a read lag
+  // we already have a fix for. A dropped delegate/native-state facet (the AI-1759
+  // bug class) still fails loudly; that risk is unrelated to label read lag.
+  if (
+    failureKind === "verification" &&
+    divergent.length > 0 &&
+    divergent.every((d) => d.startsWith("state-label"))
+  ) {
+    log.warn(
+      `workflow-gate: AI-1762/INF-424: state-label verification stayed lagged after ${maxAttempts} attempt(s) for ${internalId} — ` +
+      `accepting on applied-state-store authority (mutation succeeded, no delegate/native-state divergence): ${divergent.join("; ")}`,
+    );
+    return { ok: true, attempts: maxAttempts, failureKind: "none", divergent, unverified: true };
   }
 
   return { ok: false, attempts: maxAttempts, failureKind, divergent, unverified: false };
