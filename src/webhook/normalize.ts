@@ -45,6 +45,7 @@ function extractIssueData(data: Record<string, unknown>): LinearIssueData {
     labelIds: Array.isArray(data.labelIds)
       ? (data.labelIds as unknown[]).map(String)
       : [],
+    parentId: data.parentId ? String(data.parentId) : (data.parentId === null ? null : undefined),
     url: String(data.url ?? ""),
     createdAt: String(data.createdAt ?? ""),
     updatedAt: String(data.updatedAt ?? ""),

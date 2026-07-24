@@ -1096,7 +1096,7 @@ async function postSpawnIfErrorComment(
 async function fetchIssueTeamAndParent(
   issueId: string,
   authToken: string,
-): Promise<{ internalId: string; teamId: string; parentIssueId: string | null; description: string | null; title: string | null } | null> {
+): Promise<{ internalId: string; teamId: string; parentIssueId: string | null; description: string | null; title: string | null; labels: Array<{ name: string }> } | null> {
   const query = `
     query IssueTeamParent($id: String!) {
       issue(id: $id) {
@@ -1105,6 +1105,7 @@ async function fetchIssueTeamAndParent(
         description
         team { id }
         parent { id }
+        labels { nodes { name } }
       }
     }
   `;
@@ -1134,6 +1135,7 @@ async function fetchIssueTeamAndParent(
       parentIssueId: issue.parent?.id ?? null,
       description: issue.description,
       title: issue.title,
+      labels: issue.labels?.nodes ?? [],
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1540,6 +1542,11 @@ export async function executeFanout(
   const createdInternalIds: string[] = [];
   const createdComponents: Array<{ internalId: string; identifier: string; finding: Finding }> = [];
 
+  // INF-475: Canonical Hierarchy — resolve sub-parent if the parent is a Sprint.
+  // We cache sub-parent IDs by title to avoid redundant API calls.
+  const isSprint = parentCtx.labels.some((l) => l.name === "wf:dev-sprint");
+  const subParentCache = new Map<string, string>();
+
   // AI-1994: only the deduped `toSpawn` set is minted — existing children are
   // left untouched.
   for (let i = 0; i < toSpawn.length; i++) {
@@ -1572,6 +1579,37 @@ export async function executeFanout(
       });
       continue;
     }
+
+    // INF-475: Canonical Hierarchy — resolve sub-parent if the parent is a Sprint.
+    let mintParentId = parentCtx.internalId;
+    if (isSprint) {
+      const subParentTitle = (() => {
+        if (findingWorkflow.startsWith("wf:sprint-arm-")) return "Scope";
+        if (findingWorkflow === "wf:dev-impl" || findingWorkflow === "wf:task") return "Implementation";
+        if (findingWorkflow === "wf:ui-audit") return "Validation";
+        return null;
+      })();
+
+      if (subParentTitle) {
+        let spId = subParentCache.get(subParentTitle);
+        if (spId === undefined) {
+          const { findChildByTitle } = await import("./hierarchy.js");
+          const subParent = await findChildByTitle(parentCtx.internalId, subParentTitle, authToken);
+          if (subParent) {
+            spId = subParent.id;
+            subParentCache.set(subParentTitle, spId);
+          } else {
+            spId = ""; // mark as not found to avoid retrying
+            subParentCache.set(subParentTitle, spId);
+            log.warn(`fanout: INF-475: could not find sub-parent '${subParentTitle}' for sprint ${parentCtx.internalId}`);
+          }
+        }
+        if (spId) {
+          mintParentId = spId;
+        }
+      }
+    }
+
     // INF-111: resolve entry state label for this child's workflow.
     // If the caller provided lookupEntryState, use it to get the correct
     // state label from the workflow definition. Otherwise fall back to
@@ -1623,7 +1661,7 @@ export async function executeFanout(
       parentCtx.teamId,
       childTitle,
       childDescription,
-      parentCtx.internalId,
+      mintParentId,
       labelIds,
       authToken,
       delegateId,
@@ -1635,6 +1673,18 @@ export async function executeFanout(
       createdInternalIds.push(child.internalId);
       createdComponents.push({ ...child, finding });
       log.info(`fanout: created child ${child.identifier} — "${childTitle}" (finding ${i + 1}/${toSpawn.length})`);
+
+      // INF-475: Canonical Hierarchy — auto-create skeleton sub-parents for dev-sprint children.
+      // If the child fanned out is a dev-sprint orchestrator, it MUST have the 3 skeleton sub-parents
+      // (Scope, Implementation, Validation) to ensure a single canonical hierarchy.
+      if (findingWorkflow === "wf:dev-sprint") {
+        const { ensureSkeletonChildren } = await import("./hierarchy.js");
+        // We use the same token. This happens inside the fan-out loop.
+        // The newly created child is the 'sprint'.
+        ensureSkeletonChildren(child.internalId, parentCtx.teamId, authToken).catch((err) => {
+          log.warn(`fanout: INF-475: failed to ensure skeleton children for sprint ${child.internalId}: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      }
     } else {
       result.errors.push({
         findingIndex: i,
