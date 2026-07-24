@@ -37,6 +37,7 @@ import { createLogger, componentLogger } from "../logger.js";
 import { checkLinearIssueRouting, isTerminalIssueEvent, issueIdentifierFromEvent } from "../linear-actionable.js";
 import { onChildTerminal } from "../barrier.js";
 import { maybeBootstrapWorkflow } from "../workflow-bootstrap.js";
+import { maybeReparentIssue, ensureSkeletonChildren } from "../hierarchy.js";
 import { notify } from "../alerts/alert-bus.js";
 import { loadKnownHumans } from "../known-humans.js";
 import { emitStreamTopic } from "../admin-stream.js";
@@ -502,6 +503,18 @@ export function createWebhookRouter(
             const am = auditErr instanceof Error ? auditErr.message : String(auditErr);
             log.warn(`[webhook] label-sync audit failed for ${enrollIdentifier}: ${am}`);
           });
+
+          // INF-475: Canonical Hierarchy re-parenting.
+          // When a ticket's parentId changes, check if it needs to be moved to a skeleton sub-parent.
+          const parentChanged = event.action === "update" && updatedFrom && "parentId" in updatedFrom;
+          const newParentId = enrollData?.parentId as string | undefined;
+          if (parentChanged && newParentId) {
+            maybeReparentIssue(enrollIssueId, newParentId, enrollToken).catch((err) => {
+              log.warn(
+                `maybeReparentIssue failed for ${enrollIssueId} -> ${newParentId}: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            });
+          }
         }
       }
 
@@ -553,6 +566,20 @@ export function createWebhookRouter(
             log.info(`Workflow bootstrap: ${bootstrapResult.action} (wf:${bootstrapResult.workflowId ?? "unknown"})`);
             const bootstrapOutcome = bootstrapResult.action === "bootstrapped" ? "bootstrap-bootstrapped" : "bootstrap-demoted";
             appendOperationalEvent(operationalEventStore, { outcome: bootstrapOutcome, type: event.type });
+
+            // INF-475: Canonical Hierarchy skeleton creation.
+            // When a dev-sprint is bootstrapped, ensure its 3 sub-parents (Scope, Implementation, Validation) exist.
+            if (bootstrapResult.action === "bootstrapped" && bootstrapResult.workflowId === "dev-sprint") {
+              const issueId = (event.data as any)?.id;
+              const teamId = (event.data as any)?.teamId;
+              if (issueId && teamId) {
+                ensureSkeletonChildren(issueId, teamId, bootstrapToken).catch((err) => {
+                  log.warn(
+                    `ensureSkeletonChildren failed for ${issueId}: ${err instanceof Error ? err.message : String(err)}`,
+                  );
+                });
+              }
+            }
 
             // AI-fix: after bootstrap, deliver a workflow-aware wake to the
             // newly-assigned delegate so they know what to do.
