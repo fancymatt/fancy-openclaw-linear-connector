@@ -1581,7 +1581,12 @@ export async function executeFanout(
       : undefined;
     // INF-441: default to 'state:todo' (To Do) instead of 'state:intake' (Backlog)
     // for all spawned children to ensure they are dispatched and not silently inert.
-    const stateLabelName = entryStateLabel ?? "state:todo";
+    // INF-478: enforce non-Backlog even when lookupEntryState returns it (e.g. scoping).
+    let stateLabelName = entryStateLabel ?? "state:todo";
+    if (stateLabelName === "state:intake") {
+      log.info(`fanout: override state:intake -> state:todo for child mint (INF-478)`);
+      stateLabelName = "state:todo";
+    }
     let entryStateLabelId: string | undefined | null = stateLabelCache.get(stateLabelName);
     if (!entryStateLabelId) {
       entryStateLabelId = await findOrCreateLabel(parentCtx.teamId, stateLabelName, authToken);
