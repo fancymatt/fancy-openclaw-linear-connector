@@ -61,6 +61,7 @@ import type { EnrolledTicketsStore } from "./store/enrolled-tickets-store.js";
 import { reposWithoutCiAutoDeploy, githubRepoFromUrl } from "./deploy-policy.js";
 import { notify } from "./alerts/alert-bus.js";
 import type { OperationalEventStore } from "./store/operational-event-store.js";
+import { probeDeployOutcome } from "./deploy-probe.js";
 
 /**
  * Phase 6.5 / H-6: Label read-only projection + override path + drift reconciliation.
@@ -145,6 +146,8 @@ export interface WorkflowTransition {
   requires_comment?: boolean;
   /** Generic transition role: 'continue' maps to `linear continue-workflow`, 'revision' maps to `linear request-revision`. */
   generic?: 'continue' | 'revision';
+  /** INF-452: if true, requires a live-service probe confirming the running artifact reflects this ticket's merged change before the transition is allowed. */
+  requires_deploy_probe?: boolean;
 }
 
 /**
@@ -1772,6 +1775,10 @@ interface BranchAndPRStatus {
   prMetadataAvailable: boolean;
   /** URLs of PR attachments found on the issue (INF-112). */
   prUrls: string[];
+  /** INF-452: merge commit SHA of the merged PR, if present in attachment metadata. Used as the expected artifact identity for the deploy probe. */
+  mergeSha?: string | null;
+  /** INF-452: owner/repo slug parsed from the first PR URL. Used to scope the deploy probe to the connector repo. */
+  repoUrl?: string | null;
 }
 
 /**
@@ -1858,6 +1865,9 @@ async function fetchBranchAndPRStatus(
     // sync merge status (externally-created branches).
     let hasMergedPR = false;
     let prMetadataAvailable = false;
+    // INF-452: merge commit SHA, if the GitHub integration synced it onto the
+    // attachment (either key name has been observed in the wild).
+    let mergeSha: string | null = null;
     for (const n of prNodes) {
       const meta = n.metadata ?? {};
       const status = (meta as { status?: unknown; state?: unknown }).status ?? (meta as { state?: unknown }).state;
@@ -1865,6 +1875,12 @@ async function fetchBranchAndPRStatus(
         prMetadataAvailable = true;
         if (status.toLowerCase() === "merged") {
           hasMergedPR = true;
+          const shaMeta = meta as { mergeSha?: unknown; mergeCommitSha?: unknown };
+          if (typeof shaMeta.mergeSha === "string") {
+            mergeSha = shaMeta.mergeSha;
+          } else if (typeof shaMeta.mergeCommitSha === "string") {
+            mergeSha = shaMeta.mergeCommitSha;
+          }
         }
       }
     }
@@ -1888,6 +1904,16 @@ async function fetchBranchAndPRStatus(
     }
 
     const allPrUrls = [...attachmentPrUrls, ...descPrUrls];
+
+    // INF-452: owner/repo slug from the first known PR URL — used to scope the
+    // deploy probe to the repo it's actually configured for.
+    let repoUrl: string | null = null;
+    if (allPrUrls.length > 0) {
+      const slugMatch = allPrUrls[0].match(/github\.com\/([^/]+\/[^/]+)\/pull\/\d+/i);
+      if (slugMatch) {
+        repoUrl = slugMatch[1];
+      }
+    }
 
     // INF-132: If no PR is confirmed merged by Linear metadata, verify via
     // GitHub API. Linear's GitHub integration syncs PR data asynchronously, so
@@ -1932,6 +1958,8 @@ async function fetchBranchAndPRStatus(
       hasMergedPR,
       prMetadataAvailable,
       prUrls: allPrUrls,
+      mergeSha,
+      repoUrl,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -3366,6 +3394,37 @@ export async function checkWorkflowRules(
   // Resolve destination state for subsequent gates.
   const destStateNode = def.states.find((s) => s.id === match.to);
 
+  // ── INF-452: Outcome-verified deploy gate ────────────────────────────
+  // A transition marked requires_deploy_probe must not advance until a live
+  // probe confirms the running service reflects this ticket's merged change.
+  // "Done" must mean the change is running, not merely merged — the INF-296
+  // shape (source/merge correct, /health still stale) must not reach a
+  // terminal or otherwise non-blocking state. Break-glass is exempt (steward
+  // recovery path, identity-gated).
+  if (match.requires_deploy_probe && !breakGlassOverride) {
+    const branchStatus = await fetchBranchAndPRStatus(issueId, authToken, fetchedIdentifier);
+    const probeResult = await probeDeployOutcome(issueId, branchStatus?.mergeSha, branchStatus?.repoUrl);
+    if (!probeResult.ok) {
+      log.warn(`workflow-gate: INF-452 deploy gate blocked '${intent}' on ${issueId} — probe failed: ${probeResult.reason}`);
+      notify({
+        severity: "warning",
+        source: "deploy-gate",
+        title: `deploy gate blocked '${intent}' on ${issueId}`,
+        detail: probeResult.reason ?? "the running service does not yet reflect the expected change",
+        ticket: issueId,
+        dedupKey: `deploy-gate|probe-failed|${issueId}`,
+      });
+      const legalMoves = [...transitions.map((t) => t.command), breakGlassCommand].join(", ");
+      return (
+        `[Proxy] '${intent}' blocked: the running service is stale. ` +
+        `Deployment verification failed: ${probeResult.reason ?? "expected change not yet live"}. ` +
+        `Wait for the deploy to complete and retry, or use break-glass if a steward must override. ` +
+        `Legal moves: ${legalMoves}.`
+      );
+    }
+    log.info(`workflow-gate: INF-452 deploy gate passed for ${issueId} (evidence: ${probeResult.evidence})`);
+  }
+
   // ── AI-2476: Merged-PR release gate re-armed (§5.6) ──────────────────
   // A wf:dev-impl ticket must not leave merge or deploy states forward without
   // evidence that the implementation was pushed, reviewed, and merged.
@@ -4497,6 +4556,26 @@ export async function applyStateTransition(
       return { status: "failed", code: "no-transition", detail: `no transition for '${intent}' in state '${currentStateName}'`, from: currentStateName };
     }
     toStateName = matchedTransition.to;
+  }
+
+  // INF-452: defense-in-depth deploy probe at the apply layer. checkWorkflowRules
+  // (B1) already gates this at the proxy, but B2 is the actual state mutation —
+  // re-verify here so a transition reached through any path other than the proxy
+  // (e.g. direct engine calls) cannot advance while the running service is stale.
+  // Break-glass is exempt (steward recovery path, identity-gated).
+  if (matchedTransition?.requires_deploy_probe && intent !== breakGlassCommand) {
+    const branchStatus = await fetchBranchAndPRStatus(issueId, authToken, issue.identifier);
+    const probeResult = await probeDeployOutcome(issueId, branchStatus?.mergeSha, branchStatus?.repoUrl);
+    if (!probeResult.ok) {
+      log.warn(`workflow-gate: B2 apply: INF-452 deploy gate blocked '${intent}' on ${issueId} — probe failed: ${probeResult.reason}`);
+      return {
+        status: "blocked",
+        code: "deploy-gate-probe-failed",
+        detail: probeResult.reason ?? "the running service does not yet reflect the expected change",
+        from: currentStateName,
+        to: toStateName,
+      };
+    }
   }
 
   // INF-311: clean up artifact binding and implementer record BEFORE the

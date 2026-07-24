@@ -221,6 +221,7 @@ states:
         generic: continue
         requires_capability: infra:ssh
         requires_human_signoff_above_stakes: true   # H-7 (AI-1482): high-stakes release needs human sign-off
+        requires_deploy_probe: true   # INF-452: verify the running service reflects this ticket's merge before ac-validate can begin
         assign: { mode: auto }     # ac-validate steward is singleton (Astrid) — auto-assign
       - command: reject
         to: implementation
@@ -251,6 +252,7 @@ states:
     transitions:
       - command: validated
         to: done
+        requires_deploy_probe: true   # INF-452 AC2/AC4: don't allow Done while the running service is stale (INF-296 shape)
         # terminal → no assignment
       - command: ac-fail
         to: implementation

@@ -8215,10 +8215,26 @@ describe("AI-1776: H-7 fail-visible — warning comment on null AC capture", () 
   });
 });
 
-describe("checkWorkflowRules — deploy health gate (AI-2361)", () => {
+describe("checkWorkflowRules — deploy health gate (AI-2361 / INF-452)", () => {
   let originalFetch: typeof globalThis.fetch;
   let originalHealthCheckUrl: string | undefined;
   let originalConnectorRepo: string | undefined;
+  let originalWorkflowPath: string | undefined;
+
+  beforeAll(() => {
+    // The default in-memory test fixture doesn't declare the merge/deploy/
+    // ac-validate spine — use the canonical dev-impl def, which carries the
+    // real requires_deploy_probe transitions this gate exercises.
+    originalWorkflowPath = process.env.WORKFLOW_DEF_PATH;
+    process.env.WORKFLOW_DEF_PATH = CANONICAL_FIXTURE;
+    resetWorkflowCache();
+  });
+
+  afterAll(() => {
+    if (originalWorkflowPath !== undefined) process.env.WORKFLOW_DEF_PATH = originalWorkflowPath;
+    else delete process.env.WORKFLOW_DEF_PATH;
+    resetWorkflowCache();
+  });
 
   beforeEach(() => {
     originalFetch = globalThis.fetch;
@@ -8226,6 +8242,7 @@ describe("checkWorkflowRules — deploy health gate (AI-2361)", () => {
     originalConnectorRepo = process.env.CONNECTOR_REPO;
     process.env.HEALTH_CHECK_URL = "http://connector.test/health";
     process.env.CONNECTOR_REPO = "fancymatt/repo";
+    resetWorkflowCache();
   });
 
   afterEach(() => {
@@ -8240,17 +8257,18 @@ describe("checkWorkflowRules — deploy health gate (AI-2361)", () => {
     } else {
       delete process.env.CONNECTOR_REPO;
     }
+    resetWorkflowCache();
   });
 
-  it("blocks 'deploy' when running commit doesn't include merge SHA on connector-repo ticket", async () => {
+  it("blocks 'continue' from 'deploy' when running commit doesn't include merge SHA on connector-repo ticket", async () => {
     globalThis.fetch = makeLabelFetch(
-      ["wf:dev-impl", "state:deployment"],
+      ["wf:dev-impl", "state:deploy"],
       { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "fancymatt/repo" },
       "def789",
       false,
     );
     const result = await checkWorkflowRules(
-      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
+      "continue", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
     );
     expect(result).not.toBeNull();
     expect(result).toContain("abc123def456");
@@ -8260,53 +8278,53 @@ describe("checkWorkflowRules — deploy health gate (AI-2361)", () => {
 
   it("includes both commit SHAs in rejection message on stale artifact", async () => {
     globalThis.fetch = makeLabelFetch(
-      ["wf:dev-impl", "state:deployment"],
+      ["wf:dev-impl", "state:deploy"],
       { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "fancymatt/repo" },
       "def789",
       false,
     );
     const result = await checkWorkflowRules(
-      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
+      "continue", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
     );
     expect(result).toContain("abc123def456");
     expect(result).toContain("def789");
   });
 
-  it("allows 'deploy' when running commit matches merge SHA on connector-repo ticket", async () => {
+  it("allows 'continue' from 'deploy' when running commit matches merge SHA on connector-repo ticket", async () => {
     globalThis.fetch = makeLabelFetch(
-      ["wf:dev-impl", "state:deployment"],
+      ["wf:dev-impl", "state:deploy"],
       { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "fancymatt/repo" },
       "abc123def456",
       false,
     );
     const result = await checkWorkflowRules(
-      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
+      "continue", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
     );
     expect(result).toBeNull();
   });
 
-  it("allows 'deploy' without health check for non-connector repo ticket", async () => {
+  it("allows 'continue' from 'deploy' without health check for non-connector repo ticket", async () => {
     globalThis.fetch = makeLabelFetch(
-      ["wf:dev-impl", "state:deployment"],
+      ["wf:dev-impl", "state:deploy"],
       { hasPR: true, hasMergedPR: true, mergeSha: "abc123def456", repoUrl: "other-org/other-repo" },
       "def789",
       false,
     );
     const result = await checkWorkflowRules(
-      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
+      "continue", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
     );
     expect(result).toBeNull();
   });
 
-  it("allows 'deploy' without health check when PR has no merge SHA", async () => {
+  it("allows 'continue' from 'deploy' without health check when PR has no merge SHA", async () => {
     globalThis.fetch = makeLabelFetch(
-      ["wf:dev-impl", "state:deployment"],
+      ["wf:dev-impl", "state:deploy"],
       { hasPR: true, hasMergedPR: true, mergeSha: null, repoUrl: "fancymatt/repo" },
       "def789",
       false,
     );
     const result = await checkWorkflowRules(
-      "deploy", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
+      "continue", "issue-uuid", "Bearer tok", "hanzo", null, null, null, false, false, false,
     );
     expect(result).toBeNull();
   });
