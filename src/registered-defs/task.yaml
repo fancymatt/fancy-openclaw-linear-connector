@@ -104,6 +104,7 @@ states:
       - command: submit
         to: review
         generic: continue      # `linear continue-workflow` — review auto-assigns the head (singleton)
+        requires_deploy_probe: true
 
   - id: review
     owner_role: department-head    # SAME body as routing (domain-routed, pinned)
@@ -135,6 +136,7 @@ states:
       - command: accept
         to: done                   # terminal
         generic: continue          # `linear continue-workflow`
+        requires_deploy_probe: true
       - command: reject
         to: doing
         generic: revision          # `linear request-revision`
