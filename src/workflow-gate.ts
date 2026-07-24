@@ -39,11 +39,11 @@ import path from "node:path";
 import yaml from "js-yaml";
 import { componentLogger, createLogger, type Logger } from "./logger.js";
 import { defaultWorkflowDefPath } from "./instance-config.js";
-import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability } from "./escalation-gate.js";
+import { bodyHasCapability, resolveBodiesForRole, resolveBodiesWithCapability, isBodyKnown } from "./escalation-gate.js";
+import { probeDeployOutcome } from "./deploy-probe.js";
 import { isTerminalIssueState } from "./linear-actionable.js";
 import type { ObservationStore } from "./store/observation-store.js";
 import { recordObservation } from "./store/observation-write-path.js";
-import { isBodyKnown } from "./escalation-gate.js";
 import { getAgent, getAgents } from "./agents.js";
 import { executeFanout, shouldTriggerFanout, validateFanoutSpec, extractSpecFindings, autoDeriveArmFindings, deriveSpecFromPriorChildren, deriveStructuredFromChildren, upsertDerivedSpecSection, updateIssueDescription, type Finding } from "./fanout.js";
 import { recordFanoutOutcome } from "./fanout-outcome-store.js";
@@ -141,6 +141,8 @@ export interface WorkflowTransition {
   capture_ac?: boolean;
   /** Phase 6.5 / H-7 (AI-1482): if true, requires human sign-off when stakes >= threshold. */
   requires_human_signoff_above_stakes?: boolean;
+  /** INF-452: if true, requires a live probe of the running service to verify the change landed. */
+  requires_deploy_probe?: boolean;
   /** If true, a comment must accompany this transition. Surfaced in delivery messages and enforced by the CLI. */
   requires_comment?: boolean;
   /** Generic transition role: 'continue' maps to `linear continue-workflow`, 'revision' maps to `linear request-revision`. */
@@ -1772,6 +1774,8 @@ interface BranchAndPRStatus {
   prMetadataAvailable: boolean;
   /** URLs of PR attachments found on the issue (INF-112). */
   prUrls: string[];
+  /** Merge SHA of the pull request, if known (INF-452). */
+  mergeSha: string | null;
 }
 
 /**
@@ -1894,8 +1898,13 @@ async function fetchBranchAndPRStatus(
     // metadata can be stale — a merged PR may still show "open" in Linear for
     // minutes or longer. The GitHub API is the source of truth. Check both
     // attachment-based and description-scanned URLs for full coverage.
-    if (!hasMergedPR && allPrUrls.length > 0) {
-      hasMergedPR = await verifyPrMergeStateViaGitHub(allPrUrls);
+    let mergeSha: string | null = null;
+    if (allPrUrls.length > 0) {
+      const res = await verifyPrMergeStateViaGitHub(allPrUrls);
+      if (res.merged) {
+        hasMergedPR = true;
+        mergeSha = res.mergeSha;
+      }
     }
 
     // INF-144: When no PR evidence found via attachments or description,
@@ -1914,9 +1923,10 @@ async function fetchBranchAndPRStatus(
       if (searchedPrUrls.length > 0) {
         log.info(`workflow-gate: found ${searchedPrUrls.length} PR(s) via GitHub search for ticket ${issueIdentifier} (INF-144 ticket-ref search)`);
         // Verify merge status via GitHub API for the newly found PRs
-        const verified = await verifyPrMergeStateViaGitHub(searchedPrUrls);
-        if (verified) {
+        const res = await verifyPrMergeStateViaGitHub(searchedPrUrls);
+        if (res.merged) {
           hasMergedPR = true;
+          mergeSha = res.mergeSha;
         }
       }
     }
@@ -1932,6 +1942,7 @@ async function fetchBranchAndPRStatus(
       hasMergedPR,
       prMetadataAvailable,
       prUrls: allPrUrls,
+      mergeSha,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -2180,7 +2191,7 @@ async function searchGitHubPRsByPerRepoScan(identifier: string): Promise<string[
  * (higher rate limit, private repo access). Falls back to unauthenticated
  * requests when no token is available.
  */
-async function verifyPrMergeStateViaGitHub(prUrls: string[]): Promise<boolean> {
+async function verifyPrMergeStateViaGitHub(prUrls: string[]): Promise<{ merged: boolean; mergeSha: string | null }> {
   for (const prUrl of prUrls) {
     const parsed = parseGitHubPrUrl(prUrl);
     if (!parsed) continue;
@@ -2194,17 +2205,17 @@ async function verifyPrMergeStateViaGitHub(prUrls: string[]): Promise<boolean> {
         headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
       }
       // GET /repos/{owner}/{repo}/pulls/{pull_number}
-      // Response includes `merged` (boolean) and `merged_at` (ISO timestamp).
+      // Response includes `merged` (boolean) and `merge_commit_sha` (string).
       const res = await fetch(`${GITHUB_API_BASE}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}`, { headers });
       if (!res.ok) {
         log.warn(`INF-132: GitHub API returned ${res.status} for ${owner}/${repo}#${number} — skipping GitHub verification (falling back to Linear metadata)`);
         continue;
       }
-      type GitHubPrResponse = { merged?: boolean };
+      type GitHubPrResponse = { merged?: boolean; merge_commit_sha?: string | null };
       const prData = (await res.json()) as GitHubPrResponse;
       if (prData.merged === true) {
         log.info(`INF-132: GitHub API confirmed PR ${owner}/${repo}#${number} is merged, overriding stale Linear metadata`);
-        return true;
+        return { merged: true, mergeSha: prData.merge_commit_sha ?? null };
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -2212,7 +2223,7 @@ async function verifyPrMergeStateViaGitHub(prUrls: string[]): Promise<boolean> {
       continue;
     }
   }
-  return false;
+  return { merged: false, mergeSha: null };
 }
 
 /**
@@ -3360,6 +3371,40 @@ export async function checkWorkflowRules(
         }
         log.info(`workflow-gate: stakes-threshold gate: ${intent} on ${issueId} — stakes level ${ticketStakesLevel} >= threshold ${def.stakes.threshold}, but caller '${bodyId}' is human/unknown — allowing`);
       }
+    }
+  }
+
+  // INF-452: Outcome-verified deploy gate.
+  // Gated transitions (deploy -> ac-validate, ac-validate -> done) require a
+  // live probe of the running service to verify the change landed.
+  if (match.requires_deploy_probe && !breakGlassOverride) {
+    const repoRefs = await resolveTicketRepoRefs(labels, issueId, authToken);
+    // Only enforce for connector-family repos.
+    const isConnectorRepo = repoRefs.some(r => r.includes("fancy-openclaw-linear-connector"));
+    
+    if (isConnectorRepo) {
+      const branchStatus = await fetchBranchAndPRStatus(issueId, authToken, fetchedIdentifier);
+      const expectedCommit = branchStatus?.mergeSha;
+      
+      if (!expectedCommit) {
+        log.warn(`workflow-gate: deploy-probe blocked on ${issueId} — no merge SHA found to verify`);
+        return `[Proxy] '${intent}' blocked: cannot verify deployment outcome — no merge SHA found. Ensure the PR is merged.`;
+      }
+
+      // Look for a behavioral probe hallmark in the description (e.g. "Hallmark: [pattern]")
+      const { description } = await fetchIssueDescription(issueId, authToken);
+      const hallmarkMatch = /Hallmark:\s*\[(.*?)\]/i.exec(description ?? "");
+      const behaviorProbe = hallmarkMatch ? { pattern: hallmarkMatch[1], description: "Hallmark in description" } : undefined;
+
+      const probe = await probeDeployOutcome(expectedCommit, process.env.HEALTH_CHECK_URL, behaviorProbe);
+      if (!probe.success) {
+        log.warn(`workflow-gate: deploy-probe FAILED for ${issueId}: ${probe.reason}`);
+        return `[Proxy] '${intent}' blocked: Deployment Integrity check failed. ${probe.reason}. ` +
+               `The running service is stale or does not reflect the expected behavior. ` +
+               `Ensure the deploy succeeded and the service restarted before advancing. ` +
+               `(Running: ${probe.runningCommit ?? 'unknown'}, Expected: ${expectedCommit})`;
+      }
+      log.info(`workflow-gate: deploy-probe SUCCEEDED for ${issueId}`);
     }
   }
 

@@ -231,6 +231,7 @@ states:
         to: ac-validate
         generic: continue
         requires_capability: infra:ssh
+        requires_deploy_probe: true
         requires_human_signoff_above_stakes: true   # H-7 (AI-1482): high-stakes release needs human sign-off
         assign: { mode: auto }     # ac-validate steward is singleton (Astrid) — auto-assign
       - command: reject
@@ -262,6 +263,7 @@ states:
     transitions:
       - command: validated
         to: done
+        requires_deploy_probe: true
         # terminal → no assignment
       - command: ac-fail
         to: implementation
