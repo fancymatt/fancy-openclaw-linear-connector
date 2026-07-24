@@ -30,7 +30,7 @@
 #   → 5. ac-definition → 6. spawn-impl → 7. managing-impl → 8. validation → done
 
 id: dev-sprint
-version: 8
+version: 9
 archetype: orchestrator
 entry_state: intake
 
@@ -91,6 +91,12 @@ states:
       - command: spawn
         to: managing-arms
         generic: continue
+      - command: cancel
+        to: cancelled
+        owner_role: steward
+      - command: abandon
+        to: cancelled
+        owner_role: steward
 
   - id: managing-arms
     owner_role: steward
@@ -103,6 +109,12 @@ states:
       - command: continue
         to: ac-definition
         generic: continue
+      - command: cancel
+        to: cancelled
+        owner_role: steward
+      - command: abandon
+        to: cancelled
+        owner_role: steward
 
   - id: ac-definition
     owner_role: steward
