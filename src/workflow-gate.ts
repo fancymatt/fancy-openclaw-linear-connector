@@ -2912,6 +2912,19 @@ export async function checkWorkflowRules(
     }
   }
 
+  // INF-474: Sprint-Workflow E2E Readiness Guard
+  // Spawners remain frozen until the harness is marked green.
+  // Gated on proceed/start-cycle from evaluating state.
+  if (workflowId === "sprint-spawner" && (intent === "proceed" || intent === "start-cycle") && !breakGlassOverride) {
+    if (!labels.includes("harness-green")) {
+       log.warn(`workflow-gate: INF-474 Readiness Guard — blocking '${intent}' on ${issueId} (wf:sprint-spawner) because harness-green label is missing`);
+       return (
+         `[Proxy] '${intent}' blocked: the sprint-spawner is frozen until the integration-test harness is green. ` +
+         `Apply the 'harness-green' label to the spawner once the E2E harness (INF-474) is operational.`
+       );
+    }
+  }
+
   // §4.4 / AI-1668: break-glass escape is caller-gated.
   // The delegate can always escape their own ticket; the workflow steward
   // (break_glass.owner_role) can escape any ticket. All other known agents
@@ -5484,7 +5497,16 @@ export async function applyStateTransition(
           `workflow-gate: B-2 fan-out: ${fanoutResult.created} child(ren) created for ${issueId}: ${fanoutResult.childIdentifiers.join(", ")}`,
         );
       } else {
-        log.warn(`workflow-gate: B-2 fan-out: no children created for ${issueId} — ${fanoutResult.errors.map((e) => e.message).join(";")}`);
+        const errorDetail = fanoutResult.errors.map((e) => e.message).join("; ");
+        log.warn(`workflow-gate: B-2 fan-out: no children created for ${issueId} — ${errorDetail}`);
+        
+        // INF-474: Ensure refusal on empty fanout is loud.
+        // If it was attempted but created 0 children, post a loud error comment.
+        // executeFanout already posts specific comments for refused/spawn_if_waived,
+        // but the generic "attempted N, minted 0" or "empty spec" path needs a summary.
+        if (fanoutResult.attempted > 0 || (fanoutResult.refused && fanoutResult.errors.length > 0)) {
+           await postComment(issue.internalId, `❌ **Fan-out Failed**: No children were created.\n\n**Reason**: ${errorDetail || "Unknown error during fan-out execution."}`, authToken);
+        }
       }
       // Post a summary comment on the parent ticket with the fan-out result.
       if (fanoutResult.created > 0) {
