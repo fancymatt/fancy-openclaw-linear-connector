@@ -375,18 +375,52 @@ export function extractSpecFindings(
    */
   const PER_ENTRY_MARKER_RE = /^\\?\[wf:([^\s\\\]]+)(?:\s*[→>-]\s*([^\s\\\]]+))?\\?\]\s*/;
 
+  /**
+   * INF-488: ASCII arrow arm markers ("-> sprint-arm-x: title" or
+   * "-> sprint-arm-x -> delegate: title"). These are a distinct line shape
+   * from the bullet/numbered formats below — a bare "-" immediately followed
+   * by ">" never satisfies the bullet regex's "[-*]\s+" prefix (whitespace
+   * must follow the "-"), so the whole line was silently skipped and the
+   * arm's workflow/delegate routing fell back to the fanout default.
+   */
+  const ARROW_LINE_RE = /^->\s*([^\s:>]+)(?:\s*->\s*([^\s:]+))?\s*:\s*(.+)$/;
+  const lineRegex = /[-*]\s+\*\*(.+?)\*\*(?:[:\s-]+(.*))?|[-*]\s+(.+?)(?:\n|$)|\d+\.\s+(.+?)(?:\n|$)/;
+
   if (sectionMatch) {
     const sectionBody = sectionMatch[1];
-    const lineRegex = /[-*]\s+\*\*(.+?)\*\*(?:[:\s-]+(.*))?|[-*]\s+(.+?)(?:\n|$)|\d+\.\s+(.+?)(?:\n|$)/g;
-    let match: RegExpExecArray | null;
-    while ((match = lineRegex.exec(sectionBody)) !== null) {
-      let title = (match[1] ?? match[3] ?? match[4] ?? "").trim();
+    for (const rawLine of sectionBody.split("\n")) {
+      const line = rawLine.trim();
+      if (!line) continue;
+
+      const arrowMatch = ARROW_LINE_RE.exec(line);
+      if (arrowMatch) {
+        const title = arrowMatch[3].trim();
+        if (title) {
+          const finding: Finding = { title, child_workflow: `wf:${arrowMatch[1]}` };
+          if (arrowMatch[2]) {
+            finding.delegate = arrowMatch[2];
+          }
+          findings.push(finding);
+        }
+        continue;
+      }
+
+      const match = lineRegex.exec(line);
+      if (!match) continue;
+      const title = (match[1] ?? match[3] ?? match[4] ?? "").trim();
       const desc = (match[2] ?? "").trim();
       if (title) {
         // AI-2199: check for per-entry child workflow marker
         const markerMatch = PER_ENTRY_MARKER_RE.exec(title);
+        // Guard: a marker that consumes the ENTIRE title (no trailing text)
+        // would strip to an empty string — keep the literal text instead of
+        // producing an unusable blank title.
+        const strippedTitle =
+          markerMatch && title.length > markerMatch[0].length
+            ? title.slice(markerMatch[0].length)
+            : title;
         const finding: Finding = {
-          title: markerMatch ? title.slice(markerMatch[0].length) : title,
+          title: strippedTitle,
           description: desc || undefined,
         };
         if (markerMatch) {
