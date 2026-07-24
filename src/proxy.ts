@@ -45,6 +45,7 @@ import type { NoActivityDetector } from "./bag/no-activity-detector.js";
 import { tryNormalizeSessionKey } from "./session-key.js";
 import { IssueCreateDedupCache, extractIssueCreateInput, fingerprintIssueCreate, isSuccessfulIssueCreate, DEFAULT_DEDUP_TTL_MS, type Claim } from "./issue-create-dedup.js";
 import { checkArtifactDisclosure } from "./artifact-disclosure.js";
+import { recordTransitionCarriedComment } from "./transition-comment-logic.js";
 
 const log = componentLogger(createLogger(process.env.LOG_LEVEL ?? "info"), "proxy");
 const LINEAR_API_URL = "https://api.linear.app/graphql";
@@ -317,6 +318,60 @@ function stripNullDelegateAssigneeFields(body: GraphQLRequestBody | null, effect
   if (input.assigneeId === null) delete input.assigneeId;
 }
 
+function rejectStrippedAppUserHandoffShape(body: GraphQLRequestBody | null, effectiveIntent: string | null): string | null {
+  if (effectiveIntent !== "handoff-work" || !isIssueUpdateMutation(body)) return null;
+  const input = issueUpdateInput(body);
+  if (!input) return null;
+  if (input.assigneeId === null && !("delegateId" in input)) {
+    return "[Proxy] 'handoff-work' blocked: app-user delegate handoffs must include delegateId alongside assigneeId:null. This request looks like the known stripped delegateId fallback shape; update the Linear skill CLI and retry.";
+  }
+  return null;
+}
+
+/**
+ * INF-274: Guard raw-path delegate=null on plain (non-workflow) tickets.
+ *
+ * Intent-bearing verbs (needs-human, complete, park) legitimately clear delegate
+ * and are exempted by stripNullDelegateAssigneeFields above — this guard catches
+ * the remaining case where a CLI sends delegateId:null directly on a ticket that
+ * has no workflow definition (ad-hoc / plain ticket).
+ *
+ * Workflow tickets are deferred to checkRawMutationInterception which already
+ * governs delegate mutations.
+ *
+ * Returns a blocking message string when the mutation should be rejected, or
+ * null to allow the request to proceed.
+ */
+export async function guardPlainTicketDelegateClear(
+  body: GraphQLRequestBody | null,
+  issueId: string | null,
+  authToken: string,
+): Promise<string | null> {
+  // Only applies to issueUpdate mutations that set delegateId to null
+  if (!isIssueUpdateMutation(body)) return null;
+  const input = issueUpdateInput(body);
+  if (!input || !("delegateId" in input) || input.delegateId !== null) return null;
+
+  // If the caller could not determine an issueId, we cannot verify the ticket
+  // type — allow through
+  if (!issueId) return null;
+
+  // Fetch labels to determine if this is a workflow or plain ticket
+  let labels: string[];
+  try {
+    labels = await fetchWorkflowLabels(issueId, authToken);
+  } catch {
+    // Fail-open — can't verify ticket type, allow through
+    return null;
+  }
+
+  // If the ticket has workflow labels, defer to workflow-gate's interception
+  if (getWorkflowId(labels) !== null) return null;
+
+  // Plain (non-workflow) ticket — block the delegate clear
+  return `Rejected delegate=null on plain (non-workflow) ticket ${issueId}: the proxy owns delegate management; CLI must not directly null the delegate field.`;
+}
+
 /**
  * Build the ticket context string for log lines (empty string when no ID found).
  */
@@ -518,6 +573,8 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   const target = (req.headers["x-openclaw-linear-target"] as string | undefined) ?? null;
   const feedbackCategoryHeader = (req.headers["x-openclaw-feedback-category"] as string | undefined) ?? null;
   const artifactRefHeader = (req.headers["x-openclaw-artifact-ref"] as string | undefined) ?? null;
+  const deployProbeUrlHeader = (req.headers["x-openclaw-deploy-probe-url"] as string | undefined) ?? null;
+  const expectedArtifactSymbolHeader = (req.headers["x-openclaw-expected-artifact-symbol"] as string | undefined) ?? null;
   const codeArtifactHeader = (req.headers["x-openclaw-code-artifact"] as string | undefined) ?? null;
   const substitutionReasonHeader = (req.headers["x-openclaw-substitution-reason"] as string | undefined) ?? null;
   const cliVersion = (req.headers["x-openclaw-linear-cli-version"] as string | undefined) ?? null;
@@ -642,7 +699,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // (begin-work, handoff-work, etc.) don't need a command nonce because they
       // already resolve to the user-supplied verb directly.
       if (
-        (intent === 'continue-workflow' || intent === 'request-revision') &&
+        (intent === 'continue-workflow' || intent === 'request-revision' || intent === 'begin-workflow') &&
         issueId &&
         !commandId
       ) {
@@ -667,7 +724,7 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
       // preserved in the header for logging; effectiveIntent drives all validation and
       // state transition logic.
       let effectiveIntent = intent!;
-      if ((intent === 'continue-workflow' || intent === 'request-revision') && issueId) {
+      if ((intent === 'continue-workflow' || intent === 'request-revision' || intent === 'begin-workflow') && issueId) {
         const metaResult = await resolveMetaIntent(intent, issueId, authorization, snapshotState);
         if ('error' in metaResult) {
           log.warn(`meta-intent-block agent=${agentId} intent=${intent}${ticketCtx}: ${metaResult.error}`);
@@ -889,6 +946,13 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           log.warn(`comment-satisfied-by rejected agent=${agentId} intent=${effectiveIntent}${ticketCtx} comment=${satisfiedByHeader}`);
         }
       }
+      // INF-443: a comment carried alongside a transition intent is mandatory
+      // transition metadata, not free-standing agent chatter — record it on the
+      // transition-carried counter so it never feeds a recent-comment
+      // rate-limit/dedup counter.
+      if (requestHasComment) {
+        recordTransitionCarriedComment();
+      }
       const p3rejection = await checkWorkflowRules(effectiveIntent, issueId, authorization, agentId, target, callerLinearUserId, artifactRefHeader, breakGlassOverride, intent !== effectiveIntent, requestHasComment, snapshotDelegateId, snapshotState);
       if (p3rejection) {
         log.warn(`workflow-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${p3rejection}`);
@@ -1020,12 +1084,31 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           }
         }
 
+        // INF-274: Guard raw-path delegate=null on plain (non-workflow) tickets.
+        // Only applies to non-intent-bearing mutations (raw-path). Intent-bearing
+        // verbs like note, handoff-work, etc. are handled by
+        // stripNullDelegateAssigneeFields below.
+        if (!effectiveIntent && isIssueUpdateMutation(body)) {
+          const guardResult = await guardPlainTicketDelegateClear(body, issueId ?? null, authorization);
+          if (guardResult !== null) {
+            log.warn(`plain-delegate-clear-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${guardResult}`);
+            res.status(200).json({ errors: [{ message: `[Proxy] ${guardResult}` }] });
+            return;
+          }
+        }
+
         // AI-1857: Strip null delegateId/assigneeId from forwarded intent-bearing mutations.
         // The proxy manages delegates; partial semantic-verb application (e.g. complete)
         // bundles these null clears, which must not reach Linear directly.
         // AI-2067: needs-human is exempt — it is the documented path for clearing delegate
         // while setting a human assignee.
         if (isIssueUpdateMutation(body)) {
+          const strippedAppUserHandoffRejection = rejectStrippedAppUserHandoffShape(body, effectiveIntent);
+          if (strippedAppUserHandoffRejection) {
+            log.warn(`app-user-handoff-stripped-block agent=${agentId} intent=${effectiveIntent}${ticketCtx}: ${strippedAppUserHandoffRejection}`);
+            res.status(200).json({ errors: [{ message: strippedAppUserHandoffRejection }] });
+            return;
+          }
           stripNullDelegateAssigneeFields(body, effectiveIntent);
         }
 
@@ -1060,7 +1143,25 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
           ) {
             inputForDelegate.assigneeId = null;
             log.info(
-              `app-user-delegate-assignee-clear agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected assigneeId:null alongside delegateId so the delegate persists (AI-2417)`,
+              `app-user-delegate-assignee-clear agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected assigneeId:null alongside delegateId in input (AI-2417)`,
+            );
+          }
+          // AI-1395/INF-312: Also handle inline input format where delegateId is a
+          // top-level variable (e.g. `input: { delegateId: $delegateId }` with
+          // variables: { id, delegateId } rather than variables: { id, input: { delegateId } }).
+          // The issueUpdateInput helper returns undefined for this shape, so we check
+          // body.variables directly for delegateId at the top level.
+          const vars = body?.variables as Record<string, unknown> | undefined;
+          if (
+            vars &&
+            typeof vars === "object" &&
+            "delegateId" in vars &&
+            vars.delegateId != null &&
+            !("assigneeId" in vars)
+          ) {
+            vars.assigneeId = null;
+            log.info(
+              `app-user-delegate-assignee-clear agent=${agentId} intent=${effectiveIntent}${ticketCtx}: injected assigneeId:null alongside delegateId in top-level variables (AI-2417/INF-312)`,
             );
           }
         }
@@ -1270,6 +1371,8 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
             enrolledTicketsStore: deps?.enrolledTicketsStore,
             operationalEventStore: deps?.operationalEventStore,
             delegateOverride,
+            deployProbeUrl: deployProbeUrlHeader,
+            expectedArtifactSymbol: expectedArtifactSymbolHeader,
           });
 
           // ── AI-2554: Structured transition audit record ──────────────
@@ -1438,25 +1541,6 @@ export async function handleProxyRequest(req: Request, res: Response, deps?: Pro
   // inside the TTL is answered with the first create's upstream response, so the
   // caller receives the issue that already exists instead of minting a second one.
   // `linear create` carries no intent header, so this sits on the non-intent path.
-  // INF-152: team-default project injection for issueCreate.
-  // When no projectId is set and the team has a configured default, inject it
-  // before forwarding. This covers ALL agents routing through the proxy.
-  if (body && typeof body === "object" && "variables" in body) {
-    const vars = (body as Record<string, unknown>).variables as Record<string, unknown> | undefined;
-    const input = vars?.input as Record<string, unknown> | undefined;
-    if (input && typeof input === "object" && !input.projectId && input.teamId) {
-      const TEAM_DEFAULT_PROJECTS: Record<string, string> = {
-        // INF: all tickets auto-attach to "Fancy Openclaw Linear Connector"
-        "1519bfb2-fc64-4f4c-883c-0aeba9faf30a": "a6a0fd38-720f-42e8-9791-02682f44d269",
-      };
-      const defaultProjectId = TEAM_DEFAULT_PROJECTS[input.teamId as string];
-      if (defaultProjectId) {
-        input.projectId = defaultProjectId;
-        log.info(`team-default-project teamId=${input.teamId} projectId=${defaultProjectId}`);
-      }
-    }
-  }
-
   let createClaim: Claim | null = null;
   const createInput = issueCreateDedupTtlMs > 0 ? extractIssueCreateInput(body) : null;
   if (createInput) {

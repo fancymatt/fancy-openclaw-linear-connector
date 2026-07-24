@@ -18,7 +18,8 @@
 export type DispatchIntegrityGateKey =
   | "deliveryTimeRecipientResolution"
   | "phantomFetchabilityGate"
-  | "wakeSessionDedup";
+  | "wakeSessionDedup"
+  | "deployOutcomeVerification";
 
 export interface DispatchIntegrityGateState {
   active: boolean;
@@ -30,6 +31,7 @@ const GATE_KEYS: DispatchIntegrityGateKey[] = [
   "deliveryTimeRecipientResolution",
   "phantomFetchabilityGate",
   "wakeSessionDedup",
+  "deployOutcomeVerification",
 ];
 
 function blankGates(): Record<DispatchIntegrityGateKey, DispatchIntegrityGateState> {
